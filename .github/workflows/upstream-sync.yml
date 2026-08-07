@@ -30,10 +30,13 @@ jobs:
 
       - name: Resolve and pin upstream SHA
         id: pin
+        env:
+          # Pass through env, never interpolate ${{ }} into run: - expression injection guard.
+          INPUT_SHA: ${{ inputs.upstream_sha }}
         run: |
           git remote add upstream https://github.com/The-PR-Agent/pr-agent.git
           git fetch upstream main --quiet
-          SHA="${{ inputs.upstream_sha }}"
+          SHA="$INPUT_SHA"
           [ -z "$SHA" ] && SHA=$(git rev-parse upstream/main)
           # Refuse SHAs that are not actually on upstream/main.
           git merge-base --is-ancestor "$SHA" upstream/main
