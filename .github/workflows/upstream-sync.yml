@@ -36,9 +36,17 @@ jobs:
         run: |
           git remote add upstream https://github.com/The-PR-Agent/pr-agent.git
           git fetch upstream main --quiet
-          SHA="$INPUT_SHA"
-          [ -z "$SHA" ] && SHA=$(git rev-parse upstream/main)
-          # Refuse SHAs that are not actually on upstream/main.
+          RAW="$INPUT_SHA"
+          [ -z "$RAW" ] && RAW="upstream/main"
+          # Canonicalize to a hex commit id before anything downstream sees it: the raw
+          # dispatch input must never reach a later run: script as a step output.
+          SHA=$(git rev-parse --verify --quiet "${RAW}^{commit}") || {
+            echo "Not a commit: $RAW" >&2; exit 1; }
+          case "$SHA" in
+            [0-9a-f][0-9a-f]*) [ ${#SHA} -eq 40 ] || { echo "Bad SHA: $SHA" >&2; exit 1; } ;;
+            *) echo "Bad SHA: $SHA" >&2; exit 1 ;;
+          esac
+          # Refuse commits that are not actually on upstream/main.
           git merge-base --is-ancestor "$SHA" upstream/main
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "short=${SHA:0:8}" >> "$GITHUB_OUTPUT"
@@ -64,9 +72,11 @@ jobs:
         if: steps.pin.outputs.up_to_date == 'false' && steps.existing.outputs.open == '0'
         env:
           GH_TOKEN: ${{ github.token }}
+          # Same guard as the pin step: step outputs go through env, never ${{ }} in run:.
+          SHA: ${{ steps.pin.outputs.sha }}
+          SHORT: ${{ steps.pin.outputs.short }}
         run: |
-          SHA="${{ steps.pin.outputs.sha }}"
-          BRANCH="sync/upstream-$(date -u +%Y%m%d)-${{ steps.pin.outputs.short }}"
+          BRANCH="sync/upstream-$(date -u +%Y%m%d)-${SHORT}"
           git branch "$BRANCH" "$SHA"
           git push origin "$BRANCH"
 
@@ -102,5 +112,5 @@ jobs:
           } > body.md
 
           gh pr create --base main --head "$BRANCH" \
-            --title "sync: upstream @ ${{ steps.pin.outputs.short }}" \
+            --title "sync: upstream @ ${SHORT}" \
             --body-file body.md
