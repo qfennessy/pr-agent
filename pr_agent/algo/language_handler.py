@@ -15,6 +15,14 @@ def filter_bad_extensions(files):
 def is_valid_file(filename:str, bad_extensions=None) -> bool:
     if not filename:
         return False
+
+    # An explicit allowlist (config.files_to_review) wins over the
+    # auto-generated and bad-extension filters, so a repo can opt specific
+    # files (e.g. yarn.lock) into review by exact basename.
+    files_to_review = get_settings().config.get('files_to_review', [])
+    if filename.replace('\\', '/').split('/')[-1] in files_to_review:
+        return True
+
     if not bad_extensions:
         bad_extensions = get_settings().bad_extensions.default
         if get_settings().config.use_extra_bad_extensions:

@@ -122,3 +122,51 @@ class TestSortFilesByMainLanguages:
             {'language': 'Other', 'files': []}
         ]
         assert sort_files_by_main_languages(languages, files) == expected_output
+
+
+import pytest
+
+from pr_agent.algo.language_handler import is_valid_file
+from pr_agent.config_loader import get_settings
+
+_SETTINGS_KEYS = ["config.files_to_review"]
+
+
+@pytest.fixture(autouse=True)
+def files_to_review_cfg():
+    s = get_settings()
+    saved = {k: s.get(k, None) for k in _SETTINGS_KEYS}
+
+    def _set(value):
+        s.set("config.files_to_review", value)
+
+    yield _set
+    for key, value in saved.items():
+        if value is None:
+            s.unset(key, force=True)
+        else:
+            s.set(key, value)
+
+
+class TestIsValidFileFilesToReviewAllowlist:
+    def test_lockfile_skipped_by_default(self, files_to_review_cfg):
+        files_to_review_cfg([])
+        assert is_valid_file("yarn.lock") is False
+
+    def test_lockfile_included_when_allowed(self, files_to_review_cfg):
+        files_to_review_cfg(["yarn.lock"])
+        assert is_valid_file("yarn.lock") is True
+
+    def test_allowlist_matches_basename_across_paths(self, files_to_review_cfg):
+        files_to_review_cfg(["yarn.lock"])
+        assert is_valid_file("apps/web/yarn.lock") is True
+
+    def test_allowlist_only_reviews_matching_files(self, files_to_review_cfg):
+        files_to_review_cfg(["yarn.lock"])
+        assert is_valid_file("src/main.py") is True
+        assert is_valid_file("other.lock") is False
+
+    def test_other_auto_generated_skipped_even_with_allowlist(self, files_to_review_cfg):
+        files_to_review_cfg(["yarn.lock"])
+        assert is_valid_file("bun.lockb") is False
+        assert is_valid_file("app.min.js") is False
