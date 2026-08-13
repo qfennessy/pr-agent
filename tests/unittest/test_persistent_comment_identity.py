@@ -143,8 +143,53 @@ def test_marker_is_attached_once_and_names_the_answering_model(comment_id):
     marked = attach_persistent_comment_id(f"{HEADER}\nreview text")
 
     assert f"{PERSISTENT_COMMENT_ID_MARKER} kimi-k3 -->" in marked
-    assert "answered by `openai/glm-5`" in marked  # honest attribution when a fallback answered
+    assert "`openai/glm-5`" in marked  # honest attribution when a fallback answered
     assert attach_persistent_comment_id(marked) == marked  # idempotent across updates
+
+
+def test_attribution_is_readable_without_scrolling(comment_id):
+    """Every reviewer publishes under the same heading, so the name must be near it.
+
+    With three reviewers on one PR, an attribution at the end of a long comment leaves
+    the reader unable to tell the opinions apart while scanning the timeline.
+    """
+    comment_id("qwen3.6-plus")
+    get_settings().set("config.last_used_model", "openai/qwen3.6-plus")
+    long_review = HEADER + "\n\n" + "\n".join(f"finding {i}" for i in range(200))
+
+    marked = attach_persistent_comment_id(long_review)
+    lines = [line for line in marked.split("\n") if line.strip()]
+
+    assert lines[0] == HEADER
+    assert lines[1] == "> Reviewed by `qwen3.6-plus`"
+    # The redundant "answered by itself" half is dropped, so a real fallback stands out.
+    assert "fallback" not in lines[1]
+    # ...and the marker is still where ownership and the CI guard look for it.
+    assert marked.rstrip().endswith(f"{PERSISTENT_COMMENT_ID_MARKER} qwen3.6-plus -->")
+
+
+def test_a_fired_fallback_announces_itself(comment_id):
+    comment_id("kimi-k3")
+    get_settings().set("config.last_used_model", "openai/kimi-k2.7-code")
+
+    lines = [line for line in attach_persistent_comment_id(f"{HEADER}\n\nbody").split("\n") if line.strip()]
+
+    assert lines[1] == "> Reviewed by `kimi-k3` - fallback model `openai/kimi-k2.7-code` answered"
+
+
+def test_a_new_run_replaces_the_previous_attribution_instead_of_stacking(comment_id):
+    """A reviewer whose fallback fires on one push and not the next must not show both."""
+    comment_id("deepseek-v4-flash")
+    get_settings().set("config.last_used_model", "openai/glm-5")
+    first = attach_persistent_comment_id(f"{HEADER}\n\nbody")
+
+    # Same body re-rendered on the next push, this time answered by its own model.
+    get_settings().set("config.last_used_model", "openai/deepseek-v4-flash")
+    second = attach_persistent_comment_id(first.replace(
+        f"\n{PERSISTENT_COMMENT_ID_MARKER} deepseek-v4-flash -->", ""))
+
+    assert second.count("> Reviewed by") == 1
+    assert "openai/glm-5" not in second
 
 
 def test_each_reviewer_updates_only_its_own_comment(comment_id):

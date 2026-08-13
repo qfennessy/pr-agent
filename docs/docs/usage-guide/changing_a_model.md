@@ -54,7 +54,7 @@ config.model: "openai/model-b"
 config.persistent_comment_id: "model-b"
 ```
 
-Each run then creates and updates only its own comment, and each comment carries a footer naming the reviewer and the model that actually answered.
+Each run then creates and updates only its own comment, and each comment names its reviewer on the line under the heading — where it is readable while scanning a PR, rather than at the end of a long comment. When a fallback model answered, that line says so.
 
 ### OpenAI like API
 

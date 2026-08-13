@@ -18,6 +18,8 @@ MAX_FILES_ALLOWED_FULL = 50
 # their visible header, which is identical for every run, so a second run would overwrite
 # the first run's comment instead of publishing its own.
 PERSISTENT_COMMENT_ID_MARKER = "<!-- pr-agent-persistent-id:"
+# Opens the visible attribution line placed under the comment's heading.
+PERSISTENT_COMMENT_ATTRIBUTION_PREFIX = "> Reviewed by"
 
 _GLOBAL_SETTINGS_CACHE: dict = {}
 _GLOBAL_SETTINGS_CACHE_TTL_SECONDS = 15 * 60
@@ -162,19 +164,58 @@ def _last_line(text: str) -> str:
     return stripped.rsplit("\n", 1)[-1].strip()
 
 
+def _persistent_comment_attribution(comment_id: str) -> str:
+    """Render the visible "who reviewed this" line for the current run.
+
+    Names the model that actually answered, not just the configured id: with
+    fallback_models a different model may have produced the text, and crediting the
+    wrong one is worse than not crediting at all. When the answering model is the
+    reviewer's own, the redundant half is dropped - "reviewer x, answered by x" is
+    noise that makes the interesting case (a fallback) harder to spot.
+
+    Args:
+        comment_id: The configured reviewer identity.
+
+    Returns:
+        A single markdown line.
+
+    Example:
+        >>> _persistent_comment_attribution("kimi-k3")  # doctest: +SKIP
+        '> Reviewed by `kimi-k3` - fallback model `openai/kimi-k2.7-code` answered'
+    """
+    try:
+        model_used = get_settings().config.get("last_used_model", "") or comment_id
+    except AttributeError:
+        model_used = comment_id
+    # Model ids carry a provider prefix ("openai/kimi-k3") that reviewer ids do not.
+    is_own_model = str(model_used).rsplit("/", 1)[-1] == comment_id
+    if is_own_model:
+        return f"{PERSISTENT_COMMENT_ATTRIBUTION_PREFIX} `{comment_id}`"
+    return (
+        f"{PERSISTENT_COMMENT_ATTRIBUTION_PREFIX} `{comment_id}` - "
+        f"fallback model `{model_used}` answered"
+    )
+
+
 def attach_persistent_comment_id(pr_comment: str) -> str:
-    """Append this run's hidden identity marker (and a visible attribution) to a comment.
+    """Label a comment with this run's reviewer identity, visibly and invisibly.
+
+    The visible attribution goes directly under the heading, because every reviewer
+    publishes under the same "PR Reviewer Guide" heading: with three reviewers on one
+    PR, an attribution at the bottom of a long comment means the reader cannot tell the
+    opinions apart while scanning. The hidden marker stays the last line, where comment
+    ownership and the CI publish guard both look for it.
 
     Args:
         pr_comment: The rendered comment body.
 
     Returns:
-        The body unchanged when no id is configured; otherwise the body plus a footer
-        naming the model that actually answered and a hidden marker used for matching.
+        The body unchanged when no id is configured; otherwise the body with an
+        attribution line after its heading and the id marker as its final line.
 
     Example:
         >>> attach_persistent_comment_id("## PR Reviewer Guide")  # doctest: +SKIP
-        '## PR Reviewer Guide\\n\\n<sub>...</sub>\\n<!-- pr-agent-persistent-id: kimi-k3 -->'
+        '## PR Reviewer Guide\\n\\n> Reviewed by `kimi-k3`\\n<!-- pr-agent-persistent-id: kimi-k3 -->'
     """
     comment_id = get_persistent_comment_id()
     if not comment_id:
@@ -182,15 +223,20 @@ def attach_persistent_comment_id(pr_comment: str) -> str:
     marker = _persistent_comment_marker(comment_id)
     if _last_line(pr_comment) == marker:  # already attached; do not double-append
         return pr_comment
-    # Name the model that actually answered, not the configured id: with fallback_models a
-    # different model may have produced this text, and an unattributed comment invites the
-    # reader to credit the wrong one.
-    try:
-        model_used = get_settings().config.get("last_used_model", "") or comment_id
-    except AttributeError:
-        model_used = comment_id
-    footer = f"<sub>Reviewer `{comment_id}` - answered by `{model_used}`</sub>"
-    return f"{pr_comment}\n\n{footer}\n{marker}"
+
+    attribution = _persistent_comment_attribution(comment_id)
+    body = (pr_comment or "").rstrip()
+    heading, _, rest = body.partition("\n")
+    if heading.strip():
+        rest = rest.lstrip("\n")
+        # Replace a stale attribution rather than stacking a second one.
+        first_rest_line, _, remainder = rest.partition("\n")
+        if first_rest_line.startswith(PERSISTENT_COMMENT_ATTRIBUTION_PREFIX):
+            rest = remainder.lstrip("\n")
+        body = f"{heading}\n\n{attribution}\n\n{rest}".rstrip() if rest else f"{heading}\n\n{attribution}"
+    else:
+        body = attribution
+    return f"{body}\n{marker}"
 
 
 def is_own_persistent_comment(comment_body: str, initial_header: str) -> bool:
