@@ -6,6 +6,10 @@ import pytest
 from pr_agent.config_loader import get_settings
 from pr_agent.tools.pr_reviewer import PRReviewer
 
+# _prepare_prediction now rejects output it cannot parse, so the model's answer can fall
+# back to another model instead of failing after every retry is spent.
+VALID_PREDICTION = "review:\n  score: 90\nsecurity_concerns: No\n"
+
 
 def _make_reviewer(git_provider=None):
     reviewer = PRReviewer.__new__(PRReviewer)
@@ -26,7 +30,7 @@ def _make_prediction_reviewer(git_provider=None):
 @pytest.mark.asyncio
 async def test_prepare_prediction_requests_remaining_files_and_preserves_tuple_result():
     reviewer = _make_prediction_reviewer()
-    reviewer._get_prediction = AsyncMock(return_value="prediction")
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
 
     with patch(
         "pr_agent.tools.pr_reviewer.get_pr_diff",
@@ -44,34 +48,34 @@ async def test_prepare_prediction_requests_remaining_files_and_preserves_tuple_r
     )
     assert reviewer.patches_diff == "diff"
     assert reviewer.remaining_files_list == ["src/one.py", "docs/two.md"]
-    assert reviewer.prediction == "prediction"
+    assert reviewer.prediction == VALID_PREDICTION
 
 
 @pytest.mark.asyncio
 async def test_prepare_prediction_accepts_full_diff_string_when_token_budget_is_sufficient():
     reviewer = _make_prediction_reviewer()
-    reviewer._get_prediction = AsyncMock(return_value="prediction")
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
 
     with patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value="diff"):
         await reviewer._prepare_prediction("model")
 
     assert reviewer.patches_diff == "diff"
     assert reviewer.remaining_files_list == []
-    assert reviewer.prediction == "prediction"
+    assert reviewer.prediction == VALID_PREDICTION
 
 
 @pytest.mark.asyncio
 async def test_prepare_prediction_keeps_incremental_review_compatible_with_tuple_result():
     reviewer = _make_prediction_reviewer()
     reviewer.incremental = SimpleNamespace(is_incremental=True)
-    reviewer._get_prediction = AsyncMock(return_value="prediction")
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
 
     with patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value=("diff", ["skipped.py"])):
         await reviewer._prepare_prediction("model")
 
     assert reviewer.patches_diff == "diff"
     assert reviewer.remaining_files_list == ["skipped.py"]
-    assert reviewer.prediction == "prediction"
+    assert reviewer.prediction == VALID_PREDICTION
 
 
 def _render_review(reviewer, remaining_files, supports_gfm_markdown=False):
@@ -431,3 +435,30 @@ def test_answer_mode_prefers_the_newest_question_and_answer(monkeypatch):
 
     assert reviewer.vars["question_str"] == "Questions to better understand the PR:\n- Current question?"
     assert reviewer.vars["answer_str"] == "/answer Current answer."
+
+
+def _reviewer_with_prediction(prediction):
+    """A bare PRReviewer carrying only the prediction, for the parse guard."""
+    reviewer = PRReviewer.__new__(PRReviewer)
+    reviewer.prediction = prediction
+    return reviewer
+
+
+@pytest.mark.parametrize(
+    "prediction, expect_error",
+    [
+        ("review:\n  score: 90\nsecurity_concerns: No\n", False),
+        # Seen live: an unquoted colon inside a value derails the YAML parser.
+        ("review:\n  summary: note: this breaks\n   - bad indent\n", True),
+        ("", True),
+        (None, True),
+        ("not_a_review:\n  x: 1\n", True),
+    ],
+)
+def test_unparsable_prediction_is_rejected_so_the_fallback_model_runs(prediction, expect_error):
+    reviewer = _reviewer_with_prediction(prediction)
+    if expect_error:
+        with pytest.raises(ValueError):
+            reviewer._reject_unparsable_prediction("openai/some-model")
+    else:
+        reviewer._reject_unparsable_prediction("openai/some-model")
