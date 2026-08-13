@@ -1,9 +1,9 @@
-from abc import ABC, abstractmethod
 # enum EDIT_TYPE (ADDED, DELETED, MODIFIED, RENAMED)
 import os
 import shutil
 import subprocess
 import time
+from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 
 from pr_agent.algo.types import FilePatchInfo
@@ -12,6 +12,12 @@ from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 
 MAX_FILES_ALLOWED_FULL = 50
+
+# Hidden marker that lets several PR-Agent runs keep separate persistent comments on the
+# same PR - for example one review per model. Persistent comments are otherwise found by
+# their visible header, which is identical for every run, so a second run would overwrite
+# the first run's comment instead of publishing its own.
+PERSISTENT_COMMENT_ID_MARKER = "<!-- pr-agent-persistent-id:"
 
 _GLOBAL_SETTINGS_CACHE: dict = {}
 _GLOBAL_SETTINGS_CACHE_TTL_SECONDS = 15 * 60
@@ -112,6 +118,82 @@ def get_git_ssl_env() -> dict[str, str]:
     if chosen_cert_file:
         returned_env.update({"GIT_SSL_CAINFO": chosen_cert_file, "REQUESTS_CA_BUNDLE": chosen_cert_file})
     return returned_env
+
+
+def get_persistent_comment_id() -> str:
+    """Return the configured identity for this run's persistent comments, or "".
+
+    Set config.persistent_comment_id when more than one PR-Agent run comments on the same
+    PR (for example a review per model, run as separate CI jobs). Each run then finds and
+    updates only its own comment. Leave it unset for the single-run default.
+
+    Returns:
+        The trimmed id, or "" when unset.
+
+    Example:
+        >>> get_settings().set("config.persistent_comment_id", "kimi-k3")
+        >>> get_persistent_comment_id()
+        'kimi-k3'
+    """
+    try:
+        value = get_settings().config.get("persistent_comment_id", "")
+    except AttributeError:
+        return ""
+    return str(value).strip() if value else ""
+
+
+def attach_persistent_comment_id(pr_comment: str) -> str:
+    """Append this run's hidden identity marker (and a visible attribution) to a comment.
+
+    Args:
+        pr_comment: The rendered comment body.
+
+    Returns:
+        The body unchanged when no id is configured; otherwise the body plus a footer
+        naming the model that actually answered and a hidden marker used for matching.
+
+    Example:
+        >>> attach_persistent_comment_id("## PR Reviewer Guide")  # doctest: +SKIP
+        '## PR Reviewer Guide\\n\\n<sub>...</sub>\\n<!-- pr-agent-persistent-id: kimi-k3 -->'
+    """
+    comment_id = get_persistent_comment_id()
+    if not comment_id or PERSISTENT_COMMENT_ID_MARKER in (pr_comment or ""):
+        return pr_comment
+    # Name the model that actually answered, not the configured id: with fallback_models a
+    # different model may have produced this text, and an unattributed comment invites the
+    # reader to credit the wrong one.
+    try:
+        model_used = get_settings().config.get("last_used_model", "") or comment_id
+    except AttributeError:
+        model_used = comment_id
+    footer = f"<sub>Reviewer `{comment_id}` - answered by `{model_used}`</sub>"
+    return f"{pr_comment}\n\n{footer}\n{PERSISTENT_COMMENT_ID_MARKER} {comment_id} -->"
+
+
+def is_own_persistent_comment(comment_body: str, initial_header: str) -> bool:
+    """Decide whether an existing PR comment is the one this run should update.
+
+    With an id configured, only the marker matches - so parallel reviewers never edit each
+    other's comments. Without one, the historical header match applies, except that a
+    comment belonging to an identified run is skipped: an un-identified run must not adopt
+    another reviewer's comment as its own.
+
+    Args:
+        comment_body: The existing comment's body.
+        initial_header: The header this run publishes under.
+
+    Returns:
+        True when this run owns the comment.
+
+    Example:
+        >>> is_own_persistent_comment("## PR Reviewer Guide 🔍\\nbody", "## PR Reviewer Guide 🔍")
+        True
+    """
+    body = comment_body or ""
+    comment_id = get_persistent_comment_id()
+    if comment_id:
+        return f"{PERSISTENT_COMMENT_ID_MARKER} {comment_id} -->" in body
+    return body.startswith(initial_header) and PERSISTENT_COMMENT_ID_MARKER not in body
 
 
 class GitProvider(ABC):
@@ -360,10 +442,11 @@ class GitProvider(ABC):
                                    name='review',
                                    final_update_message=True,
                                    as_thread: bool = False):
+        pr_comment = attach_persistent_comment_id(pr_comment)
         try:
             prev_comments = list(self.get_issue_comments())
             for comment in prev_comments:
-                if comment.body.startswith(initial_header):
+                if is_own_persistent_comment(comment.body, initial_header):
                     latest_commit_url = self.get_latest_commit_url()
                     comment_url = self.get_comment_url(comment)
                     if update_header:

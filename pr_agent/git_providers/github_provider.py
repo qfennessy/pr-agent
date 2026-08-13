@@ -11,8 +11,8 @@ from datetime import datetime
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
-from github.Issue import Issue
 from github import AppAuthentication, Auth, Github, GithubException
+from github.Issue import Issue
 from retry.api import retry_call
 from starlette_context import context
 
@@ -29,8 +29,11 @@ from ..algo.utils import (PRReviewHeader, Range, clip_tokens,
 from ..config_loader import get_settings
 from ..log import get_logger
 from ..servers.utils import RateLimitExceeded
-from .git_provider import (MAX_FILES_ALLOWED_FULL, FilePatchInfo, GitProvider,
-                           IncrementalPR, get_cached_global_settings)
+from .git_provider import (MAX_FILES_ALLOWED_FULL,
+                           PERSISTENT_COMMENT_ID_MARKER, FilePatchInfo,
+                           GitProvider, IncrementalPR,
+                           get_cached_global_settings,
+                           get_persistent_comment_id)
 
 
 def _next_page_url(headers: dict) -> str:
@@ -207,8 +210,16 @@ class GithubProvider(GitProvider):
             prefixes.append(PRReviewHeader.REGULAR.value)
         if incremental:
             prefixes.append(PRReviewHeader.INCREMENTAL.value)
+        # When several PR-Agent runs comment on the same PR (e.g. one review per model), the
+        # previous review of *this* run is the one carrying its id marker; without the filter
+        # an incremental review could be built on another reviewer's output.
+        comment_id = get_persistent_comment_id()
+        marker = f"{PERSISTENT_COMMENT_ID_MARKER} {comment_id} -->" if comment_id else ""
         for index in range(len(self.comments) - 1, -1, -1):
-            if any(self.comments[index].body.startswith(prefix) for prefix in prefixes):
+            body = self.comments[index].body or ""
+            if marker and marker not in body:
+                continue
+            if any(body.startswith(prefix) for prefix in prefixes):
                 return self.comments[index]
         return None
 

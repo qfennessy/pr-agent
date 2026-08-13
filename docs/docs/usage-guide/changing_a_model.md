@@ -17,6 +17,45 @@ You can give parameters via a configuration file, or from environment variables.
     See [litellm documentation](https://litellm.vercel.app/docs/proxy/quick_start#supported-llms) for the environment variables needed per model, as they may vary and change over time. Our documentation per-model may not always be up-to-date with the latest changes.
     Failing to set the needed keys of a specific model will usually result in litellm not identifying the model type, and failing to utilize it.
 
+### Bounding how long a stuck provider can take
+
+Three retry budgets multiply, so a provider that accepts connections but never answers can consume far more time than `ai_timeout` suggests:
+
+| Setting | Default | What it counts |
+| --- | --- | --- |
+| `config.model_retries` | 2 | Attempts per model, before moving on to the next fallback |
+| `config.fallback_models` | – | Models tried in order after the primary |
+| `config.ai_provider_max_retries` | unset | Cap on the provider client's own retries. LiteLLM's OpenAI path defaults to 2, i.e. **3 requests per attempt** — one logged `timeout value=120` attempt then takes ~360s of wall clock |
+
+Worst case is roughly `ai_timeout x model_retries x (1 + len(fallback_models)) x (1 + provider retries)`. With the defaults and one fallback, that is 120s x 2 x 2 x 3 ≈ 24 minutes. To bound it:
+
+```toml
+[config]
+ai_timeout = 90
+model_retries = 1
+ai_provider_max_retries = 0
+fallback_models = ["<a model from a different family>"]
+```
+
+A fallback entry identical to `model` is not a fallback — it retries the same endpoint and doubles the time spent on an outage.
+
+When every model fails and `GITHUB_STEP_SUMMARY` is set, PR-Agent writes a table of the attempts (model, attempt, configured timeout, error class, elapsed) to the job summary, with credential-shaped text redacted. It is the fastest way to tell a provider outage apart from a repository CI failure.
+
+### Running more than one model on the same PR
+
+To get a second opinion, run PR-Agent twice on the same PR (for example as two CI jobs) with different models. Give each run its own `config.persistent_comment_id` — otherwise both runs match the same review header and the second overwrites the first:
+
+```yaml
+# job 1
+config.model: "openai/model-a"
+config.persistent_comment_id: "model-a"
+# job 2
+config.model: "openai/model-b"
+config.persistent_comment_id: "model-b"
+```
+
+Each run then creates and updates only its own comment, and each comment carries a footer naming the reviewer and the model that actually answered.
+
 ### OpenAI like API
 
 To use an OpenAI like API, set the following in your `.secrets.toml` file:
