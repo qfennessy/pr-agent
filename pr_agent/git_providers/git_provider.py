@@ -142,6 +142,26 @@ def get_persistent_comment_id() -> str:
     return str(value).strip() if value else ""
 
 
+def _persistent_comment_marker(comment_id: str) -> str:
+    """Return the exact marker line published for the given id."""
+    return f"{PERSISTENT_COMMENT_ID_MARKER} {comment_id} -->"
+
+
+def _last_line(text: str) -> str:
+    """Return the final non-empty line of a body, or "" - where the marker is written.
+
+    Ownership is decided on the LAST line, never on a substring of the whole body. A
+    review can quote a marker in its own text (a PR that edits the marker template will
+    quote it verbatim in the diff), and a substring test then reads that quotation as
+    proof of ownership - which drops the real marker and hands the comment to the wrong
+    run. Anchoring to the final line makes quoted text inert.
+    """
+    stripped = (text or "").rstrip()
+    if not stripped:
+        return ""
+    return stripped.rsplit("\n", 1)[-1].strip()
+
+
 def attach_persistent_comment_id(pr_comment: str) -> str:
     """Append this run's hidden identity marker (and a visible attribution) to a comment.
 
@@ -157,7 +177,10 @@ def attach_persistent_comment_id(pr_comment: str) -> str:
         '## PR Reviewer Guide\\n\\n<sub>...</sub>\\n<!-- pr-agent-persistent-id: kimi-k3 -->'
     """
     comment_id = get_persistent_comment_id()
-    if not comment_id or PERSISTENT_COMMENT_ID_MARKER in (pr_comment or ""):
+    if not comment_id:
+        return pr_comment
+    marker = _persistent_comment_marker(comment_id)
+    if _last_line(pr_comment) == marker:  # already attached; do not double-append
         return pr_comment
     # Name the model that actually answered, not the configured id: with fallback_models a
     # different model may have produced this text, and an unattributed comment invites the
@@ -167,16 +190,16 @@ def attach_persistent_comment_id(pr_comment: str) -> str:
     except AttributeError:
         model_used = comment_id
     footer = f"<sub>Reviewer `{comment_id}` - answered by `{model_used}`</sub>"
-    return f"{pr_comment}\n\n{footer}\n{PERSISTENT_COMMENT_ID_MARKER} {comment_id} -->"
+    return f"{pr_comment}\n\n{footer}\n{marker}"
 
 
 def is_own_persistent_comment(comment_body: str, initial_header: str) -> bool:
     """Decide whether an existing PR comment is the one this run should update.
 
-    With an id configured, only the marker matches - so parallel reviewers never edit each
-    other's comments. Without one, the historical header match applies, except that a
-    comment belonging to an identified run is skipped: an un-identified run must not adopt
-    another reviewer's comment as its own.
+    With an id configured, only this run's marker line matches - so parallel reviewers
+    never edit each other's comments. Without one, the historical header match applies,
+    except that a comment belonging to an identified run is skipped: an un-identified run
+    must not adopt another reviewer's comment as its own.
 
     Args:
         comment_body: The existing comment's body.
@@ -190,10 +213,14 @@ def is_own_persistent_comment(comment_body: str, initial_header: str) -> bool:
         True
     """
     body = comment_body or ""
+    last_line = _last_line(body)
     comment_id = get_persistent_comment_id()
     if comment_id:
-        return f"{PERSISTENT_COMMENT_ID_MARKER} {comment_id} -->" in body
-    return body.startswith(initial_header) and PERSISTENT_COMMENT_ID_MARKER not in body
+        return last_line == _persistent_comment_marker(comment_id)
+    owned_by_an_identified_run = (
+        last_line.startswith(PERSISTENT_COMMENT_ID_MARKER) and last_line.endswith("-->")
+    )
+    return body.startswith(initial_header) and not owned_by_an_identified_run
 
 
 class GitProvider(ABC):

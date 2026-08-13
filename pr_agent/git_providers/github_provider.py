@@ -29,9 +29,9 @@ from ..algo.utils import (PRReviewHeader, Range, clip_tokens,
 from ..config_loader import get_settings
 from ..log import get_logger
 from ..servers.utils import RateLimitExceeded
-from .git_provider import (MAX_FILES_ALLOWED_FULL,
-                           PERSISTENT_COMMENT_ID_MARKER, FilePatchInfo,
-                           GitProvider, IncrementalPR,
+from .git_provider import (MAX_FILES_ALLOWED_FULL, FilePatchInfo, GitProvider,
+                           IncrementalPR, _last_line,
+                           _persistent_comment_marker,
                            get_cached_global_settings,
                            get_persistent_comment_id)
 
@@ -211,13 +211,13 @@ class GithubProvider(GitProvider):
         if incremental:
             prefixes.append(PRReviewHeader.INCREMENTAL.value)
         # When several PR-Agent runs comment on the same PR (e.g. one review per model), the
-        # previous review of *this* run is the one carrying its id marker; without the filter
-        # an incremental review could be built on another reviewer's output.
+        # previous review of *this* run is the one whose marker line closes it; without the
+        # filter an incremental review could be built on another reviewer's output.
         comment_id = get_persistent_comment_id()
-        marker = f"{PERSISTENT_COMMENT_ID_MARKER} {comment_id} -->" if comment_id else ""
+        marker = _persistent_comment_marker(comment_id) if comment_id else ""
         for index in range(len(self.comments) - 1, -1, -1):
             body = self.comments[index].body or ""
-            if marker and marker not in body:
+            if marker and _last_line(body) != marker:
                 continue
             if any(body.startswith(prefix) for prefix in prefixes):
                 return self.comments[index]

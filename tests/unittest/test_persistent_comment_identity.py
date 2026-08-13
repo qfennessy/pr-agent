@@ -191,3 +191,56 @@ def test_identified_run_ignores_a_legacy_unmarked_comment(comment_id):
     comment_id("deepseek")
 
     assert is_own_persistent_comment(f"{HEADER}\nlegacy", HEADER) is False
+
+
+def test_a_review_quoting_a_marker_still_gets_its_own(comment_id):
+    """Regression, seen live: a review that quotes a marker must still be marked.
+
+    A PR that edits the marker template puts the literal marker in its diff, and the
+    review then quotes it. Treating any occurrence of the marker as "already attached"
+    dropped the real marker, so the run no longer owned its comment and its CI guard
+    could never find it.
+    """
+    comment_id("qwen3.6-plus")
+    quoted = (
+        f"{HEADER}\n"
+        "The workflow adds:\n"
+        f"    {PERSISTENT_COMMENT_ID_MARKER} ${{REVIEWER_ID}} -->\n"
+        "which gives each reviewer its own comment.\n"
+    )
+
+    marked = attach_persistent_comment_id(quoted)
+
+    assert marked.rstrip().endswith(f"{PERSISTENT_COMMENT_ID_MARKER} qwen3.6-plus -->")
+    assert is_own_persistent_comment(marked, HEADER) is True
+
+
+def test_a_quoted_marker_does_not_confer_ownership(comment_id):
+    """The other half: quoting someone else's marker must not make the comment theirs."""
+    quoting_body = (
+        f"{HEADER}\n"
+        f"see {PERSISTENT_COMMENT_ID_MARKER} deepseek -->\n"
+        "end of review\n"
+    )
+
+    comment_id("deepseek")
+    assert is_own_persistent_comment(quoting_body, HEADER) is False
+
+    # And an un-identified run may still adopt it: the quotation is inert either way.
+    comment_id("")
+    assert is_own_persistent_comment(quoting_body, HEADER) is True
+
+
+def test_reviewer_keeps_its_comment_when_the_review_quotes_a_marker(comment_id):
+    """End to end: the update path survives a review whose text quotes a marker."""
+    provider = FakeProvider()
+    quoting_review = f"{HEADER}\nbody mentioning {PERSISTENT_COMMENT_ID_MARKER} other -->\n"
+
+    comment_id("qwen3.6-plus")
+    provider.publish_persistent_comment_full(quoting_review, initial_header=HEADER,
+                                             final_update_message=False)
+    provider.publish_persistent_comment_full(quoting_review + "second push\n",
+                                             initial_header=HEADER, final_update_message=False)
+
+    assert len(provider.existing) == 1  # updated in place, not duplicated
+    assert len(provider.edited) == 1
