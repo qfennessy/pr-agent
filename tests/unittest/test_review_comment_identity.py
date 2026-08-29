@@ -87,7 +87,9 @@ def test_full_and_incremental_review_identities_remain_distinct():
 
     assert PRReviewIdentity.REGULAR.value in full_identifiers
     assert PRReviewIdentity.INCREMENTAL.value not in full_identifiers
+    assert PRReviewIdentity.BUGS_ONLY.value not in full_identifiers
     assert PRReviewIdentity.INCREMENTAL.value in incremental_identifiers
+    assert PRReviewIdentity.BUGS_ONLY.value in incremental_identifiers
     assert not any(comment_matches_identity(incremental, item) for item in full_identifiers)
 
 
@@ -104,6 +106,11 @@ def test_full_and_incremental_review_identities_remain_distinct():
         (
             "## Incremental Team Review 🔍\n\n<!-- pr-agent:review:incremental -->\n\nmarked",
             False,
+            True,
+        ),
+        (
+            "## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\nmarked",
+            True,
             True,
         ),
     ],
@@ -151,6 +158,30 @@ def test_clear_persistent_bugs_only_review_preserves_full_review():
 
     assert result is True
     provider.remove_comment.assert_called_once_with(bugs_only_review)
+
+
+def test_persistent_review_updates_dictionary_shaped_comment_by_identity():
+    provider = MagicMock()
+    existing = {
+        "comment_id": 42,
+        "comment": "## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\nold defect",
+    }
+    provider.get_issue_comments.return_value = [existing]
+    provider.get_latest_commit_url.return_value = "https://example.test/commit/deadbeef"
+    provider.get_comment_url.return_value = ""
+
+    GitProvider.publish_persistent_comment_full(
+        provider,
+        "## Team Review 🔍\n\nnew defect",
+        initial_header="## Team Review 🔍",
+        final_update_message=False,
+        identity_marker=PRReviewIdentity.BUGS_ONLY.value,
+    )
+
+    provider.edit_comment.assert_called_once()
+    assert provider.edit_comment.call_args.args[0] is existing
+    assert PRReviewIdentity.BUGS_ONLY.value in provider.edit_comment.call_args.args[1]
+    provider.publish_comment.assert_not_called()
 
 
 def test_github_check_run_receives_presentation_without_comment_identity():
@@ -217,7 +248,7 @@ def test_azure_comment_path_forwards_review_identity():
     }
 
 
-def test_gitea_keeps_identity_inactive_until_comment_payloads_are_normalized():
+def test_gitea_comment_path_forwards_review_identity():
     provider = GiteaProvider.__new__(GiteaProvider)
     provider.publish_persistent_comment_full = MagicMock()
     review = "## Team Review 🔍\n\nbody"
@@ -229,4 +260,7 @@ def test_gitea_keeps_identity_inactive_until_comment_payloads_are_normalized():
         legacy_initial_header="## PR Reviewer Guide 🔍",
     )
 
-    assert provider.publish_persistent_comment_full.call_args.kwargs == {}
+    assert provider.publish_persistent_comment_full.call_args.kwargs == {
+        "identity_marker": PRReviewIdentity.REGULAR.value,
+        "legacy_initial_header": "## PR Reviewer Guide 🔍",
+    }

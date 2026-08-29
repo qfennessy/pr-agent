@@ -277,6 +277,13 @@ def is_own_persistent_comment_for_identities(comment_body: str, identities: Iter
     return not owned_by_an_identified_run
 
 
+def _comment_body(comment) -> str:
+    """Read comment text from provider objects and dictionary-shaped payloads."""
+    if isinstance(comment, dict):
+        return str(comment.get("body") or comment.get("comment") or "")
+    return str(getattr(comment, "body", "") or "")
+
+
 class GitProvider(ABC):
     @abstractmethod
     def is_supported(self, capability: str) -> bool:
@@ -566,7 +573,7 @@ class GitProvider(ABC):
         try:
             comments = list(self.get_issue_comments())
             for comment in reversed(comments):
-                if is_own_persistent_comment_for_identities(comment.body, (identity_marker,)):
+                if is_own_persistent_comment_for_identities(_comment_body(comment), (identity_marker,)):
                     self.remove_comment(comment)
                     return True
         except Exception as e:
@@ -619,7 +626,7 @@ class GitProvider(ABC):
                     for identifier in identifiers
                     if identifier
                     for comment in prev_comments
-                    if is_own_persistent_comment_for_identities(comment.body, (identifier,))
+                    if is_own_persistent_comment_for_identities(_comment_body(comment), (identifier,))
                 ),
                 None,
             )

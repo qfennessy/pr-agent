@@ -155,7 +155,11 @@ def get_pr_review_comment_identifiers(*, full: bool, incremental: bool) -> tuple
     if full:
         identifiers.extend((PRReviewIdentity.REGULAR.value, PRReviewHeader.REGULAR.value))
     if incremental:
-        identifiers.extend((PRReviewIdentity.INCREMENTAL.value, PRReviewHeader.INCREMENTAL.value))
+        identifiers.extend((
+            PRReviewIdentity.BUGS_ONLY.value,
+            PRReviewIdentity.INCREMENTAL.value,
+            PRReviewHeader.INCREMENTAL.value,
+        ))
     return tuple(identifiers)
 
 
