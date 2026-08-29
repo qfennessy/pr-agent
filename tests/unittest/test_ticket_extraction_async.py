@@ -12,14 +12,15 @@ from unittest.mock import MagicMock
 import pytest
 
 from pr_agent.config_loader import get_settings
-from pr_agent.git_providers import (AzureDevopsProvider, GithubProvider,
-                                    GitLabProvider)
+from pr_agent.git_providers import AzureDevopsProvider, GithubProvider, GitLabProvider
 from pr_agent.tools import ticket_pr_compliance_check as tpc
 from pr_agent.tools.ticket_pr_compliance_check import (
-    extract_and_cache_pr_tickets, extract_gitlab_ticket_references,
-    extract_ticket_links_from_pr_description, extract_tickets)
-from tests.unittest._settings_helpers import (restore_settings,
-                                              snapshot_settings)
+    extract_and_cache_pr_tickets,
+    extract_gitlab_ticket_references,
+    extract_ticket_links_from_pr_description,
+    extract_tickets,
+)
+from tests.unittest._settings_helpers import restore_settings, snapshot_settings
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -144,12 +145,14 @@ def settings_snapshot():
             "related_tickets",
             "pr_reviewer.require_ticket_analysis_review",
             "extract_issue_from_branch",
+            "require_explicit_issue_reference",
         ]
     )
     # Reset to known defaults for each test
     s.set("related_tickets", [])
     s.set("pr_reviewer.require_ticket_analysis_review", False)
     s.set("extract_issue_from_branch", False)
+    s.set("require_explicit_issue_reference", True)
     try:
         yield s
     finally:
@@ -256,6 +259,33 @@ class TestGithubExplicitReferenceParsing:
             f"{verb} #12", "org/repo"
         ) == ["https://github.com/org/repo/issues/12"]
 
+    @pytest.mark.parametrize(
+        "description",
+        [
+            "This PR closes issue #7",
+            "Resolves issue #7",
+            "Fixes bug #7",
+            "Related issues: #7",
+            "Part of #7",
+            "Implements #7",
+            "Depends on #7",
+        ],
+    )
+    def test_explicit_reference_allows_common_natural_phrasing(self, description):
+        assert extract_ticket_links_from_pr_description(description, "org/repo") == [
+            "https://github.com/org/repo/issues/7"
+        ]
+
+    def test_legacy_shorthand_can_be_enabled(self, settings_snapshot):
+        settings_snapshot.set("require_explicit_issue_reference", False)
+
+        assert extract_ticket_links_from_pr_description(
+            "Issue-like text #7 and org/other-repo#8", "org/repo"
+        ) == [
+            "https://github.com/org/repo/issues/7",
+            "https://github.com/org/other-repo/issues/8",
+        ]
+
     @pytest.mark.parametrize("repo", ["pr-agent", "pr.agent", "pr_agent"])
     def test_cross_repository_shorthand_supports_github_repo_characters(self, repo):
         assert extract_ticket_links_from_pr_description(
@@ -278,6 +308,18 @@ class TestGithubExplicitReferenceParsing:
         )
         assert github == ["https://github.com/org/repo/issues/4"]
         assert enterprise == ["https://github.enterprise.local/acme/repo.name/issues/8"]
+
+    def test_trailing_slash_issue_url_is_supported(self):
+        assert extract_ticket_links_from_pr_description(
+            "https://github.com/org/repo/issues/5/", "org/repo"
+        ) == ["https://github.com/org/repo/issues/5"]
+
+    def test_github_dot_com_url_is_ignored_on_enterprise(self):
+        assert extract_ticket_links_from_pr_description(
+            "https://github.com/org/repo/issues/5",
+            "acme/repo",
+            "https://github.enterprise.local",
+        ) == []
 
     def test_duplicate_forms_collapse_in_first_seen_order(self):
         description = (
@@ -303,7 +345,15 @@ https://github.com/org/repo/issues/10
 
     @pytest.mark.parametrize(
         "malformed",
-        ["owner/#5", "owner/repo#", "owner//repo#5", "##5", "owner/repo#5junk"],
+        [
+            "owner/#5",
+            "owner/repo#",
+            "owner//repo#5",
+            "owner/.#5",
+            "owner/..#5",
+            "##5",
+            "owner/repo#5junk",
+        ],
     )
     def test_malformed_references_are_ignored(self, malformed):
         assert extract_ticket_links_from_pr_description(

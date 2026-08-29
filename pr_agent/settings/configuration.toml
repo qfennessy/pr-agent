@@ -97,6 +97,10 @@ claude_extended_thinking_models_override = []
 # by default; set it to true to merge branch-derived issue URLs with explicit references from the PR description.
 # Note: Branch-name extraction is GitHub-only for now; other providers planned for later.
 extract_issue_from_branch = false
+# Require local and cross-repository shorthand in PR descriptions to follow an explicit reference phrase such as
+# "Fixes", "References", or "Related to". Full issue URLs are always accepted. Set to false to preserve the legacy
+# behavior that accepted any #123 or owner/repo#123 text outside Markdown code.
+require_explicit_issue_reference = true
 # Optional: custom regex with exactly one capturing group for the issue number (validated at runtime; falls back
 # to default if missing). If empty, uses default pattern: first 1-6 digits at start of branch or after a slash,
 # followed by hyphen or end (e.g. feature/1-test, 123-fix). GitHub only; other providers planned for later.

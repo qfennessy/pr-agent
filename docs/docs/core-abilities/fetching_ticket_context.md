@@ -3,7 +3,7 @@
 `Supported Git Platforms: GitHub, GitLab, Bitbucket`
 
 !!! note "Branch-name issue linking: GitHub only (for now)"
-    Extracting issue links from the **branch name** (and the optional `branch_issue_regex` setting) is currently implemented for **GitHub only**. Support for GitLab, Bitbucket, and other platforms is planned for a later release. The GitHub flow was the most relevant to implement first; other providers will follow.
+    Optional issue linking from the **branch name** (and the `branch_issue_regex` setting) is currently implemented for **GitHub only**. It is disabled by default; set `extract_issue_from_branch=true` to enable it. Support for GitLab, Bitbucket, and other platforms is planned for a later release.
 
 ## Overview
 
@@ -29,7 +29,8 @@ This integration enriches the review process by automatically surfacing relevant
 
 Ticket Recognition Requirements:
 
-- The PR description should contain a link to the ticket or if the branch name starts with the ticket id / number.
+- The PR description should contain a full ticket URL or an explicit reference such as `Fixes #123`.
+- GitHub branch-name inference is available as an opt-in by setting `extract_issue_from_branch=true`.
 - For Jira tickets, you should follow the instructions in [Jira Integration](#jira-integration) in order to authenticate with Jira.
 - For Asana tickets, see [Asana Integration](#asana-integration).
 
@@ -80,14 +81,16 @@ A `PR Code Verified` label indicates the PR code meets ticket requirements, but 
 
 ## GitHub/Gitlab Issues Integration
 
-PR-Agent will automatically recognize GitHub/Gitlab issues mentioned in the PR description and fetch the issue content.
+PR-Agent will automatically recognize GitHub/Gitlab issues explicitly referenced in the PR description and fetch the issue content. GitHub shorthand references must follow a phrase such as `Fixes`, `References`, or `Related to`; full issue URLs are accepted directly. References inside inline or fenced Markdown code are ignored.
 Examples of valid GitHub/Gitlab issue references:
 
 - `https://github.com/<ORG_NAME>/<REPO_NAME>/issues/<ISSUE_NUMBER>` or `https://gitlab.com/<ORG_NAME>/<REPO_NAME>/-/issues/<ISSUE_NUMBER>`
-- `#<ISSUE_NUMBER>`
-- `<ORG_NAME>/<REPO_NAME>#<ISSUE_NUMBER>`
+- `Fixes #<ISSUE_NUMBER>`
+- `References <ORG_NAME>/<REPO_NAME>#<ISSUE_NUMBER>`
 
-Branch names can also be used to link issues, for example:
+To retain the previous GitHub behavior that accepted any bare `#123` or `owner/repo#123` text, set `require_explicit_issue_reference=false`.
+
+Branch names can also be used to link GitHub issues after setting `extract_issue_from_branch=true`, for example:
 - `123-fix-bug` (where `123` is the issue number)
 
 This branch-name detection applies **only when the git provider is GitHub**. Support for other platforms is planned for later.
@@ -201,8 +204,8 @@ This following steps will help you check if the basic auth is working correctly,
 
     ```python
     from jira import JIRA
-    
-    
+
+
     if __name__ == "__main__":
         try:
             # Jira server URL
@@ -212,7 +215,7 @@ This following steps will help you check if the basic auth is working correctly,
             password = "..."
             # Jira ticket code (e.g. "PROJ-123")
             ticket_id = "..."
-    
+
             print("Initializing JiraServerTicketProvider with JIRA server")
             # Initialize JIRA client
             jira = JIRA(
@@ -224,11 +227,11 @@ This following steps will help you check if the basic auth is working correctly,
                 print(f"JIRA client initialized successfully")
             else:
                 print("Error initializing JIRA client")
-    
+
             # Fetch ticket details
             ticket = jira.issue(ticket_id)
             print(f"Ticket title: {ticket.fields.summary}")
-    
+
         except Exception as e:
             print(f"Error fetching JIRA ticket details: {e}")
     ```
@@ -257,8 +260,8 @@ This following steps will help you check if the token is working correctly, and 
 
     ```python
     from jira import JIRA
-    
-    
+
+
     if __name__ == "__main__":
         try:
             # Jira server URL
@@ -267,7 +270,7 @@ This following steps will help you check if the token is working correctly, and 
             token_auth = "..."
             # Jira ticket code (e.g. "PROJ-123")
             ticket_id = "..."
-    
+
             print("Initializing JiraServerTicketProvider with JIRA server")
             # Initialize JIRA client
             jira = JIRA(
@@ -279,11 +282,11 @@ This following steps will help you check if the token is working correctly, and 
                 print(f"JIRA client initialized successfully")
             else:
                 print("Error initializing JIRA client")
-    
+
             # Fetch ticket details
             ticket = jira.issue(ticket_id)
             print(f"Ticket title: {ticket.fields.summary}")
-    
+
         except Exception as e:
             print(f"Error fetching JIRA ticket details: {e}")
     ```

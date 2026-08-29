@@ -6,14 +6,13 @@ from urllib.parse import urlparse
 import aiohttp
 
 from pr_agent.config_loader import get_settings
-from pr_agent.git_providers import (AzureDevopsProvider, GithubProvider,
-                                    GitLabProvider)
+from pr_agent.git_providers import AzureDevopsProvider, GithubProvider, GitLabProvider
 from pr_agent.log import get_logger
 
 # Match complete references in precedence order so a cross-repository shorthand is
 # consumed before its trailing ``#number`` can be interpreted as a local issue.
 GITHUB_TICKET_PATTERN = re.compile(
-    r"(?P<url>https?://[^\s<>()`,;]+/issues/(?P<url_issue>\d+)(?![\w/]))"
+    r"(?P<url>https?://[^\s<>()`,;]+/issues/(?P<url_issue>\d+)/?)(?![\w/])"
     r"|(?<![\w./-])(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))"
     r"/(?P<repo>[A-Za-z0-9_.-]+)#(?P<repo_issue>\d+)(?![\w/#])"
     r"|(?<![\w/#])#(?P<local_issue>\d+)(?![\w/#])"
@@ -22,7 +21,9 @@ GITHUB_OWNER_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9]
 GITHUB_REPOSITORY_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 GITHUB_EXPLICIT_REFERENCE_PREFIX_PATTERN = re.compile(
     r"(?:\b(?:close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?|reference(?:s|d)?|refs?"
-    r"|relat(?:e|es|ed)\s+to|address(?:es|ed)?|links?|see))\s*:?\s*$",
+    r"|relat(?:e|es|ed)(?:\s+to)?|address(?:es|ed)?|links?|see|implements?"
+    r"|depends?\s+on|part\s+of))"
+    r"(?:\s+(?:github\s+)?(?:issues?|bugs?|tickets?))?\s*:?\s*$",
     re.IGNORECASE,
 )
 MARKDOWN_FENCED_CODE_PATTERN = re.compile(
@@ -280,7 +281,7 @@ def _parse_github_issue_reference_url(ticket_url):
     owner, repo = path_parts[-4], path_parts[-3]
     if not GITHUB_OWNER_PATTERN.fullmatch(owner) or "--" in owner:
         return None
-    if not GITHUB_REPOSITORY_COMPONENT_PATTERN.fullmatch(repo):
+    if not GITHUB_REPOSITORY_COMPONENT_PATTERN.fullmatch(repo) or repo in {".", ".."}:
         return None
     return (_normalize_github_host(ticket_url), owner.casefold(), repo.casefold(), int(path_parts[-1]))
 
@@ -303,6 +304,11 @@ def extract_ticket_links_from_pr_description(pr_description, repo_path, base_url
         return []
 
     visible_description = _mask_markdown_code(pr_description)
+    settings = get_settings()
+    require_explicit_reference = settings.get(
+        "require_explicit_issue_reference",
+        settings.get("config.require_explicit_issue_reference", True),
+    )
     seen = set()
     github_tickets = []
 
@@ -320,15 +326,15 @@ def extract_ticket_links_from_pr_description(pr_description, repo_path, base_url
         provider_host = _normalize_github_host(base_url_html)
         for match in GITHUB_TICKET_PATTERN.finditer(visible_description):
             if match.group("url"):
-                ticket_url = match.group("url")
+                ticket_url = match.group("url").rstrip("/")
                 ticket_identity = _parse_github_issue_reference_url(ticket_url)
-                if not ticket_identity or ticket_identity[0] not in {"github.com", provider_host}:
+                if not ticket_identity or ticket_identity[0] != provider_host:
                     continue
                 if _add(ticket_url):
                     previous_accepted_match_end = match.end()
                 continue
 
-            if not _has_explicit_github_reference_prefix(
+            if require_explicit_reference and not _has_explicit_github_reference_prefix(
                 visible_description, match.start(), previous_accepted_match_end
             ):
                 continue

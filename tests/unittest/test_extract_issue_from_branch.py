@@ -85,7 +85,7 @@ class TestExtractTicketsLinkFromBranchName:
             )
         )
         monkeypatch.setattr(tpc, "get_settings", lambda: fake_settings)
-        result = extract_ticket_links_from_branch_name(
+        result = tpc.extract_ticket_links_from_branch_name(
             "feature/1-test", "org/repo", "https://github.com"
         )
         assert result == []
@@ -99,7 +99,7 @@ class TestExtractTicketsLinkFromBranchName:
             )
         )
         monkeypatch.setattr(tpc, "get_settings", lambda: fake_settings)
-        result = extract_ticket_links_from_branch_name(
+        result = tpc.extract_ticket_links_from_branch_name(
             "feature/1-test", "org/repo", "https://github.com"
         )
         assert result == ["https://github.com/org/repo/issues/1"]
@@ -132,7 +132,7 @@ class TestExtractTicketLinksFromPrDescription:
         small input. test_cap_selects_deterministic_first_seen_subset is the reliable
         regression guard (see its note)."""
         desc = "Fixes #3, relates to #1, references #3 again and fixes #2"
-        result = extract_ticket_links_from_pr_description(desc, "org/repo", "https://github.com")
+        result = tpc.extract_ticket_links_from_pr_description(desc, "org/repo", "https://github.com")
         assert result == [
             "https://github.com/org/repo/issues/3",
             "https://github.com/org/repo/issues/1",
@@ -148,6 +148,6 @@ class TestExtractTicketLinksFromPrDescription:
         that (essentially) never equals the first-seen subset, on any hash seed."""
         nums = list(range(1, MAX_TICKETS + 4))
         desc = "Fixes " + ", ".join(f"#{n}" for n in nums)
-        result = extract_ticket_links_from_pr_description(desc, "org/repo", "https://github.com")
+        result = tpc.extract_ticket_links_from_pr_description(desc, "org/repo", "https://github.com")
         expected = [f"https://github.com/org/repo/issues/{n}" for n in nums[:MAX_TICKETS]]
         assert result == expected
