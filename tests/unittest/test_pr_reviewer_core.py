@@ -278,6 +278,23 @@ def test_bugs_only_preserves_an_empty_finding_list():
     assert reviewer._normalize_bugs_only_review(data) == {"review": {"key_issues_to_review": []}}
 
 
+def test_bugs_only_preserves_fail_closed_verifier_output_without_requiring_candidate_fields():
+    verified_finding = {
+        "relevant_file": "app.py",
+        "issue_header": "Bug",
+        "issue_content": "Verified defect with repository evidence.",
+        "start_line": 2,
+        "end_line": 2,
+        "verification_evidence": ["app.py"],
+    }
+    reviewer, data = _bugs_only_reviewer(verified_finding)
+    reviewer.candidate_verification_artifact = {"status": "complete"}
+
+    assert reviewer._normalize_bugs_only_review(data) == {
+        "review": {"key_issues_to_review": [verified_finding]}
+    }
+
+
 def _reviewer_with_findings(*issues, head_file="one\ntwo\nthree\nfour\n"):
     git_provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
     git_provider.azure_devops_client = MagicMock()

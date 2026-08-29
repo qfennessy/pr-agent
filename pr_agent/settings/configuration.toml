@@ -110,6 +110,18 @@ branch_issue_regex = ""
 [pr_reviewer] # /review #
 # enable/disable features
 review_profile="full" # "full" preserves the standard review; "bugs_only" emits only qualifying defects.
+# Opt in to a bounded second pass that verifies review candidates against repository evidence.
+enable_candidate_verification=false
+candidate_verification_model="" # Empty uses config.model.
+candidate_verification_max_model_calls=1 # The implementation performs at most one verifier call per review.
+candidate_verification_max_candidates=3
+candidate_verification_max_files=6
+candidate_verification_max_lines_per_file=160
+candidate_verification_max_total_lines=600
+candidate_verification_max_context_tokens=6000
+candidate_verification_timeout_seconds=10
+# Matching changed files are always submitted as independent audit candidates.
+candidate_verification_sensitive_path_globs=[]
 require_score_review=false
 require_tests_review=true
 require_estimate_effort_to_review=true

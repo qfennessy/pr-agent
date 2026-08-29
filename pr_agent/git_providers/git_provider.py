@@ -293,6 +293,10 @@ class GitProvider(ABC):
         """Return whether `publish_code_suggestions()` writes a standalone output artifact."""
         return False
 
+    def supports_repo_file_fetching(self) -> bool:
+        """Return whether this provider implements base-branch repository file reads."""
+        return type(self).get_repo_file_content is not GitProvider.get_repo_file_content
+
     def publish_code_suggestions_artifact(
             self, code_suggestions: list, artifact_footer: str = "",
             no_suggestions_message: str = "No code suggestions found for the PR.") -> bool:
