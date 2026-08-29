@@ -8,6 +8,9 @@ model="gpt-5.6"
 fallback_models=["gpt-5.6-terra"]
 #model_reasoning="gpt-5.6-terra" # dedicated reasoning model for self-reflection
 #model_weak="gpt-5.6-luna" # optional, a weaker model to use for some easier tasks
+model_retries=2 # attempts per model before moving on to the next fallback model. Total requests are roughly model_retries x (1 + len(fallback_models)) x (1 + ai_provider_max_retries), so raising any one of them raises the worst-case wall clock.
+#ai_provider_max_retries=0 # optional cap on the provider client's own retries. LiteLLM's OpenAI path defaults to 2 (3 requests per attempt), which is invisible in the logs: one "timeout value=120" attempt shows up as ~360s. Unset = keep LiteLLM's default.
+#persistent_comment_id="" # optional identity for this run's persistent comments. Set it (to a different value per run) when more than one PR-Agent run comments on the same PR - e.g. one review per model as separate CI jobs - so each run updates only its own comment instead of overwriting the previous one.
 # CLI
 git_provider="github"
 publish_output=true
