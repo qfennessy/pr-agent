@@ -45,6 +45,10 @@ def _next_page_url(headers: dict) -> str:
     return ""
 
 
+def _bounded_ci_text(value, limit: int = 1000) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
 class GithubProvider(GitProvider):
     def __init__(self, pr_url: Optional[str] = None):
         self.repo_obj = None
@@ -410,6 +414,35 @@ class GithubProvider(GitProvider):
 
     def supports_review_comment_identity(self) -> bool:
         return True
+
+    def get_ci_failure_context(self) -> dict:
+        """Return bounded failed check-run details for the current PR head."""
+        if not getattr(self, "last_commit_id", None) or not getattr(self, "pr", None):
+            return {"status": "unavailable", "failures": []}
+        failure_conclusions = {"action_required", "cancelled", "failure", "startup_failure", "timed_out"}
+        failures = []
+        try:
+            url = f"{self.base_url}/repos/{self.repo}/commits/{self.last_commit_id.sha}/check-runs"
+            while url and len(failures) < 20:
+                headers, data = self.pr._requester.requestJsonAndCheck("GET", url)
+                for run in data.get("check_runs", []):
+                    conclusion = str(run.get("conclusion") or "").strip().lower()
+                    if conclusion not in failure_conclusions:
+                        continue
+                    output = run.get("output") or {}
+                    failures.append({
+                        "name": _bounded_ci_text(run.get("name"), 200),
+                        "conclusion": conclusion,
+                        "title": _bounded_ci_text(output.get("title")),
+                        "summary": _bounded_ci_text(output.get("summary")),
+                    })
+                    if len(failures) >= 20:
+                        break
+                url = _next_page_url(headers)
+        except Exception:
+            get_logger().warning("Failed to load CI failure context")
+            return {"status": "unavailable", "failures": []}
+        return {"status": "available", "failures": failures}
 
     def _publish_check_run(self, text: str, name: str) -> bool:
         if not getattr(self, 'last_commit_id', None):

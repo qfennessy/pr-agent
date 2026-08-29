@@ -42,10 +42,12 @@ review_profile = "bugs_only"
 ```
 
 Before, a style-only PR could still receive the normal review sections or a "No major issues detected" comment.
-After selecting `bugs_only`, non-defect feedback and failures already reported by CI are omitted, findings with the
-same root cause are collapsed, and PR-Agent publishes no summary when no qualifying finding remains. Structured
-output still contains `review.key_issues_to_review`, using an empty list for that case. Set `inline_key_issues = true`
-to keep supported inline publication behavior.
+After selecting `bugs_only`, non-defect feedback is omitted and findings with the same root cause are collapsed.
+GitHub check-run failures are supplied as bounded evidence; a finding is suppressed as a CI duplicate only when it
+names an observed failed check. If CI evidence is unavailable, PR-Agent keeps the finding instead of trusting a model
+guess. PR-Agent publishes no summary when no qualifying finding remains, and a clean rerun removes its previous
+persistent defect comment. Structured output still contains `review.key_issues_to_review`, using an empty list for
+that case. Set `inline_key_issues = true` to keep supported inline publication behavior.
 
 If you want to edit [configurations](#configuration-options), add the relevant ones to the command:
 

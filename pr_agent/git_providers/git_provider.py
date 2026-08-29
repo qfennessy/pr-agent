@@ -557,6 +557,10 @@ class GitProvider(ABC):
     def supports_review_comment_identity(self) -> bool:
         return False
 
+    def get_ci_failure_context(self) -> dict:
+        """Return bounded failed-check metadata when the provider can supply it."""
+        return {"status": "unavailable", "failures": []}
+
     def unresolve_comment_thread(self, comment):  # noqa: B027 - intentional no-op
         pass
 

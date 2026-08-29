@@ -1,5 +1,6 @@
 import copy
 import datetime
+import json
 import re
 from functools import partial
 from typing import List, Optional, Tuple
@@ -101,6 +102,22 @@ class PRReviewer:
             get_logger().debug(f"AI metadata is disabled for this command")
 
         bugs_only = self.review_profile == "bugs_only"
+        self.ci_failure_context = (
+            self.git_provider.get_ci_failure_context()
+            if bugs_only
+            else {"status": "not_requested", "failures": []}
+        )
+        if not isinstance(self.ci_failure_context, dict):
+            self.ci_failure_context = {"status": "unavailable", "failures": []}
+        ci_failures = self.ci_failure_context.get("failures")
+        if not isinstance(ci_failures, list):
+            ci_failures = []
+            self.ci_failure_context["failures"] = ci_failures
+        self.ci_failure_names = {
+            str(failure.get("name") or "").strip().casefold()
+            for failure in ci_failures
+            if isinstance(failure, dict) and str(failure.get("name") or "").strip()
+        }
         self.vars = {
             "title": self.git_provider.pr.title,
             "branch": self.git_provider.get_pr_branch(),
@@ -133,6 +150,7 @@ class PRReviewer:
             "related_tickets": [] if bugs_only else get_settings().get('related_tickets', []),
             'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False),
             "date": datetime.datetime.now().strftime('%Y-%m-%d'),
+            "ci_failure_context": json.dumps(self.ci_failure_context, ensure_ascii=False),
         }
 
         self.token_handler = TokenHandler(
@@ -207,6 +225,7 @@ class PRReviewer:
 
             should_publish = get_settings().config.publish_output and self._should_publish_review_no_suggestions(pr_review)
             if not should_publish:
+                self._clear_stale_persistent_bugs_only_review()
                 reason = "Review output is not published"
                 if get_settings().config.publish_output:
                     reason += ": no major issues detected."
@@ -264,6 +283,13 @@ class PRReviewer:
     def _review_profile(self) -> str:
         """Return the selected profile, defaulting legacy/test instances to full review."""
         return getattr(self, "review_profile", "full")
+
+    def _clear_stale_persistent_bugs_only_review(self) -> None:
+        """Remove a prior persistent defect summary after a clean bugs-only rerun."""
+        if (self._review_profile() != "bugs_only" or not get_settings().config.publish_output or
+                not get_settings().pr_reviewer.persistent_comment or self.incremental.is_incremental):
+            return
+        self._remove_previous_review_comment(self._get_previous_review_comment())
 
     async def _prepare_prediction(self, model: str) -> None:
         output = get_pr_diff(self.git_provider,
@@ -399,7 +425,9 @@ class PRReviewer:
             finding_type = str(issue.get("finding_type") or "").strip().lower()
             if finding_type not in _BUG_FINDING_HEADERS:
                 continue
-            if self._strict_bool(issue.get("duplicates_ci_failure")) is not False:
+            matching_ci_failure = str(issue.get("matching_ci_failure") or "").strip().casefold()
+            if (self._strict_bool(issue.get("duplicates_ci_failure")) is True and
+                    matching_ci_failure in getattr(self, "ci_failure_names", set())):
                 continue
 
             relevant_file = str(issue.get("relevant_file") or "").strip()

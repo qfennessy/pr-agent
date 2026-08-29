@@ -239,3 +239,47 @@ def test_find_existing_check_run_returns_none_on_api_error():
     result = provider._find_existing_check_run("PR Agent - Review", "deadbeef")
 
     assert result is None
+
+
+def test_get_ci_failure_context_returns_only_bounded_failed_checks():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    requester.set_response(
+        "GET",
+        f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs",
+        (
+            {},
+            {
+                "check_runs": [
+                    {"name": "Passing", "conclusion": "success", "output": {}},
+                    {
+                        "name": "Unit tests",
+                        "conclusion": "failure",
+                        "output": {"title": "Tests failed", "summary": "first\nsecond"},
+                    },
+                ]
+            },
+        ),
+    )
+
+    assert provider.get_ci_failure_context() == {
+        "status": "available",
+        "failures": [{
+            "name": "Unit tests",
+            "conclusion": "failure",
+            "title": "Tests failed",
+            "summary": "first second",
+        }],
+    }
+
+
+def test_get_ci_failure_context_is_explicitly_unavailable_on_api_error():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    requester.set_exception(
+        "GET",
+        f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs",
+        RuntimeError("API error"),
+    )
+
+    assert provider.get_ci_failure_context() == {"status": "unavailable", "failures": []}
