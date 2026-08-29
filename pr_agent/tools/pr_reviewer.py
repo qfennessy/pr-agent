@@ -5,7 +5,7 @@ import time
 from functools import partial
 from typing import List, Optional, Tuple
 
-from jinja2 import Environment, StrictUndefined
+from jinja2 import Environment, StrictUndefined, select_autoescape
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
@@ -528,7 +528,10 @@ class PRReviewer:
             variables = {
                 "verification_payload": render_verification_payload(candidates, self.patches_diff or "", evidence),
             }
-            environment = Environment(undefined=StrictUndefined)
+            environment = Environment(
+                autoescape=select_autoescape(default_for_string=False),
+                undefined=StrictUndefined,
+            )
             verification_prompt = get_settings().pr_review_verification_prompt
             system_prompt = environment.from_string(verification_prompt.system).render(variables)
             user_prompt = environment.from_string(verification_prompt.user).render(variables)
