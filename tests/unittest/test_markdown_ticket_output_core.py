@@ -693,7 +693,7 @@ class TestExtractTicketLinksFromPRDescription:
         assert out == []
 
     def test_results_capped_at_three(self):
-        desc = " ".join(f"foo/bar#{i}" for i in range(1, 8))
+        desc = " ".join(f"References foo/bar#{i}" for i in range(1, 8))
         out = extract_ticket_links_from_pr_description(desc, "foo/bar")
         assert len(out) == 3
 
