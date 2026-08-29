@@ -332,3 +332,28 @@ def test_clear_persistent_bugs_only_review_does_not_replace_full_review_check():
 
     assert result is False
     assert all(call[0] == "GET" for call in requester.calls)
+
+
+def test_clear_persistent_bugs_only_review_falls_back_to_matching_comment():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    requester.set_response(
+        "GET",
+        f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs",
+        ({}, {"check_runs": []}),
+    )
+    comment = SimpleNamespace(
+        body="## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\ndefect"
+    )
+    provider.pr.get_issue_comments = lambda: [comment]
+    provider.remove_comment = lambda value: setattr(provider, "removed_comment", value)
+    original = get_settings().github.publish_as_check_run
+    try:
+        get_settings().github.publish_as_check_run = True
+
+        result = provider.clear_persistent_review("<!-- pr-agent:review:bugs-only -->", "bugs-only review")
+    finally:
+        get_settings().github.publish_as_check_run = original
+
+    assert result is True
+    assert provider.removed_comment is comment

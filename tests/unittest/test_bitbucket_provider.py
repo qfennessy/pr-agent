@@ -116,6 +116,22 @@ class TestBitbucketProvider:
         mock_get_logger.return_value.opt.return_value.warning.assert_called_once_with(
             "Failed to publish persistent review update message; review was already updated")
 
+    def test_clear_persistent_review_uses_pr_comments_api(self):
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.pr = MagicMock()
+        full_review = MagicMock()
+        full_review.raw = "## Review\n\n<!-- pr-agent:review:full -->\n\nfull"
+        full_review.data = {"id": 41}
+        bugs_only_review = MagicMock()
+        bugs_only_review.raw = "## Review\n\n<!-- pr-agent:review:bugs-only -->\n\ndefect"
+        bugs_only_review.data = {"id": 42}
+        provider.pr.comments.return_value = [full_review, bugs_only_review]
+
+        result = provider.clear_persistent_review(PRReviewIdentity.BUGS_ONLY.value, "bugs-only review")
+
+        assert result is True
+        provider.pr.delete.assert_called_once_with("comments/42")
+
     def test_persistent_review_update_falls_back_when_edit_fails(self):
         provider = BitbucketProvider.__new__(BitbucketProvider)
         provider.pr = MagicMock()

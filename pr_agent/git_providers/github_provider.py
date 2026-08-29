@@ -455,12 +455,14 @@ class GithubProvider(GitProvider):
             check_run_name, self.last_commit_id.sha
         )
         if not existing_id:
-            return False
-        return self._update_check_run(
+            return super().clear_persistent_review(identity_marker, name)
+        if self._update_check_run(
             existing_id,
             "No qualifying defects found in the latest bugs-only review.",
             name,
-        )
+        ):
+            return True
+        return super().clear_persistent_review(identity_marker, name)
 
     def _check_run_output(self, text: str, name: str) -> tuple[str, dict]:
         check_run_name = f"PR Agent - {name.capitalize()}"
