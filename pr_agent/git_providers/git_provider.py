@@ -561,6 +561,18 @@ class GitProvider(ABC):
         """Return bounded failed-check metadata when the provider can supply it."""
         return {"status": "unavailable", "failures": []}
 
+    def clear_persistent_review(self, identity_marker: str, name: str = "review") -> bool:
+        """Remove the newest persistent review matching an exact tool identity."""
+        try:
+            comments = list(self.get_issue_comments())
+            for comment in reversed(comments):
+                if is_own_persistent_comment_for_identities(comment.body, (identity_marker,)):
+                    self.remove_comment(comment)
+                    return True
+        except Exception as e:
+            get_logger().exception(f"Failed to clear persistent {name}, error: {e}")
+        return False
+
     def unresolve_comment_thread(self, comment):  # noqa: B027 - intentional no-op
         pass
 

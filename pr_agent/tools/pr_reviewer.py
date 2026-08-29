@@ -239,13 +239,23 @@ class PRReviewer:
             review_thread_kwargs = {"as_thread": True} if self.git_provider.should_publish_review_as_thread() else {}
             if get_settings().pr_reviewer.persistent_comment and not self.incremental.is_incremental:
                 final_update_message = get_settings().pr_reviewer.final_update_message
+                identity_marker = (
+                    PRReviewIdentity.BUGS_ONLY.value
+                    if self._review_profile() == "bugs_only"
+                    else PRReviewIdentity.REGULAR.value
+                )
                 self.git_provider.publish_persistent_comment(
                     pr_review,
                     initial_header=pr_review.split("\n", 1)[0],
                     update_header=True,
                     final_update_message=final_update_message,
-                    identity_marker=PRReviewIdentity.REGULAR.value,
-                    legacy_initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
+                    name="bugs-only review" if self._review_profile() == "bugs_only" else "review",
+                    identity_marker=identity_marker,
+                    legacy_initial_header=(
+                        None
+                        if self._review_profile() == "bugs_only"
+                        else f"{PRReviewHeader.REGULAR.value} 🔍"
+                    ),
                     **review_thread_kwargs,
                 )
             else:
@@ -253,7 +263,11 @@ class PRReviewer:
                     identity_marker = (
                         PRReviewIdentity.INCREMENTAL.value
                         if self.incremental.is_incremental
-                        else PRReviewIdentity.REGULAR.value
+                        else (
+                            PRReviewIdentity.BUGS_ONLY.value
+                            if self._review_profile() == "bugs_only"
+                            else PRReviewIdentity.REGULAR.value
+                        )
                     )
                     pr_review = add_pr_review_identity(pr_review, identity_marker)
                 self.git_provider.publish_comment(pr_review, **review_thread_kwargs)
@@ -289,7 +303,10 @@ class PRReviewer:
         if (self._review_profile() != "bugs_only" or not get_settings().config.publish_output or
                 not get_settings().pr_reviewer.persistent_comment or self.incremental.is_incremental):
             return
-        self._remove_previous_review_comment(self._get_previous_review_comment())
+        self.git_provider.clear_persistent_review(
+            identity_marker=PRReviewIdentity.BUGS_ONLY.value,
+            name="bugs-only review",
+        )
 
     async def _prepare_prediction(self, model: str) -> None:
         output = get_pr_diff(self.git_provider,

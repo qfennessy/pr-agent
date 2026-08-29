@@ -444,52 +444,68 @@ class GithubProvider(GitProvider):
             return {"status": "unavailable", "failures": []}
         return {"status": "available", "failures": failures}
 
+    def clear_persistent_review(self, identity_marker: str, name: str = "review") -> bool:
+        """Clear the matching comment, or update an existing GitHub check to a clean result."""
+        if not get_settings().github.publish_as_check_run:
+            return super().clear_persistent_review(identity_marker, name)
+        if not getattr(self, "last_commit_id", None):
+            return False
+        check_run_name = f"PR Agent - {name.capitalize()}"
+        existing_id = self._check_run_ids.get(name) or self._find_existing_check_run(
+            check_run_name, self.last_commit_id.sha
+        )
+        if not existing_id:
+            return False
+        return self._update_check_run(
+            existing_id,
+            "No qualifying defects found in the latest bugs-only review.",
+            name,
+        )
+
+    def _check_run_output(self, text: str, name: str) -> tuple[str, dict]:
+        check_run_name = f"PR Agent - {name.capitalize()}"
+        summary = text.split("\n\n")[0] if "\n\n" in text else text[:200]
+        summary = summary.strip(" #")
+        text = text[:65535]
+        return check_run_name, {
+            "title": check_run_name,
+            "summary": summary[:300],
+            "text": text,
+        }
+
+    def _update_check_run(self, check_run_id: int, text: str, name: str) -> bool:
+        check_run_name, output = self._check_run_output(text, name)
+        try:
+            self.pr._requester.requestJsonAndCheck(
+                "PATCH",
+                f"{self.base_url}/repos/{self.repo}/check-runs/{check_run_id}",
+                input={"status": "completed", "conclusion": "neutral", "output": output},
+            )
+            self._check_run_ids[name] = check_run_id
+            return True
+        except Exception:
+            get_logger().warning(f"Failed to update check run {check_run_id}")
+            return False
+
     def _publish_check_run(self, text: str, name: str) -> bool:
         if not getattr(self, 'last_commit_id', None):
             get_logger().error("Cannot publish check run without a commit SHA")
             return False
-        conclusion = "neutral"
-        check_run_name = f"PR Agent - {name.capitalize()}"
-        summary = text.split("\n\n")[0] if "\n\n" in text else text[:200]
-        summary = summary.strip(" #")
-        # GitHub Checks API limits: text 65535 chars, summary 65535 chars
-        max_text = 65535
-        if len(text) > max_text:
-            text = text[:max_text]
+        check_run_name, output = self._check_run_output(text, name)
         create_body = {
             "name": check_run_name,
             "head_sha": self.last_commit_id.sha,
             "status": "completed",
-            "conclusion": conclusion,
-            "output": {
-                "title": check_run_name,
-                "summary": summary[:300],
-                "text": text,
-            },
-        }
-        update_body = {
-            "status": "completed",
-            "conclusion": conclusion,
-            "output": {
-                "title": check_run_name,
-                "summary": summary[:300],
-                "text": text,
-            },
+            "conclusion": "neutral",
+            "output": output,
         }
         existing_id = self._check_run_ids.get(name)
         if not existing_id:
             existing_id = self._find_existing_check_run(check_run_name, self.last_commit_id.sha)
         if existing_id:
-            try:
-                self.pr._requester.requestJsonAndCheck(
-                    "PATCH",
-                    f"{self.base_url}/repos/{self.repo}/check-runs/{existing_id}",
-                    input=update_body,
-                )
-                self._check_run_ids[name] = existing_id
+            if self._update_check_run(existing_id, text, name):
                 return True
-            except Exception:
-                get_logger().warning(f"Failed to update check run {existing_id}, creating new one")
+            get_logger().warning(f"Creating a new check run after update failed for {existing_id}")
         try:
             headers, data = self.pr._requester.requestJsonAndCheck(
                 "POST",

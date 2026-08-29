@@ -69,6 +69,7 @@ class PRReviewHeader(str, Enum):
 
 class PRReviewIdentity(str, Enum):
     REGULAR = "<!-- pr-agent:review:full -->"
+    BUGS_ONLY = "<!-- pr-agent:review:bugs-only -->"
     INCREMENTAL = "<!-- pr-agent:review:incremental -->"
 
 

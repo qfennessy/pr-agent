@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -670,14 +670,12 @@ async def test_run_removes_its_progress_comment_when_quiet_output_suppresses_rev
 
 
 @pytest.mark.asyncio
-async def test_clean_bugs_only_rerun_removes_stale_persistent_review(monkeypatch):
+async def test_clean_bugs_only_rerun_clears_only_bugs_only_persistent_review(monkeypatch):
     from pr_agent.tools import pr_reviewer as pr_reviewer_module
 
     progress_comment = MagicMock()
-    previous_review = MagicMock()
     git_provider = MagicMock()
     git_provider.get_files.return_value = ["app.py"]
-    git_provider.get_previous_review.return_value = previous_review
     git_provider.publish_comment.return_value = progress_comment
     reviewer = _make_reviewer(git_provider)
     reviewer.review_profile = "bugs_only"
@@ -708,8 +706,11 @@ async def test_clean_bugs_only_rerun_removes_stale_persistent_review(monkeypatch
         settings.config.is_auto_command = original["is_auto_command"]
         settings.pr_reviewer.persistent_comment = original["persistent_comment"]
 
-    git_provider.get_previous_review.assert_called_once_with(full=True, incremental=False)
-    assert git_provider.remove_comment.call_args_list == [call(previous_review), call(progress_comment)]
+    git_provider.clear_persistent_review.assert_called_once_with(
+        identity_marker=PRReviewIdentity.BUGS_ONLY.value,
+        name="bugs-only review",
+    )
+    git_provider.remove_comment.assert_called_once_with(progress_comment)
     git_provider.publish_persistent_comment.assert_not_called()
 
 
@@ -1122,7 +1123,16 @@ def test_get_user_answers_collects_question_and_answer_from_issue_comments():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("persistent", [True, False])
 @pytest.mark.parametrize("thread_enabled", [True, False])
-async def test_run_threads_only_the_final_review_comment(monkeypatch, persistent, thread_enabled):
+@pytest.mark.parametrize(
+    ("review_profile", "expected_identity", "expected_name", "expected_legacy_header"),
+    [
+        ("full", PRReviewIdentity.REGULAR.value, "review", f"{PRReviewHeader.REGULAR.value} 🔍"),
+        ("bugs_only", PRReviewIdentity.BUGS_ONLY.value, "bugs-only review", None),
+    ],
+)
+async def test_run_threads_only_the_final_review_comment(
+        monkeypatch, persistent, thread_enabled, review_profile, expected_identity, expected_name,
+        expected_legacy_header):
     """`as_thread` is forwarded to the review's final publish call only when the provider opts in
     (should_publish_review_as_thread), and is omitted entirely otherwise - other providers'
     publish methods don't accept it. Status/progress comments are never threaded.
@@ -1135,6 +1145,7 @@ async def test_run_threads_only_the_final_review_comment(monkeypatch, persistent
     git_provider.supports_review_comment_identity.return_value = False
     git_provider.publish_comment.return_value = progress_comment
     reviewer = _make_reviewer(git_provider)
+    reviewer.review_profile = review_profile
     reviewer.incremental = SimpleNamespace(is_incremental=False)
     reviewer.vars = {}
     reviewer.prediction = None
@@ -1170,8 +1181,9 @@ async def test_run_threads_only_the_final_review_comment(monkeypatch, persistent
     if persistent:
         publish = git_provider.publish_persistent_comment
         publish.assert_called_once()
-        assert publish.call_args.kwargs["identity_marker"] == PRReviewIdentity.REGULAR.value
-        assert publish.call_args.kwargs["legacy_initial_header"] == f"{PRReviewHeader.REGULAR.value} 🔍"
+        assert publish.call_args.kwargs["name"] == expected_name
+        assert publish.call_args.kwargs["identity_marker"] == expected_identity
+        assert publish.call_args.kwargs["legacy_initial_header"] == expected_legacy_header
     else:
         publish = git_provider.publish_comment
     assert publish.call_args.args[0] == review_text

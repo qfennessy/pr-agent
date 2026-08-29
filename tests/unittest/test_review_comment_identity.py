@@ -11,6 +11,7 @@ from pr_agent.algo.utils import (PRReviewIdentity, add_pr_review_identity,
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
 from pr_agent.git_providers.gitea_provider import GiteaProvider
+from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.git_providers.github_provider import GithubProvider
 from tests.unittest._settings_helpers import (restore_settings,
                                               snapshot_settings)
@@ -130,6 +131,26 @@ def test_github_full_lookup_does_not_adopt_incremental_marker():
     provider.pr.get_issue_comments.return_value = [incremental]
 
     assert provider.get_previous_review(full=True, incremental=False) is None
+
+
+def test_clear_persistent_bugs_only_review_preserves_full_review():
+    provider = MagicMock()
+    full_review = SimpleNamespace(
+        body="## Team Review 🔍\n\n<!-- pr-agent:review:full -->\n\nfull findings"
+    )
+    bugs_only_review = SimpleNamespace(
+        body="## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\ndefect"
+    )
+    provider.get_issue_comments.return_value = [full_review, bugs_only_review]
+
+    result = GitProvider.clear_persistent_review(
+        provider,
+        PRReviewIdentity.BUGS_ONLY.value,
+        "bugs-only review",
+    )
+
+    assert result is True
+    provider.remove_comment.assert_called_once_with(bugs_only_review)
 
 
 def test_github_check_run_receives_presentation_without_comment_identity():

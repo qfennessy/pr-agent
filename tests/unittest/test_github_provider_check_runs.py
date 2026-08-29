@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.github_provider import GithubProvider
 
 
@@ -283,3 +284,51 @@ def test_get_ci_failure_context_is_explicitly_unavailable_on_api_error():
     )
 
     assert provider.get_ci_failure_context() == {"status": "unavailable", "failures": []}
+
+
+def test_clear_persistent_bugs_only_review_updates_its_existing_check_run():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    requester.set_response(
+        "GET",
+        f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs",
+        ({}, {"check_runs": [{"id": 42, "name": "PR Agent - Bugs-only review"}]}),
+    )
+    requester.set_response(
+        "PATCH",
+        f"{provider.base_url}/repos/{provider.repo}/check-runs/42",
+        ({}, {}),
+    )
+    original = get_settings().github.publish_as_check_run
+    try:
+        get_settings().github.publish_as_check_run = True
+
+        result = provider.clear_persistent_review("<!-- pr-agent:review:bugs-only -->", "bugs-only review")
+    finally:
+        get_settings().github.publish_as_check_run = original
+
+    assert result is True
+    patch_call = next(call for call in requester.calls if call[0] == "PATCH")
+    assert patch_call[2]["input"]["output"]["text"] == (
+        "No qualifying defects found in the latest bugs-only review."
+    )
+
+
+def test_clear_persistent_bugs_only_review_does_not_replace_full_review_check():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    requester.set_response(
+        "GET",
+        f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs",
+        ({}, {"check_runs": [{"id": 42, "name": "PR Agent - Review"}]}),
+    )
+    original = get_settings().github.publish_as_check_run
+    try:
+        get_settings().github.publish_as_check_run = True
+
+        result = provider.clear_persistent_review("<!-- pr-agent:review:bugs-only -->", "bugs-only review")
+    finally:
+        get_settings().github.publish_as_check_run = original
+
+    assert result is False
+    assert all(call[0] == "GET" for call in requester.calls)
