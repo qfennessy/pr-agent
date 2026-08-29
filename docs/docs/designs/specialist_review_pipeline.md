@@ -1,4 +1,4 @@
-# Specialist review pipeline for Cocos Story
+# Specialist review pipeline
 
 !!! note "Status: proposed, not implemented"
     This page describes a design for the `qfennessy/pr-agent` fork. The configuration keys and CLI commands below are illustrative. Current PR-Agent releases do not yet provide the file-save watcher, specialist router, or quality-escalation pipeline described here.
@@ -21,18 +21,18 @@ This is a cascade, not a vote. The system should not publish the union of every 
 
 The earliest useful review point is when code first exists in the worktree. Waiting for a commit or GitHub pull request adds avoidable latency.
 
-An initial manual assessment of the current Cocos Story corpus gives the following opportunity split. These labels still need independent adjudication and should become explicit corpus metadata before they are used as benchmark truth.
+An initial manual assessment in one target repository suggests the following planning split. The labels still need independent adjudication and should become explicit corpus metadata before they are used as benchmark truth.
 
-| Earliest useful checkpoint | Verified defects | High severity | Meaning |
-| --- | ---: | ---: | --- |
-| File save | 17 of 40 | 10 | The defect-bearing file contains enough evidence for a focused check. |
-| Coherent worktree | 23 of 40 | 19 | The reviewer needs callers, contracts, tests, lifecycle state, or another changed file. |
-| Commit only | 0 of 40 | 0 | A commit is a stable scheduling boundary, but it does not create new code evidence. |
-| Pull request only | 0 of 40 | 0 | GitHub metadata can help, but no sampled defect inherently required PR latency. |
+| Earliest useful checkpoint | Planning estimate | Meaning |
+| --- | ---: | --- |
+| File save | About 40% | The defect-bearing file contains enough evidence for a focused check. |
+| Coherent worktree | About 60% | The reviewer needs callers, contracts, tests, lifecycle state, or another changed file. |
+| Commit only | No additional evidence | A commit is a stable scheduling boundary, but it does not create new code evidence. |
+| Pull request only | No additional evidence in the sample | Hosted metadata can help, but the sampled defects did not inherently require PR latency. |
 
-The implication is important: file-save review is worthwhile, but it cannot replace worktree-wide review. It may find roughly 42.5% of the current defect set at the first opportunity. The remaining 57.5% require a coherent view of the change.
+The implication is important: file-save review is worthwhile, but it cannot replace worktree-wide review. The initial assessment suggests roughly two in five defects may be visible at the first opportunity; the rest require a coherent view of the change. These are planning proportions, not published benchmark results.
 
-The existing 16 clean controls are also not enough to validate file-save review. They freeze final PR heads, not the intentionally incomplete states developers produce while editing. A local pilot must capture clean intermediate saves, self-corrected mistakes, and partial worktrees so that interruption noise is measurable.
+Final-head clean controls are not enough to validate file-save review. They freeze completed changes, not the intentionally incomplete states developers produce while editing. A local pilot must capture clean intermediate saves, self-corrected mistakes, and partial worktrees so that interruption noise is measurable.
 
 ## Current foundation and missing pieces
 
@@ -53,10 +53,10 @@ The shortest implementation path is to reuse plain-diff parsing and Agent Skills
 
 A normal save should feel like pair coding, not a miniature pull-request ceremony:
 
-1. The editor or coding agent reports that `services/functions/src/billing/refund.ts` was saved.
+1. The editor or coding agent reports that `src/accounts/update_record.ts` was saved.
 2. The watcher waits briefly for related writes, computes the semantic delta, and assigns a content hash.
-3. Deterministic path rules mark the change as billing-sensitive. The small router also classifies it as TypeScript, external-provider, and tenant-scoped.
-4. The same small model runs with the billing and tenant-isolation specialist prompts. At most two specialists run on a save.
+3. Deterministic path rules mark the change as tenant-sensitive. The small router also classifies it as TypeScript, persistent-write, and tenant-scoped.
+4. The same small model runs with the tenant-isolation and contract specialist prompts. At most two specialists run on a save.
 5. If no concrete issue is found, the system stays silent.
 6. A strong file-local finding appears as short-lived local advice with an exact trigger and line. It is not posted to GitHub.
 7. A cross-file or consequential candidate is queued for the worktree verifier. Sensitive changes are guaranteed broader review at the next stable checkpoint even when the small model reports confidence; they do not launch a frontier call on every save.
@@ -125,7 +125,7 @@ The small tier does more than scan for bugs. It is used at both ends of the pipe
 | Risk routing | Identifies changes that deserve an expensive model, including security boundaries, migrations, concurrency, billing, and destructive operations. Deterministic policy can only raise this risk, never be overruled by the model. |
 | Diff prioritization | Ranks files and hunks so a larger model reads the important 10–20% first. |
 | Context selection | Requests relevant architecture decision records, coding rules, interfaces, callers, and nearby tests for each changed hunk. |
-| Mechanical policy checking | Detects likely violations such as a missing `tenantId` filter, unhandled error, undocumented Python function, or forbidden Firestore pattern. Deterministic tools remain the authority where a rule can be encoded. |
+| Mechanical policy checking | Detects likely violations such as a missing tenant-scope filter, unhandled error, undocumented Python function, or forbidden database access pattern. Deterministic tools remain the authority where a rule can be encoded. |
 | Review-comment cleanup | Classifies proposed comments as actionable, stylistic, duplicate, unsupported, stale, or low-confidence. |
 | Change summarization | Produces a structured fact summary for larger reviewers, not polished prose for humans. |
 | Regression matching | Compares the delta with patterns from previously fixed defects and accepted review comments, using only training-period examples. |
@@ -139,8 +139,8 @@ The router should select only specialists relevant to the change. Fan-out to eve
 | Specialist | Deterministic route signals | Main questions | Escalate when |
 | --- | --- | --- | --- |
 | Authentication and authorization | Auth middleware, session/token code, route guards, security rules | Can an unauthenticated or wrong-role user reach this behavior? | Any plausible boundary bypass or missing enforcement |
-| Tenant isolation and privacy | `tenantId`, user-owned records, storage paths, logging, analytics | Can data cross tenants or expose personal information? | Ownership evidence is absent, conflicting, or distributed across services |
-| Data, schema, and migration | Schemas, migrations, backfills, serialization, Firestore writes | Is the change backward-compatible, idempotent, and safe for existing data? | Destructive transform, partial-failure risk, or mixed-version contract |
+| Tenant isolation and privacy | Tenant-scoped queries, user-owned records, storage paths, logging, analytics | Can data cross tenants or expose personal information? | Ownership evidence is absent, conflicting, or distributed across services |
+| Data, schema, and migration | Schemas, migrations, backfills, serialization, persistent writes | Is the change backward-compatible, idempotent, and safe for existing data? | Destructive transform, partial-failure risk, or mixed-version contract |
 | Concurrency and reliability | Queues, jobs, retries, locks, async workflows, external calls | Can retries duplicate work, race, leak resources, or leave partial state? | Cross-process reasoning, non-idempotent side effect, or unclear recovery |
 | Billing and third-party effects | Payments, refunds, provider callbacks, metering, quotas | Can the change charge twice, misreport usage, or lose reconciliation evidence? | Money movement, destructive provider call, or ambiguous callback ordering |
 | API and contract compatibility | Interfaces, API routes, events, types, shared packages | Do producers, consumers, and tests agree on shape and lifecycle? | More than one service or release version is involved |
@@ -159,8 +159,8 @@ Every run receives an immutable `ReviewSnapshot` so that results can be cancelle
   "snapshot_id": "sha256:<content-and-policy-hash>",
   "event": "file_save",
   "base_revision": "<merge-base-or-index>",
-  "changed_paths": ["services/functions/src/billing/refund.ts"],
-  "focus_path": "services/functions/src/billing/refund.ts",
+  "changed_paths": ["src/accounts/update_record.ts"],
+  "focus_path": "src/accounts/update_record.ts",
   "diff": "<unified diff>",
   "task_intent": "<optional issue or coding-agent task>",
   "deterministic_results": [],
@@ -193,7 +193,7 @@ Specialists return evidence, not prose essays or hidden reasoning. A proposed sc
   "location": {"path": "src/file.ts", "line": 42},
   "trigger": "A caller supplies a record id owned by another tenant",
   "observable_impact": "The update reaches a record outside the active tenant",
-  "evidence": ["The query filters by id but not tenantId"],
+  "evidence": ["The query filters by record id but not tenant scope"],
   "suggested_test": "Use two tenants and attempt the update with the second tenant's id",
   "missing_context": [],
   "recommended_route": "frontier",
@@ -300,8 +300,8 @@ suppress_static_tool_duplicates = true
 [[specialist_pipeline.specialists]]
 name = "tenant_isolation"
 skill = "specialists/tenant-isolation/SKILL.md"
-path_patterns = ["**/firestore/**", "**/storage/**", "**/services/**"]
-symbols = ["tenantId", "userId", "ownerId"]
+path_patterns = ["**/data/**", "**/storage/**", "**/services/**"]
+symbols = ["tenant_key", "account_id", "owner_id"]
 minimum_route = "open_verifier"
 
 [[specialist_pipeline.specialists]]
@@ -320,7 +320,7 @@ Git does not have a file-save hook. The first prototype should support explicit 
 
 ```bash
 # Proposed commands; they do not exist yet.
-pr-agent review-snapshot --event file-save --path services/functions/src/billing/refund.ts
+pr-agent review-snapshot --event file-save --path src/accounts/update_record.ts
 pr-agent review-snapshot --event worktree-idle --base origin/develop
 pr-agent watch --base origin/develop --idle-seconds 15
 ```
@@ -373,7 +373,7 @@ Every arm reviews the same frozen snapshot:
 4. specialists plus open-weight verifier;
 5. full cascade with frontier escalation.
 
-Run file-focused replay on the adjudicated save-eligible defects and checkpoint controls. Run worktree replay on all 40 verified defects and the matched controls. Keep prompt calibration, threshold calibration, temporal backtest, and final holdout separate.
+Run file-focused replay on the adjudicated save-eligible defects and checkpoint controls. Run worktree replay on the complete adjudicated defect set and matched controls. Keep prompt calibration, threshold calibration, temporal backtest, and final holdout separate.
 
 ### 3. Measure the thing the developer feels
 
