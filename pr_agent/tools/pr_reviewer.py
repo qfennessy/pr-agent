@@ -9,38 +9,40 @@ from jinja2 import Environment, StrictUndefined
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.inline_comment_dedup import (
-    InlineCommentStore,
-    can_verify_inline_comment_publication,
-    get_inline_comment_store,
-    key_issue_body_with_markers,
-    key_issue_fingerprint,
-    key_issue_location_fingerprint,
-)
-from pr_agent.algo.pr_processing import add_ai_metadata_to_diff_files, get_pr_diff, retry_with_fallback_models
+    InlineCommentStore, can_verify_inline_comment_publication,
+    get_inline_comment_store, key_issue_body_with_markers,
+    key_issue_fingerprint, key_issue_location_fingerprint)
+from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
+                                         get_pr_diff,
+                                         retry_with_fallback_models)
 from pr_agent.algo.repo_context import build_repo_context
-from pr_agent.algo.run_details import get_run_details, init_run_details
+from pr_agent.algo.run_details import (get_run_details, init_run_details,
+                                       record_review_profile)
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.token_handler import TokenHandler
-from pr_agent.algo.utils import (
-    ModelType,
-    PRReviewHeader,
-    PRReviewIdentity,
-    add_pr_review_identity,
-    convert_to_markdown_v2,
-    github_action_output,
-    load_yaml,
-    show_relevant_configurations,
-    show_run_details,
-)
+from pr_agent.algo.utils import (ModelType, PRReviewHeader, PRReviewIdentity,
+                                 add_pr_review_identity,
+                                 convert_to_markdown_v2, github_action_output,
+                                 load_yaml, show_relevant_configurations,
+                                 show_run_details)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider_with_context
-from pr_agent.git_providers.git_provider import IncrementalPR, get_main_pr_language
+from pr_agent.git_providers.git_provider import (IncrementalPR,
+                                                 get_main_pr_language)
 from pr_agent.log import get_logger
 from pr_agent.servers.help import HelpMessage
-from pr_agent.tools.ticket_pr_compliance_check import extract_and_cache_pr_tickets
+from pr_agent.tools.ticket_pr_compliance_check import \
+    extract_and_cache_pr_tickets
 
 MAX_REVIEW_COVERAGE_FILES = 50
 _SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_VALID_REVIEW_PROFILES = {"full", "bugs_only"}
+_BUG_FINDING_HEADERS = {
+    "bug": "Bug",
+    "security": "Security vulnerability",
+    "performance": "Performance regression",
+}
 
 
 class PRReviewer:
@@ -72,6 +74,13 @@ class PRReviewer:
         self.pr_url = pr_url
         self.is_answer = is_answer
         self.is_auto = is_auto
+        configured_profile = str(get_settings().pr_reviewer.get("review_profile", "full")).strip().lower()
+        if configured_profile not in _VALID_REVIEW_PROFILES:
+            get_logger().warning(
+                f"Unknown pr_reviewer.review_profile '{configured_profile}'; falling back to 'full'"
+            )
+            configured_profile = "full"
+        self.review_profile = configured_profile
 
         if self.is_answer and not self.git_provider.is_supported("get_issue_comments"):
             raise Exception(f"Answer mode is not supported for {get_settings().config.git_provider} for now")
@@ -91,6 +100,7 @@ class PRReviewer:
             get_settings().set("config.enable_ai_metadata", False)
             get_logger().debug(f"AI metadata is disabled for this command")
 
+        bugs_only = self.review_profile == "bugs_only"
         self.vars = {
             "title": self.git_provider.pr.title,
             "branch": self.git_provider.get_pr_branch(),
@@ -99,13 +109,18 @@ class PRReviewer:
             "diff": "",  # empty diff for initial calculation
             "num_pr_files": self.git_provider.get_num_of_files(),
             "num_max_findings": get_settings().pr_reviewer.num_max_findings,
-            "require_score": get_settings().pr_reviewer.require_score_review,
-            "require_tests": get_settings().pr_reviewer.require_tests_review,
-            "require_estimate_effort_to_review": get_settings().pr_reviewer.require_estimate_effort_to_review,
-            "require_estimate_contribution_time_cost": get_settings().pr_reviewer.require_estimate_contribution_time_cost,
-            'require_can_be_split_review': get_settings().pr_reviewer.require_can_be_split_review,
-            'require_security_review': get_settings().pr_reviewer.require_security_review,
-            'require_todo_scan': get_settings().pr_reviewer.get("require_todo_scan", False),
+            "bugs_only": bugs_only,
+            "require_score": not bugs_only and get_settings().pr_reviewer.require_score_review,
+            "require_tests": not bugs_only and get_settings().pr_reviewer.require_tests_review,
+            "require_estimate_effort_to_review": (
+                not bugs_only and get_settings().pr_reviewer.require_estimate_effort_to_review
+            ),
+            "require_estimate_contribution_time_cost": (
+                not bugs_only and get_settings().pr_reviewer.require_estimate_contribution_time_cost
+            ),
+            'require_can_be_split_review': not bugs_only and get_settings().pr_reviewer.require_can_be_split_review,
+            'require_security_review': not bugs_only and get_settings().pr_reviewer.require_security_review,
+            'require_todo_scan': not bugs_only and get_settings().pr_reviewer.get("require_todo_scan", False),
             'question_str': question_str,
             'answer_str': answer_str,
             "extra_instructions": get_settings().pr_reviewer.extra_instructions,
@@ -113,9 +128,9 @@ class PRReviewer:
             "repo_context": build_repo_context(self.git_provider),
             "commit_messages_str": self.git_provider.get_commit_messages(),
             "custom_labels": "",
-            "enable_custom_labels": get_settings().config.enable_custom_labels,
+            "enable_custom_labels": not bugs_only and get_settings().config.enable_custom_labels,
             "is_ai_metadata":  get_settings().get("config.enable_ai_metadata", False),
-            "related_tickets": get_settings().get('related_tickets', []),
+            "related_tickets": [] if bugs_only else get_settings().get('related_tickets', []),
             'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False),
             "date": datetime.datetime.now().strftime('%Y-%m-%d'),
         }
@@ -138,6 +153,7 @@ class PRReviewer:
 
     async def run(self) -> None:
         init_run_details()
+        record_review_profile(self._review_profile())
         progress_response = None
         review_failed = False
         try:
@@ -162,7 +178,8 @@ class PRReviewer:
             get_logger().debug("Relevant configs", artifacts=relevant_configs)
 
             # ticket extraction if exists
-            await extract_and_cache_pr_tickets(self.git_provider, self.vars)
+            if self._review_profile() != "bugs_only":
+                await extract_and_cache_pr_tickets(self.git_provider, self.vars)
 
             if (
                 self.incremental.is_incremental
@@ -240,7 +257,13 @@ class PRReviewer:
                     get_logger().exception(f"Failed to publish review failure result, error: {e}")
 
     def _should_publish_review_no_suggestions(self, pr_review: str) -> bool:
+        if self._review_profile() == "bugs_only":
+            return bool(pr_review.strip())
         return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
+
+    def _review_profile(self) -> str:
+        """Return the selected profile, defaulting legacy/test instances to full review."""
+        return getattr(self, "review_profile", "full")
 
     async def _prepare_prediction(self, model: str) -> None:
         output = get_pr_diff(self.git_provider,
@@ -319,6 +342,97 @@ class PRReviewer:
 
         return response
 
+    def _changed_lines_by_file(self) -> dict[str, set[int]]:
+        """Return added line numbers for each diff file, using unified-diff hunks."""
+        changed_lines = {}
+        for file in self.git_provider.get_diff_files() or []:
+            filename = (getattr(file, "filename", "") or "").strip()
+            patch = getattr(file, "patch", "") or ""
+            if not filename or not patch:
+                continue
+            file_lines = set()
+            new_line = None
+            for patch_line in patch.splitlines():
+                header = _HUNK_HEADER_RE.match(patch_line)
+                if header:
+                    new_line = int(header.group(1))
+                    continue
+                if new_line is None or patch_line.startswith("\\ No newline at end of file"):
+                    continue
+                if patch_line.startswith("+") and not patch_line.startswith("+++"):
+                    file_lines.add(new_line)
+                    new_line += 1
+                elif patch_line.startswith("-") and not patch_line.startswith("---"):
+                    continue
+                else:
+                    new_line += 1
+            changed_lines[filename] = file_lines
+            changed_lines.setdefault(filename.lstrip("/"), file_lines)
+        return changed_lines
+
+    @staticmethod
+    def _strict_bool(value) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized == "true":
+                return True
+            if normalized == "false":
+                return False
+        return None
+
+    def _normalize_bugs_only_review(self, data: dict) -> dict:
+        """Keep only complete, changed-line defect reports and collapse shared root causes."""
+        if self._review_profile() != "bugs_only":
+            return data
+
+        issues = (data.get("review") or {}).get("key_issues_to_review")
+        if not isinstance(issues, list):
+            issues = []
+        changed_lines = self._changed_lines_by_file()
+        normalized_issues = []
+        seen_root_causes = set()
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            finding_type = str(issue.get("finding_type") or "").strip().lower()
+            if finding_type not in _BUG_FINDING_HEADERS:
+                continue
+            if self._strict_bool(issue.get("duplicates_ci_failure")) is not False:
+                continue
+
+            relevant_file = str(issue.get("relevant_file") or "").strip()
+            issue_content = str(issue.get("issue_content") or "").strip()
+            trigger = str(issue.get("trigger") or "").strip()
+            impact = str(issue.get("impact") or "").strip()
+            root_cause = " ".join(str(issue.get("root_cause") or "").split())
+            try:
+                start_line = int(str(issue.get("start_line", "")).strip())
+                end_line = int(str(issue.get("end_line", "")).strip())
+            except ValueError:
+                continue
+            file_changed_lines = changed_lines.get(relevant_file) or changed_lines.get(relevant_file.lstrip("/"))
+            if (not relevant_file or not issue_content or not trigger or not impact or not root_cause or
+                    start_line < 1 or end_line < start_line or not file_changed_lines or
+                    not any(line in file_changed_lines for line in range(start_line, end_line + 1))):
+                continue
+
+            root_cause_key = root_cause.casefold()
+            if root_cause_key in seen_root_causes:
+                continue
+            seen_root_causes.add(root_cause_key)
+            normalized_issues.append({
+                "relevant_file": relevant_file,
+                "issue_header": _BUG_FINDING_HEADERS[finding_type],
+                "issue_content": f"{issue_content}\n\n**Trigger:** {trigger}\n\n**Impact:** {impact}",
+                "start_line": start_line,
+                "end_line": end_line,
+            })
+            if len(normalized_issues) >= get_settings().pr_reviewer.num_max_findings:
+                break
+        return {"review": {"key_issues_to_review": normalized_issues}}
+
     def _prepare_pr_review(self) -> str:
         """
         Prepare the PR review by processing the AI prediction and generating a markdown-formatted text that summarizes
@@ -330,11 +444,12 @@ class PRReviewer:
                          keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:", "key_issues_to_review:",
                                         "relevant_file:", "relevant_line:", "suggestion:"],
                          first_key=first_key, last_key=last_key)
-        github_action_output(data, 'review')
 
-        if 'review' not in data:
+        if not isinstance(data, dict) or 'review' not in data:
             get_logger().exception("Failed to parse review data", artifact={"data": data})
             return ""
+        data = self._normalize_bugs_only_review(data)
+        github_action_output(data, 'review')
 
         structured_publisher = getattr(self.git_provider, "publish_structured_review", None)
         if callable(structured_publisher):
@@ -352,6 +467,7 @@ class PRReviewer:
                     "total_tokens": details.total_tokens,
                 }
             structured_data["usage"] = usage
+            structured_data["metadata"] = {"review_profile": self._review_profile()}
             structured_publisher(structured_data)
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
@@ -361,6 +477,10 @@ class PRReviewer:
 
         if get_settings().config.publish_output and get_settings().pr_reviewer.get('inline_key_issues', False):
             data = self._publish_key_issues_as_inline_comments(data)
+
+        if self._review_profile() == "bugs_only" and not (
+                (data.get("review") or {}).get("key_issues_to_review")):
+            return ""
 
         incremental_review_markdown_text = None
         # Add incremental review section
@@ -372,9 +492,11 @@ class PRReviewer:
         markdown_text = convert_to_markdown_v2(data, self.git_provider.is_supported("gfm_markdown"),
                                             incremental_review_markdown_text,
                                                git_provider=self.git_provider,
-                                               files=self.git_provider.get_diff_files())
+                                               files=self.git_provider.get_diff_files(),
+                                               review_profile=self._review_profile())
 
-        if self.remaining_files_list and get_settings().pr_reviewer.enable_review_coverage_footer:
+        if (self._review_profile() != "bugs_only" and self.remaining_files_list and
+                get_settings().pr_reviewer.enable_review_coverage_footer):
             displayed_files = self.remaining_files_list[:MAX_REVIEW_COVERAGE_FILES]
             markdown_text += (
                 "\n\n<hr>\n\n"
@@ -387,21 +509,25 @@ class PRReviewer:
                 markdown_text += f"\n... and {remaining_count} more"
 
         # Add help text if gfm_markdown is supported
-        if self.git_provider.is_supported("gfm_markdown") and get_settings().pr_reviewer.enable_help_text:
+        if (self._review_profile() != "bugs_only" and self.git_provider.is_supported("gfm_markdown") and
+                get_settings().pr_reviewer.enable_help_text):
             markdown_text += "<hr>\n\n<details> <summary><strong>💡 Tool usage guide:</strong></summary><hr> \n\n"
             markdown_text += HelpMessage.get_review_usage_guide()
             markdown_text += "\n</details>\n"
 
         # Output the relevant configurations if enabled
-        if get_settings().get('config', {}).get('output_relevant_configurations', False):
+        if (self._review_profile() != "bugs_only" and
+                get_settings().get('config', {}).get('output_relevant_configurations', False)):
             markdown_text += show_relevant_configurations(relevant_section='pr_reviewer')
 
         # Output the agent run details (model, tokens, time cost) if enabled
-        if get_settings().get('config', {}).get('output_run_details', False):
+        if (self._review_profile() != "bugs_only" and
+                get_settings().get('config', {}).get('output_run_details', False)):
             markdown_text += show_run_details(self.git_provider.is_supported("gfm_markdown"))
 
         # Add custom labels from the review prediction (effort, security)
-        self.set_review_labels(data)
+        if self._review_profile() != "bugs_only":
+            self.set_review_labels(data)
 
         if markdown_text == None or len(markdown_text) == 0:
             markdown_text = ""

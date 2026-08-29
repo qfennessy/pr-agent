@@ -24,6 +24,29 @@ After ~30 seconds, the tool will generate a review for the PR:
 
 ![review](https://codium.ai/images/pr_agent/review3.png){width=512}
 
+#### Bugs-only reviews
+
+The default `full` profile keeps the existing review: effort, tests, security summary, ticket analysis, and key issues
+can all appear when their settings are enabled. Use the `bugs_only` profile when the review should contain only
+introduced functional bugs, security vulnerabilities, or demonstrated material performance regressions:
+
+```
+/review --pr_reviewer.review_profile=bugs_only
+```
+
+Or make it persistent in `.pr_agent.toml`:
+
+```toml
+[pr_reviewer]
+review_profile = "bugs_only"
+```
+
+Before, a style-only PR could still receive the normal review sections or a "No major issues detected" comment.
+After selecting `bugs_only`, non-defect feedback and failures already reported by CI are omitted, findings with the
+same root cause are collapsed, and PR-Agent publishes no summary when no qualifying finding remains. Structured
+output still contains `review.key_issues_to_review`, using an empty list for that case. Set `inline_key_issues = true`
+to keep supported inline publication behavior.
+
 If you want to edit [configurations](#configuration-options), add the relevant ones to the command:
 
 ```
@@ -54,6 +77,13 @@ extra_instructions = "..."
 ???+ example "General options"
 
     <table>
+      <tr>
+        <td><b>review_profile</b></td>
+        <td>
+          Review output contract. <code>full</code> preserves the standard review; <code>bugs_only</code> emits only
+          qualifying introduced defects and stays silent when none remain. Default is <code>full</code>.
+        </td>
+      </tr>
       <tr>
         <td><b>persistent_comment</b></td>
         <td>If set to true, the review comment will be persistent, meaning that every new review request will edit the previous one. Default is true.</td>

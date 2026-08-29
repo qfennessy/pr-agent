@@ -5,7 +5,8 @@ import pytest
 
 from pr_agent.algo.run_details import (RunDetails, add_token_usage,
                                        get_run_details, init_run_details,
-                                       record_ai_call, record_model_used)
+                                       record_ai_call, record_model_used,
+                                       record_review_profile)
 
 
 class _Usage:
@@ -22,6 +23,7 @@ def test_init_returns_fresh_instance_with_zeroed_counters():
 
     assert isinstance(details, RunDetails)
     assert details.model_used is None
+    assert details.review_profile is None
     assert details.fallback_used is False
     assert details.prompt_tokens == 0
     assert details.completion_tokens == 0
@@ -55,6 +57,14 @@ def test_record_model_used_tracks_model_and_fallback_flag():
     details = get_run_details()
     assert details.model_used == "openai/gpt-5.4"
     assert details.fallback_used is True
+
+
+def test_record_review_profile_tracks_selected_reviewer_mode():
+    init_run_details()
+
+    record_review_profile("bugs_only")
+
+    assert get_run_details().review_profile == "bugs_only"
 
 
 def test_fallback_flag_is_sticky_once_a_fallback_was_used():

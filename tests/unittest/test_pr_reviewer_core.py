@@ -3,11 +3,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pr_agent.algo.inline_comment_dedup import (
-    body_with_markers,
-    get_inline_comment_store,
-    key_issue_fingerprint,
-)
+from pr_agent.algo.inline_comment_dedup import (body_with_markers,
+                                                get_inline_comment_store,
+                                                key_issue_fingerprint)
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity
 from pr_agent.config_loader import get_settings
@@ -194,6 +192,90 @@ def _key_issue(**overrides):
     }
     issue.update(overrides)
     return issue
+
+
+def _bugs_only_issue(**overrides):
+    issue = {
+        "relevant_file": "app.py",
+        "issue_header": "Possible Bug",
+        "issue_content": "The new branch reuses another tenant's cache entry.",
+        "start_line": 2,
+        "end_line": 2,
+        "finding_type": "bug",
+        "trigger": "Two tenants request the same record identifier.",
+        "impact": "The second tenant receives the first tenant's data.",
+        "root_cause": "The cache key omits the tenant identifier.",
+        "duplicates_ci_failure": False,
+    }
+    issue.update(overrides)
+    return issue
+
+
+def _bugs_only_reviewer(*issues):
+    git_provider = MagicMock()
+    git_provider.get_diff_files.return_value = [
+        FilePatchInfo(
+            base_file="one\ntwo\nthree\n",
+            head_file="one\nchanged\ntwo\nthree\n",
+            patch="@@ -1,3 +1,4 @@\n one\n+changed\n two\n three\n",
+            filename="app.py",
+        )
+    ]
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "bugs_only"
+    data = {"review": {"key_issues_to_review": list(issues)}}
+    return reviewer, data
+
+
+def test_bugs_only_keeps_a_complete_defect_and_exposes_only_the_public_finding_shape():
+    reviewer, data = _bugs_only_reviewer(_bugs_only_issue())
+
+    result = reviewer._normalize_bugs_only_review(data)
+
+    assert result == {"review": {"key_issues_to_review": [{
+        "relevant_file": "app.py",
+        "issue_header": "Bug",
+        "issue_content": (
+            "The new branch reuses another tenant's cache entry.\n\n"
+            "**Trigger:** Two tenants request the same record identifier.\n\n"
+            "**Impact:** The second tenant receives the first tenant's data."
+        ),
+        "start_line": 2,
+        "end_line": 2,
+    }]}}
+
+
+@pytest.mark.parametrize("issue", [
+    _bugs_only_issue(finding_type="style"),
+    _bugs_only_issue(duplicates_ci_failure=True),
+    _bugs_only_issue(start_line=1, end_line=1),
+    _bugs_only_issue(trigger=""),
+    _bugs_only_issue(impact=""),
+])
+def test_bugs_only_discards_non_defects_ci_duplicates_and_unverifiable_findings(issue):
+    reviewer, data = _bugs_only_reviewer(issue)
+
+    assert reviewer._normalize_bugs_only_review(data) == {"review": {"key_issues_to_review": []}}
+
+
+def test_bugs_only_collapses_multiple_symptoms_with_the_same_root_cause():
+    first = _bugs_only_issue()
+    second = _bugs_only_issue(
+        issue_content="A second endpoint leaks the same cached value.",
+        trigger="The same key is requested through the batch endpoint.",
+    )
+    reviewer, data = _bugs_only_reviewer(first, second)
+
+    result = reviewer._normalize_bugs_only_review(data)
+
+    assert len(result["review"]["key_issues_to_review"]) == 1
+    assert "new branch" in result["review"]["key_issues_to_review"][0]["issue_content"]
+
+
+def test_bugs_only_preserves_an_empty_finding_list():
+    reviewer, data = _bugs_only_reviewer()
+
+    assert reviewer._normalize_bugs_only_review(data) == {"review": {"key_issues_to_review": []}}
 
 
 def _reviewer_with_findings(*issues, head_file="one\ntwo\nthree\nfour\n"):
@@ -879,6 +961,7 @@ def test_prepare_review_publishes_provider_neutral_structured_data(monkeypatch):
             "security_concerns": False,
         },
         "usage": {"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42},
+        "metadata": {"review_profile": "full"},
     })
     # Assert key order to prove the snapshot is isolated: _prepare_pr_review moves
     # key_issues_to_review to the end of its own dict after the hook fires, so an
@@ -886,6 +969,27 @@ def test_prepare_review_publishes_provider_neutral_structured_data(monkeypatch):
     # (assert_called_once_with cannot catch this: dict equality ignores key order.)
     published = git_provider.publish_structured_review.call_args[0][0]
     assert list(published["review"].keys()) == ["key_issues_to_review", "security_concerns"]
+
+
+def test_bugs_only_publishes_structured_empty_list_but_no_markdown():
+    reviewer, _ = _bugs_only_reviewer()
+    reviewer.prediction = "review:\n  key_issues_to_review: []\n"
+    reviewer.git_provider.is_supported.return_value = False
+    reviewer.git_provider.publish_structured_review = MagicMock()
+    reviewer.set_review_labels = MagicMock()
+
+    from pr_agent.algo.run_details import init_run_details
+
+    init_run_details()
+    review = reviewer._prepare_pr_review()
+
+    assert review == ""
+    reviewer.set_review_labels.assert_not_called()
+    reviewer.git_provider.publish_structured_review.assert_called_once_with({
+        "review": {"key_issues_to_review": []},
+        "usage": {},
+        "metadata": {"review_profile": "bugs_only"},
+    })
 
 
 def test_can_run_incremental_review_skips_auto_mode_without_new_commit():

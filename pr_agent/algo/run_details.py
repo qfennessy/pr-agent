@@ -31,6 +31,8 @@ class RunDetails:
     # took over. Stays None when no prediction succeeded, which the renderer reads as
     # "nothing worth showing".
     model_used: Optional[str] = None
+    # Review mode selected for this run. Other tools leave it unset.
+    review_profile: Optional[str] = None
     # Sticky: once a fallback has won, a later success on the primary model must not
     # clear this, or the comment would hide that a fallback ran at all.
     fallback_used: bool = False
@@ -99,6 +101,13 @@ def record_model_used(model: str, is_fallback: bool) -> None:
     if is_fallback:
         # sticky: later primary success must not hide that a fallback ran
         details.fallback_used = True
+
+
+def record_review_profile(profile: str) -> None:
+    """Record the selected reviewer profile in the current run metadata."""
+    details = get_run_details()
+    if details is not None:
+        details.review_profile = profile
 
 
 def _read_token_field(usage, name: str) -> int:
