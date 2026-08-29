@@ -93,7 +93,7 @@ async def test_chat_completion_retries_are_bounded_by_config(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chat_completion_default_retry_budget_is_two_attempts(monkeypatch):
-    monkeypatch.setattr(litellm_handler, "get_settings", lambda: FakeSettings())
+    monkeypatch.setattr(litellm_handler, "get_settings", FakeSettings)
 
     with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion", new_callable=AsyncMock) as mock_call:
         mock_call.side_effect = openai.APIError("boom", request=MagicMock(), body=None)
@@ -125,7 +125,7 @@ async def test_provider_max_retries_is_forwarded(monkeypatch, configured, expect
 
 @pytest.mark.asyncio
 async def test_provider_max_retries_unset_leaves_provider_default(monkeypatch):
-    monkeypatch.setattr(litellm_handler, "get_settings", lambda: FakeSettings())
+    monkeypatch.setattr(litellm_handler, "get_settings", FakeSettings)
 
     with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion", new_callable=AsyncMock) as mock_call:
         mock_call.return_value = _mock_response()
