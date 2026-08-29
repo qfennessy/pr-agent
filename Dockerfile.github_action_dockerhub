@@ -1,1 +1,15 @@
 FROM pragent/pr-agent:github_action
+
+# The base image is the upstream Docker Hub build, which contains none of the
+# changes made in this fork (e.g. the config.files_to_review allowlist in
+# pr_agent/algo/language_handler.py that lets lockfile-only PRs be reviewed).
+# GitHub Actions builds this Dockerfile from the fork's checked-out source at
+# the pinned action SHA, so overlaying the fork's pr_agent package here is what
+# actually runs the fork code. Without this COPY, a pin bump to a new fork
+# commit silently still executes the upstream image.
+#
+# PYTHONPATH=/app (see base image) and the entrypoint runs
+# /app/pr_agent/servers/github_action_runner.py, so this overlay takes effect
+# for the action runner. Dependencies are already installed in the base image;
+# only the fork's source is replaced.
+COPY pr_agent /app/pr_agent

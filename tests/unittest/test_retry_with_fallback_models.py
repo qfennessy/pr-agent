@@ -6,13 +6,15 @@ from pr_agent.algo.pr_processing import retry_with_fallback_models
 from pr_agent.algo.run_details import get_run_details, init_run_details
 from pr_agent.algo.utils import ModelType
 from pr_agent.config_loader import get_settings
-from tests.unittest._settings_helpers import SENTINEL, restore_settings, snapshot_settings
+from tests.unittest._settings_helpers import (SENTINEL, restore_settings,
+                                              snapshot_settings)
 
 _TRACKED_KEYS = (
     "config.model",
     "config.model_weak",
     "config.model_reasoning",
     "config.fallback_models",
+    "config.last_used_model",
     "openai.deployment_id",
     "openai.fallback_deployments",
 )
@@ -241,6 +243,7 @@ def test_records_fallback_model_with_fallback_flag():
         details = get_run_details()
         assert details.model_used == "fallback-1"
         assert details.fallback_used is True
+        assert get_settings().config.get("last_used_model") == "fallback-1"
     finally:
         _restore_settings(snapshot)
 
@@ -296,5 +299,76 @@ def test_recording_successful_model_does_not_trigger_fallback_retry(monkeypatch)
             asyncio.run(retry_with_fallback_models(fake_f))
 
         assert calls == ["primary-model"]
+    finally:
+        _restore_settings(snapshot)
+
+
+def test_all_models_failed_writes_ci_summary_with_attempt_evidence(tmp_path, monkeypatch):
+    """A provider outage must be diagnosable without downloading the raw log archive."""
+    snapshot = _snapshot_settings()
+    summary = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    try:
+        get_settings().set("config.model", "openai/primary")
+        get_settings().set("config.fallback_models", ["openai/fallback"])
+        get_settings().set("openai.deployment_id", None)
+        get_settings().set("openai.fallback_deployments", [])
+
+        async def fake_f(model):
+            raise TimeoutError("Request timed out - timeout value=90.0, api_key=sk-secret123456789")
+
+        with pytest.raises(Exception):
+            asyncio.run(retry_with_fallback_models(fake_f))
+
+        written = summary.read_text(encoding="utf-8")
+        assert "no model produced a response" in written
+        assert "openai/primary" in written and "openai/fallback" in written
+        assert "1/2" in written and "2/2" in written
+        assert "TimeoutError" in written
+        assert "timeout value=90.0" in written
+        assert "sk-secret123456789" not in written  # credential-shaped text is redacted
+    finally:
+        _restore_settings(snapshot)
+
+
+@pytest.mark.parametrize("prefix", ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"])
+def test_all_models_failed_redacts_github_token_shapes(tmp_path, monkeypatch, prefix):
+    snapshot = _snapshot_settings()
+    summary = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    fake_token = prefix + "x" * 20
+    try:
+        get_settings().set("config.model", "openai/primary")
+        get_settings().set("config.fallback_models", [])
+        get_settings().set("openai.deployment_id", None)
+        get_settings().set("openai.fallback_deployments", [])
+
+        async def fake_f(model):
+            raise RuntimeError(f"provider rejected credential {fake_token}")
+
+        with pytest.raises(Exception):
+            asyncio.run(retry_with_fallback_models(fake_f))
+
+        written = summary.read_text(encoding="utf-8")
+        assert fake_token not in written
+        assert "[redacted]" in written
+    finally:
+        _restore_settings(snapshot)
+
+
+def test_no_ci_summary_written_outside_ci(tmp_path, monkeypatch):
+    snapshot = _snapshot_settings()
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    try:
+        get_settings().set("config.model", "openai/primary")
+        get_settings().set("config.fallback_models", [])
+        get_settings().set("openai.deployment_id", None)
+        get_settings().set("openai.fallback_deployments", [])
+
+        async def fake_f(model):
+            raise TimeoutError("boom")
+
+        with pytest.raises(Exception):
+            asyncio.run(retry_with_fallback_models(fake_f))
     finally:
         _restore_settings(snapshot)

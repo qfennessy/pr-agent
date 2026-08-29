@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import re
+import time
 import traceback
 from typing import Callable, List, Tuple
 
@@ -334,25 +337,95 @@ def generate_full_patch(convert_hunks_to_line_numbers, file_dict, max_tokens_mod
 async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelType.REGULAR):
     all_models = _get_all_models(model_type)
     all_deployments = _get_all_deployments(all_models)
+    attempts: List[dict] = []
     # try each (model, deployment_id) pair until one is successful, otherwise raise exception
     for i, (model, deployment_id) in enumerate(zip(all_models, all_deployments)):
+        started_at = time.monotonic()
         try:
             get_logger().debug(
-                f"Generating prediction with {model}"
+                f"Generating prediction with {model} (attempt {i + 1}/{len(all_models)})"
                 f"{(' from deployment ' + deployment_id) if deployment_id else ''}"
             )
             get_settings().set("openai.deployment_id", deployment_id)
             result = await f(model)
         except Exception as e:
+            elapsed = round(time.monotonic() - started_at, 1)
+            attempt = {
+                "attempt": f"{i + 1}/{len(all_models)}",
+                "model": model,
+                "ai_timeout": get_settings().config.get("ai_timeout", None),
+                "error_class": type(e).__name__,
+                "elapsed_seconds": elapsed,
+            }
+            attempts.append(attempt)
             get_logger().warning(
-                f"Failed to generate prediction with {model}",
-                artifact={"error": e},
+                f"Failed to generate prediction with {model} "
+                f"(attempt {i + 1}/{len(all_models)}, {elapsed}s)",
+                artifact={"error": e, **attempt},
             )
             if i == len(all_models) - 1:  # If it's the last iteration
+                _publish_model_failure_summary(attempts, str(e))
                 raise Exception(f"Failed to generate prediction with any model of {all_models}") from e
         else:
+            # Keep both attribution surfaces in sync: run details power the optional
+            # telemetry footer, while persistent multi-review comments display the model
+            # that actually answered when a fallback succeeds.
+            get_settings().set("config.last_used_model", model)
             record_model_used(model, is_fallback=i > 0)
             return result
+
+
+# Redacts anything shaped like a credential before a provider error is copied into a CI
+# job summary, which is world-readable on public repositories. Syntax-only: it matches
+# token shapes, never message meaning.
+_SECRET_LIKE = re.compile(
+    r"(?i)(bearer\s+\S+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*\S+|"
+    r"\b(?:(?:sk|rk|glpat)-|(?:ghp|gho|ghu|ghs|ghr)_|github_pat_)[A-Za-z0-9_-]{8,})"
+)
+_MAX_SUMMARY_ERROR_CHARS = 400
+
+
+def _publish_model_failure_summary(attempts: List[dict], last_error: str) -> None:
+    """Write the model-failure evidence to the CI job summary, when running in one.
+
+    The published review comment is the only signal most workflows check, so a run in
+    which every model failed looks identical to a run that had nothing to say. Writing
+    the per-attempt evidence (model, attempt, configured timeout, error class, elapsed)
+    to GITHUB_STEP_SUMMARY makes a provider outage diagnosable without downloading the
+    raw log archive, where the error is buried behind the multi-megabyte diff artifact.
+
+    Args:
+        attempts: One dict per failed (model, deployment) attempt, in order.
+        last_error: The final exception rendered as a string; redacted before writing.
+
+    Returns:
+        None. Failures to write the summary are logged and swallowed - diagnostics must
+        never mask the underlying model error.
+
+    Example:
+        >>> _publish_model_failure_summary([{"attempt": "1/2", "model": "openai/x"}], "timeout")
+    """
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path or not attempts:
+        return
+    redacted = _SECRET_LIKE.sub("[redacted]", last_error or "")[:_MAX_SUMMARY_ERROR_CHARS]
+    lines = [
+        "### PR-Agent: no model produced a response",
+        "",
+        "| Attempt | Model | Configured timeout (s) | Error | Elapsed (s) |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for a in attempts:
+        lines.append(
+            f"| {a.get('attempt', '')} | `{a.get('model', '')}` | {a.get('ai_timeout', '')} "
+            f"| {a.get('error_class', '')} | {a.get('elapsed_seconds', '')} |"
+        )
+    lines += ["", f"Last error (redacted, truncated): `{redacted}`", ""]
+    try:
+        with open(summary_path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except OSError as e:
+        get_logger().warning(f"Failed to write model-failure summary: {e}")
 
 
 def _get_all_models(model_type: ModelType = ModelType.REGULAR) -> List[str]:

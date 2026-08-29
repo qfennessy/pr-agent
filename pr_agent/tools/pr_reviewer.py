@@ -258,9 +258,40 @@ class PRReviewer:
         if self.patches_diff:
             get_logger().debug(f"PR diff", diff=self.patches_diff)
             self.prediction = await self._get_prediction(model)
+            self._reject_unparsable_prediction(model)
         else:
             get_logger().warning(f"Empty diff for PR: {self.pr_url}")
             self.prediction = None
+
+    def _reject_unparsable_prediction(self, model: str) -> None:
+        """Treat a prediction that will not parse as a failure of this model.
+
+        A model can answer promptly and still emit YAML the parser cannot read (an
+        unquoted colon inside a summary is enough). Raising here, while still inside
+        retry_with_fallback_models, lets the next model answer instead - previously the
+        parse happened after all retries, so an unparsable answer skipped the fallback
+        entirely and the run published nothing.
+
+        Args:
+            model: The model that produced self.prediction, for the log line.
+
+        Raises:
+            ValueError: When the prediction is missing or does not yield review data.
+        """
+        if not self.prediction or not self.prediction.strip():
+            raise ValueError(f"Model {model} returned an empty prediction")
+        try:
+            data = load_yaml(
+                self.prediction.strip(),
+                keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:",
+                               "security_concerns:", "key_issues_to_review:",
+                               "relevant_file:", "relevant_line:", "suggestion:"],
+                first_key='review', last_key='security_concerns',
+            )
+        except Exception as e:
+            raise ValueError(f"Model {model} returned unparsable output: {e}") from e
+        if not isinstance(data, dict) or not isinstance(data.get('review'), dict) or not data['review']:
+            raise ValueError(f"Model {model} returned output without a non-empty 'review' mapping")
 
     async def _get_prediction(self, model: str) -> str:
         """

@@ -10,7 +10,8 @@ on:
       - main
 
 jobs:
-  build-and-test:
+  coverage:
+    name: Coverage
     runs-on: ubuntu-latest
 
     steps:

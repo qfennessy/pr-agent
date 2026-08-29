@@ -9,7 +9,7 @@ import openai
 import requests
 from litellm import acompletion
 from tenacity import (retry, retry_if_exception_type,
-                      retry_if_not_exception_type, stop_after_attempt)
+                      retry_if_not_exception_type)
 
 from pr_agent.algo import (CLAUDE_EXTENDED_THINKING_MODELS,
                            NO_SUPPORT_TEMPERATURE_MODELS,
@@ -27,6 +27,36 @@ from pr_agent.log import get_logger
 
 MODEL_RETRIES = 2
 DUMMY_LITELLM_API_KEY = "dummy_key"  # placeholder set when no OpenAI key is configured
+
+
+def _model_retries_stop(retry_state) -> bool:
+    """Stop condition for chat_completion's @retry, read from config at call time.
+
+    tenacity evaluates decorator arguments at import time, so a plain
+    stop_after_attempt(MODEL_RETRIES) would freeze the attempt budget before any
+    configuration is loaded. Reading config.model_retries here lets a deployment
+    bound its own worst-case wall clock: attempts per model multiply with the
+    number of fallback models and with the provider client's own retries, so an
+    unresponsive provider can otherwise consume the whole CI job window.
+
+    Args:
+        retry_state: tenacity's state for the current call, whose attempt_number
+            is 1 on the first attempt.
+
+    Returns:
+        True when no further attempt should be made for this model.
+
+    Example:
+        >>> get_settings().set("config.model_retries", 1)  # single attempt per model
+    """
+    try:
+        attempts = int(get_settings().config.get("model_retries", MODEL_RETRIES))
+    except (TypeError, ValueError):
+        get_logger().warning(
+            f"Invalid config.model_retries; using default {MODEL_RETRIES}"
+        )
+        attempts = MODEL_RETRIES
+    return retry_state.attempt_number >= max(1, attempts)
 
 
 class LiteLLMAIHandler(BaseAiHandler):
@@ -621,7 +651,7 @@ class LiteLLMAIHandler(BaseAiHandler):
 
     @retry(
         retry=retry_if_exception_type(openai.APIError) & retry_if_not_exception_type(openai.RateLimitError),
-        stop=stop_after_attempt(MODEL_RETRIES),
+        stop=_model_retries_stop,
         reraise=True,  # surface the provider's error; RetryError hides the reason
     )
     async def chat_completion(self, model: str, system: str, user: str, temperature: float = 0.2, img_path: str = None):
@@ -738,6 +768,21 @@ class LiteLLMAIHandler(BaseAiHandler):
                         "timeout": get_settings().config.ai_timeout,
                         "api_base": api_base,
                     }
+
+                # Cap the provider client's own retries. LiteLLM's OpenAI path defaults
+                # max_retries to 2 (i.e. 3 requests) and that budget is invisible in the
+                # logs: a single "timeout value=120.0" attempt reappears as ~360s of wall
+                # clock. Left unset, this multiplies with the tenacity attempts above and
+                # with fallback_models, so a hung endpoint can burn tens of minutes before
+                # anything is published. None keeps LiteLLM's default.
+                provider_max_retries = get_settings().config.get("ai_provider_max_retries", None)
+                if provider_max_retries is not None:
+                    try:
+                        kwargs["max_retries"] = max(0, int(provider_max_retries))
+                    except (TypeError, ValueError):
+                        get_logger().warning(
+                            "Invalid config.ai_provider_max_retries; leaving the provider default in place"
+                        )
 
                 # Add temperature only if model supports it
                 if model not in self.no_support_temperature_models and not get_settings().config.custom_reasoning_model:

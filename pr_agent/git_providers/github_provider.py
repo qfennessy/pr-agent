@@ -11,8 +11,8 @@ from datetime import datetime
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
-from github.Issue import Issue
 from github import AppAuthentication, Auth, Github, GithubException
+from github.Issue import Issue
 from retry.api import retry_call
 from starlette_context import context
 
@@ -23,15 +23,15 @@ from ..algo.inline_comment_dedup import (body_fingerprint, body_with_markers,
                                          get_inline_comment_store, has_marker)
 from ..algo.language_handler import is_valid_file
 from ..algo.types import EDIT_TYPE
-from ..algo.utils import (Range, clip_tokens, comment_matches_any_identity,
-                          find_line_number_of_relevant_line_in_file,
+from ..algo.utils import (Range, clip_tokens, find_line_number_of_relevant_line_in_file,
                           get_pr_review_comment_identifiers, load_large_diff,
                           set_file_languages)
 from ..config_loader import get_settings
 from ..log import get_logger
 from ..servers.utils import RateLimitExceeded
 from .git_provider import (MAX_FILES_ALLOWED_FULL, FilePatchInfo, GitProvider,
-                           IncrementalPR, get_cached_global_settings)
+                           IncrementalPR, get_cached_global_settings,
+                           is_own_persistent_comment_for_identities)
 
 
 def _next_page_url(headers: dict) -> str:
@@ -205,7 +205,7 @@ class GithubProvider(GitProvider):
             self.comments = list(self.pr.get_issue_comments())
         identifiers = get_pr_review_comment_identifiers(full=full, incremental=incremental)
         for index in range(len(self.comments) - 1, -1, -1):
-            if comment_matches_any_identity(self.comments[index].body, identifiers):
+            if is_own_persistent_comment_for_identities(self.comments[index].body, identifiers):
                 return self.comments[index]
         return None
 

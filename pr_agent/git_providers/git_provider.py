@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import time
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.algo.utils import (Range, add_pr_review_identity,
@@ -13,6 +13,14 @@ from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 
 MAX_FILES_ALLOWED_FULL = 50
+
+# Hidden marker that lets several PR-Agent runs keep separate persistent comments on the
+# same PR - for example one review per model. Persistent comments are otherwise found by
+# their visible header, which is identical for every run, so a second run would overwrite
+# the first run's comment instead of publishing its own.
+PERSISTENT_COMMENT_ID_MARKER = "<!-- pr-agent-persistent-id:"
+# Opens the visible attribution line placed under the comment's heading.
+PERSISTENT_COMMENT_ATTRIBUTION_PREFIX = "> Reviewed by"
 
 _GLOBAL_SETTINGS_CACHE: dict = {}
 _GLOBAL_SETTINGS_CACHE_TTL_SECONDS = 15 * 60
@@ -113,6 +121,160 @@ def get_git_ssl_env() -> dict[str, str]:
     if chosen_cert_file:
         returned_env.update({"GIT_SSL_CAINFO": chosen_cert_file, "REQUESTS_CA_BUNDLE": chosen_cert_file})
     return returned_env
+
+
+def get_persistent_comment_id() -> str:
+    """Return the configured identity for this run's persistent comments, or "".
+
+    Set config.persistent_comment_id when more than one PR-Agent run comments on the same
+    PR (for example a review per model, run as separate CI jobs). Each run then finds and
+    updates only its own comment. Leave it unset for the single-run default.
+
+    Returns:
+        The trimmed id, or "" when unset.
+
+    Example:
+        >>> get_settings().set("config.persistent_comment_id", "kimi-k3")
+        >>> get_persistent_comment_id()
+        'kimi-k3'
+    """
+    try:
+        value = get_settings().config.get("persistent_comment_id", "")
+    except AttributeError:
+        return ""
+    return str(value).strip() if value else ""
+
+
+def _persistent_comment_marker(comment_id: str) -> str:
+    """Return the exact marker line published for the given id."""
+    return f"{PERSISTENT_COMMENT_ID_MARKER} {comment_id} -->"
+
+
+def _last_line(text: str) -> str:
+    """Return the final non-empty line of a body, or "" - where the marker is written.
+
+    Ownership is decided on the LAST line, never on a substring of the whole body. A
+    review can quote a marker in its own text (a PR that edits the marker template will
+    quote it verbatim in the diff), and a substring test then reads that quotation as
+    proof of ownership - which drops the real marker and hands the comment to the wrong
+    run. Anchoring to the final line makes quoted text inert.
+    """
+    stripped = (text or "").rstrip()
+    if not stripped:
+        return ""
+    return stripped.rsplit("\n", 1)[-1].strip()
+
+
+def _persistent_comment_attribution(comment_id: str) -> str:
+    """Render the visible "who reviewed this" line for the current run.
+
+    Names the model that actually answered, not just the configured id: with
+    fallback_models a different model may have produced the text, and crediting the
+    wrong one is worse than not crediting at all. When the answering model is the
+    reviewer's own, the redundant half is dropped - "reviewer x, answered by x" is
+    noise that makes the interesting case (a fallback) harder to spot.
+
+    Args:
+        comment_id: The configured reviewer identity.
+
+    Returns:
+        A single markdown line.
+
+    Example:
+        >>> _persistent_comment_attribution("kimi-k3")  # doctest: +SKIP
+        '> Reviewed by `kimi-k3` - fallback model `openai/kimi-k2.7-code` answered'
+    """
+    try:
+        model_used = get_settings().config.get("last_used_model", "") or comment_id
+    except AttributeError:
+        model_used = comment_id
+    # Model ids carry a provider prefix ("openai/kimi-k3") that reviewer ids do not.
+    is_own_model = str(model_used).rsplit("/", 1)[-1] == comment_id
+    if is_own_model:
+        return f"{PERSISTENT_COMMENT_ATTRIBUTION_PREFIX} `{comment_id}`"
+    return (
+        f"{PERSISTENT_COMMENT_ATTRIBUTION_PREFIX} `{comment_id}` - "
+        f"fallback model `{model_used}` answered"
+    )
+
+
+def attach_persistent_comment_id(pr_comment: str) -> str:
+    """Label a comment with this run's reviewer identity, visibly and invisibly.
+
+    The visible attribution goes directly under the heading, because every reviewer
+    publishes under the same "PR Reviewer Guide" heading: with three reviewers on one
+    PR, an attribution at the bottom of a long comment means the reader cannot tell the
+    opinions apart while scanning. The hidden marker stays the last line, where comment
+    ownership and the CI publish guard both look for it.
+
+    Args:
+        pr_comment: The rendered comment body.
+
+    Returns:
+        The body unchanged when no id is configured; otherwise the body with an
+        attribution line after its heading and the id marker as its final line.
+
+    Example:
+        >>> attach_persistent_comment_id("## PR Reviewer Guide")  # doctest: +SKIP
+        '## PR Reviewer Guide\\n\\n> Reviewed by `kimi-k3`\\n<!-- pr-agent-persistent-id: kimi-k3 -->'
+    """
+    comment_id = get_persistent_comment_id()
+    if not comment_id:
+        return pr_comment
+    marker = _persistent_comment_marker(comment_id)
+    if _last_line(pr_comment) == marker:  # already attached; do not double-append
+        return pr_comment
+
+    attribution = _persistent_comment_attribution(comment_id)
+    body = (pr_comment or "").rstrip()
+    heading, _, rest = body.partition("\n")
+    if heading.strip():
+        rest = rest.lstrip("\n")
+        # Replace a stale attribution rather than stacking a second one.
+        first_rest_line, _, remainder = rest.partition("\n")
+        if first_rest_line.startswith(PERSISTENT_COMMENT_ATTRIBUTION_PREFIX):
+            rest = remainder.lstrip("\n")
+        body = f"{heading}\n\n{attribution}\n\n{rest}".rstrip() if rest else f"{heading}\n\n{attribution}"
+    else:
+        body = attribution
+    return f"{body}\n{marker}"
+
+
+def is_own_persistent_comment(comment_body: str, initial_header: str) -> bool:
+    """Decide whether an existing PR comment is the one this run should update.
+
+    With an id configured, both this tool's header and this run's marker line must match,
+    so parallel tools and reviewers never edit each other's comments. Without one, the
+    historical header match applies, except that a comment belonging to an identified run
+    is skipped: an un-identified run must not adopt another reviewer's comment as its own.
+
+    Args:
+        comment_body: The existing comment's body.
+        initial_header: The header this run publishes under.
+
+    Returns:
+        True when this run owns the comment.
+
+    Example:
+        >>> is_own_persistent_comment("## PR Reviewer Guide 🔍\\nbody", "## PR Reviewer Guide 🔍")
+        True
+    """
+    return is_own_persistent_comment_for_identities(comment_body, (initial_header,))
+
+
+def is_own_persistent_comment_for_identities(comment_body: str, identities: Iterable[str]) -> bool:
+    """Match a tool identity and, when configured, this run's persistent reviewer id."""
+    body = comment_body or ""
+    if not any(comment_matches_identity(body, identity) for identity in identities if identity):
+        return False
+    last_line = _last_line(body)
+    comment_id = get_persistent_comment_id()
+    if comment_id:
+        return last_line == _persistent_comment_marker(comment_id)
+    owned_by_an_identified_run = (
+        last_line.startswith(PERSISTENT_COMMENT_ID_MARKER) and last_line.endswith("-->")
+    )
+    return not owned_by_an_identified_run
 
 
 class GitProvider(ABC):
@@ -426,6 +588,7 @@ class GitProvider(ABC):
                                    as_thread: bool = False,
                                    identity_marker: str | None = None,
                                    legacy_initial_header: str | None = None):
+        pr_comment = attach_persistent_comment_id(pr_comment)
         try:
             pr_comment = add_pr_review_identity(pr_comment, identity_marker)
             prev_comments = list(self.get_issue_comments())
@@ -440,7 +603,7 @@ class GitProvider(ABC):
                     for identifier in identifiers
                     if identifier
                     for comment in prev_comments
-                    if comment_matches_identity(comment.body, identifier)
+                    if is_own_persistent_comment_for_identities(comment.body, (identifier,))
                 ),
                 None,
             )
