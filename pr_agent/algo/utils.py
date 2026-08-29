@@ -249,7 +249,8 @@ def convert_to_markdown_v2(output_data: dict,
                            gfm_supported: bool = True,
                            incremental_review=None,
                            git_provider=None,
-                           files=None) -> str:
+                           files=None,
+                           review_profile: str = "full") -> str:
     """
     Convert a dictionary of data into markdown format.
     Args:
@@ -281,7 +282,7 @@ def convert_to_markdown_v2(output_data: dict,
     if not output_data or not output_data.get('review', {}):
         return ""
 
-    if get_settings().get("pr_reviewer.enable_intro_text", False):
+    if review_profile != "bugs_only" and get_settings().get("pr_reviewer.enable_intro_text", False):
         markdown_text += f"Here are some key observations to aid the review process:\n\n"
 
     if gfm_supported:
@@ -403,9 +404,15 @@ def convert_to_markdown_v2(output_data: dict,
                 if gfm_supported:
                     markdown_text += f"<tr><td>"
                     # markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong><br><br>\n\n"
-                    markdown_text += f"{emoji}&nbsp;<strong>Recommended focus areas for review</strong><br><br>\n\n"
+                    section_title = (
+                        "Introduced defects" if review_profile == "bugs_only" else "Recommended focus areas for review"
+                    )
+                    markdown_text += f"{emoji}&nbsp;<strong>{section_title}</strong><br><br>\n\n"
                 else:
-                    markdown_text += f"### {emoji} Recommended focus areas for review\n\n#### \n"
+                    section_title = (
+                        "Introduced defects" if review_profile == "bugs_only" else "Recommended focus areas for review"
+                    )
+                    markdown_text += f"### {emoji} {section_title}\n\n#### \n"
                 for i, issue in enumerate(issues):
                     try:
                         if not issue or not isinstance(issue, dict):
@@ -1590,6 +1597,8 @@ def show_run_details(gfm_supported: bool) -> str:
 
     title = "⚙️ Agent run details"
     lines = [f"- Model: {details.model_used}{' (fallback)' if details.fallback_used else ''}"]
+    if details.review_profile:
+        lines.append(f"- Review profile: {details.review_profile}")
     if details.has_token_usage:
         # A counter still at zero after a successful call means the provider never
         # reported that component, so drop it instead of claiming it was zero.

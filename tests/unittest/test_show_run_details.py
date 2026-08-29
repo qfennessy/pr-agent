@@ -5,7 +5,8 @@ import pytest
 
 from pr_agent.algo import run_details
 from pr_agent.algo.run_details import (get_run_details, init_run_details,
-                                       record_ai_call, record_model_used)
+                                       record_ai_call, record_model_used,
+                                       record_review_profile)
 from pr_agent.algo.utils import show_run_details
 from pr_agent.config_loader import get_settings
 
@@ -49,6 +50,16 @@ def test_marks_fallback_model():
     output = show_run_details(gfm_supported=True)
 
     assert "Model: openai/gpt-5.4 (fallback)" in output
+
+
+def test_renders_review_profile_when_recorded():
+    init_run_details()
+    record_model_used("openai/gpt-5.4", is_fallback=False)
+    record_review_profile("bugs_only")
+
+    output = show_run_details(gfm_supported=True)
+
+    assert "Review profile: bugs_only" in output
 
 
 def test_omits_token_components_the_provider_did_not_report():

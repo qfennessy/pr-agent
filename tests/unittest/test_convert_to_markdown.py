@@ -2,7 +2,8 @@
 import textwrap
 from unittest.mock import Mock
 
-from pr_agent.algo.utils import PRReviewHeader, _expand_minute_suffix, convert_to_markdown_v2
+from pr_agent.algo.utils import (PRReviewHeader, _expand_minute_suffix,
+                                 convert_to_markdown_v2)
 from pr_agent.tools.pr_description import insert_br_after_x_chars
 
 """
@@ -122,6 +123,22 @@ class TestConvertToMarkdown:
 
         assert convert_to_markdown_v2(input_data, git_provider=mock_git_provider).strip() == expected_output.strip()
         mock_git_provider.get_line_link.assert_called_with('src/utils.py', 30, 50)
+
+    def test_bugs_only_renders_only_the_defect_section(self):
+        input_data = {'review': {'key_issues_to_review': [{
+            'relevant_file': 'src/cache.py',
+            'issue_header': 'Bug',
+            'issue_content': 'The cache returns data from the wrong tenant.',
+            'start_line': 12,
+            'end_line': 12,
+        }]}}
+
+        output = convert_to_markdown_v2(input_data, gfm_supported=False, review_profile="bugs_only")
+
+        assert "Introduced defects" in output
+        assert "The cache returns data from the wrong tenant." in output
+        assert "key observations" not in output
+        assert "Recommended focus areas" not in output
 
     def test_ticket_compliance(self):
         input_data = {'review': {
