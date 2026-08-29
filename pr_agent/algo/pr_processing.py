@@ -13,6 +13,7 @@ from pr_agent.algo.git_patch_processing import (
     decouple_and_convert_to_hunks_with_lines_numbers, extend_patch,
     handle_patch_deletions)
 from pr_agent.algo.language_handler import sort_files_by_main_languages
+from pr_agent.algo.run_details import record_model_used
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.algo.utils import (ModelType, clip_tokens, get_max_tokens,
@@ -33,6 +34,12 @@ MAX_EXTRA_LINES = 10
 
 
 def cap_and_log_extra_lines(value, direction) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError):
+        get_logger().warning(
+            f"patch_extra_lines_{direction} is not a number ({value!r}), using 0")
+        return 0
     if value > MAX_EXTRA_LINES:
         get_logger().warning(f"patch_extra_lines_{direction} was {value}, capping to {MAX_EXTRA_LINES}")
         return MAX_EXTRA_LINES
@@ -216,6 +223,11 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, mo
                                 large_pr_handling: bool) -> Tuple[list, list, list, list, dict, list]:
     deleted_files_list = []
 
+    for lang in top_langs:
+        for file in lang["files"]:
+            if file.tokens is None or file.tokens < 0:
+                file.tokens = token_handler.count_tokens(file.patch) if file.patch else 0
+
     # sort each one of the languages in top_langs by the number of tokens in the diff
     sorted_files = []
     for lang in top_langs:
@@ -336,11 +348,6 @@ async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelT
             )
             get_settings().set("openai.deployment_id", deployment_id)
             result = await f(model)
-            # Record which model actually produced the output. With fallbacks configured the
-            # answer is not the configured primary, and publishers (and humans reading the
-            # published comment) otherwise have no way to attribute it.
-            get_settings().set("config.last_used_model", model)
-            return result
         except Exception as e:
             elapsed = round(time.monotonic() - started_at, 1)
             attempt = {
@@ -359,6 +366,13 @@ async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelT
             if i == len(all_models) - 1:  # If it's the last iteration
                 _publish_model_failure_summary(attempts, str(e))
                 raise Exception(f"Failed to generate prediction with any model of {all_models}") from e
+        else:
+            # Keep both attribution surfaces in sync: run details power the optional
+            # telemetry footer, while persistent multi-review comments display the model
+            # that actually answered when a fallback succeeds.
+            get_settings().set("config.last_used_model", model)
+            record_model_used(model, is_fallback=i > 0)
+            return result
 
 
 # Redacts anything shaped like a credential before a provider error is copied into a CI

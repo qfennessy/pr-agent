@@ -8,13 +8,15 @@ its own hidden marker, so each finds and updates only its own comment.
 
 import pytest
 
+from pr_agent.algo.utils import PRReviewIdentity, add_pr_review_identity
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.git_providers.git_provider import (PERSISTENT_COMMENT_ID_MARKER,
                                                  GitProvider,
                                                  attach_persistent_comment_id,
                                                  get_persistent_comment_id,
-                                                 is_own_persistent_comment)
+                                                 is_own_persistent_comment,
+                                                 is_own_persistent_comment_for_identities)
 
 HEADER = "## PR Reviewer Guide 🔍"
 
@@ -246,6 +248,21 @@ def test_identified_run_does_not_adopt_another_tools_comment(comment_id):
 
     assert is_own_persistent_comment(marked, HEADER) is False
     assert is_own_persistent_comment(marked, other_header) is True
+
+
+def test_tool_and_reviewer_identities_both_scope_comment_ownership(comment_id):
+    """Custom review headings still require both the review type and reviewer id."""
+    comment_id("kimi")
+    marked = add_pr_review_identity(
+        attach_persistent_comment_id("## Team Review 🔍\nreview text"),
+        PRReviewIdentity.REGULAR.value,
+    )
+
+    assert is_own_persistent_comment_for_identities(marked, (PRReviewIdentity.REGULAR.value,)) is True
+    assert is_own_persistent_comment_for_identities(marked, (PRReviewIdentity.INCREMENTAL.value,)) is False
+
+    comment_id("deepseek")
+    assert is_own_persistent_comment_for_identities(marked, (PRReviewIdentity.REGULAR.value,)) is False
 
 
 def test_github_unidentified_run_skips_identified_previous_review(comment_id):

@@ -15,13 +15,15 @@ from pr_agent.algo.pr_processing import (OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
                                          get_pr_diff,
                                          get_pr_diff_multiple_patchs,
                                          retry_with_fallback_models)
+from pr_agent.algo.run_details import init_run_details
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.repo_context import build_repo_context
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import (ModelType, PRDescriptionHeader, clip_tokens,
                                  get_max_tokens, get_user_labels, load_yaml,
                                  set_custom_labels,
-                                 show_relevant_configurations)
+                                 show_relevant_configurations,
+                                 show_run_details)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import (GithubProvider, get_git_provider,
                                     get_git_provider_with_context)
@@ -99,13 +101,16 @@ class PRDescription:
         self.file_label_dict = None
 
     async def run(self):
+        init_run_details()
+        progress_response = None
         try:
             get_logger().info(f"Generating a PR description for pr_id: {self.pr_id}")
             relevant_configs = {'pr_description': dict(get_settings().pr_description),
                                 'config': dict(get_settings().config)}
             get_logger().debug("Relevant configs", artifact=relevant_configs)
             if get_settings().config.publish_output and not get_settings().config.get('is_auto_command', False):
-                self.git_provider.publish_comment("Preparing PR description...", is_temporary=True)
+                progress_response = self.git_provider.publish_comment(
+                    "Preparing PR description...", is_temporary=True)
 
             # ticket extraction if exists
             await extract_and_cache_pr_tickets(self.git_provider, self.vars)
@@ -116,7 +121,6 @@ class PRDescription:
                 self._prepare_data()
             else:
                 get_logger().warning(f"Empty prediction, PR: {self.pr_id}")
-                self.git_provider.remove_initial_comment()
                 return None
 
             if get_settings().pr_description.enable_semantic_files_types:
@@ -159,6 +163,10 @@ class PRDescription:
             if get_settings().get('config', {}).get('output_relevant_configurations', False):
                 pr_body += show_relevant_configurations(relevant_section='pr_description')
 
+            # Output the agent run details (model, tokens, time cost) if enabled
+            if get_settings().get('config', {}).get('output_run_details', False):
+                pr_body += show_run_details(self.git_provider.is_supported("gfm_markdown"))
+
             if get_settings().config.publish_output:
 
                 # publish labels
@@ -189,6 +197,10 @@ class PRDescription:
                     # Pass None when the title is not AI-generated so the provider
                     # leaves it untouched, avoiding reverting a manual edit (#2474).
                     title_to_publish = pr_title.strip() if get_settings().pr_description.generate_ai_title else None
+                    # Prepend a hidden HTML comment so recognition can match it
+                    # anywhere in the body without depending on visible section
+                    # headers that a human might quote.
+                    pr_body = '<!-- pr-agent-generated -->\n' + pr_body
                     self.git_provider.publish_description(title_to_publish, pr_body)
 
                     # publish final update message
@@ -198,7 +210,6 @@ class PRDescription:
                             pr_url = self.git_provider.get_pr_url()
                             update_comment = f"**[PR Description]({pr_url})** updated to latest commit ({latest_commit_url})"
                             self.git_provider.publish_comment(update_comment)
-                self.git_provider.remove_initial_comment()
             else:
                 get_logger().info('PR description, but not published since publish_output is False.')
                 get_settings().data = {"artifact": pr_body}
@@ -208,6 +219,20 @@ class PRDescription:
                                artifact={"traceback": traceback.format_exc()})
             if get_settings().config.get("propagate_tool_errors", False):
                 raise
+        finally:
+            if progress_response is not None:
+                try:
+                    self.git_provider.edit_comment(
+                        progress_response, "PR description generation finished.")
+                except Exception as e:
+                    get_logger().exception(
+                        f"Failed to update PR description progress comment, "
+                        f"error: {e}")
+                try:
+                    self.git_provider.remove_comment(progress_response)
+                except Exception as e:
+                    get_logger().exception(
+                        f"Failed to remove PR description progress comment, error: {e}")
 
         return ""
 

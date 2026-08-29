@@ -88,6 +88,7 @@ jobs:
 #### 2. CLI Usage (Local Development)
 
 Run PR-Agent locally on your repository:
+
 ```bash
 pip install pr-agent
 export OPENAI_KEY=your_key_here
@@ -172,7 +173,6 @@ PR-Agent offers comprehensive pull request functionalities integrated with vario
 |                                                         | [Repo context files (`AGENTS.md`)](https://docs.pr-agent.ai/usage-guide/additional_configurations/#bringing-per-repo-context-files-to-pr-agent) |   ✅   |   ✅   |    ✅     |      ✅      |  ✅   |
 |                                                         | [Dynamic context](https://docs.pr-agent.ai/core-abilities/dynamic_context/)                                  |   ✅   |   ✅   |    ✅     |      ✅      |       |
 |                                                         | [Fetching ticket context](https://docs.pr-agent.ai/core-abilities/fetching_ticket_context/)                  |   ✅    |  ✅    |     ✅     |              |       |
-|                                                         | [Interactivity](https://docs.pr-agent.ai/core-abilities/interactivity/)                                      |   ✅   |  ✅   |           |              |       |
 |                                                         | [Local and global metadata](https://docs.pr-agent.ai/core-abilities/metadata/)                               |   ✅   |   ✅   |    ✅     |      ✅      |       |
 |                                                         | [Multiple models support](https://docs.pr-agent.ai/usage-guide/changing_a_model/)                            |   ✅   |   ✅   |    ✅     |      ✅      |       |
 |                                                         | [PR compression](https://docs.pr-agent.ai/core-abilities/compression_strategy/)                              |   ✅   |   ✅   |    ✅     |      ✅      |       |
