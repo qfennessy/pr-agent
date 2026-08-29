@@ -242,10 +242,10 @@ def attach_persistent_comment_id(pr_comment: str) -> str:
 def is_own_persistent_comment(comment_body: str, initial_header: str) -> bool:
     """Decide whether an existing PR comment is the one this run should update.
 
-    With an id configured, only this run's marker line matches - so parallel reviewers
-    never edit each other's comments. Without one, the historical header match applies,
-    except that a comment belonging to an identified run is skipped: an un-identified run
-    must not adopt another reviewer's comment as its own.
+    With an id configured, both this tool's header and this run's marker line must match,
+    so parallel tools and reviewers never edit each other's comments. Without one, the
+    historical header match applies, except that a comment belonging to an identified run
+    is skipped: an un-identified run must not adopt another reviewer's comment as its own.
 
     Args:
         comment_body: The existing comment's body.
@@ -262,7 +262,7 @@ def is_own_persistent_comment(comment_body: str, initial_header: str) -> bool:
     last_line = _last_line(body)
     comment_id = get_persistent_comment_id()
     if comment_id:
-        return last_line == _persistent_comment_marker(comment_id)
+        return body.startswith(initial_header) and last_line == _persistent_comment_marker(comment_id)
     owned_by_an_identified_run = (
         last_line.startswith(PERSISTENT_COMMENT_ID_MARKER) and last_line.endswith("-->")
     )

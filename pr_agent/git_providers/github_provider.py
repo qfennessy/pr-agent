@@ -30,10 +30,8 @@ from ..config_loader import get_settings
 from ..log import get_logger
 from ..servers.utils import RateLimitExceeded
 from .git_provider import (MAX_FILES_ALLOWED_FULL, FilePatchInfo, GitProvider,
-                           IncrementalPR, _last_line,
-                           _persistent_comment_marker,
-                           get_cached_global_settings,
-                           get_persistent_comment_id)
+                           IncrementalPR, get_cached_global_settings,
+                           is_own_persistent_comment)
 
 
 def _next_page_url(headers: dict) -> str:
@@ -210,16 +208,13 @@ class GithubProvider(GitProvider):
             prefixes.append(PRReviewHeader.REGULAR.value)
         if incremental:
             prefixes.append(PRReviewHeader.INCREMENTAL.value)
-        # When several PR-Agent runs comment on the same PR (e.g. one review per model), the
-        # previous review of *this* run is the one whose marker line closes it; without the
-        # filter an incremental review could be built on another reviewer's output.
-        comment_id = get_persistent_comment_id()
-        marker = _persistent_comment_marker(comment_id) if comment_id else ""
+        # When several PR-Agent runs comment on the same PR (e.g. one review per model), use
+        # the same ownership rule as persistent updates. This also prevents an unidentified
+        # run from building an incremental review on an identified reviewer's output.
         for index in range(len(self.comments) - 1, -1, -1):
             body = self.comments[index].body or ""
-            if marker and _last_line(body) != marker:
-                continue
-            if any(body.startswith(prefix) for prefix in prefixes):
+            matching_prefix = next((prefix for prefix in prefixes if body.startswith(prefix)), None)
+            if matching_prefix and is_own_persistent_comment(body, matching_prefix):
                 return self.comments[index]
         return None
 

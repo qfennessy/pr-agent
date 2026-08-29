@@ -254,8 +254,8 @@ class PRReviewer:
             )
         except Exception as e:
             raise ValueError(f"Model {model} returned unparsable output: {e}") from e
-        if not isinstance(data, dict) or 'review' not in data:
-            raise ValueError(f"Model {model} returned output without a 'review' section")
+        if not isinstance(data, dict) or not isinstance(data.get('review'), dict) or not data['review']:
+            raise ValueError(f"Model {model} returned output without a non-empty 'review' mapping")
 
     async def _get_prediction(self, model: str) -> str:
         """

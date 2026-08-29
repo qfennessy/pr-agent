@@ -453,6 +453,9 @@ def _reviewer_with_prediction(prediction):
         ("", True),
         (None, True),
         ("not_a_review:\n  x: 1\n", True),
+        ("review: null\nsecurity_concerns: No\n", True),
+        ("review: text\nsecurity_concerns: No\n", True),
+        ("review: {}\nsecurity_concerns: No\n", True),
     ],
 )
 def test_unparsable_prediction_is_rejected_so_the_fallback_model_runs(prediction, expect_error):

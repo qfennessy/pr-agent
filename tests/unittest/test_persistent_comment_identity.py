@@ -9,6 +9,7 @@ its own hidden marker, so each finds and updates only its own comment.
 import pytest
 
 from pr_agent.config_loader import get_settings
+from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.git_providers.git_provider import (PERSISTENT_COMMENT_ID_MARKER,
                                                  GitProvider,
                                                  attach_persistent_comment_id,
@@ -236,6 +237,27 @@ def test_identified_run_ignores_a_legacy_unmarked_comment(comment_id):
     comment_id("deepseek")
 
     assert is_own_persistent_comment(f"{HEADER}\nlegacy", HEADER) is False
+
+
+def test_identified_run_does_not_adopt_another_tools_comment(comment_id):
+    comment_id("deepseek")
+    other_header = "## Title"
+    marked = attach_persistent_comment_id(f"{other_header}\ndescription")
+
+    assert is_own_persistent_comment(marked, HEADER) is False
+    assert is_own_persistent_comment(marked, other_header) is True
+
+
+def test_github_unidentified_run_skips_identified_previous_review(comment_id):
+    comment_id("kimi")
+    identified_review = FakeComment(attach_persistent_comment_id(f"{HEADER}\nfrom kimi"))
+    legacy_review = FakeComment(f"{HEADER}\nfrom the default run")
+    provider = GithubProvider.__new__(GithubProvider)
+    provider.comments = [legacy_review, identified_review]
+
+    comment_id("")
+
+    assert provider.get_previous_review(full=True, incremental=False) is legacy_review
 
 
 def test_a_review_quoting_a_marker_still_gets_its_own(comment_id):

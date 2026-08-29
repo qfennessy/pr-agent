@@ -251,6 +251,31 @@ def test_all_models_failed_writes_ci_summary_with_attempt_evidence(tmp_path, mon
         _restore_settings(snapshot)
 
 
+@pytest.mark.parametrize("prefix", ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"])
+def test_all_models_failed_redacts_github_token_shapes(tmp_path, monkeypatch, prefix):
+    snapshot = _snapshot_settings()
+    summary = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    fake_token = prefix + "x" * 20
+    try:
+        get_settings().set("config.model", "openai/primary")
+        get_settings().set("config.fallback_models", [])
+        get_settings().set("openai.deployment_id", None)
+        get_settings().set("openai.fallback_deployments", [])
+
+        async def fake_f(model):
+            raise RuntimeError(f"provider rejected credential {fake_token}")
+
+        with pytest.raises(Exception):
+            asyncio.run(retry_with_fallback_models(fake_f))
+
+        written = summary.read_text(encoding="utf-8")
+        assert fake_token not in written
+        assert "[redacted]" in written
+    finally:
+        _restore_settings(snapshot)
+
+
 def test_no_ci_summary_written_outside_ci(tmp_path, monkeypatch):
     snapshot = _snapshot_settings()
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)

@@ -365,7 +365,8 @@ async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelT
 # job summary, which is world-readable on public repositories. Syntax-only: it matches
 # token shapes, never message meaning.
 _SECRET_LIKE = re.compile(
-    r"(?i)(bearer\s+\S+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*\S+|\b(?:sk|rk|ghp|gho|glpat)-[A-Za-z0-9_-]{8,})"
+    r"(?i)(bearer\s+\S+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*\S+|"
+    r"\b(?:(?:sk|rk|glpat)-|(?:ghp|gho|ghu|ghs|ghr)_|github_pat_)[A-Za-z0-9_-]{8,})"
 )
 _MAX_SUMMARY_ERROR_CHARS = 400
 
