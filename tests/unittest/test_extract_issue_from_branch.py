@@ -1,9 +1,9 @@
 import pytest
 
+import pr_agent.tools.ticket_pr_compliance_check as tpc
 from pr_agent.tools.ticket_pr_compliance_check import (
     extract_ticket_links_from_branch_name,
-    extract_ticket_links_from_pr_description,
-)
+    extract_ticket_links_from_pr_description)
 
 # The PR-description extractor caps results at 3 (hardcoded in the function).
 MAX_TICKETS = 3
@@ -11,6 +11,14 @@ MAX_TICKETS = 3
 
 class TestExtractTicketsLinkFromBranchName:
     """Unit tests for branch-name issue extraction (option A: number at start of segment)."""
+
+    @pytest.fixture(autouse=True)
+    def enable_branch_extraction(self, monkeypatch):
+        fake_settings = type("Settings", (), {})()
+        fake_settings.get = lambda key, default=None: (
+            True if key in ("extract_issue_from_branch", "config.extract_issue_from_branch") else default
+        )
+        monkeypatch.setattr(tpc, "get_settings", lambda: fake_settings)
 
     def test_feature_slash_number_suffix(self):
         """feature/1-test-issue -> issue #1"""
@@ -65,8 +73,7 @@ class TestExtractTicketsLinkFromBranchName:
                 "" if key in ("branch_issue_regex", "config.branch_issue_regex") else default
             )
         )
-        import pr_agent.tools.ticket_pr_compliance_check as m
-        monkeypatch.setattr(m, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(tpc, "get_settings", lambda: fake_settings)
         result = extract_ticket_links_from_branch_name(
             "feature/1-test", "org/repo", "https://github.com"
         )
@@ -80,8 +87,7 @@ class TestExtractTicketsLinkFromBranchName:
                 "[" if key in ("branch_issue_regex", "config.branch_issue_regex") else default
             )
         )
-        import pr_agent.tools.ticket_pr_compliance_check as m
-        monkeypatch.setattr(m, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(tpc, "get_settings", lambda: fake_settings)
         result = extract_ticket_links_from_branch_name(
             "feature/1-test", "org/repo", "https://github.com"
         )
@@ -95,8 +101,7 @@ class TestExtractTicketsLinkFromBranchName:
                 r"\d+" if key in ("branch_issue_regex", "config.branch_issue_regex") else default
             )
         )
-        import pr_agent.tools.ticket_pr_compliance_check as m
-        monkeypatch.setattr(m, "get_settings", lambda: fake_settings)
+        monkeypatch.setattr(tpc, "get_settings", lambda: fake_settings)
         result = extract_ticket_links_from_branch_name(
             "feature/1-test", "org/repo", "https://github.com"
         )
@@ -129,7 +134,7 @@ class TestExtractTicketLinksFromPrDescription:
         process (PYTHONHASHSEED) and may coincidentally match insertion order for a
         small input. test_cap_selects_deterministic_first_seen_subset is the reliable
         regression guard (see its note)."""
-        desc = "Fixes #3, relates to #1, also #3 again and #2"
+        desc = "Fixes #3, relates to #1, references #3 again and fixes #2"
         result = extract_ticket_links_from_pr_description(desc, "org/repo", "https://github.com")
         assert result == [
             "https://github.com/org/repo/issues/3",
@@ -145,7 +150,7 @@ class TestExtractTicketLinksFromPrDescription:
         the old code sliced list(set)[:MAX_TICKETS], so it returned an arbitrary subset
         that (essentially) never equals the first-seen subset, on any hash seed."""
         nums = list(range(1, MAX_TICKETS + 4))
-        desc = " ".join(f"#{n}" for n in nums)
+        desc = "Fixes " + ", ".join(f"#{n}" for n in nums)
         result = extract_ticket_links_from_pr_description(desc, "org/repo", "https://github.com")
         expected = [f"https://github.com/org/repo/issues/{n}" for n in nums[:MAX_TICKETS]]
         assert result == expected

@@ -6,13 +6,31 @@ from urllib.parse import urlparse
 import aiohttp
 
 from pr_agent.config_loader import get_settings
-from pr_agent.git_providers import AzureDevopsProvider, GithubProvider, GitLabProvider
+from pr_agent.git_providers import (AzureDevopsProvider, GithubProvider,
+                                    GitLabProvider)
 from pr_agent.log import get_logger
 
-# Compile the regex pattern once, outside the function
+# Match complete references in precedence order so a cross-repository shorthand is
+# consumed before its trailing ``#number`` can be interpreted as a local issue.
 GITHUB_TICKET_PATTERN = re.compile(
-     r'(https://github[^/]+/[^/]+/[^/]+/issues/\d+)|(\b(\w+)/(\w+)#(\d+)\b)|(#\d+)'
+    r"(?P<url>https?://[^\s<>()`,;]+/issues/(?P<url_issue>\d+)(?![\w/]))"
+    r"|(?<![\w./-])(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))"
+    r"/(?P<repo>[A-Za-z0-9_.-]+)#(?P<repo_issue>\d+)(?![\w/#])"
+    r"|(?<![\w/#])#(?P<local_issue>\d+)(?![\w/#])"
 )
+GITHUB_OWNER_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+GITHUB_REPOSITORY_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+GITHUB_EXPLICIT_REFERENCE_PREFIX_PATTERN = re.compile(
+    r"(?:\b(?:close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?|reference(?:s|d)?|refs?"
+    r"|relat(?:e|es|ed)\s+to|address(?:es|ed)?|links?|see))\s*:?\s*$",
+    re.IGNORECASE,
+)
+MARKDOWN_FENCED_CODE_PATTERN = re.compile(
+    r"^[ \t]*(?P<fence>`{3,}|~{3,})[^\n]*(?:\n|$).*?"
+    r"(?:^[ \t]*(?P=fence)[ \t]*(?=\n|$)|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+MARKDOWN_INLINE_CODE_PATTERN = re.compile(r"`+[^`\n]*`+")
 # Option A: issue number at start of branch or after /, followed by - or end (e.g. feature/1-test-issue, 123-fix)
 BRANCH_ISSUE_PATTERN = re.compile(r"(?:^|/)(\d{1,6})(?=-|$)")
 
@@ -239,34 +257,95 @@ def extract_gitlab_ticket_references(pr_description, repo_path, gitlab_url):
     return references[:MAX_GITLAB_TICKETS]
 
 
+def _mask_markdown_code(text):
+    """Replace Markdown code with spaces while retaining source offsets."""
+
+    def _mask(match):
+        return "".join("\n" if character == "\n" else " " for character in match.group(0))
+
+    text = MARKDOWN_FENCED_CODE_PATTERN.sub(_mask, text)
+    return MARKDOWN_INLINE_CODE_PATTERN.sub(_mask, text)
+
+
+def _parse_github_issue_reference_url(ticket_url):
+    """Return a normalized GitHub issue identity, or ``None`` for an invalid URL."""
+    try:
+        parsed = urlparse(ticket_url)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if len(path_parts) < 4 or path_parts[-2] != "issues" or not path_parts[-1].isdigit():
+        return None
+    owner, repo = path_parts[-4], path_parts[-3]
+    if not GITHUB_OWNER_PATTERN.fullmatch(owner) or "--" in owner:
+        return None
+    if not GITHUB_REPOSITORY_COMPONENT_PATTERN.fullmatch(repo):
+        return None
+    return (_normalize_github_host(ticket_url), owner.casefold(), repo.casefold(), int(path_parts[-1]))
+
+
+def _has_explicit_github_reference_prefix(text, match_start, previous_match_end):
+    """Check whether shorthand is introduced by a closing or reference phrase."""
+    prefix = text[max(0, match_start - 80):match_start]
+    if GITHUB_EXPLICIT_REFERENCE_PREFIX_PATTERN.search(prefix):
+        return True
+    if previous_match_end is None:
+        return False
+    return re.fullmatch(r"\s*(?:,|and|&)\s*", text[previous_match_end:match_start], re.IGNORECASE) is not None
+
+
 def extract_ticket_links_from_pr_description(pr_description, repo_path, base_url_html='https://github.com'):
-    """
-    Extract all ticket links from PR description
-    """
+    """Extract explicit GitHub issue references from a PR description."""
     # Preserve first-seen order while de-duplicating, so the cap below selects a
     # deterministic subset (a plain set would slice an arbitrary, run-varying one).
+    if not isinstance(pr_description, str) or not pr_description:
+        return []
+
+    visible_description = _mask_markdown_code(pr_description)
     seen = set()
     github_tickets = []
 
     def _add(url):
-        if url not in seen:
-            seen.add(url)
+        identity = _parse_github_issue_reference_url(url)
+        if not identity:
+            return False
+        if identity not in seen:
+            seen.add(identity)
             github_tickets.append(url)
+        return True
 
     try:
-        # Use the updated pattern to find matches
-        matches = GITHUB_TICKET_PATTERN.findall(pr_description)
+        previous_accepted_match_end = None
+        provider_host = _normalize_github_host(base_url_html)
+        for match in GITHUB_TICKET_PATTERN.finditer(visible_description):
+            if match.group("url"):
+                ticket_url = match.group("url")
+                ticket_identity = _parse_github_issue_reference_url(ticket_url)
+                if not ticket_identity or ticket_identity[0] not in {"github.com", provider_host}:
+                    continue
+                if _add(ticket_url):
+                    previous_accepted_match_end = match.end()
+                continue
 
-        for match in matches:
-            if match[0]:  # Full URL match
-                _add(match[0])
-            elif match[1]:  # Shorthand notation match: owner/repo#issue_number
-                owner, repo, issue_number = match[2], match[3], match[4]
-                _add(f"{base_url_html.strip('/')}/{owner}/{repo}/issues/{issue_number}")
-            else:  # #123 format
-                issue_number = match[5][1:]  # remove #
-                if issue_number.isdigit() and len(issue_number) < 5 and repo_path:
-                    _add(f"{base_url_html.strip('/')}/{repo_path}/issues/{issue_number}")
+            if not _has_explicit_github_reference_prefix(
+                visible_description, match.start(), previous_accepted_match_end
+            ):
+                continue
+
+            if match.group("owner"):
+                ticket_url = (
+                    f"{base_url_html.strip('/')}/{match.group('owner')}/{match.group('repo')}"
+                    f"/issues/{match.group('repo_issue')}"
+                )
+            elif repo_path and len(match.group("local_issue")) < 5:
+                ticket_url = (
+                    f"{base_url_html.strip('/')}/{repo_path}/issues/{match.group('local_issue')}"
+                )
+            else:
+                continue
+            if _add(ticket_url):
+                previous_accepted_match_end = match.end()
 
         if len(github_tickets) > MAX_GITHUB_TICKETS:
             get_logger().info(f"Too many tickets found in PR description: {len(github_tickets)}")
@@ -289,9 +368,10 @@ def extract_ticket_links_from_branch_name(branch_name, repo_path, base_url_html=
     if not isinstance(branch_name, str):
         return []
     settings = get_settings()
-    if not settings.get("extract_issue_from_branch", settings.get("config.extract_issue_from_branch", True)):
+    if not settings.get("extract_issue_from_branch", settings.get("config.extract_issue_from_branch", False)):
         return []
-    github_tickets = set()
+    seen = set()
+    github_tickets = []
     custom_regex_str = settings.get("branch_issue_regex") or settings.get("config.branch_issue_regex", "") or ""
     if custom_regex_str:
         try:
@@ -313,10 +393,11 @@ def extract_ticket_links_from_branch_name(branch_name, repo_path, base_url_html=
         except IndexError:
             continue
         if issue_number and issue_number.isdigit():
-            github_tickets.add(
-                f"{base_url_html.strip('/')}/{repo_path}/issues/{issue_number}"
-            )
-    return list(github_tickets)
+            ticket_url = f"{base_url_html.strip('/')}/{repo_path}/issues/{issue_number}"
+            if ticket_url not in seen:
+                seen.add(ticket_url)
+                github_tickets.append(ticket_url)
+    return github_tickets
 
 
 def _normalize_github_host(url):

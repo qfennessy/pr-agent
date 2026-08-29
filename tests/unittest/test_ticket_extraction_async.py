@@ -12,18 +12,19 @@ from unittest.mock import MagicMock
 import pytest
 
 from pr_agent.config_loader import get_settings
-from pr_agent.git_providers import AzureDevopsProvider, GithubProvider, GitLabProvider
+from pr_agent.git_providers import (AzureDevopsProvider, GithubProvider,
+                                    GitLabProvider)
 from pr_agent.tools import ticket_pr_compliance_check as tpc
 from pr_agent.tools.ticket_pr_compliance_check import (
-    extract_and_cache_pr_tickets,
-    extract_gitlab_ticket_references,
-    extract_tickets,
-)
-from tests.unittest._settings_helpers import restore_settings, snapshot_settings
+    extract_and_cache_pr_tickets, extract_gitlab_ticket_references,
+    extract_ticket_links_from_pr_description, extract_tickets)
+from tests.unittest._settings_helpers import (restore_settings,
+                                              snapshot_settings)
 
 # ---------------------------------------------------------------------------
 # Test doubles
 # ---------------------------------------------------------------------------
+
 
 class _FakeLabel:
     def __init__(self, name):
@@ -139,11 +140,16 @@ def settings_snapshot():
     """
     s = get_settings()
     snapshot = snapshot_settings(
-        ["related_tickets", "pr_reviewer.require_ticket_analysis_review"]
+        [
+            "related_tickets",
+            "pr_reviewer.require_ticket_analysis_review",
+            "extract_issue_from_branch",
+        ]
     )
     # Reset to known defaults for each test
     s.set("related_tickets", [])
     s.set("pr_reviewer.require_ticket_analysis_review", False)
+    s.set("extract_issue_from_branch", False)
     try:
         yield s
     finally:
@@ -155,6 +161,10 @@ def settings_snapshot():
 # ---------------------------------------------------------------------------
 
 class TestGithubExtractionMerging:
+    @pytest.fixture(autouse=True)
+    def enable_branch_extraction(self, settings_snapshot):
+        settings_snapshot.set("extract_issue_from_branch", True)
+
     def test_branch_extraction_contributes_ticket_not_in_description(self, settings_snapshot):
         # Description mentions only #1; branch contributes #2. Without branch
         # extraction the result would be [1]; with it, [1, 2] (description first).
@@ -239,11 +249,96 @@ class TestGithubExtractionMerging:
         assert ids == [10, 11, 12]
 
 
+class TestGithubExplicitReferenceParsing:
+    @pytest.mark.parametrize("verb", ["Fixes", "References", "Related to"])
+    def test_local_reference_requires_supported_explicit_text(self, verb):
+        assert extract_ticket_links_from_pr_description(
+            f"{verb} #12", "org/repo"
+        ) == ["https://github.com/org/repo/issues/12"]
+
+    @pytest.mark.parametrize("repo", ["pr-agent", "pr.agent", "pr_agent"])
+    def test_cross_repository_shorthand_supports_github_repo_characters(self, repo):
+        assert extract_ticket_links_from_pr_description(
+            f"References qfennessy/{repo}#5", "org/repo"
+        ) == [f"https://github.com/qfennessy/{repo}/issues/5"]
+
+    def test_cross_repository_reference_does_not_fall_through_to_local_issue(self):
+        assert extract_ticket_links_from_pr_description(
+            "References qfennessy/pr-agent#5", "sagacious-heritage/cocos-story"
+        ) == ["https://github.com/qfennessy/pr-agent/issues/5"]
+
+    def test_full_github_and_enterprise_urls_are_supported(self):
+        github = extract_ticket_links_from_pr_description(
+            "https://github.com/org/repo/issues/4", "org/repo"
+        )
+        enterprise = extract_ticket_links_from_pr_description(
+            "https://github.enterprise.local/acme/repo.name/issues/8",
+            "acme/repo.name",
+            "https://github.enterprise.local",
+        )
+        assert github == ["https://github.com/org/repo/issues/4"]
+        assert enterprise == ["https://github.enterprise.local/acme/repo.name/issues/8"]
+
+    def test_duplicate_forms_collapse_in_first_seen_order(self):
+        description = (
+            "References org/repo#2, fixes #2, "
+            "https://github.com/org/repo/issues/2, and References #3"
+        )
+        assert extract_ticket_links_from_pr_description(description, "org/repo") == [
+            "https://github.com/org/repo/issues/2",
+            "https://github.com/org/repo/issues/3",
+        ]
+
+    def test_code_and_arbitrary_issue_like_text_are_ignored(self):
+        description = """Commit summary mentions #7 without a reference phrase.
+
+`Fixes #8`
+
+```markdown
+References qfennessy/pr-agent#9
+https://github.com/org/repo/issues/10
+```
+"""
+        assert extract_ticket_links_from_pr_description(description, "org/repo") == []
+
+    @pytest.mark.parametrize(
+        "malformed",
+        ["owner/#5", "owner/repo#", "owner//repo#5", "##5", "owner/repo#5junk"],
+    )
+    def test_malformed_references_are_ignored(self, malformed):
+        assert extract_ticket_links_from_pr_description(
+            f"References {malformed}", "org/repo"
+        ) == []
+
+    def test_branch_reference_is_ignored_by_default(self, settings_snapshot):
+        provider = _make_github_provider(
+            user_description="No explicit issue reference.",
+            branch="fix/77-from-branch",
+            repo_obj=_FakeRepoObj({77: _FakeIssue(77)}),
+        )
+        assert asyncio.run(extract_tickets(provider)) == []
+
+
 # ---------------------------------------------------------------------------
 # Scenario 1b: tickets are fetched from the repository that owns them
 # ---------------------------------------------------------------------------
 
 class TestCrossRepoTicketResolution:
+    def test_hyphenated_shorthand_is_fetched_only_from_named_repo(self, settings_snapshot):
+        pr_repo_obj = _FakeRepoObj({5: _FakeIssue(5, title="Wrong local issue")})
+        linked_repo_obj = _FakeRepoObj({5: _FakeIssue(5, title="Correct linked issue")})
+        provider = _make_github_provider(
+            user_description="References qfennessy/pr-agent#5",
+            repo="sagacious-heritage/cocos-story",
+            repo_obj=pr_repo_obj,
+            github_client=_FakeGithubClient({"qfennessy/pr-agent": linked_repo_obj}),
+        )
+
+        result = asyncio.run(extract_tickets(provider))
+
+        assert [ticket["title"] for ticket in result] == ["Correct linked issue"]
+        assert provider.github_client.get_repo_calls == ["qfennessy/pr-agent"]
+
     def test_ticket_in_other_repo_is_fetched_from_that_repo(self, settings_snapshot):
         # Both repositories happen to have an issue #5. The PR links the one in
         # ``other/repo``, so the ``other/repo`` issue must be the one returned —
