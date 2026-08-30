@@ -264,12 +264,13 @@ class PRReviewer:
                 previous_review_url = ""
                 if hasattr(self.git_provider, "previous_review") and self.git_provider.previous_review is not None:
                     previous_review_url = getattr(self.git_provider.previous_review, "html_url", "") or ""
-                if get_settings().config.publish_output:
+                if get_settings().config.publish_output and self._provider_mutations_allowed():
                     self.git_provider.publish_comment(f"Incremental Review Skipped\n"
                                     f"No files were changed since the [previous PR Review]({previous_review_url})")
                 return None
 
-            if get_settings().config.publish_output and not get_settings().config.get('is_auto_command', False):
+            if (get_settings().config.publish_output and self._provider_mutations_allowed() and
+                    not get_settings().config.get('is_auto_command', False)):
                 progress_response = self.git_provider.publish_comment("Preparing review...", is_temporary=True)
 
             model_route = self._review_model_route()
@@ -351,6 +352,7 @@ class PRReviewer:
                 except Exception as e:
                     get_logger().exception(f"Failed to remove review progress comment, error: {e}")
             if (review_failed and get_settings().config.publish_output and
+                    self._provider_mutations_allowed() and
                     not get_settings().config.get("is_auto_command", False)):
                 try:
                     self.git_provider.publish_comment("Failed to review PR")
@@ -363,6 +365,10 @@ class PRReviewer:
         if self._review_profile() == "bugs_only":
             return bool(pr_review.strip())
         return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
+
+    def _provider_mutations_allowed(self) -> bool:
+        """Keep a shadow-only route observational, including cleanup and progress updates."""
+        return not getattr(self, "_review_shadow_only", False)
 
     def _review_profile(self) -> str:
         """Return the selected profile, defaulting legacy/test instances to full review."""
@@ -556,10 +562,35 @@ class PRReviewer:
             not isinstance(record, RoleExecution) for record in result.records
         ):
             return invalid
+
+        role_configs = getattr(pipeline, "roles", None)
+        if not isinstance(role_configs, tuple):
+            return invalid
+        configurations = {}
+        for config in role_configs:
+            role = getattr(config, "role", None)
+            enabled = getattr(config, "enabled", None)
+            if not isinstance(role, SpecialistRole) or not isinstance(enabled, bool) or role in configurations:
+                return invalid
+            configurations[role] = config
+        record_roles = set()
+        for record in result.records:
+            config = configurations.get(record.role)
+            if config is None or config.enabled is not True or record.role in record_roles:
+                return invalid
+            record_roles.add(record.role)
+
+        risk_config = configurations.get(SpecialistRole.RISK_RECOMMENDATION)
         records = [record for record in result.records if record.role is SpecialistRole.RISK_RECOMMENDATION]
+        if risk_config is None:
+            return invalid
+        if risk_config.enabled is not True:
+            return unavailable if not records else invalid
         if len(records) != 1:
             return invalid
         record = records[0]
+        if record.state is SpecialistState.MALFORMED_OUTPUT or record.state is SpecialistState.DISABLED:
+            return invalid
         if record.state not in {SpecialistState.SUCCESS, SpecialistState.CACHED}:
             return unavailable
         output = record.output
@@ -664,7 +695,8 @@ class PRReviewer:
 
     def _clear_stale_persistent_bugs_only_review(self) -> None:
         """Remove a prior persistent defect summary after a clean bugs-only rerun."""
-        if (self._review_profile() != "bugs_only" or not get_settings().config.publish_output or
+        if (not self._provider_mutations_allowed() or self._review_profile() != "bugs_only" or
+                not get_settings().config.publish_output or
                 not get_settings().pr_reviewer.persistent_comment or self.incremental.is_incremental):
             return
         self.git_provider.clear_persistent_review(
@@ -982,7 +1014,7 @@ class PRReviewer:
         github_action_output(data, 'review')
 
         structured_publisher = getattr(self.git_provider, "publish_structured_review", None)
-        if callable(structured_publisher):
+        if self._provider_mutations_allowed() and callable(structured_publisher):
             # Deep-copy the data: dict(data) is shallow, so structured_data["review"]
             # would alias data["review"], which is mutated right below (key reordering).
             # Hand implementers an isolated snapshot, since the hook is provider-neutral

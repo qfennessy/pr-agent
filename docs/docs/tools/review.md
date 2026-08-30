@@ -161,8 +161,9 @@ fallback/deployment configuration. `max_retries` counts retries after the first 
 publication. `max_verification_candidates` is a request-local budget for guarded verifier stages and is recorded even
 when no verifier is enabled; it does not launch an independent model by itself. `publication_threshold` is supplied to
 the reviewer prompt and recorded in structured metadata; it does not invent a severity score after the model answers.
-`shadow_only = true` keeps the bounded result in structured output without publishing review Markdown, inline findings,
-or review labels.
+`shadow_only = true` keeps the bounded result in the run artifact and GitHub Actions output without mutating the review
+provider. It does not publish structured or Markdown reviews, inline findings, progress comments, review labels, or
+delete an earlier persistent review.
 
 Forced-deep rules always win, including when a sensitive file is renamed or deleted. A dependency change requires at
 least `standard`; a large or malformed change selects `deep`. Missing paths, line counts, labels, or optional escalation

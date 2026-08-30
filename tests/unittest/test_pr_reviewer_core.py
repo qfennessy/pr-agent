@@ -48,7 +48,9 @@ def _make_prediction_reviewer(git_provider=None):
     return reviewer
 
 
-def _routing_configuration(*, consume=False, requested_depth="auto", sensitive_categories=()):
+def _routing_configuration(
+    *, consume=False, requested_depth="auto", sensitive_categories=(), shadow_only=False
+):
     return load_review_routing_configuration({
         "enabled": True,
         "requested_depth": requested_depth,
@@ -65,6 +67,7 @@ def _routing_configuration(*, consume=False, requested_depth="auto", sensitive_c
                 "max_output_tokens": 2_048,
                 "max_published_findings": 2,
                 "publication_threshold": "high",
+                "shadow_only": shadow_only,
             },
             "standard": {
                 "context_tokens": 24_000,
@@ -413,7 +416,15 @@ def test_sensitive_old_rename_path_forces_deep_over_docs_only_signal():
     assert decision.matched_sensitive_categories == ("authorization",)
 
 
-def _install_specialist_result(reviewer, *, state, recommendation="escalate", identity="head"):
+def _install_specialist_result(
+    reviewer,
+    *,
+    state,
+    recommendation="escalate",
+    identity="head",
+    risk_enabled=True,
+    include_risk_record=True,
+):
     specialist_input = SimpleNamespace(
         snapshot_id="snapshot",
         head_sha="head",
@@ -423,6 +434,7 @@ def _install_specialist_result(reviewer, *, state, recommendation="escalate", id
     pipeline = SimpleNamespace(
         configuration_hash="configuration-hash",
         prompt=lambda role: prompt,
+        roles=(SimpleNamespace(role=SpecialistRole.RISK_RECOMMENDATION, enabled=risk_enabled),),
     )
     output = {
         "schema_version": prompt.schema_version,
@@ -435,17 +447,20 @@ def _install_specialist_result(reviewer, *, state, recommendation="escalate", id
     }
     reviewer._specialist_input = specialist_input
     reviewer._specialist_pipeline = pipeline
+    records = ()
+    if include_risk_record:
+        records = (RoleExecution(
+            role=SpecialistRole.RISK_RECOMMENDATION,
+            state=state,
+            output=output,
+            confidence=0.9,
+        ),)
     reviewer.specialist_shadow_result = SpecialistBatchResult(
         snapshot_id="snapshot",
         head_sha=identity,
         input_hash="input-hash",
         configuration_hash="configuration-hash",
-        records=(RoleExecution(
-            role=SpecialistRole.RISK_RECOMMENDATION,
-            state=state,
-            output=output,
-            confidence=0.9,
-        ),),
+        records=records,
         role_records={},
         changed_path_count=1,
         hunk_count=1,
@@ -460,6 +475,7 @@ def _install_specialist_result(reviewer, *, state, recommendation="escalate", id
         (SpecialistState.CACHED, "none", ReviewDepth.QUICK),
         (SpecialistState.LOW_CONFIDENCE, "escalate", ReviewDepth.STANDARD),
         (SpecialistState.TIMEOUT, "escalate", ReviewDepth.STANDARD),
+        (SpecialistState.MALFORMED_OUTPUT, "escalate", ReviewDepth.DEEP),
     ],
 )
 async def test_guarded_specialist_consumer_only_escalates_validated_success(
@@ -486,6 +502,85 @@ async def test_guarded_specialist_consumer_only_escalates_validated_success(
     assert "untrusted specialist prose" not in str(serialized_reasons)
     if recommendation == "escalate" and state in {SpecialistState.SUCCESS, SpecialistState.CACHED}:
         assert "pull_request:title" in str(serialized_reasons)
+
+
+@pytest.mark.asyncio
+async def test_guarded_specialist_consumer_treats_disabled_omission_as_unavailable(monkeypatch):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(
+        reviewer,
+        state=SpecialistState.DISABLED,
+        risk_enabled=False,
+        include_risk_record=False,
+    )
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.STANDARD
+    reason_codes = [reason.code for reason in reviewer.review_route_decision.reasons]
+    assert "escalation_unavailable" in reason_codes
+    assert "escalation_invalid" not in reason_codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corruption",
+    ["disabled_record", "enabled_omission", "duplicate", "wrong_role", "missing_config"],
+)
+async def test_guarded_specialist_consumer_rejects_contradictory_batches(monkeypatch, corruption):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(
+        reviewer,
+        state=SpecialistState.SUCCESS,
+        risk_enabled=corruption != "disabled_record",
+        include_risk_record=corruption not in {"enabled_omission", "wrong_role", "missing_config"},
+    )
+    batch = reviewer.specialist_shadow_result
+    if corruption == "duplicate":
+        reviewer.specialist_shadow_result = replace(batch, records=(batch.records[0], batch.records[0]))
+    elif corruption == "wrong_role":
+        reviewer._specialist_pipeline.roles = (
+            *reviewer._specialist_pipeline.roles,
+            SimpleNamespace(role=SpecialistRole.CHANGE_CLASSIFICATION, enabled=True),
+        )
+        reviewer.specialist_shadow_result = replace(
+            batch,
+            records=(RoleExecution(
+                role=SpecialistRole.CHANGE_CLASSIFICATION,
+                state=SpecialistState.SUCCESS,
+                output={},
+                confidence=0.9,
+            ),),
+        )
+    elif corruption == "missing_config":
+        reviewer._specialist_pipeline.roles = ()
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert "escalation_invalid" in [reason.code for reason in reviewer.review_route_decision.reasons]
 
 
 @pytest.mark.asyncio
@@ -1338,6 +1433,60 @@ async def test_clean_bugs_only_rerun_clears_only_bugs_only_persistent_review(mon
     )
     git_provider.remove_comment.assert_called_once_with(progress_comment)
     git_provider.publish_persistent_comment.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shadow_only_run_performs_no_provider_mutations(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["app.py"]
+    git_provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    git_provider.is_supported.return_value = True
+    git_provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "bugs_only"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    async def fake_retry(prepare_fn, model_type=None, model_route=None):
+        reviewer.prediction = "review:\n  key_issues_to_review: []\n"
+
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+
+    settings = get_settings()
+    original = {
+        "publish_output": settings.config.publish_output,
+        "persistent_comment": settings.pr_reviewer.persistent_comment,
+        "inline_key_issues": settings.pr_reviewer.get("inline_key_issues", False),
+        "is_auto_command": settings.config.get("is_auto_command", False),
+    }
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.pr_reviewer.persistent_comment = True
+        settings.pr_reviewer.inline_key_issues = True
+
+        await reviewer.run()
+    finally:
+        settings.config.publish_output = original["publish_output"]
+        settings.config.is_auto_command = original["is_auto_command"]
+        settings.pr_reviewer.persistent_comment = original["persistent_comment"]
+        settings.pr_reviewer.inline_key_issues = original["inline_key_issues"]
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.QUICK
+    assert reviewer._review_shadow_only is True
+    for method_name in (
+        "publish_comment",
+        "remove_comment",
+        "remove_initial_comment",
+        "clear_persistent_review",
+        "publish_persistent_comment",
+        "publish_structured_review",
+        "publish_code_suggestions",
+        "set_pr_labels",
+    ):
+        getattr(git_provider, method_name).assert_not_called()
 
 
 @pytest.mark.asyncio
