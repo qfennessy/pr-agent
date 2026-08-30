@@ -475,6 +475,66 @@ def test_untracked_copy_from_excluded_tracked_source_is_omitted(event, tmp_path)
     ) in snapshot.coverage_issues
 
 
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_copy_from_git_ignored_untracked_excluded_source_is_omitted(event, tmp_path):
+    repo = _repo(tmp_path, f"ignored-untracked-excluded-copy-{event}")
+    (repo / ".gitignore").write_text(".env\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore local environment")
+    (repo / ".env").write_text("API_TOKEN=untracked-secret\n", encoding="utf-8")
+    (repo / "public.txt").write_text(
+        "API_TOKEN=untracked-secret\n", encoding="utf-8"
+    )
+    if event == "pre-commit":
+        _git(repo, "add", "public.txt")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="public.txt" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "untracked-secret" not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="public.txt", reason="rename_group_omitted"
+    ) in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_copy_from_untracked_filtered_source_is_omitted(event, tmp_path):
+    repo = _repo(tmp_path, f"untracked-filtered-copy-{event}")
+    (repo / ".gitattributes").write_text(
+        "*.secret filter=crypt\n", encoding="utf-8"
+    )
+    _git(repo, "add", ".gitattributes")
+    _git(repo, "commit", "-m", "mark encrypted inputs")
+    (repo / "vault.secret").write_text(
+        "API_TOKEN=filtered-untracked-secret\n", encoding="utf-8"
+    )
+    (repo / "public.txt").write_text(
+        "API_TOKEN=filtered-untracked-secret\n", encoding="utf-8"
+    )
+    if event == "pre-commit":
+        _git(repo, "add", "public.txt")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="public.txt" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "filtered-untracked-secret" not in snapshot.diff
+    assert CoverageIssue(
+        path="vault.secret", reason="content_filter_unsupported"
+    ) in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="public.txt", reason="rename_group_omitted"
+    ) in snapshot.coverage_issues
+
+
 @pytest.mark.parametrize("event", ["file-save", "worktree-idle"])
 def test_edited_untracked_copy_from_excluded_tracked_source_is_omitted(event, tmp_path):
     repo = _repo(tmp_path, f"untracked-edited-excluded-copy-{event}")

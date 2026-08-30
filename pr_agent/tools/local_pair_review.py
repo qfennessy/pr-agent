@@ -782,6 +782,30 @@ class LocalPairReview:
         )
         return None if output is None else _decode_z_paths(output)
 
+    def _untracked_source_paths(self) -> Optional[list[str]]:
+        """Discover bounded untracked inputs, including Git-ignored sources."""
+        outputs = []
+        remaining_bytes = self.max_path_discovery_bytes
+        for ignored_args in (
+            ("--exclude-standard",),
+            ("--ignored", "--exclude-standard"),
+        ):
+            output = _run_git_bounded(
+                self.repository_root,
+                "--literal-pathspecs",
+                "ls-files",
+                "--others",
+                *ignored_args,
+                "-z",
+                "--",
+                max_output_bytes=remaining_bytes,
+            )
+            if output is None:
+                return None
+            outputs.append(output)
+            remaining_bytes -= len(output)
+        return list(dict.fromkeys(_decode_z_paths(b"".join(outputs))))
+
     def _unsafe_copy_sources(
         self,
         event: ReviewEvent,
@@ -789,8 +813,9 @@ class LocalPairReview:
         *,
         current_candidate_paths: Sequence[str] = (),
         index_candidate_paths: Sequence[str] = (),
+        current_source_paths: Sequence[str] = (),
     ) -> Optional[dict[str, tuple[tuple[str, str], ...]]]:
-        """Find candidate additions copied from unsafe tracked files."""
+        """Find candidate changes copied from unsafe tracked or untracked files."""
         if not current_candidate_paths and not index_candidate_paths:
             return {}
         base_entries = _run_git_bounded(
@@ -829,7 +854,7 @@ class LocalPairReview:
 
         add_entries(base_entries, index=False)
         add_entries(index_entries, index=True)
-        source_paths = tuple(source_oids)
+        source_paths = tuple(dict.fromkeys((*source_oids, *current_source_paths)))
         source_filtered = self._tracked_filtered_paths(
             event, base_revision, source_paths
         )
@@ -933,7 +958,7 @@ class LocalPairReview:
             path: {} for path in unsafe_reasons
         }
         for path in unsafe_reasons:
-            for object_id in source_oids[path]:
+            for object_id in source_oids.get(path, ()):
                 try:
                     object_size = int(
                         _run_git(
@@ -995,7 +1020,7 @@ class LocalPairReview:
                 current_oid = current_oid_output.decode("ascii").strip()
             except (SnapshotCaptureError, UnicodeDecodeError):
                 return None
-            source_oids[path].add(current_oid)
+            source_oids.setdefault(path, set()).add(current_oid)
             source_contents[path][current_oid] = content
 
         large_signatures: list[tuple[str, str, frozenset[int]]] = []
@@ -1173,6 +1198,11 @@ class LocalPairReview:
             add_coverage(None, "untracked_path_discovery_budget")
             untracked = []
             discovery_overflow = True
+        untracked_sources = self._untracked_source_paths()
+        if untracked_sources is None:
+            add_coverage(None, "untracked_source_discovery_budget")
+            untracked_sources = []
+            discovery_overflow = True
         index_copy_candidates = tuple(
             dict.fromkeys(
                 group[-1]
@@ -1198,6 +1228,7 @@ class LocalPairReview:
             base_revision,
             current_candidate_paths=current_copy_candidates,
             index_candidate_paths=index_copy_candidates,
+            current_source_paths=untracked_sources,
         )
         if unsafe_copy_sources is None:
             add_coverage(None, "copy_source_discovery_budget")
@@ -1262,6 +1293,7 @@ class LocalPairReview:
             tuple(tracked_groups),
             tuple(sorted(filtered_paths)),
             tuple(untracked),
+            tuple(untracked_sources),
             tuple(sorted(unsafe_copy_sources.items())),
         )
 
@@ -1283,6 +1315,9 @@ class LocalPairReview:
                 else self._untracked_paths(normalized_focus)
             )
             if current_untracked is None:
+                return None
+            current_untracked_sources = self._untracked_source_paths()
+            if current_untracked_sources is None:
                 return None
             current_index_candidates = tuple(
                 dict.fromkeys(
@@ -1309,6 +1344,7 @@ class LocalPairReview:
                 base_revision,
                 current_candidate_paths=current_candidates,
                 index_candidate_paths=current_index_candidates,
+                current_source_paths=current_untracked_sources,
             )
             if current_unsafe_sources is None:
                 return None
@@ -1332,6 +1368,7 @@ class LocalPairReview:
                 tuple(current_groups),
                 tuple(sorted(current_filtered)),
                 tuple(current_untracked),
+                tuple(current_untracked_sources),
                 tuple(sorted(current_unsafe_sources.items())),
             )
 
