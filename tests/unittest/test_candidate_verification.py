@@ -113,6 +113,70 @@ def test_prepare_candidates_rejects_locations_outside_the_changed_diff():
     assert rejected == [{"candidate_id": "candidate-1", "reason": "invalid_candidate"}]
 
 
+@pytest.mark.parametrize(
+    ("side", "patch", "source", "filename"),
+    [
+        (
+            "new",
+            "--- a/src/counter.cpp\n+++ b/src/counter.cpp\n@@ -0,0 +1,1 @@\n+++counter;",
+            "++counter;",
+            "src/counter.cpp",
+        ),
+        (
+            "old",
+            "--- a/auth/counter.cpp\n+++ b/auth/counter.cpp\n@@ -1,1 +0,0 @@\n---counter;",
+            "--counter;",
+            "auth/counter.cpp",
+        ),
+    ],
+)
+def test_hunk_lines_resembling_file_headers_remain_changed_evidence(
+    side, patch, source, filename
+):
+    diff_file = _diff_file(
+        filename,
+        base_file=source if side == "old" else "",
+        head_file=source if side == "new" else "",
+    )
+    diff_file.patch = patch
+    if side == "new":
+        candidates, rejected = prepare_candidates(
+            _review_data(_candidate(
+                relevant_file=filename,
+                start_line=1,
+                end_line=1,
+                context_files=[],
+                context_symbols=[],
+            )),
+            [diff_file],
+            [],
+            3,
+        )
+    else:
+        candidates, rejected = prepare_candidates(
+            _review_data(),
+            [diff_file],
+            ["auth/**"],
+            3,
+        )
+
+    assert rejected == []
+    assert len(candidates) == 1
+    assert candidates[0]["side"] == side
+    assert candidates[0]["start_line"] == 1
+    assert candidates[0]["end_line"] == 1
+    assert candidates[0]["_changed_line_ranges"] == [(1, 1)]
+    assert candidates[0]["_changed_anchor_shape"]
+
+    evidence = candidate_verification._candidate_changed_patch_evidence(
+        diff_file, candidates[0]
+    )
+    assert evidence["side"] == side
+    assert evidence["content"] == source
+    assert evidence["start_line"] == 1
+    assert evidence["end_line"] == 1
+
+
 @pytest.mark.parametrize("side", ["new", "old"])
 def test_prepare_candidates_rejects_patch_locations_beyond_a_complete_file(side):
     diff_file = _diff_file(

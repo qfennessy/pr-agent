@@ -251,7 +251,7 @@ def _first_changed_line(patch: str) -> int:
             continue
         if new_line is None or line.startswith("\\ No newline at end of file"):
             continue
-        if line.startswith("+") and not line.startswith("+++"):
+        if line.startswith("+"):
             return new_line
         if not line.startswith("-"):
             new_line += 1
@@ -279,7 +279,7 @@ def _added_line_ranges(patch: str) -> list[tuple[int, int]]:
             continue
         if new_line is None or line.startswith("\\ No newline at end of file"):
             continue
-        if line.startswith("+") and not line.startswith("+++"):
+        if line.startswith("+"):
             added_lines.append(new_line)
         if not line.startswith("-"):
             new_line += 1
@@ -297,7 +297,7 @@ def _deleted_line_ranges(patch: str) -> list[tuple[int, int]]:
             continue
         if old_line is None or line.startswith("\\ No newline at end of file"):
             continue
-        if line.startswith("-") and not line.startswith("---"):
+        if line.startswith("-"):
             deleted_lines.append(old_line)
         if not line.startswith("+"):
             old_line += 1
@@ -410,9 +410,9 @@ def _changed_anchor_identity(
         if old_line is None or new_line is None or line.startswith("\\ No newline at end of file"):
             continue
         is_changed = (
-            side == "new" and line.startswith("+") and not line.startswith("+++")
+            side == "new" and line.startswith("+")
         ) or (
-            side == "old" and line.startswith("-") and not line.startswith("---")
+            side == "old" and line.startswith("-")
         )
         changed_line = new_line if side == "new" else old_line
         if is_changed:
