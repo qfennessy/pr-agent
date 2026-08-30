@@ -1526,6 +1526,73 @@ def test_non_regular_unsafe_fifo_source_fails_closed(event, tmp_path):
     assert CoverageIssue(reason="copy_source_discovery_budget") in snapshot.coverage_issues
 
 
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+@pytest.mark.parametrize("source_kind", ["symlink", "fifo"])
+def test_nested_git_named_non_regular_unsafe_source_fails_closed(
+    event, source_kind, tmp_path
+):
+    if source_kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("platform has no FIFO support")
+    repo = _repo(tmp_path, f"nested-git-{source_kind}-{event}")
+    nested = repo / "scratch"
+    nested.mkdir()
+    source = nested / ".git"
+    if source_kind == "symlink":
+        target = tmp_path / f"nested-git-private-target-{event}"
+        target.write_text("API_TOKEN=nested-git-secret\n", encoding="utf-8")
+        source.symlink_to(target)
+    else:
+        os.mkfifo(source)
+    secret_line = "API_TOKEN=nested-git-secret"
+    destination = repo / "public.txt"
+    destination.write_text(f"{secret_line}\n", encoding="utf-8")
+    if event == "pre-commit":
+        _git(repo, "add", "public.txt")
+
+    reviewer = LocalPairReview(
+        str(repo), ignored_paths=["scratch/.git"]
+    )
+    discovered = reviewer._non_regular_source_paths(
+        reviewer.max_path_discovery_bytes
+    )
+    snapshot = reviewer.capture(
+        event=event,
+        focus_path="public.txt" if event == "file-save" else None,
+    )
+
+    assert discovered is not None and "scratch/.git" in discovered
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(
+        reason="copy_source_discovery_budget"
+    ) in snapshot.coverage_issues
+
+
+def test_non_regular_source_discovery_never_descends_into_root_git_directory(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path, "root-git-directory-skip")
+    root_git = repo / ".git"
+    scanned = []
+    original_scandir = local_pair_review_module.os.scandir
+
+    def guarded_scandir(directory):
+        directory_path = Path(directory)
+        scanned.append(directory_path)
+        if directory_path == root_git:
+            raise AssertionError("descended into repository metadata")
+        return original_scandir(directory)
+
+    monkeypatch.setattr(local_pair_review_module.os, "scandir", guarded_scandir)
+
+    paths = LocalPairReview(str(repo))._non_regular_source_paths(1024)
+
+    assert paths == []
+    assert repo in scanned
+    assert root_git not in scanned
+
+
 def test_non_regular_source_discovery_stops_before_materializing_over_budget(
     tmp_path, monkeypatch
 ):

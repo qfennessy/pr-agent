@@ -852,7 +852,7 @@ class LocalPairReview:
                     relative = lexical_path.relative_to(self.repository_root).as_posix()
                 except ValueError:
                     return None
-                if entry.name == ".git":
+                if directory == self.repository_root and entry.name == ".git":
                     continue
                 try:
                     is_junction = getattr(os.path, "isjunction", None)
