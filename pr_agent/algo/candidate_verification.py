@@ -5,6 +5,7 @@ import fnmatch
 import hashlib
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -31,6 +32,57 @@ _TELEMETRY_SAFE_DECISION_REASONS = frozenset({
     "unknown_candidate",
     "unverified_or_incomplete_evidence",
 })
+_REPO_FETCH_MAX_WORKERS = 4
+_REPO_FETCH_SLOTS = threading.BoundedSemaphore(_REPO_FETCH_MAX_WORKERS)
+
+
+class _RepositoryFetchCapacityExhausted(RuntimeError):
+    """Raised when timed-out provider work already occupies every bounded fetch slot."""
+
+
+async def _bounded_repo_file_fetch(git_provider, path: str, timeout_seconds: float):
+    """Run a synchronous provider fetch without allowing abandoned work to grow unboundedly."""
+    if timeout_seconds <= 0:
+        raise asyncio.TimeoutError
+    if not _REPO_FETCH_SLOTS.acquire(blocking=False):
+        raise _RepositoryFetchCapacityExhausted
+
+    loop = asyncio.get_running_loop()
+    result = loop.create_future()
+
+    def deliver(value=None, error=None):
+        if result.done():
+            return
+        if error is not None:
+            result.set_exception(error)
+        else:
+            result.set_result(value)
+
+    def fetch():
+        try:
+            value = git_provider.get_repo_file_content(path, False)
+            outcome = (value, None)
+        except BaseException as exc:
+            outcome = (None, exc)
+        finally:
+            _REPO_FETCH_SLOTS.release()
+        try:
+            loop.call_soon_threadsafe(deliver, *outcome)
+        except RuntimeError:
+            # The timed-out caller may have closed its event loop. The bounded
+            # slot is already released and no result remains to deliver.
+            pass
+
+    try:
+        threading.Thread(
+            target=fetch,
+            name="pr-agent-repo-context-fetch",
+            daemon=True,
+        ).start()
+    except BaseException:
+        _REPO_FETCH_SLOTS.release()
+        raise
+    return await asyncio.wait_for(result, timeout=timeout_seconds)
 
 
 @dataclass(frozen=True)
@@ -623,6 +675,52 @@ def _matching_static_evidence(candidate: dict, static_evidence: list) -> list[di
     return matches
 
 
+def _candidate_changed_patch_evidence(diff_file, candidate: dict) -> Optional[dict]:
+    """Return exact candidate-scoped changed lines from one trusted provider patch."""
+    if diff_file is None:
+        return None
+    side = candidate.get("side", "new")
+    try:
+        candidate_start = int(candidate.get("start_line"))
+        candidate_end = int(candidate.get("end_line"))
+    except (TypeError, ValueError):
+        return None
+    old_line = None
+    new_line = None
+    selected = []
+    selected_lines = []
+    for record in iter_git_patch_lines(getattr(diff_file, "patch", "") or ""):
+        line = strip_git_line_ending(record)
+        header = RE_HUNK_HEADER.match(line)
+        if header:
+            old_line = int(header.group(1))
+            new_line = int(header.group(3))
+            continue
+        if old_line is None or new_line is None or line.startswith("\\ No newline at end of file"):
+            continue
+        if (side == "new" and line.startswith("+") and not line.startswith("+++")
+                and candidate_start <= new_line <= candidate_end):
+            selected.append(line[1:])
+            selected_lines.append(new_line)
+        elif (side == "old" and line.startswith("-") and not line.startswith("---")
+              and candidate_start <= old_line <= candidate_end):
+            selected.append(line[1:])
+            selected_lines.append(old_line)
+        if not line.startswith("+"):
+            old_line += 1
+        if not line.startswith("-"):
+            new_line += 1
+    if candidate_start not in selected_lines or not selected:
+        return None
+    return {
+        "source": "changed_patch",
+        "side": side,
+        "content": "\n".join(selected),
+        "start_line": min(selected_lines),
+        "end_line": max(selected_lines),
+    }
+
+
 async def retrieve_evidence(git_provider, candidates: list[dict], budgets: VerificationBudgets,
                             static_evidence: list, diff_files: Optional[list] = None,
                             token_counter: Optional[Callable[[str], int]] = None) -> tuple[list[dict], dict]:
@@ -672,13 +770,13 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         prepared.update({"path": path, "content": excerpt})
         prepared.setdefault("start_line", start_line)
         prepared.setdefault("end_line", end_line)
-        if prepared.get("source") == "changed_head":
+        if prepared.get("source") in {"changed_head", "changed_patch"}:
             prepared["anchor_start_line"] = candidate.get("start_line")
             prepared["anchor_end_line"] = candidate.get("end_line")
         evidence_tokens = count_tokens(excerpt)
         if evidence_tokens > token_budget:
             budget_exhausted = True
-            if prepared.get("source") == "changed_head":
+            if prepared.get("source") in {"changed_head", "changed_patch"}:
                 best = None
                 lower = 0.0
                 upper = 1.0
@@ -717,9 +815,25 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         lines_by_path[path] = lines_by_path.get(path, 0) + line_count
         total_lines += line_count
         total_tokens += evidence_tokens
-        if prepared.get("source") == "changed_head":
+        if prepared.get("source") in {"changed_head", "changed_patch"}:
             changed_evidence_count += 1
         return True
+
+    # Reserve each exact candidate anchor before any larger same-file or
+    # repository excerpt can consume its path budget. This keeps one candidate
+    # from starving another candidate in the same file of changed-code proof.
+    for candidate in candidates:
+        candidate_id = candidate["candidate_id"]
+        relevant_file = candidate.get("relevant_file")
+        changed_patch = _candidate_changed_patch_evidence(
+            diff_by_file.get(relevant_file), candidate
+        )
+        if changed_patch is not None:
+            append_evidence(
+                {"candidate_id": candidate_id, **changed_patch},
+                candidate,
+                relevant_file,
+            )
 
     for candidate in candidates:
         candidate_id = candidate["candidate_id"]
@@ -766,12 +880,15 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             unique_files.add(path)
             if path not in cache:
                 try:
-                    cache[path] = await asyncio.wait_for(
-                        asyncio.to_thread(git_provider.get_repo_file_content, path, False),
-                        timeout=remaining_time,
+                    cache[path] = await _bounded_repo_file_fetch(
+                        git_provider, path, remaining_time
                     )
                 except asyncio.TimeoutError:
                     request["status"] = "time_budget_exhausted"
+                    budget_exhausted = True
+                    continue
+                except _RepositoryFetchCapacityExhausted:
+                    request["status"] = "fetch_capacity_exhausted"
                     budget_exhausted = True
                     continue
                 except Exception as exc:
@@ -857,7 +974,7 @@ def bounded_verification_evidence(evidence: list[dict], content_fraction: float)
             anchor_start = bounded_item.get("anchor_start_line")
             anchor_end = bounded_item.get("anchor_end_line")
             excerpt_start = bounded_item.get("start_line")
-            if (fraction < 1.0 and bounded_item.get("source") == "changed_head"
+            if (fraction < 1.0 and bounded_item.get("source") in {"changed_head", "changed_patch"}
                     and all(isinstance(value, int) for value in (anchor_start, anchor_end, excerpt_start))):
                 lines = split_git_file_lines(content)
                 relative_start = anchor_start - excerpt_start
@@ -899,7 +1016,7 @@ def bounded_verification_evidence(evidence: list[dict], content_fraction: float)
     return bounded
 
 
-def _verified_finding_identity(candidate: dict, cited_evidence: list[dict]) -> Optional[tuple[str, str]]:
+def _verified_finding_identity(candidate: dict) -> Optional[tuple[str, str]]:
     """Derive identities internally from a verified assertion and its cited proof.
 
     The verifier cannot supply either identifier. The stable key ignores paths,
@@ -921,16 +1038,11 @@ def _verified_finding_identity(candidate: dict, cited_evidence: list[dict]) -> O
                    sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     root_cause_id = f"sha256:{root_digest}"
-    evidence_shapes = sorted({
-        f"{str(item.get('source') or 'unknown')}:{_normalized_evidence_shape(item.get('content'))}"
-        for item in cited_evidence
-    })
     stable_digest = hashlib.sha256(
         json.dumps({
             "schema": "verified-finding-stable-key-v1",
             "root_cause_id": root_cause_id,
             "trusted_lineage_key": lineage_key,
-            "evidence_shapes": evidence_shapes,
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return root_cause_id, f"sha256:{stable_digest}"
@@ -941,7 +1053,6 @@ def apply_verification_decisions(
     evidence: list[dict],
     verification_data: dict,
     retrieval_requests: Optional[list[dict]] = None,
-    changed_diff_available: bool = True,
 ) -> tuple[list[dict], list[dict]]:
     """Accept only complete verified decisions backed by retrieved evidence."""
     candidates_by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
@@ -1005,20 +1116,6 @@ def apply_verification_decisions(
             result_records.append(record)
             continue
         candidate_side = candidate.get("side", "new")
-        if not changed_diff_available and not (
-            candidate_side == "new" and any(
-                item.get("source") == "changed_head"
-                and str(item.get("content") or "").strip()
-                and isinstance(item.get("start_line"), int)
-                and isinstance(item.get("end_line"), int)
-                and item["start_line"] <= candidate.get("start_line") <= item["end_line"]
-                for item in available_evidence
-            )
-        ):
-            record["verdict"] = "rejected"
-            record["reason"] = "changed_code_evidence_unavailable"
-            result_records.append(record)
-            continue
         available_paths = {item.get("path") for item in available_evidence}
         normalized_citations = [safe_repo_path(path) for path in cited_paths]
         normalized_citations = [path for path in normalized_citations if path in available_paths]
@@ -1032,6 +1129,20 @@ def apply_verification_decisions(
         except (TypeError, ValueError):
             start_line = 0
             end_line = 0
+        if not any(
+            item.get("source") in {"changed_head", "changed_patch"}
+            and str(item.get("content") or "").strip()
+            and item.get("path") == candidate.get("relevant_file")
+            and item.get("side", "new") == candidate_side
+            and isinstance(item.get("start_line"), int)
+            and isinstance(item.get("end_line"), int)
+            and item["start_line"] <= start_line <= item["end_line"]
+            for item in available_evidence
+        ):
+            record["verdict"] = "rejected"
+            record["reason"] = "changed_code_evidence_unavailable"
+            result_records.append(record)
+            continue
         changed_line_ranges = candidate.get("_changed_line_ranges") or []
         if (not normalized_citations or not trigger or not impact or not explanation or
                 relevant_file != candidate.get("relevant_file") or start_line < 1 or end_line < start_line):
@@ -1059,8 +1170,7 @@ def apply_verification_decisions(
             "impact": impact,
             "verification_evidence": normalized_citations,
         }
-        cited_evidence = [item for item in available_evidence if item.get("path") in normalized_citations]
-        identity = _verified_finding_identity(candidate, cited_evidence)
+        identity = _verified_finding_identity(candidate)
         if identity is None:
             record["verdict"] = "rejected"
             record["reason"] = "trusted_identity_unavailable"

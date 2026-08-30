@@ -845,9 +845,6 @@ class PRReviewer:
                 prompt_evidence,
                 verification_data,
                 retrieval_requests=retrieval_artifact["requests"],
-                changed_diff_available=(
-                    changed_diff_fraction == 1.0 and bool((self.patches_diff or "").strip())
-                ),
             )
             max_findings = max(0, int(config.get("num_max_findings", 3)))
             published_findings = verified_findings[:max_findings]

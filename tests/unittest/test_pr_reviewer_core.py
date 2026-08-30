@@ -8,7 +8,7 @@ from pr_agent.algo.inline_comment_dedup import (body_with_markers,
                                                 key_issue_fingerprint)
 from pr_agent.algo.pr_processing import PRDiffCoverage
 from pr_agent.algo.types import FilePatchInfo
-from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity
+from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity, convert_to_markdown_v2
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
 from pr_agent.tools.pr_reviewer import PRReviewer
@@ -582,6 +582,41 @@ def test_key_issue_without_file_content_stays_in_the_summary():
 
     reviewer.git_provider.publish_code_suggestions.assert_not_called()
     assert result["review"]["key_issues_to_review"] == [issue]
+
+
+@pytest.mark.parametrize("gfm_supported", [True, False])
+def test_old_side_summary_omits_right_side_link_and_head_snippet(gfm_supported):
+    provider = MagicMock()
+    provider.get_line_link.return_value = "https://example.invalid/file.py#R10"
+    files = [FilePatchInfo(
+        base_file="deleted_secret()",
+        head_file="unrelated_current_code()",
+        patch="@@ -10,1 +10,0 @@\n-deleted_secret()",
+        filename="auth/policy.py",
+    )]
+    data = {"review": {"key_issues_to_review": [{
+        "relevant_file": "auth/policy.py",
+        "issue_header": "Deleted authorization guard",
+        "issue_content": "Removing this guard exposes the operation.",
+        "start_line": 10,
+        "end_line": 10,
+        "side": "old",
+    }]}}
+
+    rendered = convert_to_markdown_v2(
+        data,
+        gfm_supported=gfm_supported,
+        git_provider=provider,
+        files=files,
+        review_profile="bugs_only",
+    )
+
+    provider.get_line_link.assert_not_called()
+    assert "Deleted location" in rendered
+    assert "auth/policy.py" in rendered
+    assert "line 10" in rendered
+    assert "unrelated_current_code" not in rendered
+    assert "#R10" not in rendered
 
 
 def test_key_issue_is_not_published_when_the_provider_cannot_verify_it():
