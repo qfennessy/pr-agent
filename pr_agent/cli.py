@@ -836,6 +836,9 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         validated_limits = validate_local_pair_review_limits(settings)
     except SnapshotCaptureError as exc:
         outer_parser.error(str(exc))
+    configured_cache_enabled = settings.get("cache_enabled", True)
+    if not isinstance(configured_cache_enabled, bool):
+        outer_parser.error("local_pair_review.cache_enabled must be a boolean")
     _validate_configured_snapshot_event(event, settings, parser)
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
     raw_exclusions = settings.get("excluded_paths", [])
@@ -932,7 +935,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     except (OSError, SnapshotCaptureError) as exc:
         outer_parser.error(str(exc))
 
-    cache_enabled = bool(settings.get("cache_enabled", True)) and not snapshot_args.no_cache
+    cache_enabled = configured_cache_enabled and not snapshot_args.no_cache
     cache = SnapshotCache(
         reviewer.repository_root,
         max_entries=validated_limits["cache_max_entries"],

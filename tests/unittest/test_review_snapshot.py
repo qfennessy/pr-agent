@@ -492,6 +492,9 @@ def test_default_secret_paths_never_enter_snapshot_input(tmp_path):
     (repo / "credentials.json").write_text('{"token":"secret"}\n', encoding="utf-8")
     (repo / "signing.pem").write_text("PRIVATE KEY\n", encoding="utf-8")
     (repo / "id_ecdsa_sk").write_text("OPENSSH PRIVATE KEY\n", encoding="utf-8")
+    (repo / ".git-credentials").write_text(
+        "https://user:password@example.test\n", encoding="utf-8"
+    )
     (repo / "visible.py").write_text("value = 1\n", encoding="utf-8")
 
     snapshot = LocalPairReview(str(repo), excluded_paths=[]).capture(event="worktree-idle")
@@ -500,9 +503,11 @@ def test_default_secret_paths_never_enter_snapshot_input(tmp_path):
     assert "secret" not in snapshot.diff
     assert "PRIVATE KEY" not in snapshot.diff
     assert "OPENSSH PRIVATE KEY" not in snapshot.diff
+    assert "password" not in snapshot.diff
     assert CoverageIssue(path="credentials.json", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="signing.pem", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="id_ecdsa_sk", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path=".git-credentials", reason="excluded") in snapshot.coverage_issues
 
 
 def test_file_save_rejects_a_focused_rename_with_an_excluded_source(tmp_path):

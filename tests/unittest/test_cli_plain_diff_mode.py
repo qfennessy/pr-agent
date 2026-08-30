@@ -448,6 +448,33 @@ def test_review_snapshot_validates_numeric_limits_before_removing_output(
     assert output.read_text(encoding="utf-8") == previous
 
 
+def test_review_snapshot_rejects_non_boolean_cache_setting_before_output(
+    monkeypatch, tmp_path, capsys
+):
+    import subprocess
+
+    repo = tmp_path / "repo-invalid-cache-setting"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    (repo / ".pr_agent.toml").write_text(
+        '[local_pair_review]\ncache_enabled = "false"\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "previous-review.md"
+    previous = "<!-- pr-agent-review-snapshot -->\nPrevious review\n"
+    output.write_text(previous, encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "worktree-idle", "--output", str(output),
+        ])
+
+    error = capsys.readouterr().err
+    assert "local_pair_review.cache_enabled must be a boolean" in error
+    assert output.read_text(encoding="utf-8") == previous
+
+
 def test_review_snapshot_validates_base_before_removing_output(monkeypatch, tmp_path, capsys):
     import subprocess
 

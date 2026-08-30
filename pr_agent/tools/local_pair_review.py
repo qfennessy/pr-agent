@@ -51,6 +51,8 @@ _DEFAULT_SECRET_EXCLUSIONS = (
     "**/.pypirc",
     ".netrc",
     "**/.netrc",
+    ".git-credentials",
+    "**/.git-credentials",
     "id_rsa",
     "**/id_rsa",
     "id_ed25519",
