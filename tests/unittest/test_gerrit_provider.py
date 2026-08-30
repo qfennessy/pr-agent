@@ -174,3 +174,19 @@ def test_get_diff_files_filters_each_gitpython_path_shape(tmp_path):
     renamed = next(file for file in diff_files if file.filename == "src/rename_out.py")
     assert renamed.edit_type == EDIT_TYPE.RENAMED
     assert renamed.old_filename == "generated/rename_out.py"
+
+
+def test_get_files_for_routing_keeps_both_rename_paths_before_filtering(tmp_path):
+    repo = _make_repo(tmp_path, ["services/auth/guard.py"])
+    repo.git.mv("services/auth/guard.py", "generated-guard.md")
+    repo.index.commit("rename sensitive file")
+
+    provider = object.__new__(GerritProvider)
+    provider.repo = repo
+
+    routing_files = provider.get_files_for_routing()
+
+    assert len(routing_files) == 1
+    assert routing_files[0].renamed_file is True
+    assert routing_files[0].a_path == "services/auth/guard.py"
+    assert routing_files[0].b_path == "generated-guard.md"

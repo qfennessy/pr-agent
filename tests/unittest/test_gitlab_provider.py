@@ -1,4 +1,5 @@
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -123,6 +124,43 @@ class TestGitLabProvider:
         content = gitlab_provider.get_pr_file_content("CHANGELOG.md", "main")
 
         assert content == ""
+
+    def test_get_files_for_routing_preserves_unfiltered_rename_paths(self, gitlab_provider):
+        changes = [{
+            "old_path": "services/auth/guard.py",
+            "new_path": "generated/guard.md",
+            "renamed_file": True,
+            "new_file": False,
+            "deleted_file": False,
+            "diff": "",
+        }]
+        gitlab_provider.incremental = SimpleNamespace(is_incremental=False)
+        gitlab_provider._get_merge_request_changes = MagicMock(return_value={"changes": changes})
+        gitlab_provider._expand_submodule_changes = MagicMock(side_effect=lambda files: files)
+
+        routing_files = gitlab_provider.get_files_for_routing()
+
+        assert routing_files == changes
+        gitlab_provider._expand_submodule_changes.assert_called_once_with(changes)
+
+    def test_get_files_for_routing_snapshots_incremental_change_records(self, gitlab_provider):
+        change = {
+            "old_path": "services/auth/guard.py",
+            "new_path": "docs/guard.md",
+            "renamed_file": True,
+            "new_file": False,
+            "deleted_file": False,
+            "diff": "@@ patch",
+        }
+        gitlab_provider.incremental = SimpleNamespace(is_incremental=True)
+        gitlab_provider.unreviewed_files_map = {"docs/guard.md": change}
+        gitlab_provider._get_merge_request_changes = MagicMock()
+        gitlab_provider._expand_submodule_changes = MagicMock(side_effect=lambda files: files)
+
+        routing_files = gitlab_provider.get_files_for_routing()
+
+        assert routing_files == [change]
+        gitlab_provider._get_merge_request_changes.assert_not_called()
 
     def test_get_repo_file_content_loads_from_mr_target_branch(self, gitlab_provider, mock_gitlab_client, mock_project):
         mock_project.default_branch = "main"

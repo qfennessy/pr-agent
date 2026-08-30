@@ -905,6 +905,25 @@ class GitLabProvider(GitProvider):
             self.git_files = [c.get('new_path') for c in raw_changes if c.get('new_path')]
         return self.git_files
 
+    def get_files_for_routing(self) -> list[dict]:
+        """Return GitLab's unfiltered changed-file records for safety routing.
+
+        The regular file list intentionally exposes only destination paths, while
+        ``get_diff_files()`` filters ignored or unsupported destinations. Routing
+        needs GitLab's original old/new path pair so a rename cannot hide a
+        sensitive source path behind an ignored destination.
+        """
+        incremental_active = bool(
+            getattr(self, 'incremental', None)
+            and getattr(self.incremental, 'is_incremental', False)
+            and getattr(self, 'unreviewed_files_map', None)
+        )
+        if incremental_active:
+            raw_changes = list(self.unreviewed_files_map.values())
+        else:
+            raw_changes = self._get_merge_request_changes().get('changes', [])
+        return list(self._expand_submodule_changes(raw_changes))
+
     def publish_description(self, pr_title: str, pr_body: str):
         try:
             if pr_title is not None:

@@ -25,14 +25,17 @@ from pr_agent.algo.review_specialists import (
 )
 from pr_agent.algo.run_details import (get_run_details, init_run_details,
                                        record_model_used)
-from pr_agent.algo.types import FilePatchInfo
+from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.algo.utils import (PRReviewHeader, PRReviewIdentity,
                                  show_run_details)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
 from pr_agent.git_providers.bitbucket_provider import BitbucketProvider
+from pr_agent.git_providers.bitbucket_server_provider import BitbucketServerProvider
+from pr_agent.git_providers.gerrit_provider import GerritProvider
 from pr_agent.git_providers.gitea_provider import GiteaProvider
 from pr_agent.git_providers.github_provider import GithubProvider
+from pr_agent.git_providers.gitlab_provider import GitLabProvider
 from pr_agent.tools.pr_reviewer import PRReviewer
 from tests.unittest._settings_helpers import (restore_settings,
                                               snapshot_settings)
@@ -186,6 +189,76 @@ def _azure_routing_provider(net_changes, detailed_files):
     )
     provider.azure_devops_client.get_pull_request_labels.return_value = []
     provider.get_diff_files = MagicMock(return_value=list(detailed_files))
+    return provider
+
+
+def _gitlab_routing_provider(raw_changes, detailed_files, *, incremental=False):
+    provider = GitLabProvider.__new__(GitLabProvider)
+    provider.incremental = SimpleNamespace(is_incremental=incremental)
+    provider.unreviewed_files_map = (
+        {
+            change.get("new_path", f"unknown-{index}"): change
+            for index, change in enumerate(raw_changes)
+        }
+        if incremental
+        else {}
+    )
+    provider._get_merge_request_changes = MagicMock(
+        return_value={"changes": list(raw_changes)}
+    )
+    provider._expand_submodule_changes = MagicMock(side_effect=lambda files: files)
+    provider.get_diff_files = MagicMock(return_value=list(detailed_files))
+    provider.is_supported = MagicMock(return_value=True)
+    provider.get_pr_labels = MagicMock(return_value=[])
+    return provider
+
+
+def _gitlab_change(old_path, new_path, *, renamed=True):
+    return {
+        "old_path": old_path,
+        "new_path": new_path,
+        "renamed_file": renamed,
+        "new_file": False,
+        "deleted_file": False,
+        "diff": "@@ patch",
+    }
+
+
+def _remaining_rich_routing_provider(provider_type, old_path, new_path, detailed_files):
+    if provider_type is GitLabProvider:
+        return _gitlab_routing_provider(
+            [_gitlab_change(old_path, new_path)],
+            detailed_files,
+        )
+    if provider_type is BitbucketServerProvider:
+        provider = BitbucketServerProvider.__new__(BitbucketServerProvider)
+        provider.workspace_slug = "project"
+        provider.repo_slug = "repo"
+        provider.pr_num = 1
+        provider.bitbucket_client = MagicMock()
+        provider.bitbucket_client.get_pull_requests_changes.return_value = [{
+            "path": {"toString": new_path} if new_path else {},
+            "srcPath": {"toString": old_path} if old_path else {},
+            "type": "MOVE",
+        }]
+    elif provider_type is GerritProvider:
+        provider = GerritProvider.__new__(GerritProvider)
+        diff = SimpleNamespace(
+            a_path=old_path,
+            b_path=new_path,
+            renamed_file=True,
+            new_file=False,
+            deleted_file=False,
+        )
+        commit = MagicMock()
+        commit.parents = [SimpleNamespace()]
+        commit.diff.return_value = [diff]
+        provider.repo = SimpleNamespace(head=SimpleNamespace(commit=commit))
+    else:
+        raise AssertionError(f"unsupported provider type: {provider_type}")
+    provider.get_diff_files = MagicMock(return_value=list(detailed_files))
+    provider.is_supported = MagicMock(return_value=True)
+    provider.get_pr_labels = MagicMock(return_value=[])
     return provider
 
 
@@ -1159,6 +1232,242 @@ def test_provider_rich_inventory_restores_sensitive_old_rename_path(provider_typ
     assert decision.matched_sensitive_categories == ("authorization",)
     assert reviewer.review_route_request.files[0].old_path == old_path
     assert reviewer.review_route_request.files[0].new_path == new_path
+
+
+@pytest.mark.parametrize(
+    ("new_path", "detailed_files", "incremental"),
+    [
+        ("generated/guard.md", [], False),
+        (
+            "docs/guard.md",
+            [_route_file(
+                "docs/guard.md",
+                edit_type=EDIT_TYPE.RENAMED,
+                old_filename=None,
+            )],
+            True,
+        ),
+    ],
+    ids=["ignored-destination", "safe-destination-incremental"],
+)
+def test_gitlab_rich_inventory_preserves_sensitive_rename_source(
+    new_path, detailed_files, incremental
+):
+    provider = _gitlab_routing_provider(
+        [_gitlab_change("services/auth/guard.py", new_path)],
+        detailed_files,
+        incremental=incremental,
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    renamed = reviewer.review_route_request.files[0]
+    assert renamed.kind is ChangeKind.RENAMED
+    assert renamed.old_path == "services/auth/guard.py"
+    assert renamed.new_path == new_path
+
+
+def test_gitlab_filtered_detailed_inventory_keeps_all_raw_paths_visible():
+    provider = _gitlab_routing_provider(
+        [
+            _gitlab_change("docs/guide.md", "docs/guide.md", renamed=False),
+            _gitlab_change("services/auth/guard.py", "generated/guard.md"),
+        ],
+        [_route_file("docs/guide.md")],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert {file.new_path for file in reviewer.review_route_request.files} == {
+        "docs/guide.md",
+        "generated/guard.md",
+    }
+
+
+def test_gitlab_malformed_rename_inventory_fails_safe_without_inventing_source():
+    provider = _gitlab_routing_provider(
+        [_gitlab_change(None, "docs/guard.md")],
+        [],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert reviewer.review_route_request.files[0].old_path is None
+    assert "files[0].old_path" in decision.missing_inputs
+
+
+def test_gitlab_conflicting_rename_sources_retain_both_and_fail_safe():
+    provider = _gitlab_routing_provider(
+        [_gitlab_change("services/auth/guard.py", "docs/guard.md")],
+        [_route_file(
+            "docs/guard.md",
+            edit_type=EDIT_TYPE.RENAMED,
+            old_filename="docs/other-old.md",
+        )],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+    assert {file.old_path for file in reviewer.review_route_request.files if file.old_path} == {
+        "services/auth/guard.py",
+        "docs/other-old.md",
+    }
+
+
+@pytest.mark.parametrize("provider_type", [GerritProvider, BitbucketServerProvider])
+def test_remaining_rich_providers_preserve_sensitive_source_when_detail_is_filtered(
+    provider_type,
+):
+    provider = _remaining_rich_routing_provider(
+        provider_type,
+        "services/auth/guard.py",
+        "generated/guard.md",
+        [],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    renamed = reviewer.review_route_request.files[0]
+    assert renamed.old_path == "services/auth/guard.py"
+    assert renamed.new_path == "generated/guard.md"
+
+
+@pytest.mark.parametrize("provider_type", [GerritProvider, BitbucketServerProvider])
+def test_remaining_rich_providers_preserve_sensitive_destination_when_detail_is_filtered(
+    provider_type,
+):
+    provider = _remaining_rich_routing_provider(
+        provider_type,
+        "docs/guard.md",
+        "services/auth/guard.py",
+        [],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    renamed = reviewer.review_route_request.files[0]
+    assert renamed.old_path == "docs/guard.md"
+    assert renamed.new_path == "services/auth/guard.py"
+
+
+@pytest.mark.parametrize(
+    "provider_type",
+    [GitLabProvider, GerritProvider, BitbucketServerProvider],
+)
+def test_rich_provider_malformed_rename_endpoint_cannot_route_quick(provider_type):
+    provider = _remaining_rich_routing_provider(
+        provider_type,
+        None,
+        "docs/guard.md",
+        [],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert "files[0].old_path" in decision.missing_inputs
+
+
+@pytest.mark.parametrize(
+    "provider_type",
+    [GitLabProvider, GerritProvider, BitbucketServerProvider],
+)
+def test_rich_provider_complete_docs_rename_can_still_route_quick(provider_type):
+    provider = _remaining_rich_routing_provider(
+        provider_type,
+        "docs/old-guide.md",
+        "docs/new-guide.md",
+        [_route_file(
+            "docs/new-guide.md",
+            edit_type=EDIT_TYPE.RENAMED,
+            old_filename="docs/old-guide.md",
+        )],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert reviewer.review_route_request.files == (
+        ChangedFile(
+            new_path="docs/new-guide.md",
+            old_path="docs/old-guide.md",
+            kind=ChangeKind.RENAMED,
+            additions=2,
+            deletions=1,
+        ),
+    )
 
 
 def test_incomplete_rename_provenance_prevents_quick_without_inventing_old_path():
