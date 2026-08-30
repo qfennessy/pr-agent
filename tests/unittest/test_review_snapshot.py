@@ -62,6 +62,12 @@ def test_snapshot_identity_is_stable_and_policy_and_repository_scoped():
     assert first.snapshot_id != _snapshot("/repo/one", policy="v2").snapshot_id
     assert first.snapshot_id != _snapshot("/repo/one", config="c2").snapshot_id
     assert first.snapshot_id != _snapshot("/repo/two").snapshot_id
+    with_coverage = ReviewSnapshot(**{
+        key: value
+        for key, value in first.__dict__.items()
+        if key not in {"snapshot_id", "coverage_issues"}
+    }, coverage_issues=(CoverageIssue(path="x", reason="binary"),))
+    assert first.snapshot_id != with_coverage.snapshot_id
 
 
 def test_worktree_snapshot_captures_modified_untracked_deleted_and_renamed_files(tmp_path):

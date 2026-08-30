@@ -92,6 +92,7 @@ class ReviewSnapshot:
             "task_intent": self.task_intent,
             "deterministic_results": self.deterministic_results,
             "review_configuration_hash": self.review_configuration_hash,
+            "coverage_issues": [asdict(issue) for issue in self.coverage_issues],
             "policy_version": self.policy_version,
         }
         digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()

@@ -172,7 +172,12 @@ def _snapshot_review_instructions(snapshot) -> str:
 def _snapshot_review_configuration_hash() -> str:
     settings = get_settings()
 
-    sensitive_fragments = ("key", "token", "secret", "password", "auth", "credential", "private")
+    credential_names = {"key", "token", "secret", "password", "credential", "credentials", "private"}
+    credential_suffixes = (
+        "_api_key", "_token", "_access_token", "_private_token", "_client_secret",
+        "_webhook_secret", "_password", "_private_key", "_secret_access_key",
+        "_auth_header", "_authorization", "_credential", "_credentials",
+    )
     transient_config_keys = {"cli_mode", "git_provider", "publish_output", "propagate_tool_errors"}
 
     def sanitized(value, *, section: str = ""):
@@ -180,7 +185,7 @@ def _snapshot_review_configuration_hash() -> str:
             cleaned = {}
             for key, child in value.items():
                 normalized = str(key).lower()
-                if any(fragment in normalized for fragment in sensitive_fragments):
+                if normalized in credential_names or normalized.endswith(credential_suffixes):
                     continue
                 if section == "config" and normalized in transient_config_keys:
                     continue
@@ -276,6 +281,7 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
     structured_review = None
     review_error = None
     details = None
+    pending_markdown = None
     if markdown_output:
         try:
             Path(markdown_output).unlink(missing_ok=True)
@@ -331,11 +337,10 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
                 and current.snapshot_id == snapshot.snapshot_id
             ):
                 try:
-                    Path(markdown_output).parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(markdown_path, markdown_output)
+                    pending_markdown = markdown_path.read_bytes()
                 except OSError as exc:
                     raise SnapshotCaptureError(
-                        f"could not publish --output '{markdown_output}': {exc}"
+                        f"could not stage --output '{markdown_output}': {exc}"
                     ) from exc
 
     if structured_review is not None and details is not None:
@@ -357,6 +362,23 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
     )
     if cache_enabled and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}:
         cache.write(result)
+    if (
+        markdown_output
+        and pending_markdown is not None
+        and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
+    ):
+        output_path = Path(markdown_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile("wb", dir=output_path.parent, delete=False) as handle:
+                handle.write(pending_markdown)
+                temporary_path = Path(handle.name)
+            os.replace(temporary_path, output_path)
+        except OSError as exc:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise SnapshotCaptureError(f"could not publish --output '{markdown_output}': {exc}") from exc
     _emit_snapshot_result(result, json_output)
     return result
 

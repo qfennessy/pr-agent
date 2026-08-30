@@ -13,7 +13,7 @@ _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path", "plain_diff.js
                   "local_pair_review.policy_version", "local_pair_review.excluded_paths",
                   "local_pair_review.max_file_bytes", "local_pair_review.cache_enabled",
                   "local_pair_review.cache_max_entries", "config.use_repo_settings_file",
-                  "config.reasoning_effort"]
+                  "config.reasoning_effort", "config.max_model_tokens"]
 
 
 @pytest.fixture(autouse=True)
@@ -247,6 +247,11 @@ def test_snapshot_configuration_hash_covers_review_settings(cfg):
     cfg("config.reasoning_effort", "high")
 
     assert _snapshot_review_configuration_hash() != first
+    cfg("config.max_model_tokens", 4096)
+    second = _snapshot_review_configuration_hash()
+    cfg("config.max_model_tokens", 8192)
+
+    assert _snapshot_review_configuration_hash() != second
 
 
 def test_review_snapshot_applies_external_policy_before_capture(cfg, monkeypatch, tmp_path, capsys):
@@ -419,3 +424,40 @@ def test_worktree_snapshot_excludes_requested_output_artifacts(cfg, monkeypatch,
     assert first.state.value == second.state.value == "no_findings"
     assert output.read_text(encoding="utf-8") == "fresh review\n"
     assert json.loads(result_path.read_text(encoding="utf-8"))["state"] == "no_findings"
+
+
+def test_partial_clean_snapshot_does_not_publish_markdown(cfg, monkeypatch, tmp_path, capsys):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo-partial-markdown"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    (repo / "binary.dat").write_bytes(b"\0binary")
+    output = repo / "review.md"
+    monkeypatch.chdir(repo)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            Path(get_settings().plain_diff.output_path).write_text("clean review\n", encoding="utf-8")
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    result = run(inargs=[
+        "review-snapshot", "--event", "worktree-idle", "--output", str(output), "--no-cache",
+    ])
+
+    assert result.state.value == "coverage_unavailable"
+    assert not output.exists()
+    assert json.loads(capsys.readouterr().out)["state"] == "coverage_unavailable"
