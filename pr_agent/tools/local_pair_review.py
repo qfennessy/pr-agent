@@ -84,6 +84,7 @@ _UNSAFE_COPY_PROBE_WINDOW = 16
 _UNSAFE_COPY_MAX_PROBES = 128
 _UNSAFE_COPY_MAX_TOTAL_PROBES = 65_536
 _UNSAFE_COPY_MAX_SMALL_COMPARISONS = 10_000
+_MAX_FINDING_LINE = 2_147_483_647
 
 
 class SnapshotCaptureError(ValueError):
@@ -871,20 +872,6 @@ class LocalPairReview:
         if not candidate_contents:
             return {}
 
-        candidate_sizes = {len(content) for content in candidate_contents.values()}
-
-        def is_similar_size(source_size: int, destination_size: int) -> bool:
-            largest = max(source_size, destination_size)
-            if largest == 0:
-                return True
-            return (
-                min(source_size, destination_size) / largest
-                >= _UNSAFE_COPY_SIMILARITY_THRESHOLD
-            )
-
-        def has_similar_candidate_size(source_size: int) -> bool:
-            return any(is_similar_size(source_size, size) for size in candidate_sizes)
-
         object_contents: dict[str, bytes] = {}
         source_contents: dict[str, dict[str, bytes]] = {
             path: {} for path in unsafe_reasons
@@ -899,8 +886,6 @@ class LocalPairReview:
                     )
                 except (SnapshotCaptureError, ValueError):
                     return None
-                if not has_similar_candidate_size(object_size):
-                    continue
                 if object_size > self.max_file_bytes:
                     return None
                 if object_id not in object_contents:
@@ -930,7 +915,6 @@ class LocalPairReview:
             if (
                 stat.S_ISLNK(source_stat.st_mode)
                 or not stat.S_ISREG(source_stat.st_mode)
-                or not has_similar_candidate_size(source_stat.st_size)
             ):
                 continue
             if (
@@ -958,21 +942,21 @@ class LocalPairReview:
             source_oids[path].add(current_oid)
             source_contents[path][current_oid] = content
 
-        large_signatures: list[tuple[str, str, int, frozenset[int]]] = []
+        large_signatures: list[tuple[str, str, frozenset[int]]] = []
         small_sources: list[tuple[str, str, bytes]] = []
         for source, variants in source_contents.items():
             reason = unsafe_reasons[source]
             for content in variants.values():
-                if len(content) < 4 * _UNSAFE_COPY_PROBE_WINDOW:
+                if len(content) < _UNSAFE_COPY_PROBE_WINDOW:
                     small_sources.append((source, reason, content))
                     continue
                 probes = _copy_similarity_probes(content)
                 if probes:
-                    large_signatures.append((source, reason, len(content), probes))
+                    large_signatures.append((source, reason, probes))
 
         probe_index: dict[int, set[int]] = {}
         total_probes = 0
-        for signature_index, (_, _, _, probes) in enumerate(large_signatures):
+        for signature_index, (_, _, probes) in enumerate(large_signatures):
             total_probes += len(probes)
             if total_probes > _UNSAFE_COPY_MAX_TOTAL_PROBES:
                 return None
@@ -993,21 +977,21 @@ class LocalPairReview:
                 for signature_index in probe_index.get(probe, ()):
                     matched_probes.setdefault(signature_index, set()).add(probe)
             for signature_index, probes in matched_probes.items():
-                source, reason, source_size, expected = large_signatures[signature_index]
-                if (
-                    is_similar_size(source_size, len(content))
-                    and len(probes) / len(expected) >= _UNSAFE_COPY_SIMILARITY_THRESHOLD
-                ):
+                source, reason, expected = large_signatures[signature_index]
+                if len(probes) / len(expected) >= _UNSAFE_COPY_SIMILARITY_THRESHOLD:
                     sources.add((source, reason))
             for source, reason, source_content in small_sources:
-                if not is_similar_size(len(source_content), len(content)):
+                if not source_content:
                     continue
                 small_comparisons += 1
                 if small_comparisons > _UNSAFE_COPY_MAX_SMALL_COMPARISONS:
                     return None
-                if SequenceMatcher(
-                    None, source_content, content, autojunk=False
-                ).ratio() >= _UNSAFE_COPY_SIMILARITY_THRESHOLD:
+                if source_content in content or (
+                    len(content) <= 2 * len(source_content)
+                    and SequenceMatcher(
+                        None, source_content, content, autojunk=False
+                    ).ratio() >= _UNSAFE_COPY_SIMILARITY_THRESHOLD
+                ):
                     sources.add((source, reason))
             if sources:
                 matches[destination] = tuple(sorted(sources))
@@ -1490,12 +1474,12 @@ def _findings_match_snapshot(
     if not isinstance(findings, list):
         return False
 
-    reviewable_lines: dict[str, set[int]] = {}
+    changed_lines: dict[str, set[int]] = {}
     for item in parse_plain_diff(snapshot.diff):
         filename = getattr(item, "filename", None)
         if not filename or filename not in snapshot.changed_paths:
             continue
-        lines = reviewable_lines.setdefault(filename, set())
+        lines = changed_lines.setdefault(filename, set())
         new_line = None
         for patch_line in item.patch.splitlines():
             hunk_match = RE_HUNK_HEADER.match(patch_line)
@@ -1506,8 +1490,10 @@ def _findings_match_snapshot(
                 continue
             if patch_line.startswith("-"):
                 continue
-            if patch_line.startswith(("+", " ")):
+            if patch_line.startswith("+"):
                 lines.add(new_line)
+                new_line += 1
+            elif patch_line.startswith(" "):
                 new_line += 1
 
     for finding in findings:
@@ -1519,12 +1505,13 @@ def _findings_match_snapshot(
             end_line = int(str(finding.get("end_line", "")).strip())
         except ValueError:
             return False
-        allowed_lines = reviewable_lines.get(filename, set())
+        allowed_lines = changed_lines.get(filename, set())
         if (
             not allowed_lines
-            or start_line < min(allowed_lines)
-            or end_line > max(allowed_lines)
-            or any(line not in allowed_lines for line in range(start_line, end_line + 1))
+            or start_line < 1
+            or end_line < start_line
+            or end_line > _MAX_FINDING_LINE
+            or not any(start_line <= line <= end_line for line in allowed_lines)
         ):
             return False
     return True

@@ -523,6 +523,36 @@ def test_unrelated_untracked_file_remains_reviewable_with_excluded_tracked_sourc
     assert not any(issue.path == "feature.py" for issue in snapshot.coverage_issues)
 
 
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle"])
+def test_untracked_addition_embedding_excluded_source_is_omitted(event, tmp_path):
+    repo = _repo(tmp_path, f"untracked-embedded-excluded-copy-{event}")
+    source = repo / ".env"
+    source.write_text("API_TOKEN=production-secret\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".env")
+    _git(repo, "commit", "-m", "add excluded source")
+    destination = repo / "feature.py"
+    destination.write_text(
+        "def configure():\n"
+        "    settings = '''\n"
+        "    API_TOKEN=production-secret\n"
+        "    FEATURE_FLAG=enabled\n"
+        "    '''\n"
+        "    return settings\n",
+        encoding="utf-8",
+    )
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "production-secret" not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="feature.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
 def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "large.py"
@@ -1382,7 +1412,6 @@ def test_deleted_files_have_distinct_unsupported_coverage():
     [
         ("other.py", 1, 1),
         ("x", 2, 2),
-        ("x", 1, 2),
         ("x", 1, 10**30),
     ],
 )
@@ -1407,6 +1436,26 @@ def test_findings_must_match_captured_files_and_hunk_lines(
     assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
     assert result.review is None
     assert CoverageIssue(reason="review_failed:InvalidStructuredReview") in result.coverage_issues
+
+
+def test_finding_range_may_include_adjacent_unchanged_context():
+    snapshot = _snapshot("/repo/one")
+
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={"review": {"key_issues_to_review": [{
+            "relevant_file": "x",
+            "issue_header": "Bug",
+            "issue_content": "The changed line breaks the adjacent context.",
+            "start_line": 1,
+            "end_line": 2,
+        }]}},
+        started_at=monotonic(),
+    )
+
+    assert result.state is ReviewResultState.FINDINGS
+    assert result.review is not None
 
 
 @pytest.mark.parametrize(
