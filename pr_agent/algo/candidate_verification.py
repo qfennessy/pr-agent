@@ -403,6 +403,27 @@ def _trusted_file_lineage(diff_file) -> Optional[str]:
     return f"file:{path}" if path else None
 
 
+def _base_fetch_path(path: str, diff_file) -> str:
+    """Return the base-side path while keeping evidence keyed to the current path."""
+    if getattr(diff_file, "edit_type", None) == EDIT_TYPE.RENAMED:
+        return safe_repo_path(getattr(diff_file, "old_filename", None)) or path
+    return path
+
+
+def _trusted_side_line_count(diff_file, side: str) -> Optional[int]:
+    """Return a complete provider-supplied side's line count, if available."""
+    if diff_file is None:
+        return None
+    content_attribute = "head_file" if side == "new" else "base_file"
+    complete_attribute = f"{content_attribute}_is_complete"
+    if not hasattr(diff_file, complete_attribute) or not getattr(diff_file, complete_attribute):
+        return None
+    content = getattr(diff_file, content_attribute, "") or ""
+    if isinstance(content, bytes):
+        content = content.decode("utf-8", errors="replace")
+    return len(split_git_file_lines(str(content)))
+
+
 def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: list,
                        max_candidates: int) -> tuple[list[dict], list[dict]]:
     """Normalize model candidates, deduplicate them, and add deterministic sensitive-file audits."""
@@ -426,6 +447,15 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             _sensitive_change_anchors(patch), start=1
         ):
             sensitive_count += 1
+            trusted_side_line_count = _trusted_side_line_count(diff_file, side)
+            if trusted_side_line_count is not None and not (
+                1 <= start_line <= end_line <= trusted_side_line_count
+            ):
+                rejected.append({
+                    "candidate_id": f"sensitive-{sensitive_count}",
+                    "reason": "invalid_candidate",
+                })
+                continue
             candidates.append({
                 "candidate_id": f"sensitive-{sensitive_count}",
                 "candidate_type": "sensitive_path_audit",
@@ -445,6 +475,7 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
                 "_changed_anchor_shape": _changed_anchor_shape(patch, start_line, end_line, side),
                 "_changed_anchor_ordinal": _changed_anchor_ordinal(patch, start_line, side),
                 "_trusted_lineage_key": _trusted_file_lineage(diff_file),
+                "_trusted_side_line_count": trusted_side_line_count,
             })
 
     model_candidate_count = 0
@@ -473,9 +504,12 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
         required_text = ("issue_header", "issue_content", "trigger", "impact", "root_cause")
         diff_file = diff_by_file.get(candidate["relevant_file"])
         changed_line_ranges = _added_line_ranges(getattr(diff_file, "patch", "")) if diff_file else []
+        trusted_side_line_count = _trusted_side_line_count(diff_file, "new")
         if (not candidate["relevant_file"] or not diff_file or
                 not _line_is_changed(candidate["start_line"], changed_line_ranges) or
                 candidate["end_line"] < candidate["start_line"] or
+                (trusted_side_line_count is not None
+                 and candidate["end_line"] > trusted_side_line_count) or
                 any(not str(candidate.get(key) or "").strip() for key in required_text)):
             rejected.append({"candidate_id": candidate["candidate_id"], "reason": "invalid_candidate"})
             continue
@@ -492,6 +526,7 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             getattr(diff_file, "patch", ""), candidate["start_line"]
         )
         candidate["_trusted_lineage_key"] = _trusted_file_lineage(diff_file)
+        candidate["_trusted_side_line_count"] = trusted_side_line_count
         candidates.append(candidate)
         model_candidate_count += 1
     return candidates, rejected
@@ -709,13 +744,14 @@ def _matching_static_evidence(candidate: dict, static_evidence: list) -> list[di
 
 def _changed_patch_range_evidence(diff_file, side: str, start_line: int, end_line: int,
                                   source: str) -> Optional[dict]:
-    """Return exact changed lines for one trusted patch range."""
+    """Return a complete side-specific patch range with at least one changed line."""
     if diff_file is None:
         return None
     old_line = None
     new_line = None
     selected = []
     selected_lines = []
+    changed_lines = []
     for record in iter_git_patch_lines(getattr(diff_file, "patch", "") or ""):
         line = strip_git_line_ending(record)
         header = RE_HUNK_HEADER.match(line)
@@ -725,19 +761,22 @@ def _changed_patch_range_evidence(diff_file, side: str, start_line: int, end_lin
             continue
         if old_line is None or new_line is None or line.startswith("\\ No newline at end of file"):
             continue
-        if (side == "new" and line.startswith("+") and not line.startswith("+++")
-                and start_line <= new_line <= end_line):
-            selected.append(line[1:])
+        if side == "new" and not line.startswith("-") and start_line <= new_line <= end_line:
+            selected.append(line[1:] if line.startswith(("+", " ")) else line)
             selected_lines.append(new_line)
-        elif (side == "old" and line.startswith("-") and not line.startswith("---")
-              and start_line <= old_line <= end_line):
-            selected.append(line[1:])
+            if line.startswith("+"):
+                changed_lines.append(new_line)
+        elif side == "old" and not line.startswith("+") and start_line <= old_line <= end_line:
+            selected.append(line[1:] if line.startswith(("-", " ")) else line)
             selected_lines.append(old_line)
+            if line.startswith("-"):
+                changed_lines.append(old_line)
         if not line.startswith("+"):
             old_line += 1
         if not line.startswith("-"):
             new_line += 1
-    if start_line not in selected_lines or not selected:
+    expected_lines = list(range(start_line, end_line + 1))
+    if selected_lines != expected_lines or start_line not in changed_lines or not selected:
         return None
     return {
         "source": source,
@@ -1017,10 +1056,11 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 budget_exhausted = True
                 continue
             unique_files.add(path)
-            if path not in cache:
+            fetch_path = _base_fetch_path(path, diff_by_file.get(path))
+            if fetch_path not in cache:
                 try:
-                    cache[path] = await _bounded_repo_file_fetch(
-                        git_provider, path, remaining_time
+                    cache[fetch_path] = await _bounded_repo_file_fetch(
+                        git_provider, fetch_path, remaining_time
                     )
                 except asyncio.TimeoutError:
                     request["status"] = "time_budget_exhausted"
@@ -1031,11 +1071,11 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                     budget_exhausted = True
                     continue
                 except Exception as exc:
-                    cache[path] = None
+                    cache[fetch_path] = None
                     request["status"] = "fetch_failed"
                     request["error"] = type(exc).__name__
                     continue
-            content = cache[path]
+            content = cache[fetch_path]
             if not content:
                 request["status"] = "missing"
                 continue
@@ -1290,7 +1330,8 @@ def apply_verification_decisions(
             and item.get("side", "new") == candidate_side
             and isinstance(item.get("start_line"), int)
             and isinstance(item.get("end_line"), int)
-            and item["start_line"] <= start_line <= item["end_line"]
+            and item["start_line"] <= start_line
+            and end_line <= item["end_line"]
             for item in available_evidence
         ):
             record["verdict"] = "rejected"
@@ -1298,8 +1339,11 @@ def apply_verification_decisions(
             result_records.append(record)
             continue
         changed_line_ranges = candidate.get("_changed_line_ranges") or []
+        trusted_side_line_count = candidate.get("_trusted_side_line_count")
         if (not normalized_citations or not trigger or not impact or not explanation or
-                relevant_file != candidate.get("relevant_file") or start_line < 1 or end_line < start_line):
+                relevant_file != candidate.get("relevant_file") or start_line < 1 or end_line < start_line or
+                (isinstance(trusted_side_line_count, int)
+                 and end_line > trusted_side_line_count)):
             record["verdict"] = "rejected"
             record["reason"] = "unverified_or_incomplete_evidence"
             result_records.append(record)

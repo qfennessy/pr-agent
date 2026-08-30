@@ -56,8 +56,12 @@ def _review_data(*candidates):
     return {"review": {"key_issues_to_review": list(candidates)}}
 
 
-def _diff_file(filename="src/service.py", base_file="old", head_file="new",
+def _diff_file(filename="src/service.py", base_file=None, head_file=None,
                edit_type=EDIT_TYPE.UNKNOWN, old_filename=None):
+    if base_file is None:
+        base_file = "\n".join("o" for _ in range(30))
+    if head_file is None:
+        head_file = "\n".join("n" for _ in range(30))
     return FilePatchInfo(
         base_file,
         head_file,
@@ -69,7 +73,8 @@ def _diff_file(filename="src/service.py", base_file="old", head_file="new",
 
 
 def _changed_evidence(candidate_id="candidate-1", path="src/service.py", line=12,
-                      content="changed service", side="new"):
+                      content="changed service", side="new", end_line=None):
+    end_line = line if end_line is None else end_line
     return {
         "candidate_id": candidate_id,
         "source": "changed_patch",
@@ -77,9 +82,9 @@ def _changed_evidence(candidate_id="candidate-1", path="src/service.py", line=12
         "path": path,
         "content": content,
         "start_line": line,
-        "end_line": line,
+        "end_line": end_line,
         "anchor_start_line": line,
-        "anchor_end_line": line,
+        "anchor_end_line": end_line,
     }
 
 
@@ -102,6 +107,53 @@ def test_prepare_candidates_rejects_locations_outside_the_changed_diff():
 
     assert candidates == []
     assert rejected == [{"candidate_id": "candidate-1", "reason": "invalid_candidate"}]
+
+
+@pytest.mark.parametrize("side", ["new", "old"])
+def test_prepare_candidates_rejects_patch_locations_beyond_a_complete_file(side):
+    diff_file = _diff_file(
+        "auth/policy.py" if side == "old" else "src/service.py",
+        base_file="only base line",
+        head_file="only head line",
+    )
+    if side == "old":
+        diff_file.base_file_is_complete = True
+        diff_file.patch = "@@ -10000,1 +1,0 @@\n-phantom changed line"
+        review_data = _review_data()
+        sensitive_globs = ["auth/**"]
+    else:
+        diff_file.patch = "@@ -0,0 +10000,1 @@\n+phantom changed line"
+        review_data = _review_data(_candidate(
+            start_line=10_000,
+            end_line=10_000,
+            context_files=[],
+        ))
+        sensitive_globs = []
+
+    candidates, rejected = prepare_candidates(review_data, [diff_file], sensitive_globs, 3)
+
+    assert candidates == []
+    assert rejected[0]["reason"] == "invalid_candidate"
+
+
+def test_partial_provider_base_without_a_completeness_marker_keeps_sensitive_deletion():
+    diff_file = FilePatchInfo(
+        base_file="deleted_guard",
+        head_file="",
+        patch="@@ -100,1 +100,0 @@\n-deleted_guard",
+        filename="auth/policy.py",
+        edit_type=EDIT_TYPE.MODIFIED,
+        head_file_is_complete=False,
+    )
+
+    candidates, rejected = prepare_candidates(_review_data(), [diff_file], ["auth/**"], 1)
+
+    assert not hasattr(diff_file, "base_file_is_complete")
+    assert [(candidate["side"], candidate["start_line"]) for candidate in candidates] == [
+        ("old", 100)
+    ]
+    assert candidates[0]["_trusted_side_line_count"] is None
+    assert rejected == []
 
 
 def test_prepare_candidates_escalates_every_sensitive_file_without_coordinator_cap():
@@ -166,6 +218,7 @@ def test_sensitive_path_creates_a_candidate_for_each_changed_hunk():
 
 def test_sensitive_path_keeps_a_fallback_anchor_for_a_truncated_hunk():
     diff_file = _diff_file("auth/policy.py")
+    diff_file.head_file_is_complete = False
     diff_file.patch = (
         "@@ -10,0 +10,1 @@\n+complete_change\n"
         "@@ -200,0 +200,2 @@\n+visible_truncated_change"
@@ -179,6 +232,8 @@ def test_sensitive_path_keeps_a_fallback_anchor_for_a_truncated_hunk():
 @pytest.mark.asyncio
 async def test_sensitive_path_covers_both_sides_and_separated_ranges_in_one_hunk():
     diff_file = _diff_file("auth/policy.py", base_file="", head_file="")
+    diff_file.base_file_is_complete = False
+    diff_file.head_file_is_complete = False
     diff_file.patch = (
         "@@ -10,4 +10,3 @@\n"
         "-first_guard\n context_a\n context_b\n-later_sensitive_guard\n+log_request"
@@ -395,7 +450,7 @@ def test_apply_specialist_prioritization_ranks_exact_hunks_without_suppressing_s
 
 def test_apply_verification_decisions_publishes_only_evidence_backed_findings():
     candidates, _ = prepare_candidates(_review_data(_candidate()), [_diff_file()], [], 3)
-    evidence = [_changed_evidence(line=14, content="three"), {
+    evidence = [_changed_evidence(line=14, end_line=15, content="three\nfour"), {
         "candidate_id": "candidate-1",
         "source": "repository_file",
         "path": "src/caller.py",
@@ -419,6 +474,88 @@ def test_apply_verification_decisions_publishes_only_evidence_backed_findings():
     assert (findings[0]["start_line"], findings[0]["end_line"]) == (14, 15)
     assert "**Trigger:** The lookup returns None." in findings[0]["issue_content"]
     assert decisions[0]["verdict"] == "verified"
+
+
+@pytest.mark.parametrize("reported_end", [16, 10_000])
+def test_apply_verification_rejects_a_range_beyond_prompt_visible_changed_evidence(reported_end):
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(start_line=12, end_line=15, context_files=[])),
+        [_diff_file()],
+        [],
+        3,
+    )
+    evidence = [_changed_evidence(
+        line=12,
+        end_line=15,
+        content="one\ntwo\nthree\nfour",
+    )]
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": reported_end,
+        "evidence_paths": ["src/service.py"],
+    }]}}
+
+    findings, decisions = apply_verification_decisions(candidates, evidence, verification)
+
+    assert findings == []
+    assert decisions[0]["reason"] == "changed_code_evidence_unavailable"
+
+
+def test_apply_verification_rejects_a_range_beyond_the_complete_target_file():
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(start_line=12, end_line=15, context_files=[])),
+        [_diff_file()],
+        [],
+        3,
+    )
+    evidence = [_changed_evidence(
+        line=12,
+        end_line=10_000,
+        content="untrusted evidence metadata cannot expand the target file",
+    )]
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 31,
+        "evidence_paths": ["src/service.py"],
+    }]}}
+
+    findings, decisions = apply_verification_decisions(candidates, evidence, verification)
+
+    assert findings == []
+    assert decisions[0]["reason"] == "unverified_or_incomplete_evidence"
+
+
+def test_changed_patch_does_not_claim_unseen_lines_between_visible_hunks():
+    diff_file = _diff_file(head_file="one\ntwo\nthree\nfour")
+    diff_file.head_file_is_complete = False
+    diff_file.patch = (
+        "@@ -10,1 +12,1 @@\n"
+        "+one\n"
+        "@@ -19,1 +20,1 @@\n"
+        "+two"
+    )
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(start_line=12, end_line=20, context_files=[])),
+        [diff_file],
+        [],
+        3,
+    )
+
+    evidence, _ = asyncio.run(retrieve_evidence(
+        MagicMock(),
+        candidates,
+        VerificationBudgets(max_lines_per_file=4, max_total_lines=4),
+        [],
+        diff_files=[diff_file],
+    ))
+
+    assert not any(item["source"] == "changed_patch" for item in evidence)
 
 
 def test_apply_verification_decisions_rejects_disproved_and_missing_candidates():
@@ -739,6 +876,7 @@ def test_distinct_changed_operations_do_not_collide_with_the_same_proof_shape():
 
 def test_same_shaped_changed_operations_use_trusted_patch_ordinals_to_avoid_collision():
     diff_file = _diff_file(head_file="return foo(x) + 1\nreturn bar(y) + 1")
+    diff_file.head_file_is_complete = False
     diff_file.patch = (
         "@@ -10,1 +12,2 @@\n"
         "+return foo(x) + 1\n"
@@ -976,7 +1114,7 @@ async def test_static_evidence_obeys_per_file_and_total_line_budgets():
 
 @pytest.mark.asyncio
 async def test_changed_head_satisfies_same_path_request_without_double_line_budget():
-    diff_file = _diff_file(head_file="one\ntwo\nthree\nfour")
+    diff_file = _diff_file(head_file="\n".join(f"line {line}" for line in range(1, 16)))
     candidates, _ = prepare_candidates(
         _review_data(_candidate(context_files=[])), [diff_file], [], 3
     )
@@ -1127,6 +1265,67 @@ async def test_added_required_context_uses_complete_head_and_can_publish():
 
 
 @pytest.mark.asyncio
+async def test_renamed_required_context_fetches_old_path_but_keeps_new_evidence_identity():
+    service_diff = _diff_file()
+    dependency_diff = _diff_file(
+        "src/new_dependency.py",
+        base_file="def required_contract(): return old_behavior",
+        head_file="def required_contract(): return new_behavior",
+        edit_type=EDIT_TYPE.RENAMED,
+        old_filename="src/old_dependency.py",
+    )
+    dependency_diff.patch = (
+        "@@ -1,1 +1,1 @@\n"
+        "-def required_contract(): return old_behavior\n"
+        "+def required_contract(): return new_behavior"
+    )
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/new_dependency.py"],
+            context_symbols=["required_contract"],
+        )),
+        [service_diff, dependency_diff],
+        [],
+        3,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.side_effect = lambda path, _base: (
+        "def required_contract(): return old_behavior"
+        if path == "src/old_dependency.py" else None
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider, candidates, VerificationBudgets(), [], diff_files=[service_diff, dependency_diff]
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py", "src/new_dependency.py"],
+    }]}}
+
+    findings, decisions = apply_verification_decisions(
+        candidates, evidence, verification, retrieval_requests=artifact["requests"]
+    )
+
+    provider.get_repo_file_content.assert_called_once_with("src/old_dependency.py", False)
+    dependency_request = next(
+        request for request in artifact["requests"] if request.get("path") == "src/new_dependency.py"
+    )
+    repository_evidence = next(
+        item for item in evidence
+        if item["source"] == "repository_file" and item["path"] == "src/new_dependency.py"
+    )
+    assert dependency_request["status"] == "retrieved"
+    assert dependency_request["evidence_id"] == repository_evidence["evidence_id"]
+    assert "old_behavior" in repository_evidence["content"]
+    assert len(findings) == 1
+    assert decisions[0]["verdict"] == "verified"
+
+
+@pytest.mark.asyncio
 async def test_missing_specialist_context_hint_cannot_suppress_verified_candidate():
     diff_file = _diff_file(head_file="\n".join(f"line {line}" for line in range(1, 30)))
     candidates, _ = prepare_candidates(
@@ -1215,11 +1414,12 @@ async def test_changed_head_is_citable_when_base_file_is_missing(edit_type):
 
 @pytest.mark.asyncio
 async def test_deleted_candidate_uses_prompt_visible_old_side_patch_evidence():
-    diff_file = _diff_file("auth/policy.py", base_file="auth_check(request)", head_file="")
+    base_file = "\n".join([*(f"context {line}" for line in range(1, 10)), "auth_check(request)"])
+    diff_file = _diff_file("auth/policy.py", base_file=base_file, head_file="")
     diff_file.patch = "@@ -10,1 +10,0 @@\n-auth_check(request)"
     candidates, _ = prepare_candidates(_review_data(), [diff_file], ["auth/**"], 1)
     provider = MagicMock()
-    provider.get_repo_file_content.return_value = "auth_check(request)"
+    provider.get_repo_file_content.return_value = base_file
 
     evidence, artifact = await retrieve_evidence(
         provider, candidates, VerificationBudgets(), [], diff_files=[diff_file]
@@ -1647,10 +1847,11 @@ async def test_orchestration_retains_a_bounded_cross_file_diff_when_it_fits():
 async def test_orchestration_retains_deleted_candidate_patch_when_global_diff_is_clipped():
     provider = MagicMock()
     provider.supports_repo_file_fetching.return_value = True
-    diff_file = _diff_file("auth/policy.py", base_file="auth_check(request)", head_file="")
+    base_file = "\n".join([*(f"context {line}" for line in range(1, 10)), "auth_check(request)"])
+    diff_file = _diff_file("auth/policy.py", base_file=base_file, head_file="")
     diff_file.patch = "@@ -10,1 +10,0 @@\n-auth_check(request)"
     provider.get_diff_files.return_value = [diff_file]
-    provider.get_repo_file_content.return_value = "auth_check(request)"
+    provider.get_repo_file_content.return_value = base_file
     reviewer = _reviewer_for_orchestration(provider)
     reviewer.patches_diff = "+unrelated global diff\n" * 2_000
     reviewer._parse_review_prediction = MagicMock(return_value=_review_data())
