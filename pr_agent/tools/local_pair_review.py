@@ -184,6 +184,19 @@ class LocalPairReview:
     def _is_ignored(self, path: str) -> bool:
         return path in self.ignored_paths
 
+    def _has_content_filter(self, event: ReviewEvent, path: str) -> bool:
+        args = ["check-attr"]
+        if event is ReviewEvent.PRE_COMMIT:
+            args.append("--cached")
+        args.extend(["-z", "filter", "--", path])
+        fields = _decode_z_paths(
+            _run_git(self.repository_root, "--literal-pathspecs", *args)
+        )
+        if len(fields) < 3:
+            return False
+        value = fields[2].lower()
+        return value not in {"unspecified", "unset"}
+
     def _diff_filter_overrides(self) -> list[str]:
         """Replace repository-configured content filters with raw pass-throughs."""
         output = _run_git(
@@ -442,6 +455,9 @@ class LocalPairReview:
                 return None
             if self._is_excluded(normalized):
                 add_coverage(normalized, "excluded")
+                return None
+            if self._has_content_filter(event, normalized):
+                add_coverage(normalized, "content_filter_unsupported")
                 return None
             file_issue = (
                 self._inspect_index_file(normalized, base_revision)

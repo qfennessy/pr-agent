@@ -299,8 +299,32 @@ def test_snapshot_capture_does_not_execute_repository_clean_filter(tmp_path):
     snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
 
     assert not marker.exists()
-    assert "+raw = 2" in snapshot.diff
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(
+        path="tracked.py",
+        reason="content_filter_unsupported",
+    ) in snapshot.coverage_issues
     assert "FILTERED" not in snapshot.diff
+
+
+def test_pre_commit_uses_index_content_filter_attributes(tmp_path):
+    repo = _repo(tmp_path, "index-filter-attributes")
+    tracked = repo / "tracked.py"
+    tracked.write_text("staged = True\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text(
+        "tracked.py filter=danger\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "tracked.py", ".gitattributes")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="pre-commit")
+
+    assert "tracked.py" not in snapshot.changed_paths
+    assert CoverageIssue(
+        path="tracked.py",
+        reason="content_filter_unsupported",
+    ) in snapshot.coverage_issues
 
 
 def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):
