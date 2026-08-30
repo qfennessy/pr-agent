@@ -38,6 +38,8 @@ log_level = os.environ.get("LOG_LEVEL", "INFO")
 setup_logger(log_level)
 
 _MISSING_SETTING = object()
+_SNAPSHOT_ARTIFACT_TYPE = "pr-agent-review-snapshot"
+_SNAPSHOT_MARKDOWN_MARKER = b"<!-- pr-agent-review-snapshot -->\n"
 _SNAPSHOT_PROVIDER_SETTINGS = (
     "config.git_provider",
     "config.publish_output",
@@ -287,7 +289,9 @@ def _emit_snapshot_result(
     output_path: str | None,
     parent_identity: tuple[int, int] | None = None,
 ) -> None:
-    payload = json.dumps(result.to_dict(), ensure_ascii=True, sort_keys=True, indent=2) + "\n"
+    payload_data = result.to_dict()
+    payload_data["artifact_type"] = _SNAPSHOT_ARTIFACT_TYPE
+    payload = json.dumps(payload_data, ensure_ascii=True, sort_keys=True, indent=2) + "\n"
     print(payload, end="")
     if output_path:
         try:
@@ -451,9 +455,14 @@ def _restore_all_settings(snapshot: dict[str, object]) -> None:
 def _reject_existing_repository_outputs(
     repository_root: Path,
     git_metadata_root: Path,
-    *paths: str | None,
+    git_artifact_root: Path,
+    markdown_output: str | None,
+    json_output: str | None,
 ) -> None:
-    for supplied_path in paths:
+    for supplied_path, artifact_kind in (
+        (markdown_output, "markdown"),
+        (json_output, "json"),
+    ):
         if not supplied_path:
             continue
         lexical = Path(os.path.abspath(supplied_path))
@@ -469,10 +478,14 @@ def _reject_existing_repository_outputs(
         )
         lexical_metadata = lexical.is_relative_to(git_metadata_root)
         resolved_metadata = resolved.is_relative_to(git_metadata_root)
+        lexical_artifact = lexical.is_relative_to(git_artifact_root)
+        resolved_artifact = resolved.is_relative_to(git_artifact_root)
         if (
             (resolved_worktree and not lexical_worktree)
             or (resolved_metadata and not lexical_metadata)
             or (lexical_metadata and not resolved_metadata)
+            or (lexical_metadata and not lexical_artifact)
+            or (resolved_metadata and not resolved_artifact)
             or (
                 exists
                 and not lexical_worktree
@@ -482,10 +495,82 @@ def _reject_existing_repository_outputs(
             raise SnapshotCaptureError(
                 f"output destination aliases an existing repository path: {supplied_path}"
             )
-        if exists and lexical_worktree:
+        if (
+            exists
+            and lexical_worktree
+            and not _is_repeatable_snapshot_artifact(
+                lexical, repository_root, artifact_kind
+            )
+        ):
             raise SnapshotCaptureError(
                 f"output destination aliases an existing repository path: {supplied_path}"
             )
+
+
+def _is_repeatable_snapshot_artifact(
+    candidate: Path,
+    repository_root: Path,
+    artifact_kind: str,
+) -> bool:
+    try:
+        candidate_stat = candidate.lstat()
+    except OSError:
+        return False
+    if (
+        stat.S_ISLNK(candidate_stat.st_mode)
+        or not stat.S_ISREG(candidate_stat.st_mode)
+        or candidate_stat.st_nlink != 1
+        or _is_tracked_repository_path(candidate, repository_root)
+    ):
+        return False
+    try:
+        if artifact_kind == "markdown":
+            with candidate.open("rb") as handle:
+                return handle.read(len(_SNAPSHOT_MARKDOWN_MARKER)) == _SNAPSHOT_MARKDOWN_MARKER
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+        return isinstance(payload, dict) and payload.get("artifact_type") == _SNAPSHOT_ARTIFACT_TYPE
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def _is_tracked_repository_path(candidate: Path, repository_root: Path) -> bool:
+    try:
+        relative = candidate.relative_to(repository_root)
+    except ValueError:
+        return False
+    process = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository_root),
+            "--literal-pathspecs",
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            str(relative),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return process.returncode == 0
+
+
+def _git_artifact_root(repository_root: Path) -> Path:
+    process = subprocess.run(
+        ["git", "-C", str(repository_root), "rev-parse", "--git-path", "pr-agent"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if process.returncode != 0:
+        raise SnapshotCaptureError("could not resolve the repository artifact directory")
+    supplied = Path(
+        process.stdout.decode("utf-8", errors="surrogateescape").rstrip("\r\n")
+    )
+    return (supplied if supplied.is_absolute() else repository_root / supplied).resolve(
+        strict=False
+    )
 
 
 def _is_hard_linked_to_repository(candidate: Path, *roots: Path) -> bool:
@@ -553,10 +638,15 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
     configured_exclusions = list(settings.get("excluded_paths", []) or [])
     git_metadata_root = SnapshotCache(repository_root).cache_dir.parents[1]
+    git_artifact_root = _git_artifact_root(repository_root)
     output_parent_identities = {}
     try:
         _reject_existing_repository_outputs(
-            repository_root, git_metadata_root, markdown_output, json_output
+            repository_root,
+            git_metadata_root,
+            git_artifact_root,
+            markdown_output,
+            json_output,
         )
         for output_path in (markdown_output, json_output):
             if output_path:
@@ -564,7 +654,11 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         # Parent creation is intentionally followed by a second alias check so
         # newly materialized components cannot redirect into protected paths.
         _reject_existing_repository_outputs(
-            repository_root, git_metadata_root, markdown_output, json_output
+            repository_root,
+            git_metadata_root,
+            git_artifact_root,
+            markdown_output,
+            json_output,
         )
         if markdown_output:
             _unlink_output(
@@ -699,6 +793,8 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     )
     if markdown_output and pending_markdown is None and result.state is ReviewResultState.NO_FINDINGS:
         pending_markdown = b"## PR Review\n\nNo findings.\n"
+    if pending_markdown is not None and not pending_markdown.startswith(_SNAPSHOT_MARKDOWN_MARKER):
+        pending_markdown = _SNAPSHOT_MARKDOWN_MARKER + pending_markdown
     if cache_enabled and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}:
         cache.write(result)
     if (

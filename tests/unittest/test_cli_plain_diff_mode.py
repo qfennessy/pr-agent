@@ -272,6 +272,61 @@ def test_review_snapshot_rejects_metadata_hard_link_to_git_config(monkeypatch, t
     assert git_config.read_bytes() == original
 
 
+def test_review_snapshot_rejects_direct_git_metadata_file(monkeypatch, tmp_path, capsys):
+    import subprocess
+
+    repo = tmp_path / "repo-direct-metadata"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    git_config = repo / ".git" / "config"
+    original = git_config.read_bytes()
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "worktree-idle",
+            "--json-output", ".git/config", "--no-cache",
+        ])
+
+    assert "aliases an existing repository path" in capsys.readouterr().err
+    assert git_config.read_bytes() == original
+
+
+def test_git_artifact_root_uses_linked_worktree_git_directory(tmp_path):
+    import os
+    import subprocess
+
+    from pr_agent.cli import _git_artifact_root
+
+    repo = tmp_path / "primary"
+    linked = tmp_path / "linked"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "--allow-empty", "-m", "initial"],
+        check=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        },
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "linked-test", str(linked)],
+        check=True,
+        capture_output=True,
+    )
+
+    artifact_root = _git_artifact_root(linked)
+
+    assert artifact_root != linked / ".git" / "pr-agent"
+    assert artifact_root.is_relative_to(repo / ".git" / "worktrees")
+    assert artifact_root.name == "pr-agent"
+
+
 def test_review_snapshot_reports_invalid_repository_settings(monkeypatch, tmp_path, capsys):
     import subprocess
 
@@ -856,7 +911,9 @@ def test_review_snapshot_bypasses_structured_cache_when_markdown_is_requested(
 
     assert calls == ["local_snapshot"]
     assert result.state.value == "no_findings"
-    assert output.read_text(encoding="utf-8") == "fresh review\n"
+    assert output.read_text(encoding="utf-8") == (
+        "<!-- pr-agent-review-snapshot -->\nfresh review\n"
+    )
     assert json.loads(capsys.readouterr().out)["state"] == "no_findings"
 
 
@@ -891,7 +948,9 @@ def test_review_snapshot_materializes_requested_clean_markdown(cfg, monkeypatch,
     ])
 
     assert result.state.value == "no_findings"
-    assert output.read_text(encoding="utf-8") == "## PR Review\n\nNo findings.\n"
+    assert output.read_text(encoding="utf-8") == (
+        "<!-- pr-agent-review-snapshot -->\n## PR Review\n\nNo findings.\n"
+    )
     assert json.loads(capsys.readouterr().out)["state"] == "no_findings"
 
 
@@ -910,8 +969,8 @@ def test_worktree_snapshot_excludes_requested_output_artifacts(cfg, monkeypatch,
     subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
     changed.write_text("value = 2\n", encoding="utf-8")
-    output = tmp_path / "repeat-review.md"
-    result_path = tmp_path / "repeat-result.json"
+    output = repo / "repeat-review.md"
+    result_path = repo / "repeat-result.json"
     monkeypatch.chdir(repo)
     calls = []
 
@@ -937,7 +996,12 @@ def test_worktree_snapshot_excludes_requested_output_artifacts(cfg, monkeypatch,
 
     assert calls == ["local_snapshot", "local_snapshot"]
     assert first.state.value == second.state.value == "no_findings"
-    assert output.read_text(encoding="utf-8") == "fresh review\n"
+    assert output.read_text(encoding="utf-8") == (
+        "<!-- pr-agent-review-snapshot -->\nfresh review\n"
+    )
+    assert json.loads(result_path.read_text(encoding="utf-8"))["artifact_type"] == (
+        "pr-agent-review-snapshot"
+    )
     assert json.loads(result_path.read_text(encoding="utf-8"))["state"] == "no_findings"
 
 

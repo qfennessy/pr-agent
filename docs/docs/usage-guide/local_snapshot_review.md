@@ -61,7 +61,7 @@ An editor `afterSave` task can invoke the command with the saved repository-rela
 
 ```json
 {
-  "command": "python -m pr_agent.cli review-snapshot --event file-save --path ${relativeFile} --json-output .git/pr-agent/latest-save.json",
+  "command": "python -m pr_agent.cli review-snapshot --event file-save --path ${relativeFile} --json-output \"$(git rev-parse --git-path pr-agent/latest-save.json)\"",
   "runOn": "afterSave"
 }
 ```
@@ -78,8 +78,11 @@ python -m pr_agent.cli review-snapshot \
   --event worktree-idle \
   --base origin/main \
   --intent "${TASK_SUMMARY}" \
-  --json-output .git/pr-agent/agent-stop.json
+  --json-output "$(git rev-parse --git-path pr-agent/agent-stop.json)"
 ```
+
+Resolving the artifact path through Git works in both a primary checkout and a linked
+worktree, where `.git` is a pointer file rather than a directory.
 
 The callback should consume output only when `snapshot_id` equals
 `current_snapshot_id`. `stale`, `cancelled`, and `coverage_unavailable` are incomplete
