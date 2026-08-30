@@ -394,6 +394,8 @@ def test_deletion_only_auth_hunks_are_exact_evidence_for_every_role(role):
 
     assert hunk.added_lines == ()
     assert hunk.deleted_lines == (10, 11)
+    assert hunk.start_line == 10
+    assert hunk.end_line == hunk.start_line
     assert output["confidence"] >= 0.8
 
 

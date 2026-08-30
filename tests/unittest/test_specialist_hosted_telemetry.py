@@ -163,3 +163,32 @@ async def test_unavailable_specialist_batch_is_logged_without_provider_publicati
     assert logger.warning.call_count == 1
     assert not hasattr(provider, "publish_structured_review")
     assert not hasattr(provider, "publish_comment")
+
+
+@pytest.mark.asyncio
+async def test_specialist_telemetry_export_failure_remains_non_blocking():
+    provider = _ReadOnlyProvider("head-1")
+    reviewer = _reviewer(provider)
+    batch = _batch()
+    pipeline = SimpleNamespace(allowed_change_labels=("feature",))
+    logger = MagicMock()
+    logger.info.side_effect = RuntimeError("telemetry backend unavailable")
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.load_specialist_pipeline_config", return_value=pipeline),
+        patch("pr_agent.tools.pr_reviewer.get_specialist_snapshot_context", return_value=None),
+        patch("pr_agent.tools.pr_reviewer.build_specialist_input", return_value=SimpleNamespace()),
+        patch(
+            "pr_agent.tools.pr_reviewer.run_shadow_specialists",
+            new_callable=AsyncMock,
+            return_value=batch,
+        ),
+        patch("pr_agent.tools.pr_reviewer.get_logger", return_value=logger),
+    ):
+        await reviewer._run_shadow_specialists_once()
+
+    assert reviewer.specialist_shadow_result is batch
+    logger.warning.assert_called_once_with(
+        "Specialist shadow batch failed; continuing the ordinary review",
+        artifact={"error_class": "RuntimeError"},
+    )

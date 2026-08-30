@@ -20,7 +20,11 @@ from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_request_context import AIModelRoute
-from pr_agent.algo.git_patch_processing import RE_HUNK_HEADER, iter_git_patch_lines
+from pr_agent.algo.git_patch_processing import (
+    RE_HUNK_HEADER,
+    iter_git_patch_lines,
+    strip_git_line_ending,
+)
 from pr_agent.algo.pr_processing import retry_with_fallback_models
 from pr_agent.algo.review_snapshot import ReviewSnapshot
 from pr_agent.algo.run_details import get_run_details, record_specialist_result, specialist_runs_to_dict
@@ -672,7 +676,7 @@ def _parse_hunks(path: str, patch: str) -> tuple[SpecialistHunk, ...]:
                 valid = False
         if not valid or consumed_old != old_count or consumed_new != new_count:
             return
-        end_line = new_start_line + new_count - 1
+        end_line = max(new_start_line, new_start_line + new_count - 1)
         hunk_hash = _sha256(f"{path}\n{current_header}\n{patch_text}")
         hunks.append(
             SpecialistHunk(
@@ -691,10 +695,10 @@ def _parse_hunks(path: str, patch: str) -> tuple[SpecialistHunk, ...]:
             finish()
             current_header = None
             current_lines = []
-            match = RE_HUNK_HEADER.match(line.rstrip("\r\n"))
+            match = RE_HUNK_HEADER.match(strip_git_line_ending(line))
             if match is None:
                 continue
-            current_header = line.rstrip("\r\n")
+            current_header = strip_git_line_ending(line)
             current_lines = [line]
             old_start_line = int(match.group(1))
             old_count = int(match.group(2) or "1")
