@@ -495,6 +495,22 @@ def test_verified_identity_survives_rewording_and_file_symbol_renames():
     assert "model-invented" not in before
 
 
+def test_verified_identity_normalizes_adversarial_escaped_string_literals_in_linear_time():
+    diff_file = _diff_file()
+    diff_file.patch = '@@ -10,1 +12,1 @@\n+return "' + ("\\a" * 100_000)
+    candidate = _candidate(context_files=["src/caller.py"])
+
+    identity = _verified_identity_for(
+        diff_file,
+        candidate,
+        'def caller(): return "' + ("\\a" * 100_000),
+        "The unterminated literal must not cause pathological identity processing.",
+    )
+
+    assert identity[0].startswith("sha256:")
+    assert identity[1].startswith("sha256:")
+
+
 def test_distinct_changed_operations_do_not_collide_with_the_same_proof_shape():
     plus_diff = _diff_file()
     plus_diff.patch = "@@ -10,1 +12,1 @@\n+return service(value) + 1"

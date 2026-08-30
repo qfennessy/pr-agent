@@ -232,7 +232,6 @@ def _candidate_key(candidate: dict) -> tuple:
 
 _IDENTIFIER_TOKEN = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
 _NUMBER_TOKEN = re.compile(r"\b(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?)\b")
-_STRING_TOKEN = re.compile(r"(['\"])(?:\\.|(?!\1).)*\1")
 _STRUCTURAL_KEYWORDS = frozenset({
     "and", "async", "await", "break", "case", "catch", "class", "continue", "def", "do",
     "else", "except", "false", "finally", "for", "foreach", "function", "if", "in", "is",
@@ -241,9 +240,35 @@ _STRUCTURAL_KEYWORDS = frozenset({
 })
 
 
+def _replace_string_literals(value: str) -> str:
+    """Replace quoted content in linear time without parsing repository code as a language."""
+    shaped = []
+    quote = None
+    escaped = False
+    for character in str(value or ""):
+        if quote is None:
+            if character in {"'", '"'}:
+                shaped.append("<literal>")
+                quote = character
+            else:
+                shaped.append(character)
+            continue
+        if character in {"\n", "\r"}:
+            quote = None
+            escaped = False
+            shaped.append(character)
+        elif escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == quote:
+            quote = None
+    return "".join(shaped)
+
+
 def _normalized_evidence_shape(content: str) -> str:
     """Normalize names, literals, paths, whitespace, and line numbers while preserving control flow."""
-    shaped = _STRING_TOKEN.sub("<literal>", str(content or ""))
+    shaped = _replace_string_literals(content)
     shaped = _NUMBER_TOKEN.sub("<number>", shaped)
     shaped = _IDENTIFIER_TOKEN.sub(
         lambda match: match.group(0).casefold()
