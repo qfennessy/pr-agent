@@ -780,7 +780,48 @@ class PRReviewer:
                 diff_files,
                 sensitive_globs,
                 budgets.max_candidates,
+                max_sensitive_candidates=max(
+                    0, int(config.get("candidate_verification_max_sensitive_candidates", 6))
+                ),
             )
+            sensitive_candidates = [
+                candidate for candidate in candidates if candidate.get("sensitive_path")
+            ]
+            sensitive_rejections = [
+                rejection for rejection in candidate_rejections
+                if rejection.get("sensitive_path")
+            ]
+            sensitive_overflow = next((
+                rejection for rejection in sensitive_rejections
+                if rejection.get("reason") == "sensitive_audit_budget_exhausted"
+            ), {})
+            sensitive_invalid_count = sum(
+                1 for rejection in sensitive_rejections
+                if rejection.get("reason") != "sensitive_audit_budget_exhausted"
+            )
+            sensitive_selected_count = int(
+                sensitive_overflow.get(
+                    "selected_count", len(sensitive_candidates) + sensitive_invalid_count
+                )
+            )
+            sensitive_omitted_count = int(sensitive_overflow.get("omitted_count", 0))
+            sensitive_total_count = int(
+                sensitive_overflow.get(
+                    "total_count", sensitive_selected_count + sensitive_omitted_count
+                )
+            )
+            sensitive_coverage_incomplete = bool(sensitive_rejections)
+            artifact["sensitive_audit_coverage"] = {
+                "status": "incomplete" if sensitive_coverage_incomplete else "complete",
+                "budget": max(
+                    0, int(config.get("candidate_verification_max_sensitive_candidates", 6))
+                ),
+                "total_count": sensitive_total_count,
+                "selected_count": sensitive_selected_count,
+                "candidate_count": len(sensitive_candidates),
+                "omitted_count": sensitive_omitted_count,
+                "unavailable_count": sensitive_invalid_count,
+            }
             if consume_specialist_prioritization:
                 specialist_input = getattr(self, "specialist_shadow_input", None)
                 prioritization = validated_specialist_prioritization(
@@ -799,7 +840,13 @@ class PRReviewer:
                 "verified_count": 0,
             })
             if not candidates:
-                artifact.update({"status": "no_candidates", "publication_safe": True})
+                if sensitive_coverage_incomplete:
+                    artifact.update({
+                        "status": "sensitive_audit_coverage_incomplete",
+                        "publication_safe": False,
+                    })
+                else:
+                    artifact.update({"status": "no_candidates", "publication_safe": True})
                 return
 
             model = str(
@@ -970,7 +1017,8 @@ class PRReviewer:
                 for decision in decisions
             )
             verification_status = "partial" if (
-                rejected_verified_claim
+                sensitive_coverage_incomplete
+                or rejected_verified_claim
                 or retrieval_artifact["budget_exhausted"]
                 or any(
                     request["status"] not in {"retrieved", "satisfied_by_changed_head"}
@@ -979,7 +1027,10 @@ class PRReviewer:
             ) else "complete"
             artifact.update({
                 "status": verification_status,
-                "publication_safe": verification_status == "complete" or bool(published_findings),
+                "publication_safe": (
+                    not sensitive_coverage_incomplete
+                    and (verification_status == "complete" or bool(published_findings))
+                ),
                 "decisions": decisions,
                 "verified_count": len(published_findings),
                 "verifier_verified_count": len(verified_findings),

@@ -257,6 +257,7 @@ candidate_verification_consume_specialist_prioritization = false
 candidate_verification_model = "" # Empty uses config.model
 candidate_verification_max_model_calls = 1
 candidate_verification_max_candidates = 3
+candidate_verification_max_sensitive_candidates = 6
 candidate_verification_max_files = 6
 candidate_verification_max_lines_per_file = 160
 candidate_verification_max_total_lines = 600
@@ -265,8 +266,11 @@ candidate_verification_timeout_seconds = 10
 candidate_verification_sensitive_path_globs = ["auth/**", "payments/**"]
 ```
 
-Configured sensitive paths create independent audit candidates, so the first model cannot suppress them. Repository and
-static-analysis text is passed to the verifier as untrusted data. Structured review publishers receive a
+Configured sensitive paths create independent audit candidates, so the first model cannot suppress them. The separate
+sensitive-candidate budget keeps that audit payload bounded. If it cannot cover every changed range, verification records
+the omitted count and fails publication closed instead of reporting a clean review. Earlier glob entries have higher
+overflow priority, and removed ranges are selected before added ranges within the same glob. Repository and static-analysis
+text is passed to the verifier as untrusted data. Structured review publishers receive a
 `candidate_verification` artifact containing candidate and decision counts, the verifier model and call count, retrieval
 statuses, budget usage, latency, and concise rejection or failure reasons.
 

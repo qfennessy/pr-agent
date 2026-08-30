@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import pr_agent.algo.candidate_verification as candidate_verification
 from pr_agent.algo.candidate_verification import (
     _REPO_FETCH_MAX_WORKERS,
     VerificationBudgets,
@@ -167,6 +168,140 @@ def test_prepare_candidates_escalates_every_sensitive_file_without_coordinator_c
     assert rejected == []
 
 
+@pytest.mark.parametrize("range_count", [3, 4])
+def test_sensitive_audit_budget_has_exact_boundary_and_bounded_overflow_record(range_count):
+    diff_file = _diff_file(
+        "auth/policy.py",
+        head_file="\n".join(f"line {line}" for line in range(1, 100)),
+    )
+    changed_lines = [10 * index for index in range(1, range_count + 1)]
+    diff_file.patch = "\n".join(
+        f"@@ -{line},0 +{line},1 @@\n+guard_{line}"
+        for line in changed_lines
+    )
+
+    candidates, rejected = prepare_candidates(
+        _review_data(), [diff_file], ["auth/**"], 1, max_sensitive_candidates=3
+    )
+
+    assert len(candidates) == 3
+    if range_count == 3:
+        assert rejected == []
+    else:
+        assert rejected == [{
+            "candidate_id": "sensitive-overflow",
+            "reason": "sensitive_audit_budget_exhausted",
+            "sensitive_path": True,
+            "total_count": 4,
+            "selected_count": 3,
+            "omitted_count": 1,
+        }]
+
+
+def test_sensitive_audit_budget_is_risk_ordered_and_independent_of_provider_file_order():
+    auth_file = _diff_file(
+        "auth/policy.py",
+        base_file="\n".join(f"base {line}" for line in range(1, 100)),
+        head_file="\n".join(f"head {line}" for line in range(1, 100)),
+    )
+    auth_file.patch = "@@ -20,1 +20,1 @@\n-old_guard\n+new_log"
+    payment_file = _diff_file(
+        "payments/charge.py",
+        head_file="\n".join(f"line {line}" for line in range(1, 100)),
+    )
+    payment_file.patch = "@@ -49,0 +50,1 @@\n+charge_without_limit"
+
+    expected = None
+    for diff_files in ([auth_file, payment_file], [payment_file, auth_file]):
+        candidates, rejected = prepare_candidates(
+            _review_data(),
+            diff_files,
+            ["payments/**", "auth/**"],
+            1,
+            max_sensitive_candidates=2,
+        )
+        selected = [
+            (candidate["candidate_id"], candidate["relevant_file"], candidate["side"], candidate["start_line"])
+            for candidate in candidates
+        ]
+        if expected is None:
+            expected = selected
+        assert selected == expected
+        assert rejected[-1]["omitted_count"] == 1
+
+    assert expected == [
+        ("sensitive-1", "payments/charge.py", "new", 50),
+        ("sensitive-2", "auth/policy.py", "old", 20),
+    ]
+
+
+def test_sensitive_audit_budget_stays_bounded_across_many_files_and_hunks():
+    diff_files = []
+    for file_index in range(20):
+        diff_file = _diff_file(f"auth/policy_{file_index:02d}.py")
+        diff_file.base_file_is_complete = False
+        diff_file.head_file_is_complete = False
+        diff_file.patch = "\n".join(
+            f"@@ -{line},1 +{line},1 @@\n-old_{file_index}_{line}\n+new_{file_index}_{line}"
+            for line in (10, 20, 30)
+        )
+        diff_files.append(diff_file)
+
+    outputs = []
+    for ordered_files in (diff_files, list(reversed(diff_files))):
+        candidates, rejected = prepare_candidates(
+            _review_data(),
+            ordered_files,
+            ["auth/**"],
+            1,
+            max_sensitive_candidates=5,
+        )
+        outputs.append([
+            (candidate["relevant_file"], candidate["side"], candidate["start_line"])
+            for candidate in candidates
+        ])
+        assert len(candidates) == 5
+        assert rejected == [{
+            "candidate_id": "sensitive-overflow",
+            "reason": "sensitive_audit_budget_exhausted",
+            "sensitive_path": True,
+            "total_count": 120,
+            "selected_count": 5,
+            "omitted_count": 115,
+        }]
+
+    assert outputs[0] == outputs[1]
+    assert all(side == "old" for _, side, _ in outputs[0])
+
+
+def test_sensitive_audit_budget_bounds_expensive_shape_work_for_generated_diffs():
+    diff_file = _diff_file("auth/generated_policy.py")
+    diff_file.base_file_is_complete = False
+    diff_file.head_file_is_complete = False
+    diff_file.patch = "\n".join(
+        f"@@ -{line},0 +{line},1 @@\n+generated_guard_{line}"
+        for line in range(10, 20_010, 10)
+    )
+    max_sensitive_candidates = 6
+
+    with patch(
+        "pr_agent.algo.candidate_verification._changed_anchor_shape",
+        wraps=candidate_verification._changed_anchor_shape,
+    ) as changed_anchor_shape:
+        candidates, rejected = prepare_candidates(
+            _review_data(),
+            [diff_file],
+            ["auth/**"],
+            1,
+            max_sensitive_candidates=max_sensitive_candidates,
+        )
+
+    assert len(candidates) == max_sensitive_candidates
+    assert rejected[-1]["total_count"] == 2_000
+    assert rejected[-1]["omitted_count"] == 1_994
+    assert changed_anchor_shape.call_count <= max_sensitive_candidates ** 2 + 2 * max_sensitive_candidates
+
+
 def test_sensitive_deletion_uses_a_trusted_old_side_anchor():
     diff_file = _diff_file("auth/policy.py", head_file="")
     diff_file.patch = "@@ -10,1 +10,0 @@\n-auth_check(request)"
@@ -243,8 +378,8 @@ async def test_sensitive_rename_to_safe_path_audits_both_sides_with_old_lineage(
 
     assert rejected == []
     assert [(candidate["side"], candidate["relevant_file"]) for candidate in candidates] == [
-        ("new", "src/policy.py"),
         ("old", "src/policy.py"),
+        ("new", "src/policy.py"),
     ]
     assert all(candidate["_trusted_lineage_key"] == "file:auth/policy.py" for candidate in candidates)
     assert any(
@@ -324,7 +459,7 @@ async def test_sensitive_path_covers_both_sides_and_separated_ranges_in_one_hunk
     )
 
     assert [(candidate["side"], candidate["start_line"]) for candidate in candidates] == [
-        ("new", 12), ("old", 10), ("old", 13)
+        ("old", 10), ("old", 13), ("new", 12)
     ]
     assert any(
         item["candidate_id"] == later_candidate["candidate_id"]
@@ -2088,6 +2223,7 @@ def _verification_settings():
     settings = SimpleNamespace(
         pr_reviewer=_SettingsDict(
             candidate_verification_max_candidates=3,
+            candidate_verification_max_sensitive_candidates=6,
             candidate_verification_max_files=3,
             candidate_verification_max_lines_per_file=30,
             candidate_verification_max_total_lines=60,
@@ -2269,6 +2405,85 @@ async def test_explicit_rejection_for_every_candidate_is_a_valid_clean_verificat
     assert reviewer.candidate_verification_artifact["publication_safe"] is True
     assert reviewer.candidate_verification_artifact["verified_count"] == 0
     assert reviewer._candidate_verification_blocks_publication() is False
+
+
+@pytest.mark.asyncio
+async def test_sensitive_audit_overflow_recovers_prompt_budget_and_fails_publication_closed():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    diff_file = _diff_file(
+        "auth/generated_policy.py",
+        head_file="\n".join(f"line {line}" for line in range(1, 2_000)),
+    )
+    diff_file.head_file_is_complete = False
+    diff_file.patch = "\n".join(
+        f"@@ -{line},0 +{line},1 @@\n+generated_guard_{line}"
+        for line in range(10, 1_010, 10)
+    )
+    provider.get_diff_files.return_value = [diff_file]
+    provider.get_repo_file_content.return_value = diff_file.head_file
+    provider.publish_structured_review = MagicMock()
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._parse_review_prediction = MagicMock(return_value=_review_data())
+    reviewer.patches_diff = diff_file.patch
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        "verification:\n"
+        "  decisions:\n"
+        "    - candidate_id: sensitive-1\n"
+        "      verdict: rejected\n"
+        "      reason: no defect found\n"
+        "    - candidate_id: sensitive-2\n"
+        "      verdict: rejected\n"
+        "      reason: no defect found",
+        None,
+    ))
+    settings = _verification_settings()
+    settings.pr_reviewer["candidate_verification_sensitive_path_globs"] = ["auth/**"]
+    settings.pr_reviewer["candidate_verification_max_sensitive_candidates"] = 2
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch(
+            "pr_agent.tools.pr_reviewer.TokenEncoder.get_token_encoder",
+            return_value=_CharacterEncoder(),
+        ),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=5_500),
+    ):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "partial"
+    assert artifact["publication_safe"] is False
+    assert artifact["candidate_count"] == 2
+    assert artifact["sensitive_audit_coverage"] == {
+        "status": "incomplete",
+        "budget": 2,
+        "total_count": 100,
+        "selected_count": 2,
+        "candidate_count": 2,
+        "omitted_count": 98,
+        "unavailable_count": 0,
+    }
+    assert artifact["candidate_rejections"][-1]["omitted_count"] == 98
+    assert artifact["prompt_budget"]["prompt_tokens"] <= artifact["prompt_budget"]["max_prompt_tokens"]
+    assert reviewer._candidate_verification_blocks_publication() is True
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.github_action_output") as action_output,
+        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2") as markdown,
+    ):
+        review = reviewer._prepare_pr_review()
+    assert review == ""
+    assert reviewer._should_publish_review_no_suggestions("No major issues detected") is False
+    reviewer._clear_stale_persistent_bugs_only_review()
+    provider.clear_persistent_review.assert_not_called()
+    action_output.assert_not_called()
+    markdown.assert_not_called()
+    structured = provider.publish_structured_review.call_args.args[0]
+    safe_artifact = structured["candidate_verification"]
+    assert safe_artifact["publication_safe"] is False
+    assert safe_artifact["sensitive_audit_coverage"]["omitted_count"] == 98
+    assert "generated_guard" not in json.dumps(safe_artifact)
 
 
 @pytest.mark.asyncio

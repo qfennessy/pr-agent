@@ -117,6 +117,9 @@ candidate_verification_consume_specialist_prioritization=false
 candidate_verification_model="" # Empty uses config.model.
 candidate_verification_max_model_calls=1 # The implementation performs at most one verifier call per review.
 candidate_verification_max_candidates=3
+# Sensitive audits bypass the coordinator candidate cap but remain bounded independently.
+# Earlier glob entries win deterministic overflow selection; removed ranges win within a glob.
+candidate_verification_max_sensitive_candidates=6
 candidate_verification_max_files=6
 candidate_verification_max_lines_per_file=160
 candidate_verification_max_total_lines=600

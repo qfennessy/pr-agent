@@ -9,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Callable, Mapping, Optional
+from typing import Callable, Iterable, Mapping, Optional
 
 from pr_agent.algo.git_patch_processing import (
     RE_HUNK_HEADER,
@@ -127,7 +127,10 @@ def telemetry_safe_artifact(artifact: dict) -> dict:
         "verifier_verified_count", "finding_limit_dropped", "rejected_count", "failure",
         "verifier_latency_seconds", "publication_safe",
     }
-    mapping_keys = {"specialist_prioritization", "prompt_budget", "verifier_usage", "verifier_cost"}
+    mapping_keys = {
+        "specialist_prioritization", "sensitive_audit_coverage", "prompt_budget",
+        "verifier_usage", "verifier_cost",
+    }
     for key in scalar_keys:
         if key in artifact and isinstance(artifact[key], (str, int, float, bool, type(None))):
             safe[key] = artifact[key]
@@ -142,7 +145,14 @@ def telemetry_safe_artifact(artifact: dict) -> dict:
     rejections = artifact.get("candidate_rejections")
     if isinstance(rejections, list):
         safe["candidate_rejections"] = [
-            {key: item[key] for key in ("candidate_id", "reason", "sensitive_path") if key in item}
+            {
+                key: item[key]
+                for key in (
+                    "candidate_id", "reason", "sensitive_path", "total_count",
+                    "selected_count", "omitted_count",
+                )
+                if key in item
+            }
             for item in rejections if isinstance(item, dict)
         ]
 
@@ -297,12 +307,13 @@ def _first_changed_anchor(patch: str) -> tuple[str, int, list[tuple[int, int]]]:
     return "new", _first_changed_line(patch), []
 
 
-def _sensitive_change_anchors(patch: str) -> list[tuple[str, int, int, list[tuple[int, int]]]]:
+def _sensitive_change_anchors(
+    patch: str,
+) -> Iterable[tuple[str, int, int, list[tuple[int, int]]]]:
     """Return one audit for every visible contiguous changed range on both sides."""
-    anchors = []
     for side, ranges in (("new", _added_line_ranges(patch)), ("old", _deleted_line_ranges(patch))):
-        anchors.extend((side, start, end, [(start, end)]) for start, end in ranges)
-    return anchors
+        for start, end in ranges:
+            yield side, start, end, [(start, end)]
 
 
 def _line_is_changed(line: int, ranges: list) -> bool:
@@ -436,8 +447,70 @@ def _trusted_side_line_count(diff_file, side: str) -> Optional[int]:
     return len(split_git_file_lines(str(content)))
 
 
+def _bounded_sensitive_audit_specs(
+    diff_files: list,
+    normalized_globs: list[str],
+    max_sensitive_candidates: Optional[int],
+) -> tuple[list[tuple], int]:
+    """Select sensitive ranges deterministically without constructing an unbounded payload."""
+    limit = None if max_sensitive_candidates is None else max(0, int(max_sensitive_candidates))
+    selected = []
+    total_count = 0
+    for diff_file in diff_files or []:
+        relevant_file = safe_repo_path(getattr(diff_file, "filename", ""))
+        old_file = safe_repo_path(getattr(diff_file, "old_filename", ""))
+        sensitive_paths = {path for path in (relevant_file, old_file) if path}
+        matched_glob_indexes = [
+            index
+            for index, pattern in enumerate(normalized_globs)
+            if any(fnmatch.fnmatch(path, pattern) for path in sensitive_paths)
+        ]
+        if not relevant_file or not matched_glob_indexes:
+            continue
+        patch = getattr(diff_file, "patch", "")
+        patch_digest = hashlib.sha256(str(patch or "").encode("utf-8")).hexdigest()
+        lineage_path = old_file or relevant_file
+        for anchor_index, (side, start_line, end_line, changed_line_ranges) in enumerate(
+            _sensitive_change_anchors(patch), start=1
+        ):
+            total_count += 1
+            # Earlier configured globs are the explicit risk order. A removed
+            # guard is prioritized before added code within the same risk tier.
+            # All remaining tie-breakers come from repository evidence, not
+            # provider iteration order.
+            priority = (
+                min(matched_glob_indexes),
+                0 if side == "old" else 1,
+                lineage_path.casefold(),
+                lineage_path,
+                start_line,
+                end_line,
+                relevant_file.casefold(),
+                relevant_file,
+                patch_digest,
+            )
+            if limit == 0:
+                continue
+            selected.append((
+                priority,
+                diff_file,
+                relevant_file,
+                patch,
+                anchor_index,
+                side,
+                start_line,
+                end_line,
+                changed_line_ranges,
+            ))
+            selected.sort(key=lambda item: item[0])
+            if limit is not None and len(selected) > limit:
+                selected.pop()
+    return selected, total_count
+
+
 def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: list,
-                       max_candidates: int) -> tuple[list[dict], list[dict]]:
+                       max_candidates: int,
+                       max_sensitive_candidates: Optional[int] = None) -> tuple[list[dict], list[dict]]:
     """Normalize model candidates, deduplicate them, and add deterministic sensitive-file audits."""
     raw_candidates = (review_data.get("review") or {}).get("key_issues_to_review") or []
     candidates = []
@@ -449,52 +522,57 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
         if (path := safe_repo_path(getattr(diff_file, "filename", "")))
     }
     normalized_globs = [pattern.strip() for pattern in sensitive_globs if isinstance(pattern, str) and pattern.strip()]
-    sensitive_count = 0
-    for diff_file in diff_files or []:
-        relevant_file = safe_repo_path(getattr(diff_file, "filename", ""))
-        old_file = safe_repo_path(getattr(diff_file, "old_filename", ""))
-        sensitive_paths = {path for path in (relevant_file, old_file) if path}
-        if not relevant_file or not any(
-            fnmatch.fnmatch(path, pattern)
-            for path in sensitive_paths
-            for pattern in normalized_globs
+    sensitive_specs, sensitive_total_count = _bounded_sensitive_audit_specs(
+        diff_files,
+        normalized_globs,
+        max_sensitive_candidates,
+    )
+    for sensitive_count, spec in enumerate(sensitive_specs, start=1):
+        (
+            _, diff_file, relevant_file, patch, anchor_index, side,
+            start_line, end_line, changed_line_ranges,
+        ) = spec
+        trusted_side_line_count = _trusted_side_line_count(diff_file, side)
+        if trusted_side_line_count is not None and not (
+            1 <= start_line <= end_line <= trusted_side_line_count
         ):
-            continue
-        patch = getattr(diff_file, "patch", "")
-        for anchor_index, (side, start_line, end_line, changed_line_ranges) in enumerate(
-            _sensitive_change_anchors(patch), start=1
-        ):
-            sensitive_count += 1
-            trusted_side_line_count = _trusted_side_line_count(diff_file, side)
-            if trusted_side_line_count is not None and not (
-                1 <= start_line <= end_line <= trusted_side_line_count
-            ):
-                rejected.append({
-                    "candidate_id": f"sensitive-{sensitive_count}",
-                    "reason": "invalid_candidate",
-                })
-                continue
-            candidates.append({
+            rejected.append({
                 "candidate_id": f"sensitive-{sensitive_count}",
-                "candidate_type": "sensitive_path_audit",
-                "relevant_file": relevant_file,
-                "issue_header": "Sensitive path audit",
-                "issue_content": "Independently inspect this configured sensitive path change for introduced defects.",
-                "trigger": "A configured sensitive path range changed.",
-                "impact": "A high-risk regression could otherwise be suppressed before verification.",
-                "root_cause": f"sensitive audit for {relevant_file} change {anchor_index}",
-                "start_line": start_line,
-                "end_line": end_line,
-                "side": side,
-                "context_files": [relevant_file],
-                "context_symbols": [],
+                "reason": "invalid_candidate",
                 "sensitive_path": True,
-                "_changed_line_ranges": changed_line_ranges,
-                "_changed_anchor_shape": _changed_anchor_shape(patch, start_line, end_line, side),
-                "_changed_anchor_ordinal": _changed_anchor_ordinal(patch, start_line, side),
-                "_trusted_lineage_key": _trusted_file_lineage(diff_file),
-                "_trusted_side_line_count": trusted_side_line_count,
             })
+            continue
+        candidates.append({
+            "candidate_id": f"sensitive-{sensitive_count}",
+            "candidate_type": "sensitive_path_audit",
+            "relevant_file": relevant_file,
+            "issue_header": "Sensitive path audit",
+            "issue_content": "Independently inspect this configured sensitive path change for introduced defects.",
+            "trigger": "A configured sensitive path range changed.",
+            "impact": "A high-risk regression could otherwise be suppressed before verification.",
+            "root_cause": f"sensitive audit for {relevant_file} change {anchor_index}",
+            "start_line": start_line,
+            "end_line": end_line,
+            "side": side,
+            "context_files": [relevant_file],
+            "context_symbols": [],
+            "sensitive_path": True,
+            "_changed_line_ranges": changed_line_ranges,
+            "_changed_anchor_shape": _changed_anchor_shape(patch, start_line, end_line, side),
+            "_changed_anchor_ordinal": _changed_anchor_ordinal(patch, start_line, side),
+            "_trusted_lineage_key": _trusted_file_lineage(diff_file),
+            "_trusted_side_line_count": trusted_side_line_count,
+        })
+    sensitive_omitted_count = sensitive_total_count - len(sensitive_specs)
+    if sensitive_omitted_count:
+        rejected.append({
+            "candidate_id": "sensitive-overflow",
+            "reason": "sensitive_audit_budget_exhausted",
+            "sensitive_path": True,
+            "total_count": sensitive_total_count,
+            "selected_count": len(sensitive_specs),
+            "omitted_count": sensitive_omitted_count,
+        })
 
     model_candidate_count = 0
     for index, raw_candidate in enumerate(raw_candidates):

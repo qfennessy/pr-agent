@@ -12,6 +12,7 @@ candidate_verification_consume_specialist_prioritization = false
 candidate_verification_model = ""
 candidate_verification_max_model_calls = 1
 candidate_verification_max_candidates = 3
+candidate_verification_max_sensitive_candidates = 6
 candidate_verification_max_files = 6
 candidate_verification_max_lines_per_file = 160
 candidate_verification_max_total_lines = 600
