@@ -39,7 +39,7 @@ class CoverageIssue:
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
 def _repository_identity(repository_root: str) -> str:
@@ -49,7 +49,7 @@ def _repository_identity(repository_root: str) -> str:
     one-way digest so snapshot ids do not disclose an absolute path when copied.
     """
 
-    digest = hashlib.sha256(repository_root.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(repository_root.encode("utf-8", errors="surrogateescape")).hexdigest()
     return f"sha256:{digest}"
 
 

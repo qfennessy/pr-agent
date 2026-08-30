@@ -190,6 +190,34 @@ def test_review_snapshot_rejects_external_symlink_into_git_metadata(monkeypatch,
     assert (repo / ".git" / "config").read_text(encoding="utf-8") == original_config
 
 
+@pytest.mark.parametrize("repository_target", ["changed.py", ".git/config"])
+def test_review_snapshot_rejects_external_hard_link_into_repository(
+    monkeypatch, tmp_path, capsys, repository_target
+):
+    import os
+    import subprocess
+
+    repo = tmp_path / "repo-hard-link-alias"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    source = repo / "changed.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    protected = repo / repository_target
+    original = protected.read_bytes()
+    alias = tmp_path / "hard-linked-output.json"
+    os.link(protected, alias)
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--json-output", str(alias), "--no-cache",
+        ])
+
+    assert "aliases an existing repository path" in capsys.readouterr().err
+    assert protected.read_bytes() == original
+
+
 def test_review_snapshot_reports_invalid_repository_settings(monkeypatch, tmp_path, capsys):
     import subprocess
 

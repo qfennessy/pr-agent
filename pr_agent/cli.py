@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -161,7 +162,7 @@ def _parse_deterministic_checks(values: list[str], parser: argparse.ArgumentPars
 
 
 def _emit_snapshot_result(result, output_path: str | None) -> None:
-    payload = json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    payload = json.dumps(result.to_dict(), ensure_ascii=True, sort_keys=True, indent=2) + "\n"
     print(payload, end="")
     if output_path:
         try:
@@ -177,7 +178,7 @@ def _snapshot_review_instructions(snapshot) -> str:
         "task_intent": snapshot.task_intent,
         "deterministic_checks": list(snapshot.deterministic_results),
     }
-    supplied = json.dumps(context, ensure_ascii=False, sort_keys=True, indent=2)
+    supplied = json.dumps(context, ensure_ascii=True, sort_keys=True, indent=2)
     existing = str(get_settings().get("pr_reviewer.extra_instructions", "") or "").strip()
     snapshot_context = (
         "Review this immutable local snapshot using the following caller-supplied context. "
@@ -226,7 +227,7 @@ def _snapshot_review_configuration_hash(skills_context: str | None = None) -> st
             for section, contents in all_settings.items()
         },
     }
-    payload = json.dumps(effective, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    payload = json.dumps(effective, ensure_ascii=True, sort_keys=True, default=str, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -292,6 +293,12 @@ def _reject_existing_repository_outputs(
         if (
             (resolved_worktree and not lexical_worktree)
             or (resolved_metadata and not lexical_metadata)
+            or (
+                exists
+                and not lexical_worktree
+                and not lexical_metadata
+                and _is_hard_linked_to_repository(lexical, repository_root, git_metadata_root)
+            )
         ):
             raise SnapshotCaptureError(
                 f"output destination aliases an existing repository path: {supplied_path}"
@@ -300,6 +307,35 @@ def _reject_existing_repository_outputs(
             raise SnapshotCaptureError(
                 f"output destination aliases an existing repository path: {supplied_path}"
             )
+
+
+def _is_hard_linked_to_repository(candidate: Path, *roots: Path) -> bool:
+    try:
+        candidate_stat = candidate.stat()
+    except OSError:
+        return False
+    if candidate_stat.st_nlink <= 1 or not stat.S_ISREG(candidate_stat.st_mode):
+        return False
+
+    visited_roots: set[Path] = set()
+    for root in roots:
+        resolved_root = root.resolve(strict=False)
+        if resolved_root in visited_roots:
+            continue
+        visited_roots.add(resolved_root)
+        for directory, _, filenames in os.walk(resolved_root, followlinks=False):
+            for filename in filenames:
+                repository_path = Path(directory) / filename
+                try:
+                    repository_stat = repository_path.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if (
+                    repository_stat.st_dev == candidate_stat.st_dev
+                    and repository_stat.st_ino == candidate_stat.st_ino
+                ):
+                    return True
+    return False
 
 
 def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):

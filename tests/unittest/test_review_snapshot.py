@@ -1,3 +1,4 @@
+import json
 import shlex
 import stat
 import subprocess
@@ -319,6 +320,38 @@ def test_skipped_content_fingerprint_invalidates_snapshot_identity(tmp_path):
 
     assert first.coverage_issues[0].fingerprint != second.coverage_issues[0].fingerprint
     assert first.snapshot_id != second.snapshot_id
+
+
+def test_outside_symlink_target_change_invalidates_snapshot_identity(tmp_path):
+    repo = _repo(tmp_path, "outside-symlink")
+    link = repo / "outside-link"
+    link.symlink_to(tmp_path / "first-target")
+    reviewer = LocalPairReview(str(repo))
+    first = reviewer.capture(event="worktree-idle")
+    link.unlink()
+    link.symlink_to(tmp_path / "second-target")
+    second = reviewer.capture(event="worktree-idle")
+
+    assert first.coverage_issues[0].reason == "outside_repository_root"
+    assert first.coverage_issues[0].fingerprint != second.coverage_issues[0].fingerprint
+    assert first.snapshot_id != second.snapshot_id
+
+
+def test_non_utf8_git_path_has_serializable_snapshot_identity(tmp_path):
+    decoded_name = b"changed-\xff.py".decode("utf-8", errors="surrogateescape")
+    snapshot = ReviewSnapshot(
+        event=ReviewEvent.WORKTREE_IDLE,
+        repository_root=str(tmp_path),
+        base_revision="a" * 40,
+        changed_paths=(decoded_name,),
+        diff="",
+        policy_version="v1",
+        created_at="2026-01-01T00:00:00+00:00",
+        coverage_issues=(CoverageIssue(path=decoded_name, reason="binary"),),
+    )
+
+    assert snapshot.changed_paths == (decoded_name,)
+    assert "\\udcff" in json.dumps(snapshot.to_dict(), ensure_ascii=True)
 
 
 def test_skipped_mode_change_invalidates_snapshot_identity(tmp_path):

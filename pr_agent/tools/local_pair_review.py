@@ -309,9 +309,7 @@ class LocalPairReview:
         coverage: list[CoverageIssue] = []
 
         def add_coverage(path: Optional[str], reason: str) -> None:
-            fingerprint = None
-            if path and reason != "outside_repository_root":
-                fingerprint = self._path_fingerprint(event, path, base_revision)
+            fingerprint = self._path_fingerprint(event, path, base_revision) if path else None
             coverage.append(CoverageIssue(path=path, reason=reason, fingerprint=fingerprint))
 
         def validate_path(path: str) -> Optional[str]:
@@ -477,7 +475,7 @@ class SnapshotCache:
         if result.state in unavailable_states:
             return
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        payload = json.dumps(result.to_dict(), ensure_ascii=True, sort_keys=True, indent=2) + "\n"
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.cache_dir, delete=False) as handle:
             handle.write(payload)
             temporary_path = Path(handle.name)
