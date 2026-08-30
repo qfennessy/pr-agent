@@ -529,20 +529,14 @@ class LocalPairReview:
         self,
         event: ReviewEvent,
         base_revision: str,
-        focus_path: Optional[str] = None,
+        paths: Sequence[str],
     ) -> Optional[set[str]]:
-        tracked_args = ["--literal-pathspecs", "ls-files", "-z", "--"]
-        if focus_path:
-            tracked_args.append(focus_path)
-        tracked = _run_git_bounded(
-            self.repository_root,
-            *tracked_args,
-            max_output_bytes=self.max_path_discovery_bytes,
-        )
-        if tracked is None:
-            return None
-        if not tracked:
+        if not paths:
             return set()
+        tracked = b"".join(
+            path.encode("utf-8", errors="surrogateescape") + b"\0"
+            for path in paths
+        )
         attribute_args = ["--literal-pathspecs", "check-attr"]
         if event is ReviewEvent.PRE_COMMIT:
             attribute_args.append("--cached")
@@ -577,6 +571,19 @@ class LocalPairReview:
                 if fields[index + 2].lower() not in {"unspecified", "unset"}
             )
         return filtered_paths
+
+    def _tracked_attribute_candidate_paths(
+        self, focus_path: Optional[str] = None
+    ) -> Optional[list[str]]:
+        args = ["--literal-pathspecs", "ls-files", "-z", "--"]
+        if focus_path:
+            args.append(focus_path)
+        output = _run_git_bounded(
+            self.repository_root,
+            *args,
+            max_output_bytes=self.max_path_discovery_bytes,
+        )
+        return None if output is None else _decode_z_paths(output)
 
     def _untracked_paths(self, focus_path: Optional[str] = None) -> Optional[list[str]]:
         args = [
@@ -689,26 +696,39 @@ class LocalPairReview:
             fingerprint = self._path_fingerprint(event, path, base_revision) if path else None
             coverage.append(CoverageIssue(path=path, reason=reason, fingerprint=fingerprint))
 
-        filtered_paths = self._tracked_filtered_paths(
-            event, base_revision, normalized_focus
-        )
-        discovery_overflow = filtered_paths is None
-        if filtered_paths is None:
-            add_coverage(None, "filtered_path_discovery_budget")
-            filtered_paths = set()
-
         tracked_groups = self._tracked_path_groups(
             event, base_revision, normalized_focus
         )
-        discovery_overflow = discovery_overflow or tracked_groups is None
+        discovery_overflow = tracked_groups is None
         if tracked_groups is None:
             add_coverage(None, "tracked_path_discovery_budget")
             tracked_groups = []
-        if event is ReviewEvent.PRE_COMMIT:
-            changed_group_paths = {
-                path for _, group in tracked_groups for path in group
-            }
-            filtered_paths.intersection_update(changed_group_paths)
+        changed_group_paths = tuple(
+            dict.fromkeys(path for _, group in tracked_groups for path in group)
+        )
+        attribute_candidate_paths = list(changed_group_paths)
+        if event is not ReviewEvent.PRE_COMMIT:
+            active_attribute_paths = self._tracked_attribute_candidate_paths(
+                normalized_focus
+            )
+            discovery_overflow = discovery_overflow or active_attribute_paths is None
+            if active_attribute_paths is None:
+                add_coverage(None, "filtered_path_discovery_budget")
+            else:
+                attribute_candidate_paths = list(
+                    dict.fromkeys((*active_attribute_paths, *changed_group_paths))
+                )
+        filtered_paths = self._tracked_filtered_paths(
+            event, base_revision, attribute_candidate_paths
+        )
+        discovery_overflow = discovery_overflow or filtered_paths is None
+        if filtered_paths is None:
+            if not any(
+                issue.reason == "filtered_path_discovery_budget"
+                for issue in coverage
+            ):
+                add_coverage(None, "filtered_path_discovery_budget")
+            filtered_paths = set()
         for filtered_path in sorted(filtered_paths):
             add_coverage(filtered_path, "content_filter_unsupported")
         untracked = (

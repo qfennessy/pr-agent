@@ -1248,6 +1248,52 @@ def test_review_snapshot_ignores_local_external_config_input(
     assert json.loads(capsys.readouterr().out)["state"] == "no_findings"
 
 
+def test_review_snapshot_ignores_external_symlink_to_worktree_config(
+    cfg, monkeypatch, tmp_path, capsys
+):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo-local-extra-alias"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    config_target = repo / "provider-secrets.toml"
+    config_target.write_text(
+        '[openai]\nkey = "aliased-secret-must-not-reach-model"\n',
+        encoding="utf-8",
+    )
+    config_alias = tmp_path / "external-config.toml"
+    config_alias.symlink_to(config_target)
+    monkeypatch.chdir(repo)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            review_input = get_settings().plain_diff.content
+            assert "aliased-secret-must-not-reach-model" not in review_input
+            assert "provider-secrets.toml" not in review_input
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    result = run(inargs=[
+        "--extra_config_url", str(config_alias), "review-snapshot",
+        "--event", "worktree-idle", "--no-cache",
+    ])
+
+    assert result.state.value == "no_findings"
+    assert json.loads(capsys.readouterr().out)["state"] == "no_findings"
+
+
 def test_review_snapshot_ignores_repository_settings_input(
     cfg, monkeypatch, tmp_path, capsys
 ):

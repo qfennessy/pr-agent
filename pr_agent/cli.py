@@ -572,7 +572,17 @@ def _output_artifact_exclusions(repository_root: Path, *paths: str | None) -> li
 
 def _extra_config_exclusions(repository_root: Path, source) -> list[str]:
     local_path = get_local_extra_config_path(source)
-    return _output_artifact_exclusions(repository_root, local_path)
+    if not local_path:
+        return []
+    try:
+        resolved_path = str(Path(local_path).resolve(strict=False))
+    except (OSError, RuntimeError) as exc:
+        raise SnapshotCaptureError(
+            "could not resolve the local extra configuration path"
+        ) from exc
+    return _output_artifact_exclusions(
+        repository_root, local_path, resolved_path
+    )
 
 
 def _snapshot_settings(keys: tuple[str, ...]) -> dict[str, object]:
@@ -851,9 +861,12 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         repository_root, markdown_output, json_output
     )
     artifact_exclusions.append(".pr_agent.toml")
-    artifact_exclusions.extend(
-        _extra_config_exclusions(repository_root, invocation_extra_config)
-    )
+    try:
+        artifact_exclusions.extend(
+            _extra_config_exclusions(repository_root, invocation_extra_config)
+        )
+    except SnapshotCaptureError as exc:
+        outer_parser.error(str(exc))
     skills_context = get_skills_context()
     repo_context_files = {}
 

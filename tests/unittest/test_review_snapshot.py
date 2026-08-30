@@ -547,6 +547,37 @@ def test_file_save_does_not_select_a_copy_by_its_unchanged_source(tmp_path):
     assert destination_snapshot.coverage_issues == ()
 
 
+def test_file_save_checks_copy_source_filter_from_base(tmp_path):
+    repo = _repo(tmp_path, "copy-source-base-filter")
+    source = repo / "encrypted.txt"
+    source.write_text("decoded secret\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text(
+        "encrypted.txt filter=crypt\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "encrypted.txt", ".gitattributes")
+    _git(repo, "commit", "-m", "add filtered source")
+    (repo / ".gitattributes").write_text("", encoding="utf-8")
+    destination = repo / "public.txt"
+    destination.write_bytes(source.read_bytes())
+    _git(repo, "add", "public.txt")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event="file-save", focus_path="public.txt"
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(
+        path="encrypted.txt",
+        reason="content_filter_unsupported",
+    ) in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="public.txt",
+        reason="rename_group_omitted",
+    ) in snapshot.coverage_issues
+
+
 def test_pre_commit_rejects_a_copy_from_an_unchanged_excluded_source(tmp_path):
     repo = _repo(tmp_path)
     source = repo / "secrets.txt"
