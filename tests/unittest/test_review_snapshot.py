@@ -245,6 +245,20 @@ def test_snapshot_diff_disables_forced_git_color(tmp_path):
     assert {file.filename for file in parsed} == {"tracked.py", "untracked.py"}
 
 
+def test_snapshot_diff_forces_standard_prefixes(tmp_path):
+    repo = _repo(tmp_path, "standard-prefixes")
+    _git(repo, "config", "diff.mnemonicPrefix", "true")
+    (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+    (repo / "untracked.py").write_text("new = True\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    parsed = parse_plain_diff(snapshot.diff)
+    assert {file.filename for file in parsed} == {"tracked.py", "untracked.py"}
+    assert "w/tracked.py" not in snapshot.diff
+    assert "2/untracked.py" not in snapshot.diff
+
+
 def test_snapshot_diff_neutralizes_configured_clean_and_process_filters(tmp_path, monkeypatch):
     repo = _repo(tmp_path, "neutral-filters")
     reviewer = LocalPairReview(str(repo))

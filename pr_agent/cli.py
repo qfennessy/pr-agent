@@ -641,6 +641,7 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
 def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     parser = _snapshot_parser()
     snapshot_args = parser.parse_args(args.rest)
+    configuration_baseline = _snapshot_all_settings()
     if args.output and snapshot_args.output:
         parser.error("--output may be provided before or after review-snapshot, not both")
     if args.json_output and snapshot_args.json_output:
@@ -740,6 +741,12 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     )
 
     def current_configuration_hash(base_revision: str) -> str:
+        # Rebuild all file-backed layers so edits and removed keys in either the
+        # shared source or .pr_agent.toml cannot inherit the materialized values
+        # from the start of the review. The invocation baseline retains CLI/env
+        # precedence, including the original extra-config source.
+        _restore_all_settings(configuration_baseline)
+        apply_local_repo_settings(repository_root)
         return _snapshot_review_configuration_hash(
             get_skills_context(),
             _load_snapshot_repo_context(repository_root, base_revision),

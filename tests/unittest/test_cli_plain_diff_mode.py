@@ -1083,6 +1083,58 @@ def test_review_snapshot_returns_stale_when_skills_change_during_review(
     assert json.loads(capsys.readouterr().out)["state"] == "stale"
 
 
+@pytest.mark.parametrize("config_source", ["repository", "external"])
+def test_review_snapshot_returns_stale_when_file_backed_settings_change(
+    cfg, monkeypatch, tmp_path, capsys, config_source
+):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / f"repo-changing-{config_source}-config"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    config_path = (
+        repo / ".pr_agent.toml"
+        if config_source == "repository"
+        else tmp_path / "shared-changing.toml"
+    )
+    config_path.write_text(
+        '[pr_reviewer]\nextra_instructions = "before"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(repo)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            config_path.write_text(
+                '[pr_reviewer]\nextra_instructions = "after"\n',
+                encoding="utf-8",
+            )
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}),
+                encoding="utf-8",
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    inargs = ["review-snapshot", "--event", "worktree-idle", "--no-cache"]
+    if config_source == "external":
+        inargs = ["--extra_config_url", str(config_path), *inargs]
+    result = run(inargs=inargs)
+
+    assert result.state.value == "stale"
+    assert result.review is None
+    assert json.loads(capsys.readouterr().out)["state"] == "stale"
+
+
 def test_review_snapshot_restores_snapshot_only_instructions(cfg, monkeypatch, tmp_path, capsys):
     import json
     import subprocess

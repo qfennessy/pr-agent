@@ -353,7 +353,8 @@ class LocalPairReview:
         args = [
             *self._diff_filter_overrides(),
             "-c", "core.quotePath=false",
-            "--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames",
+            "--literal-pathspecs", "diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/",
+            "--no-ext-diff", "--no-textconv", "--find-renames",
         ]
         if event is ReviewEvent.PRE_COMMIT:
             args.append("--cached")
@@ -378,7 +379,8 @@ class LocalPairReview:
         args = (
             *self._diff_filter_overrides(),
             "-c", "core.quotePath=false",
-            "diff", "--no-color", "--no-index", "--no-ext-diff", "--no-textconv",
+            "diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--no-index",
+            "--no-ext-diff", "--no-textconv",
             "--", "/dev/null", path,
         )
         output = (
