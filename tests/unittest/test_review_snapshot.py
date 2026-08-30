@@ -499,6 +499,10 @@ def test_default_secret_paths_never_enter_snapshot_input(tmp_path):
     (repo / ".aws" / "credentials").write_text(
         "aws_secret_access_key = must-not-reach-model\n", encoding="utf-8"
     )
+    (repo / ".kube").mkdir()
+    (repo / ".kube" / "config").write_text(
+        "token: must-not-reach-model\n", encoding="utf-8"
+    )
     (repo / "visible.py").write_text("value = 1\n", encoding="utf-8")
 
     snapshot = LocalPairReview(str(repo), excluded_paths=[]).capture(event="worktree-idle")
@@ -509,11 +513,13 @@ def test_default_secret_paths_never_enter_snapshot_input(tmp_path):
     assert "OPENSSH PRIVATE KEY" not in snapshot.diff
     assert "password" not in snapshot.diff
     assert "aws_secret_access_key" not in snapshot.diff
+    assert "token: must-not-reach-model" not in snapshot.diff
     assert CoverageIssue(path="credentials.json", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="signing.pem", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="id_ecdsa_sk", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path=".git-credentials", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path=".aws/credentials", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path=".kube/config", reason="excluded") in snapshot.coverage_issues
 
 
 def test_file_save_rejects_a_focused_rename_with_an_excluded_source(tmp_path):

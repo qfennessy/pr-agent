@@ -264,7 +264,7 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, mo
         patch = handle_patch_deletions(patch, original_file_content_str,
                                        new_file_content_str, file.filename, file.edit_type)
         if patch is None:
-            if file.filename not in deleted_files_list:
+            if file.filename not in file_dict and file.filename not in deleted_files_list:
                 deleted_files_list.append(file.filename)
             continue
 
@@ -275,14 +275,28 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, mo
         # if file.ai_file_summary and get_settings().config.get('config.is_auto_command', False):
         #     patch = add_ai_summary_top_patch(file, patch)
 
-        new_patch_tokens = token_handler.count_tokens(patch)
-        file_dict[file.filename] = {'patch': patch, 'tokens': new_patch_tokens, 'edit_type': file.edit_type}
+        existing = file_dict.get(file.filename)
+        if existing is not None:
+            combined_patch = f"{existing['patch'].rstrip()}\n\n{patch.lstrip()}"
+            existing["patch"] = combined_patch
+            existing["tokens"] = token_handler.count_tokens(combined_patch)
+            if existing["edit_type"] != file.edit_type:
+                existing["edit_type"] = EDIT_TYPE.MODIFIED
+        else:
+            new_patch_tokens = token_handler.count_tokens(patch)
+            file_dict[file.filename] = {
+                'patch': patch,
+                'tokens': new_patch_tokens,
+                'edit_type': file.edit_type,
+            }
+        if file.filename in deleted_files_list:
+            deleted_files_list.remove(file.filename)
 
     max_tokens_model = get_max_tokens(model)
 
     # first iteration
     files_in_patches_list = []
-    remaining_files_list =  [file.filename for file in sorted_files]
+    remaining_files_list = list(file_dict)
     patches_list =[]
     total_tokens_list = []
     total_tokens, patches, remaining_files_list, files_in_patch_list = generate_full_patch(convert_hunks_to_line_numbers, file_dict,

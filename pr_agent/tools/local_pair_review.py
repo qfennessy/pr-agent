@@ -55,6 +55,8 @@ _DEFAULT_SECRET_EXCLUSIONS = (
     "**/.git-credentials",
     ".aws/credentials",
     "**/.aws/credentials",
+    ".kube/config",
+    "**/.kube/config",
     "id_rsa",
     "**/id_rsa",
     "id_ed25519",
