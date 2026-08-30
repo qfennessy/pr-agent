@@ -489,6 +489,9 @@ def test_excluding_either_side_rejects_an_entire_rename(tmp_path):
 
 def test_default_secret_paths_never_enter_snapshot_input(tmp_path):
     repo = _repo(tmp_path, "default-secret-exclusions")
+    (repo / ".secrets.toml").write_text(
+        '[openai]\nkey = "provider-secret"\n', encoding="utf-8"
+    )
     (repo / "credentials.json").write_text('{"token":"secret"}\n', encoding="utf-8")
     (repo / "signing.pem").write_text("PRIVATE KEY\n", encoding="utf-8")
     (repo / "id_ecdsa_sk").write_text("OPENSSH PRIVATE KEY\n", encoding="utf-8")
@@ -514,6 +517,8 @@ def test_default_secret_paths_never_enter_snapshot_input(tmp_path):
     assert "password" not in snapshot.diff
     assert "aws_secret_access_key" not in snapshot.diff
     assert "token: must-not-reach-model" not in snapshot.diff
+    assert "provider-secret" not in snapshot.diff
+    assert CoverageIssue(path=".secrets.toml", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="credentials.json", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="signing.pem", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="id_ecdsa_sk", reason="excluded") in snapshot.coverage_issues

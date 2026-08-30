@@ -585,6 +585,19 @@ def _extra_config_exclusions(repository_root: Path, source) -> list[str]:
     )
 
 
+def _repository_settings_exclusions(repository_root: Path) -> list[str]:
+    settings_path = repository_root / ".pr_agent.toml"
+    try:
+        resolved_path = str(settings_path.resolve(strict=False))
+    except (OSError, RuntimeError) as exc:
+        raise SnapshotCaptureError(
+            "could not resolve the repository settings path"
+        ) from exc
+    return _output_artifact_exclusions(
+        repository_root, str(settings_path), resolved_path
+    )
+
+
 def _snapshot_settings(keys: tuple[str, ...]) -> dict[str, object]:
     settings = get_settings()
     snapshot = {}
@@ -863,8 +876,10 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     artifact_exclusions = _output_artifact_exclusions(
         repository_root, markdown_output, json_output
     )
-    artifact_exclusions.append(".pr_agent.toml")
     try:
+        artifact_exclusions.extend(
+            _repository_settings_exclusions(repository_root)
+        )
         artifact_exclusions.extend(
             _extra_config_exclusions(repository_root, invocation_extra_config)
         )

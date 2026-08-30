@@ -33,6 +33,8 @@ from pr_agent.git_providers.plain_diff_provider import parse_plain_diff
 from pr_agent.log import get_logger
 
 _DEFAULT_SECRET_EXCLUSIONS = (
+    ".secrets.toml",
+    "**/.secrets.toml",
     ".env",
     ".env.*",
     "**/.env",
