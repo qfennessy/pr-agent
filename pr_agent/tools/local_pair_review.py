@@ -404,7 +404,16 @@ class LocalPairReview:
         ]
         if event is ReviewEvent.PRE_COMMIT:
             args.append("--cached")
-        args.extend(["--name-status", "-z", "--find-renames", base_revision, "--"])
+        args.extend(
+            [
+                "--name-status",
+                "-z",
+                "--find-copies",
+                "--find-copies-harder",
+                base_revision,
+                "--",
+            ]
+        )
         output = _run_git_bounded(
             self.repository_root,
             *args,

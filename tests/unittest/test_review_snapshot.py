@@ -457,6 +457,26 @@ def test_file_save_rejects_a_focused_rename_with_an_excluded_source(tmp_path):
     assert CoverageIssue(path="allowed.py", reason="rename_group_omitted") in snapshot.coverage_issues
 
 
+def test_pre_commit_rejects_a_copy_from_an_unchanged_excluded_source(tmp_path):
+    repo = _repo(tmp_path)
+    source = repo / "secrets.txt"
+    source.write_text("production secret\n", encoding="utf-8")
+    _git(repo, "add", "secrets.txt")
+    _git(repo, "commit", "-m", "add excluded source")
+    destination = repo / "public.txt"
+    destination.write_bytes(source.read_bytes())
+    _git(repo, "add", "public.txt")
+
+    snapshot = LocalPairReview(str(repo), excluded_paths=["secrets.txt"]).capture(
+        event="pre-commit"
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(path="secrets.txt", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="public.txt", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
 def test_captured_filenames_are_literal_git_pathspecs(tmp_path):
     repo = _repo(tmp_path)
     magic = ":(glob)*.py"
