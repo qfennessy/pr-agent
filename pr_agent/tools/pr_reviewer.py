@@ -61,7 +61,7 @@ from pr_agent.algo.utils import (ModelType, PRReviewHeader, PRReviewIdentity,
                                  show_run_details)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider_with_context
-from pr_agent.git_providers.git_provider import (IncrementalPR,
+from pr_agent.git_providers.git_provider import (GitProvider, IncrementalPR,
                                                  get_main_pr_language)
 from pr_agent.log import get_logger
 from pr_agent.servers.help import HelpMessage
@@ -72,6 +72,7 @@ MAX_REVIEW_COVERAGE_FILES = 50
 _SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
 _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _VALID_REVIEW_PROFILES = {"full", "bugs_only"}
+_ROUTING_INVENTORY_UNSET = object()
 _BUG_FINDING_HEADERS = {
     "bug": "Bug",
     "security": "Security vulnerability",
@@ -234,12 +235,22 @@ class PRReviewer:
                 can_run = self._can_run_incremental_review()
                 # If the gate disabled incremental (e.g., commits_range is None), fall through to full review.
                 if not can_run and self.incremental.is_incremental:
+                    scope_empty = self.git_provider.is_incremental_scope_empty()
+                    if scope_empty is True:
+                        self._prepare_known_empty_route()
+                    else:
+                        # A missing commit marker is not authoritative emptiness after
+                        # rebases or force-pushes. Preserve real/unknown routing evidence
+                        # before the threshold/no-new-commit early return.
+                        self._prepare_review_route()
+                    if getattr(self, "_review_shadow_only", False):
+                        get_settings().data = {"artifact": ""}
                     return None
                 if (
                     self.incremental.is_incremental
                     and self.git_provider.is_incremental_scope_empty() is True
                 ):
-                    self._prepare_known_empty_incremental_route()
+                    self._prepare_known_empty_route()
                     get_logger().info(
                         f"Incremental review is enabled for {self.pr_url} but there are no new files"
                     )
@@ -268,6 +279,10 @@ class PRReviewer:
                 route_prepared = True
 
             if not self.git_provider.get_files():
+                if not route_prepared:
+                    self._prepare_route_after_empty_review_inventory()
+                if getattr(self, "_review_shadow_only", False):
+                    get_settings().data = {"artifact": ""}
                 get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
                 return None
 
@@ -410,13 +425,17 @@ class PRReviewer:
             self.review_routing_configuration = configuration
         return configuration
 
-    def _prepare_review_route(self) -> ReviewRouteDecision:
+    def _prepare_review_route(
+        self,
+        *,
+        raw_inventory: Any = _ROUTING_INVENTORY_UNSET,
+    ) -> ReviewRouteDecision:
         """Select and apply deterministic depth before any review model call."""
 
         configuration = self._routing_configuration()
         if configuration.enabled:
             try:
-                files = self._changed_files_for_routing()
+                files = self._changed_files_for_routing(raw_inventory=raw_inventory)
             except Exception as exc:
                 # Provider metadata is routing evidence, not a reason to abort the
                 # review. An empty immutable snapshot records the missing input and
@@ -443,15 +462,47 @@ class PRReviewer:
         self._apply_review_route(decision)
         return decision
 
-    def _prepare_known_empty_incremental_route(self) -> ReviewRouteDecision:
-        """Apply routing to an authoritative empty scope without provider lookups."""
+    def _prepare_route_after_empty_review_inventory(self) -> ReviewRouteDecision:
+        """Route a filtered-empty full PR without losing provider safety evidence."""
 
         configuration = self._routing_configuration()
+        routing_getter = getattr(type(self.git_provider), "get_files_for_routing", None)
+        has_richer_inventory = (
+            configuration.enabled
+            and callable(routing_getter)
+            and routing_getter is not GitProvider.get_files_for_routing
+        )
+        if not has_richer_inventory:
+            # With routing disabled, preserve legacy behavior and make no metadata
+            # calls. With the base capability, get_files() is the routing inventory
+            # and its empty result is already authoritative.
+            return self._prepare_known_empty_route()
+
+        try:
+            raw_inventory = routing_getter(self.git_provider)
+        except Exception as exc:
+            get_logger().warning(
+                "Review-depth routing could not read the unfiltered changed-file inventory",
+                artifact={"error_class": type(exc).__name__},
+            )
+            # Preserve an explicit evidence gap and any available detailed inventory.
+            return self._prepare_review_route(raw_inventory=None)
+        if raw_inventory is None:
+            return self._prepare_review_route(raw_inventory=None)
+        if not raw_inventory:
+            return self._prepare_known_empty_route()
+        return self._prepare_review_route(raw_inventory=raw_inventory)
+
+    def _prepare_known_empty_route(self) -> ReviewRouteDecision:
+        """Apply routing to an authoritative empty scope without file lookups."""
+
+        configuration = self._routing_configuration()
+        labels = self._labels_for_routing() if configuration.enabled else None
         request = ReviewRouteRequest(
             files=(),
             requested_depth=configuration.requested_depth,
             review_profile=self._review_profile(),
-            labels=() if configuration.enabled else None,
+            labels=labels,
             changed_files_complete=True,
         )
         self.review_route_request = request
@@ -459,7 +510,11 @@ class PRReviewer:
         self._apply_review_route(decision)
         return decision
 
-    def _changed_files_for_routing(self) -> tuple[ChangedFile, ...]:
+    def _changed_files_for_routing(
+        self,
+        *,
+        raw_inventory: Any = _ROUTING_INVENTORY_UNSET,
+    ) -> tuple[ChangedFile, ...]:
         """Keep ignored or unsupported files visible to the safety router.
 
         The ordinary review diff is intentionally filtered for context quality. Risk
@@ -475,11 +530,12 @@ class PRReviewer:
         # containers while loading diffs; retaining an immutable tuple here keeps
         # authoritative paths stable without provider-specific branching.
         try:
-            routing_getter = getattr(type(self.git_provider), "get_files_for_routing", None)
-            if callable(routing_getter):
-                raw_inventory = routing_getter(self.git_provider)
-            else:
-                raw_inventory = self.git_provider.get_files()
+            if raw_inventory is _ROUTING_INVENTORY_UNSET:
+                routing_getter = getattr(type(self.git_provider), "get_files_for_routing", None)
+                if callable(routing_getter):
+                    raw_inventory = routing_getter(self.git_provider)
+                else:
+                    raw_inventory = self.git_provider.get_files()
             raw_files = (
                 tuple(self._provider_changed_file_for_routing(file) for file in raw_inventory)
                 if raw_inventory is not None

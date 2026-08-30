@@ -2968,18 +2968,22 @@ async def test_azure_filtered_sensitive_incremental_scope_routes_deep_before_sto
     reviewer.review_profile = "full"
     reviewer.vars = {}
     reviewer._can_run_incremental_review = MagicMock(return_value=True)
-    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
-        "name": "authorization",
-        "path_patterns": ["**/auth/**"],
-        "labels": [],
-    },))
+    reviewer.review_routing_configuration = _routing_configuration(
+        sensitive_categories=({
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },),
+        shadow_only=True,
+    )
     reviewer._specialist_escalation_consumption_enabled = MagicMock(return_value=True)
     reviewer._run_guarded_specialist_escalation = AsyncMock()
 
     settings = get_settings()
-    original_publish_output = settings.config.publish_output
-    settings.set("config.publish_output", False)
+    snapshot = snapshot_settings(("config.publish_output", "data"))
     try:
+        settings.config.publish_output = False
+        settings.data = {"artifact": "STALE REVIEW"}
         with (
             patch(
                 "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
@@ -2991,11 +2995,14 @@ async def test_azure_filtered_sensitive_incremental_scope_routes_deep_before_sto
             ) as run_main_model,
         ):
             await reviewer.run()
+            artifact = settings.data["artifact"]
     finally:
-        settings.set("config.publish_output", original_publish_output)
+        restore_settings(snapshot)
 
     assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
     assert reviewer.review_route_decision.matched_sensitive_categories == ("authorization",)
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
     assert provider.is_incremental_scope_empty() is False
     provider.get_diff_files.assert_called_once_with()
     provider._get_files_full.assert_not_called()
@@ -3027,7 +3034,12 @@ async def test_empty_incremental_shadow_route_suppresses_optional_skip_publicati
     provider.get_files = MagicMock()
     provider.get_diff_files = MagicMock()
     provider.get_pr_labels = MagicMock()
-    provider.is_supported = MagicMock()
+    provider.is_supported = MagicMock(return_value=True)
+    provider.azure_devops_client = MagicMock()
+    provider.azure_devops_client.get_pull_request_labels.return_value = []
+    provider.workspace_slug = "project"
+    provider.repo_slug = "repo"
+    provider.pr_num = 1
     provider._get_files_full = MagicMock(return_value=["/docs/full-pr.md"])
     provider._routing_incremental_files = ()
 
@@ -3070,7 +3082,12 @@ async def test_empty_incremental_shadow_route_suppresses_optional_skip_publicati
     provider.get_files.assert_not_called()
     provider.get_diff_files.assert_not_called()
     provider.get_pr_labels.assert_not_called()
-    provider.is_supported.assert_not_called()
+    provider.is_supported.assert_called_once_with("get_labels")
+    provider.azure_devops_client.get_pull_request_labels.assert_called_once_with(
+        project="project",
+        repository_id="repo",
+        pull_request_id=1,
+    )
     provider._get_files_full.assert_not_called()
     reviewer._specialist_escalation_consumption_enabled.assert_not_called()
     reviewer._run_guarded_specialist_escalation.assert_not_awaited()
@@ -3088,8 +3105,8 @@ async def test_empty_incremental_auto_shadow_clears_stale_consumer_artifact(cons
     provider.publish_comment = MagicMock()
     provider.get_files = MagicMock()
     provider.get_diff_files = MagicMock()
-    provider.get_pr_labels = MagicMock()
-    provider.is_supported = MagicMock()
+    provider.get_pr_labels = MagicMock(return_value=[])
+    provider.is_supported = MagicMock(return_value=True)
     provider.git_files = ["docs/full-pr.md"]
     provider._incremental_scope_complete = True
 
@@ -3122,8 +3139,386 @@ async def test_empty_incremental_auto_shadow_clears_stale_consumer_artifact(cons
     provider.publish_comment.assert_not_called()
     provider.get_files.assert_not_called()
     provider.get_diff_files.assert_not_called()
-    provider.get_pr_labels.assert_not_called()
-    provider.is_supported.assert_not_called()
+    provider.get_pr_labels.assert_called_once_with()
+    provider.is_supported.assert_called_once_with("get_labels")
+
+
+@pytest.mark.asyncio
+async def test_empty_incremental_sensitive_label_forces_deep_shadow_without_publication():
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {}
+    provider.previous_review = SimpleNamespace(html_url="https://example/review/previous")
+    provider.publish_comment = MagicMock()
+    provider.get_files = MagicMock()
+    provider.get_diff_files = MagicMock()
+    provider.is_supported = MagicMock(return_value=True)
+    provider.azure_devops_client = MagicMock()
+    provider.azure_devops_client.get_pull_request_labels.return_value = [
+        SimpleNamespace(name="security"),
+    ]
+    provider.workspace_slug = "project"
+    provider.repo_slug = "repo"
+    provider.pr_num = 1
+    provider._get_files_full = MagicMock(return_value=["/docs/full-pr.md"])
+    provider._routing_incremental_files = ()
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer.review_routing_configuration = _routing_configuration(
+        shadow_only=True,
+        sensitive_categories=({
+            "name": "security",
+            "path_patterns": [],
+            "labels": ["security"],
+        },),
+    )
+    reviewer._specialist_escalation_consumption_enabled = MagicMock(return_value=True)
+    reviewer._run_guarded_specialist_escalation = AsyncMock()
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert reviewer.review_route_decision.matched_sensitive_categories == ("security",)
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    provider.publish_comment.assert_not_called()
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider._get_files_full.assert_not_called()
+    provider.azure_devops_client.get_pull_request_labels.assert_called_once_with(
+        project="project",
+        repository_id="repo",
+        pull_request_id=1,
+    )
+    reviewer._specialist_escalation_consumption_enabled.assert_not_called()
+    reviewer._run_guarded_specialist_escalation.assert_not_awaited()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_incremental_unavailable_labels_fail_safe_without_publication():
+    provider = MagicMock()
+    provider.is_incremental_scope_empty.return_value = True
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.side_effect = RuntimeError("labels unavailable")
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=True)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.STANDARD
+    assert "labels" in reviewer.review_route_decision.missing_inputs
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    provider.get_pr_labels.assert_called_once_with()
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider.publish_comment.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_incremental_no_new_commit_clears_shadow_artifact_before_return():
+    provider = MagicMock()
+    provider.is_incremental_scope_empty.return_value = True
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = SimpleNamespace(
+        is_incremental=True,
+        first_new_commit_sha=None,
+    )
+    reviewer.is_auto = True
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=False)
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision is not None
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    provider.get_pr_labels.assert_called_once_with()
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider.publish_comment.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.parametrize("scope_empty", [False, None])
+@pytest.mark.asyncio
+async def test_auto_incremental_missing_commit_marker_routes_available_sensitive_evidence(scope_empty):
+    provider = MagicMock()
+    provider.is_incremental_scope_empty.return_value = scope_empty
+    provider.get_files.return_value = ["services/auth/key.pem"]
+    provider.get_diff_files.return_value = [_route_file("services/auth/key.pem")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = SimpleNamespace(
+        is_incremental=True,
+        first_new_commit_sha=None,
+    )
+    reviewer.is_auto = True
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=False)
+    reviewer.review_routing_configuration = _routing_configuration(
+        shadow_only=True,
+        sensitive_categories=({
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },),
+    )
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert reviewer.review_route_decision.matched_sensitive_categories == ("authorization",)
+    assert artifact == ""
+    provider.is_incremental_scope_empty.assert_called_once_with()
+    provider.get_files.assert_called_once_with()
+    provider.get_diff_files.assert_called_once_with()
+    provider.publish_comment.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nonincremental_empty_pr_clears_shadow_artifact_before_return():
+    provider = MagicMock()
+    provider.get_files.return_value = []
+    provider.get_diff_files.return_value = []
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision is not None
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    provider.get_files.assert_called_once_with()
+    provider.get_diff_files.assert_not_called()
+    provider.get_pr_labels.assert_called_once_with()
+    provider.publish_comment.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nonincremental_filtered_empty_gitea_routes_unfiltered_sensitive_path_deep():
+    provider = GiteaProvider.__new__(GiteaProvider)
+    provider.git_files = []
+    provider._routing_git_files = [{
+        "filename": "services/auth/key.pem",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 0,
+    }]
+    provider.get_diff_files = MagicMock(return_value=[])
+    provider.is_supported = MagicMock(return_value=True)
+    provider.get_pr_labels = MagicMock(return_value=[])
+    provider.publish_comment = MagicMock()
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(
+        shadow_only=True,
+        sensitive_categories=({
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },),
+    )
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert reviewer.review_route_decision.matched_sensitive_categories == ("authorization",)
+    assert artifact == ""
+    provider.get_diff_files.assert_called_once_with()
+    provider.get_pr_labels.assert_called_once_with()
+    provider.publish_comment.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nonincremental_empty_with_unavailable_rich_inventory_records_unknown_evidence():
+    class UnavailableRoutingProvider:
+        def get_files(self):
+            return []
+
+        def get_files_for_routing(self):
+            return None
+
+    provider = UnavailableRoutingProvider()
+    provider.get_diff_files = MagicMock(return_value=[])
+    provider.is_supported = MagicMock(return_value=True)
+    provider.get_pr_labels = MagicMock(return_value=[])
+    provider.publish_comment = MagicMock()
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.STANDARD
+    assert "files[0].kind" in reviewer.review_route_decision.missing_inputs
+    assert reviewer.review_route_request.changed_files_complete is False
+    assert artifact == ""
+    provider.get_diff_files.assert_called_once_with()
+    provider.get_pr_labels.assert_called_once_with()
+    provider.publish_comment.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
 
 
 @pytest.mark.asyncio
