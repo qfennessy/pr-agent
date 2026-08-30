@@ -9,6 +9,7 @@ from jinja2 import Environment, StrictUndefined
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.git_patch_processing import iter_git_patch_lines
 from pr_agent.algo.inline_comment_dedup import (
     InlineCommentStore, can_verify_inline_comment_publication,
     get_inline_comment_store, key_issue_body_with_markers,
@@ -479,7 +480,7 @@ class PRReviewer:
                 continue
             file_lines = set()
             new_line = None
-            for patch_line in patch.splitlines():
+            for patch_line in iter_git_patch_lines(patch):
                 header = _HUNK_HEADER_RE.match(patch_line)
                 if header:
                     new_line = int(header.group(1))
