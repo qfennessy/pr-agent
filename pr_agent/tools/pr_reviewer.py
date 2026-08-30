@@ -775,26 +775,43 @@ class PRReviewer:
             user_prompt = full_user_prompt
             prompt_tokens = full_prompt_tokens
             if full_prompt_tokens > max_prompt_tokens:
-                system_prompt, user_prompt, prompt_tokens = render_prompts(1.0, 0.0)
-                changed_diff_fraction = 0.0
-                if prompt_tokens > max_prompt_tokens:
+                diff_free_system, diff_free_user, diff_free_tokens = render_prompts(1.0, 0.0)
+                if diff_free_tokens <= max_prompt_tokens:
+                    system_prompt = diff_free_system
+                    user_prompt = diff_free_user
+                    prompt_tokens = diff_free_tokens
+                    changed_diff_fraction = 0.0
+                    lower = 0.0
+                    upper = 1.0
+                    for _ in range(18):
+                        midpoint = (lower + upper) / 2
+                        candidate_system, candidate_user, candidate_tokens = render_prompts(1.0, midpoint)
+                        if candidate_tokens <= max_prompt_tokens:
+                            lower = midpoint
+                            changed_diff_fraction = midpoint
+                            system_prompt = candidate_system
+                            user_prompt = candidate_user
+                            prompt_tokens = candidate_tokens
+                        else:
+                            upper = midpoint
+                else:
                     system_prompt, user_prompt, prompt_tokens = render_prompts(0.0, 0.0)
                     evidence_fraction = 0.0
-                if prompt_tokens > max_prompt_tokens:
-                    artifact.update({
-                        "status": "prompt_budget_exhausted",
-                        "prompt_budget": {
-                            "model_max_tokens": model_max_tokens,
-                            "reserved_completion_tokens": OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
-                            "max_prompt_tokens": max_prompt_tokens,
-                            "prompt_tokens": prompt_tokens,
-                            "truncated": True,
-                        },
-                    })
-                    return
-                lower = 0.0
-                upper = 1.0
-                if evidence_fraction < 1.0:
+                    changed_diff_fraction = 0.0
+                    if prompt_tokens > max_prompt_tokens:
+                        artifact.update({
+                            "status": "prompt_budget_exhausted",
+                            "prompt_budget": {
+                                "model_max_tokens": model_max_tokens,
+                                "reserved_completion_tokens": OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+                                "max_prompt_tokens": max_prompt_tokens,
+                                "prompt_tokens": prompt_tokens,
+                                "truncated": True,
+                            },
+                        })
+                        return
+                    lower = 0.0
+                    upper = 1.0
                     for _ in range(18):
                         midpoint = (lower + upper) / 2
                         candidate_system, candidate_user, candidate_tokens = render_prompts(midpoint, 0.0)

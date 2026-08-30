@@ -17,7 +17,13 @@ from pr_agent.algo.git_patch_processing import (
     split_git_file_lines,
     strip_git_line_ending,
 )
-from pr_agent.algo.review_specialists import SpecialistBatchResult, SpecialistInput, SpecialistRole, SpecialistState
+from pr_agent.algo.review_specialists import (
+    SpecialistBatchResult,
+    SpecialistInput,
+    SpecialistRole,
+    SpecialistState,
+)
+from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.log import get_logger
 
 _TELEMETRY_SAFE_DECISION_REASONS = frozenset({
@@ -34,6 +40,20 @@ _TELEMETRY_SAFE_DECISION_REASONS = frozenset({
 })
 _REPO_FETCH_MAX_WORKERS = 4
 _REPO_FETCH_SLOTS = threading.BoundedSemaphore(_REPO_FETCH_MAX_WORKERS)
+_ATOMIC_CHANGED_EVIDENCE_SOURCES = frozenset({
+    "changed_head",
+    "changed_patch",
+    "changed_context_patch",
+})
+_PATCH_CHANGED_EVIDENCE_SOURCES = frozenset({"changed_patch", "changed_context_patch"})
+_CHANGED_EVIDENCE_SOURCES = _ATOMIC_CHANGED_EVIDENCE_SOURCES | {"changed_context_head"}
+
+
+def _is_atomic_prompt_evidence(item: Mapping) -> bool:
+    return bool(
+        item.get("source") in _ATOMIC_CHANGED_EVIDENCE_SOURCES
+        or item.get("required_evidence")
+    )
 
 
 class _RepositoryFetchCapacityExhausted(RuntimeError):
@@ -209,6 +229,16 @@ def _first_changed_line(patch: str) -> int:
     return 1
 
 
+def _consecutive_line_ranges(lines) -> list[tuple[int, int]]:
+    ranges = []
+    for line in lines:
+        if ranges and line == ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], line)
+        else:
+            ranges.append((line, line))
+    return ranges
+
+
 def _added_line_ranges(patch: str) -> list[tuple[int, int]]:
     added_lines = []
     new_line = None
@@ -224,13 +254,7 @@ def _added_line_ranges(patch: str) -> list[tuple[int, int]]:
             added_lines.append(new_line)
         if not line.startswith("-"):
             new_line += 1
-    ranges = []
-    for line in added_lines:
-        if ranges and line == ranges[-1][1] + 1:
-            ranges[-1] = (ranges[-1][0], line)
-        else:
-            ranges.append((line, line))
-    return ranges
+    return _consecutive_line_ranges(added_lines)
 
 
 def _deleted_line_ranges(patch: str) -> list[tuple[int, int]]:
@@ -248,13 +272,7 @@ def _deleted_line_ranges(patch: str) -> list[tuple[int, int]]:
             deleted_lines.append(old_line)
         if not line.startswith("+"):
             old_line += 1
-    ranges = []
-    for line in deleted_lines:
-        if ranges and line == ranges[-1][1] + 1:
-            ranges[-1] = (ranges[-1][0], line)
-        else:
-            ranges.append((line, line))
-    return ranges
+    return _consecutive_line_ranges(deleted_lines)
 
 
 def _first_changed_anchor(patch: str) -> tuple[str, int, list[tuple[int, int]]]:
@@ -265,6 +283,14 @@ def _first_changed_anchor(patch: str) -> tuple[str, int, list[tuple[int, int]]]:
     if deleted:
         return "old", deleted[0][0], deleted
     return "new", _first_changed_line(patch), []
+
+
+def _sensitive_change_anchors(patch: str) -> list[tuple[str, int, int, list[tuple[int, int]]]]:
+    """Return one audit for every visible contiguous changed range on both sides."""
+    anchors = []
+    for side, ranges in (("new", _added_line_ranges(patch)), ("old", _deleted_line_ranges(patch))):
+        anchors.extend((side, start, end, [(start, end)]) for start, end in ranges)
+    return anchors
 
 
 def _line_is_changed(line: int, ranges: list) -> bool:
@@ -395,32 +421,31 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
         relevant_file = safe_repo_path(getattr(diff_file, "filename", ""))
         if not relevant_file or not any(fnmatch.fnmatch(relevant_file, pattern) for pattern in normalized_globs):
             continue
-        sensitive_count += 1
-        side, line, changed_line_ranges = _first_changed_anchor(getattr(diff_file, "patch", ""))
-        candidates.append({
-            "candidate_id": f"sensitive-{sensitive_count}",
-            "candidate_type": "sensitive_path_audit",
-            "relevant_file": relevant_file,
-            "issue_header": "Sensitive path audit",
-            "issue_content": "Independently inspect this configured sensitive path for introduced defects.",
-            "trigger": "A configured sensitive path changed.",
-            "impact": "A high-risk regression could otherwise be suppressed before verification.",
-            "root_cause": f"sensitive audit for {relevant_file}",
-            "start_line": line,
-            "end_line": line,
-            "side": side,
-            "context_files": [relevant_file],
-            "context_symbols": [],
-            "sensitive_path": True,
-            "_changed_line_ranges": changed_line_ranges,
-            "_changed_anchor_shape": _changed_anchor_shape(
-                getattr(diff_file, "patch", ""), line, line, side
-            ),
-            "_changed_anchor_ordinal": _changed_anchor_ordinal(
-                getattr(diff_file, "patch", ""), line, side
-            ),
-            "_trusted_lineage_key": _trusted_file_lineage(diff_file),
-        })
+        patch = getattr(diff_file, "patch", "")
+        for anchor_index, (side, start_line, end_line, changed_line_ranges) in enumerate(
+            _sensitive_change_anchors(patch), start=1
+        ):
+            sensitive_count += 1
+            candidates.append({
+                "candidate_id": f"sensitive-{sensitive_count}",
+                "candidate_type": "sensitive_path_audit",
+                "relevant_file": relevant_file,
+                "issue_header": "Sensitive path audit",
+                "issue_content": "Independently inspect this configured sensitive path change for introduced defects.",
+                "trigger": "A configured sensitive path range changed.",
+                "impact": "A high-risk regression could otherwise be suppressed before verification.",
+                "root_cause": f"sensitive audit for {relevant_file} change {anchor_index}",
+                "start_line": start_line,
+                "end_line": end_line,
+                "side": side,
+                "context_files": [relevant_file],
+                "context_symbols": [],
+                "sensitive_path": True,
+                "_changed_line_ranges": changed_line_ranges,
+                "_changed_anchor_shape": _changed_anchor_shape(patch, start_line, end_line, side),
+                "_changed_anchor_ordinal": _changed_anchor_ordinal(patch, start_line, side),
+                "_trusted_lineage_key": _trusted_file_lineage(diff_file),
+            })
 
     model_candidate_count = 0
     for index, raw_candidate in enumerate(raw_candidates):
@@ -627,10 +652,10 @@ def _requested_path_specs(candidate: dict) -> list[dict]:
     return normalized
 
 
-def _select_excerpt(content: str, candidate: dict, path: str, max_lines: int) -> tuple[str, int, int]:
+def _excerpt_anchor_line(content: str, candidate: dict, path: str) -> int:
     lines = split_git_file_lines(content)
-    if not lines or max_lines < 1:
-        return "", 0, 0
+    if not lines:
+        return 0
     center = None
     if path == candidate.get("relevant_file"):
         center = candidate.get("start_line")
@@ -648,7 +673,14 @@ def _select_excerpt(content: str, candidate: dict, path: str, max_lines: int) ->
                     break
             if center is not None:
                 break
-    center = max(1, min(len(lines), int(center or 1)))
+    return max(1, min(len(lines), int(center or 1)))
+
+
+def _select_excerpt(content: str, candidate: dict, path: str, max_lines: int) -> tuple[str, int, int]:
+    lines = split_git_file_lines(content)
+    if not lines or max_lines < 1:
+        return "", 0, 0
+    center = _excerpt_anchor_line(content, candidate, path)
     before = max_lines // 2
     start = max(1, center - before)
     end = min(len(lines), start + max_lines - 1)
@@ -675,15 +707,10 @@ def _matching_static_evidence(candidate: dict, static_evidence: list) -> list[di
     return matches
 
 
-def _candidate_changed_patch_evidence(diff_file, candidate: dict) -> Optional[dict]:
-    """Return exact candidate-scoped changed lines from one trusted provider patch."""
+def _changed_patch_range_evidence(diff_file, side: str, start_line: int, end_line: int,
+                                  source: str) -> Optional[dict]:
+    """Return exact changed lines for one trusted patch range."""
     if diff_file is None:
-        return None
-    side = candidate.get("side", "new")
-    try:
-        candidate_start = int(candidate.get("start_line"))
-        candidate_end = int(candidate.get("end_line"))
-    except (TypeError, ValueError):
         return None
     old_line = None
     new_line = None
@@ -699,26 +726,67 @@ def _candidate_changed_patch_evidence(diff_file, candidate: dict) -> Optional[di
         if old_line is None or new_line is None or line.startswith("\\ No newline at end of file"):
             continue
         if (side == "new" and line.startswith("+") and not line.startswith("+++")
-                and candidate_start <= new_line <= candidate_end):
+                and start_line <= new_line <= end_line):
             selected.append(line[1:])
             selected_lines.append(new_line)
         elif (side == "old" and line.startswith("-") and not line.startswith("---")
-              and candidate_start <= old_line <= candidate_end):
+              and start_line <= old_line <= end_line):
             selected.append(line[1:])
             selected_lines.append(old_line)
         if not line.startswith("+"):
             old_line += 1
         if not line.startswith("-"):
             new_line += 1
-    if candidate_start not in selected_lines or not selected:
+    if start_line not in selected_lines or not selected:
         return None
     return {
-        "source": "changed_patch",
+        "source": source,
         "side": side,
         "content": "\n".join(selected),
         "start_line": min(selected_lines),
         "end_line": max(selected_lines),
+        "anchor_start_line": start_line,
+        "anchor_end_line": end_line,
     }
+
+
+def _candidate_changed_patch_evidence(diff_file, candidate: dict) -> Optional[dict]:
+    """Return exact candidate-scoped changed lines from one trusted provider patch."""
+    try:
+        start_line = int(candidate.get("start_line"))
+        end_line = int(candidate.get("end_line"))
+    except (TypeError, ValueError):
+        return None
+    return _changed_patch_range_evidence(
+        diff_file,
+        candidate.get("side", "new"),
+        start_line,
+        end_line,
+        "changed_patch",
+    )
+
+
+def _changed_context_patch_evidence(diff_file) -> list[dict]:
+    """Return bounded-unit evidence for every visible changed range in a requested changed file."""
+    patch = getattr(diff_file, "patch", "") or ""
+    evidence = []
+    for side, ranges in (("new", _added_line_ranges(patch)), ("old", _deleted_line_ranges(patch))):
+        for start_line, end_line in ranges:
+            item = _changed_patch_range_evidence(
+                diff_file, side, start_line, end_line, "changed_context_patch"
+            )
+            if item is not None:
+                evidence.append(item)
+    return evidence
+
+
+def _retrieval_evidence_id(candidate_id: str, path: str, source: str) -> str:
+    payload = json.dumps(
+        {"candidate_id": candidate_id, "path": path, "source": source},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"sha256:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
 
 
 async def retrieve_evidence(git_provider, candidates: list[dict], budgets: VerificationBudgets,
@@ -738,6 +806,8 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
     budget_exhausted = False
     time_budget_exhausted = False
     changed_evidence_count = 0
+    added_context_head_available = {}
+    incomplete_changed_context = set()
     diff_by_file = {
         path: diff_file
         for diff_file in (diff_files or [])
@@ -762,7 +832,15 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         if line_budget < 1 or token_budget < 1:
             budget_exhausted = True
             return False
-        excerpt, start_line, end_line = _select_excerpt(content, candidate, path, line_budget)
+        if item.get("source") in _PATCH_CHANGED_EVIDENCE_SOURCES:
+            if content.count("\n") + 1 > line_budget:
+                budget_exhausted = True
+                return False
+            excerpt = content
+            start_line = item.get("start_line")
+            end_line = item.get("end_line")
+        else:
+            excerpt, start_line, end_line = _select_excerpt(content, candidate, path, line_budget)
         if not excerpt:
             budget_exhausted = True
             return False
@@ -770,13 +848,13 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         prepared.update({"path": path, "content": excerpt})
         prepared.setdefault("start_line", start_line)
         prepared.setdefault("end_line", end_line)
-        if prepared.get("source") in {"changed_head", "changed_patch"}:
-            prepared["anchor_start_line"] = candidate.get("start_line")
-            prepared["anchor_end_line"] = candidate.get("end_line")
+        if _is_atomic_prompt_evidence(prepared):
+            prepared.setdefault("anchor_start_line", candidate.get("start_line"))
+            prepared.setdefault("anchor_end_line", candidate.get("end_line"))
         evidence_tokens = count_tokens(excerpt)
         if evidence_tokens > token_budget:
             budget_exhausted = True
-            if prepared.get("source") in {"changed_head", "changed_patch"}:
+            if _is_atomic_prompt_evidence(prepared):
                 best = None
                 lower = 0.0
                 upper = 1.0
@@ -815,7 +893,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         lines_by_path[path] = lines_by_path.get(path, 0) + line_count
         total_lines += line_count
         total_tokens += evidence_tokens
-        if prepared.get("source") in {"changed_head", "changed_patch"}:
+        if prepared.get("source") in _CHANGED_EVIDENCE_SOURCES:
             changed_evidence_count += 1
         return True
 
@@ -835,12 +913,61 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 relevant_file,
             )
 
+    # Supplemental patches for requested changed files come only after every
+    # candidate has had its mandatory own-change anchor reserved.
+    for candidate in candidates:
+        candidate_id = candidate["candidate_id"]
+        relevant_file = candidate.get("relevant_file")
+        for request_spec in _requested_path_specs(candidate):
+            context_path = request_spec.get("path")
+            if not context_path or context_path == relevant_file:
+                continue
+            context_diff = diff_by_file.get(context_path)
+            context_key = (candidate_id, context_path)
+            if (
+                getattr(context_diff, "edit_type", None) == EDIT_TYPE.ADDED
+                and getattr(context_diff, "head_file", "")
+                and getattr(context_diff, "head_file_is_complete", True)
+            ):
+                source = "changed_context_head"
+                evidence_id = _retrieval_evidence_id(candidate_id, context_path, source)
+                anchor_line = _excerpt_anchor_line(str(context_diff.head_file), candidate, context_path)
+                if append_evidence({
+                    "candidate_id": candidate_id,
+                    "source": source,
+                    "content": str(context_diff.head_file),
+                    "evidence_id": evidence_id,
+                    "required_evidence": bool(request_spec.get("required")),
+                    "anchor_start_line": anchor_line,
+                    "anchor_end_line": anchor_line,
+                }, candidate, context_path):
+                    added_context_head_available[context_key] = evidence_id
+                else:
+                    incomplete_changed_context.add(context_key)
+                continue
+            context_items = _changed_context_patch_evidence(context_diff)
+            if not context_items:
+                continue
+            appended_all = all(
+                append_evidence(
+                    {"candidate_id": candidate_id, **context_item},
+                    candidate,
+                    context_path,
+                )
+                for context_item in context_items
+            )
+            if not appended_all:
+                incomplete_changed_context.add(context_key)
+
     for candidate in candidates:
         candidate_id = candidate["candidate_id"]
         relevant_file = candidate.get("relevant_file")
         diff_file = diff_by_file.get(candidate.get("relevant_file"))
         head_file = getattr(diff_file, "head_file", "") if diff_file is not None else ""
         changed_head_available = False
+        changed_head_evidence_id = _retrieval_evidence_id(
+            candidate_id, relevant_file, "changed_head"
+        )
         for static_index, static_item in enumerate(_matching_static_evidence(candidate, static_evidence)):
             evidence_item = {"candidate_id": candidate_id, **static_item}
             static_path = static_item.get("path") or f"@static/{candidate_id}/{static_index + 1}"
@@ -851,6 +978,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 "candidate_id": candidate_id,
                 "source": "changed_head",
                 "content": str(head_file),
+                "evidence_id": changed_head_evidence_id,
             }, candidate, relevant_file)
         for request_spec in _requested_path_specs(candidate):
             request = {"candidate_id": candidate_id, **request_spec}
@@ -863,6 +991,17 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             if path == relevant_file and changed_head_available:
                 request["status"] = "satisfied_by_changed_head"
                 request["source"] = "changed_head"
+                request["evidence_id"] = changed_head_evidence_id
+                continue
+            context_key = (candidate_id, path)
+            if context_key in added_context_head_available:
+                request["status"] = "satisfied_by_changed_head"
+                request["source"] = "changed_context_head"
+                request["evidence_id"] = added_context_head_available[context_key]
+                continue
+            if context_key in incomplete_changed_context:
+                request["status"] = "context_budget_exhausted"
+                budget_exhausted = True
                 continue
             if path not in unique_files and len(unique_files) >= budgets.max_files:
                 request["status"] = "file_budget_exhausted"
@@ -902,11 +1041,18 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 continue
             if isinstance(content, bytes):
                 content = content.decode("utf-8", errors="replace")
+            source = "repository_file"
+            evidence_id = _retrieval_evidence_id(candidate_id, path, source)
+            anchor_line = _excerpt_anchor_line(str(content), candidate, path)
             evidence_item = {
                 "candidate_id": candidate_id,
-                "source": "repository_file",
+                "source": source,
                 "path": path,
                 "content": str(content),
+                "evidence_id": evidence_id,
+                "required_evidence": bool(request.get("required")),
+                "anchor_start_line": anchor_line,
+                "anchor_end_line": anchor_line,
             }
             before = len(evidence)
             if not append_evidence(evidence_item, candidate, path):
@@ -919,6 +1065,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 "status": "retrieved",
                 "start_line": appended["start_line"],
                 "end_line": appended["end_line"],
+                "evidence_id": evidence_id,
             })
 
     artifact = {
@@ -974,7 +1121,7 @@ def bounded_verification_evidence(evidence: list[dict], content_fraction: float)
             anchor_start = bounded_item.get("anchor_start_line")
             anchor_end = bounded_item.get("anchor_end_line")
             excerpt_start = bounded_item.get("start_line")
-            if (fraction < 1.0 and bounded_item.get("source") in {"changed_head", "changed_patch"}
+            if (fraction < 1.0 and _is_atomic_prompt_evidence(bounded_item)
                     and all(isinstance(value, int) for value in (anchor_start, anchor_end, excerpt_start))):
                 lines = split_git_file_lines(content)
                 relative_start = anchor_start - excerpt_start
@@ -1104,11 +1251,18 @@ def apply_verification_decisions(
         if isinstance(cited_paths, str):
             cited_paths = [cited_paths]
         available_evidence = evidence_by_candidate.get(candidate_id, [])
+        prompt_visible_evidence_ids = {
+            item.get("evidence_id") for item in available_evidence
+            if str(item.get("content") or "").strip()
+            and item.get("evidence_id")
+        }
         failed_required_requests = [
             request for request in requests_by_candidate.get(candidate_id, [])
-            if request.get("required") and request.get("status") not in {
-                "retrieved", "satisfied_by_changed_head"
-            }
+            if request.get("required") and (
+                request.get("status") not in {"retrieved", "satisfied_by_changed_head"}
+                or not request.get("evidence_id")
+                or request.get("evidence_id") not in prompt_visible_evidence_ids
+            )
         ]
         if failed_required_requests:
             record["verdict"] = "rejected"
