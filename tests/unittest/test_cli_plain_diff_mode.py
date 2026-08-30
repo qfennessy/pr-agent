@@ -717,7 +717,7 @@ def test_snapshot_repo_context_enforces_aggregate_blob_budget(cfg, monkeypatch, 
     assert show_calls == [f"{'a' * 40}:FIRST.md"]
 
 
-def test_review_snapshot_atomically_replaces_json_symlink_swapped_during_review(
+def test_review_snapshot_rejects_json_symlink_swapped_during_review(
     cfg, monkeypatch, tmp_path, capsys
 ):
     import json
@@ -749,14 +749,59 @@ def test_review_snapshot_atomically_replaces_json_symlink_swapped_during_review(
             return True
 
     monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
-    result = run(inargs=[
-        "review-snapshot", "--event", "file-save", "--path", "changed.py",
-        "--no-cache", "--json-output", str(output),
-    ])
+    with pytest.raises(SnapshotCaptureError, match="output target changed before publication"):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--no-cache", "--json-output", str(output),
+        ])
 
     assert protected.read_bytes() == original
-    assert not output.is_symlink()
-    assert json.loads(output.read_text(encoding="utf-8"))["snapshot_id"] == result.snapshot_id
+    assert output.is_symlink()
+    capsys.readouterr()
+
+
+def test_review_snapshot_rejects_output_tracked_during_review(
+    cfg, monkeypatch, tmp_path, capsys
+):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo-output-tracked-race"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    output = repo / "result.json"
+    monkeypatch.chdir(repo)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            output.write_text("new tracked source\n", encoding="utf-8")
+            subprocess.run(["git", "add", "result.json"], check=True)
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    with pytest.raises(SnapshotCaptureError, match="output target changed before publication"):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--no-cache", "--json-output", str(output),
+        ])
+
+    assert output.read_text(encoding="utf-8") == "new tracked source\n"
+    assert subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "result.json"],
+        check=False,
+        capture_output=True,
+    ).returncode == 0
     capsys.readouterr()
 
 
@@ -805,14 +850,19 @@ def test_review_snapshot_rejects_output_parent_swapped_during_review(
 
 
 def test_atomic_snapshot_publication_uses_portable_fallback(monkeypatch, tmp_path):
-    from pr_agent.cli import _atomic_replace_bytes, _prepare_output_parent
+    from pr_agent.cli import (
+        _atomic_replace_bytes,
+        _output_target_identity,
+        _prepare_output_parent,
+    )
 
     output = tmp_path / "result.json"
     output.write_text("old", encoding="utf-8")
     identity = _prepare_output_parent(str(output))
     monkeypatch.setattr("pr_agent.cli._supports_descriptor_relative_publication", lambda: False)
+    target_identity = _output_target_identity(output, identity)
 
-    _atomic_replace_bytes(output, b"new", identity)
+    _atomic_replace_bytes(output, b"new", identity, target_identity)
 
     assert output.read_bytes() == b"new"
     assert list(tmp_path.glob(".pr-agent-*.tmp")) == []

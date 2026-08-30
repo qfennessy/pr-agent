@@ -226,10 +226,74 @@ def _validate_output_parent(
         raise SnapshotCaptureError(f"output parent changed before {action}: {destination}")
 
 
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _output_target_identity(
+    destination: Path,
+    parent_identity: tuple[int, int],
+) -> tuple[int, int, int, int, int, int] | None:
+    """Bind the expected output entry to the already validated parent directory."""
+    if not _supports_descriptor_relative_publication():
+        _validate_output_parent(destination, parent_identity, "target validation")
+        try:
+            return _stat_identity(destination.lstat())
+        except FileNotFoundError:
+            return None
+    parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        parent_stat = os.fstat(parent_fd)
+        if (parent_stat.st_dev, parent_stat.st_ino) != parent_identity:
+            raise SnapshotCaptureError(
+                f"output parent changed before target validation: {destination}"
+            )
+        try:
+            target_stat = os.stat(
+                destination.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        return _stat_identity(target_stat)
+    finally:
+        os.close(parent_fd)
+
+
+def _validate_output_target(
+    destination: Path,
+    expected_identity: tuple[int, int, int, int, int, int] | None,
+    *,
+    parent_fd: int | None = None,
+) -> None:
+    try:
+        current_stat = (
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+            if parent_fd is not None
+            else destination.lstat()
+        )
+        current_identity = _stat_identity(current_stat)
+    except FileNotFoundError:
+        current_identity = None
+    if current_identity != expected_identity:
+        raise SnapshotCaptureError(
+            f"output target changed before publication: {destination}"
+        )
+
+
 def _portable_atomic_replace_bytes(
     destination: Path,
     content: bytes,
     parent_identity: tuple[int, int],
+    target_identity: tuple[int, int, int, int, int, int] | None,
 ) -> None:
     """Publish atomically on platforms without descriptor-relative filesystem calls."""
     _validate_output_parent(destination, parent_identity, "publication")
@@ -242,6 +306,7 @@ def _portable_atomic_replace_bytes(
         with os.fdopen(temporary_fd, "wb") as handle:
             handle.write(content)
         _validate_output_parent(destination, parent_identity, "publication")
+        _validate_output_target(destination, target_identity)
         os.replace(temporary_path, destination)
         temporary_path = None
     finally:
@@ -255,9 +320,12 @@ def _atomic_replace_bytes(
     destination: Path,
     content: bytes,
     parent_identity: tuple[int, int],
+    target_identity: tuple[int, int, int, int, int, int] | None,
 ) -> None:
     if not _supports_descriptor_relative_publication():
-        _portable_atomic_replace_bytes(destination, content, parent_identity)
+        _portable_atomic_replace_bytes(
+            destination, content, parent_identity, target_identity
+        )
         return
     parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
     temporary_name = None
@@ -274,6 +342,11 @@ def _atomic_replace_bytes(
         )
         with os.fdopen(temporary_fd, "wb") as handle:
             handle.write(content)
+        _validate_output_target(
+            destination,
+            target_identity,
+            parent_fd=parent_fd,
+        )
         os.replace(
             temporary_name,
             destination.name,
@@ -313,6 +386,7 @@ def _emit_snapshot_result(
     result,
     output_path: str | None,
     parent_identity: tuple[int, int] | None = None,
+    target_identity: tuple[int, int, int, int, int, int] | None = None,
 ) -> None:
     payload_data = result.to_dict()
     payload_data["artifact_type"] = _SNAPSHOT_ARTIFACT_TYPE
@@ -322,7 +396,17 @@ def _emit_snapshot_result(
         try:
             destination = Path(output_path)
             identity = parent_identity or _prepare_output_parent(output_path)
-            _atomic_replace_bytes(destination, payload.encode("utf-8"), identity)
+            expected_target = (
+                target_identity
+                if parent_identity is not None
+                else _output_target_identity(destination, identity)
+            )
+            _atomic_replace_bytes(
+                destination,
+                payload.encode("utf-8"),
+                identity,
+                expected_target,
+            )
         except (OSError, SnapshotCaptureError) as exc:
             raise SnapshotCaptureError(f"could not write --json-output '{output_path}': {exc}") from exc
 
@@ -752,6 +836,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         outer_parser.error(str(exc))
 
     output_parent_identities = {}
+    output_target_identities = {}
     try:
         git_metadata_root = SnapshotCache(repository_root).cache_dir.parents[1]
         git_artifact_root = _git_artifact_root(repository_root)
@@ -778,6 +863,11 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             _unlink_output(
                 Path(markdown_output), output_parent_identities[markdown_output]
             )
+        for output_path in (markdown_output, json_output):
+            if output_path:
+                output_target_identities[output_path] = _output_target_identity(
+                    Path(output_path), output_parent_identities[output_path]
+                )
     except (OSError, SnapshotCaptureError) as exc:
         outer_parser.error(str(exc))
 
@@ -819,7 +909,10 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             started_at=monotonic(),
         )
         _emit_snapshot_result(
-            stale_result, json_output, output_parent_identities.get(json_output)
+            stale_result,
+            json_output,
+            output_parent_identities.get(json_output),
+            output_target_identities.get(json_output),
         )
         return stale_result
     # Cached structured results cannot reproduce the exact Markdown rendering.
@@ -833,7 +926,10 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         cached_result = cache.read(snapshot.snapshot_id, snapshot=snapshot)
         if cached_result is not None:
             _emit_snapshot_result(
-                cached_result, json_output, output_parent_identities.get(json_output)
+                cached_result,
+                json_output,
+                output_parent_identities.get(json_output),
+                output_target_identities.get(json_output),
             )
             return cached_result
 
@@ -943,10 +1039,16 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
                 output_path,
                 pending_markdown,
                 output_parent_identities[markdown_output],
+                output_target_identities[markdown_output],
             )
         except (OSError, SnapshotCaptureError) as exc:
             raise SnapshotCaptureError(f"could not publish --output '{markdown_output}': {exc}") from exc
-    _emit_snapshot_result(result, json_output, output_parent_identities.get(json_output))
+    _emit_snapshot_result(
+        result,
+        json_output,
+        output_parent_identities.get(json_output),
+        output_target_identities.get(json_output),
+    )
     return result
 
 
