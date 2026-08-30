@@ -61,6 +61,37 @@ def test_get_pr_diff_reports_pruned_deletions_separately(monkeypatch):
     assert output.deleted_files == ["deleted.py"]
 
 
+def test_get_pr_diff_reports_under_budget_deletions_separately(monkeypatch):
+    deleted = FilePatchInfo(
+        base_file="old\n",
+        head_file="",
+        patch="@@ -1 +0,0 @@\n-old",
+        filename="deleted.py",
+        edit_type=EDIT_TYPE.DELETED,
+    )
+    provider = FakeProvider([deleted])
+    token_handler = FakeTokenHandler(prompt_tokens=100)
+    monkeypatch.setattr(
+        pr_processing,
+        "pr_generate_extended_diff",
+        lambda *args, **kwargs: (["deleted summary"], 100, [100]),
+    )
+    monkeypatch.setattr(pr_processing, "get_max_tokens", lambda model: 2_500)
+
+    output = pr_processing.get_pr_diff(
+        provider,
+        token_handler,
+        "model",
+        return_remaining_files=True,
+        return_deleted_files=True,
+    )
+
+    assert isinstance(output, pr_processing.PRDiffCoverage)
+    assert output.diff == "deleted summary"
+    assert output.remaining_files == []
+    assert output.deleted_files == ["deleted.py"]
+
+
 def test_get_pr_diff_does_not_label_deletions_as_token_budget_omissions(monkeypatch):
     provider = FakeProvider([])
     token_handler = FakeTokenHandler(prompt_tokens=100)
