@@ -7,9 +7,7 @@ from unidiff.errors import UnidiffParseError
 
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.config_loader import _find_repository_root, get_settings
-from pr_agent.git_providers.diff_parsing import (parse_unified_diff,
-                                                 reconstruct_base_file,
-                                                 to_hunk_only_patch)
+from pr_agent.git_providers.diff_parsing import parse_unified_diff, reconstruct_base_file, to_hunk_only_patch
 from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.log import get_logger
 
@@ -18,6 +16,8 @@ def _decode_git_c_quoted_path(path: str) -> str:
     if len(path) < 2 or not (path.startswith('"') and path.endswith('"')):
         return path
     raw = path[1:-1]
+    if not raw.startswith(("a/", "b/")):
+        return path
     decoded = bytearray()
     index = 0
     escapes = {
@@ -49,7 +49,7 @@ def _decode_git_c_quoted_path(path: str) -> str:
         decoded.extend(escaped.encode("utf-8", errors="surrogateescape"))
         index += 1
     value = decoded.decode("utf-8", errors="surrogateescape")
-    return value[2:] if value.startswith(("a/", "b/")) else value
+    return value[2:]
 
 
 def parse_plain_diff(diff_text: str) -> List[FilePatchInfo]:

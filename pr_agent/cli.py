@@ -377,7 +377,10 @@ def _load_snapshot_repo_context(repository_root: Path, base_revision: str) -> di
         return {}
 
     files = {}
+    remaining_bytes = _MAX_SNAPSHOT_REPO_CONTEXT_BYTES
     for supplied_path in configured:
+        if remaining_bytes <= 0:
+            break
         if not isinstance(supplied_path, str) or not supplied_path.strip():
             continue
         normalized = PurePosixPath(supplied_path.strip())
@@ -395,7 +398,7 @@ def _load_snapshot_repo_context(repository_root: Path, base_revision: str) -> di
             object_size = int(size_process.stdout.strip())
         except ValueError:
             continue
-        if size_process.returncode != 0 or object_size > _MAX_SNAPSHOT_REPO_CONTEXT_BYTES:
+        if size_process.returncode != 0 or object_size < 0 or object_size > remaining_bytes:
             continue
         process = subprocess.run(
             [
@@ -406,8 +409,13 @@ def _load_snapshot_repo_context(repository_root: Path, base_revision: str) -> di
             stderr=subprocess.PIPE,
             check=False,
         )
-        if process.returncode != 0 or not process.stdout:
+        if (
+            process.returncode != 0
+            or not process.stdout
+            or len(process.stdout) > remaining_bytes
+        ):
             continue
+        remaining_bytes -= len(process.stdout)
         content = process.stdout.decode("utf-8", errors="replace").rstrip()
         files[path] = "\n".join(content.splitlines()[:max_lines])
     return files

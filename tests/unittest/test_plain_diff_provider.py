@@ -3,7 +3,7 @@ import pytest
 from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import _GIT_PROVIDERS
-from pr_agent.git_providers.plain_diff_provider import PlainDiffGitProvider
+from pr_agent.git_providers.plain_diff_provider import PlainDiffGitProvider, parse_plain_diff
 
 # Diff-mode settings keys these tests mutate on the process-wide singleton.
 _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path",
@@ -63,6 +63,34 @@ def test_get_diff_files(cfg):
     assert len(files) == 1
     assert files[0].filename == "foo.py"
     assert files[0].edit_type == EDIT_TYPE.MODIFIED
+
+
+def test_literal_quotes_in_a_unified_diff_filename_are_preserved():
+    diff = '''diff --git a/"foo" b/"foo"
+--- a/"foo"
++++ b/"foo"
+@@ -1 +1 @@
+-old
++new
+'''
+
+    files = parse_plain_diff(diff)
+
+    assert files[0].filename == '"foo"'
+
+
+def test_git_c_quoted_prefixed_filename_is_decoded():
+    diff = '''diff --git "a/foo\\tbar.py" "b/foo\\tbar.py"
+--- "a/foo\\tbar.py"
++++ "b/foo\\tbar.py"
+@@ -1 +1 @@
+-old
++new
+'''
+
+    files = parse_plain_diff(diff)
+
+    assert files[0].filename == "foo\tbar.py"
 
 
 _MULTI_LANG_DIFF = """diff --git a/foo.py b/foo.py

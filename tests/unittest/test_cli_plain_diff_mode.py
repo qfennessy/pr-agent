@@ -504,6 +504,36 @@ def test_snapshot_repo_context_skips_oversized_git_blob_before_read(cfg, monkeyp
     assert len(calls) == 1
 
 
+def test_snapshot_repo_context_enforces_aggregate_blob_budget(cfg, monkeypatch, tmp_path):
+    from pr_agent.cli import _load_snapshot_repo_context
+
+    cfg("config.repo_context_files", ["FIRST.md", "SECOND.md"])
+    monkeypatch.setattr("pr_agent.cli._MAX_SNAPSHOT_REPO_CONTEXT_BYTES", 10)
+    show_calls = []
+
+    class CompletedProcess:
+        def __init__(self, stdout=b"", returncode=0):
+            self.stdout = stdout
+            self.stderr = b""
+            self.returncode = returncode
+
+    def fake_run(args, **kwargs):
+        object_name = args[-1]
+        if "cat-file" in args:
+            return CompletedProcess(stdout=b"6\n")
+        if "show" in args:
+            show_calls.append(object_name)
+            return CompletedProcess(stdout=b"123456")
+        raise AssertionError(args)
+
+    monkeypatch.setattr("pr_agent.cli.subprocess.run", fake_run)
+
+    context = _load_snapshot_repo_context(tmp_path, "a" * 40)
+
+    assert context == {"FIRST.md": "123456"}
+    assert show_calls == [f"{'a' * 40}:FIRST.md"]
+
+
 def test_review_snapshot_atomically_replaces_json_symlink_swapped_during_review(
     cfg, monkeypatch, tmp_path, capsys
 ):
