@@ -440,6 +440,34 @@ def test_untracked_path_uses_index_and_base_filter_attributes(event, tmp_path):
     ) in snapshot.coverage_issues
 
 
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle"])
+def test_untracked_copy_from_excluded_tracked_source_is_omitted(event, tmp_path):
+    repo = _repo(tmp_path, f"untracked-excluded-copy-{event}")
+    source = repo / "secrets.txt"
+    source.write_text("complete excluded secret\n", encoding="utf-8")
+    _git(repo, "add", "secrets.txt")
+    _git(repo, "commit", "-m", "add excluded source")
+    destination = repo / "public.txt"
+    destination.write_bytes(source.read_bytes())
+
+    snapshot = LocalPairReview(
+        str(repo), excluded_paths=["secrets.txt"]
+    ).capture(
+        event=event,
+        focus_path="public.txt" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "complete excluded secret" not in snapshot.diff
+    assert CoverageIssue(
+        path="secrets.txt", reason="excluded"
+    ) in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="public.txt", reason="rename_group_omitted"
+    ) in snapshot.coverage_issues
+
+
 def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "large.py"

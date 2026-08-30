@@ -603,7 +603,7 @@ class LocalPairReview:
                 max_output_bytes=self.max_path_discovery_bytes,
                 stdin_bytes=tracked,
             )
-            if event is ReviewEvent.WORKTREE_IDLE
+            if event is not ReviewEvent.PRE_COMMIT
             else b""
         )
         base_attributes = _run_git_bounded(
@@ -665,6 +665,144 @@ class LocalPairReview:
             max_output_bytes=self.max_path_discovery_bytes,
         )
         return None if output is None else _decode_z_paths(output)
+
+    def _untracked_unsafe_copy_sources(
+        self,
+        event: ReviewEvent,
+        base_revision: str,
+        untracked_paths: Sequence[str],
+    ) -> Optional[dict[str, tuple[tuple[str, str], ...]]]:
+        """Find exact untracked copies of excluded or filtered tracked files."""
+        if not untracked_paths:
+            return {}
+        base_entries = _run_git_bounded(
+            self.repository_root,
+            "--literal-pathspecs",
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            base_revision,
+            max_output_bytes=self.max_path_discovery_bytes,
+        )
+        index_entries = _run_git_bounded(
+            self.repository_root,
+            "--literal-pathspecs",
+            "ls-files",
+            "--stage",
+            "-z",
+            max_output_bytes=self.max_path_discovery_bytes,
+        )
+        if base_entries is None or index_entries is None:
+            return None
+
+        source_oids: dict[str, set[str]] = {}
+
+        def add_entries(output: bytes, *, index: bool) -> None:
+            for entry in _decode_z_paths(output):
+                metadata, separator, path = entry.partition("\t")
+                fields = metadata.split()
+                object_index = 1 if index else 2
+                if not separator or len(fields) <= object_index:
+                    raise SnapshotCaptureError(
+                        "git object discovery returned malformed path data"
+                    )
+                source_oids.setdefault(path, set()).add(fields[object_index])
+
+        add_entries(base_entries, index=False)
+        add_entries(index_entries, index=True)
+        source_paths = tuple(source_oids)
+        source_filtered = self._tracked_filtered_paths(
+            event, base_revision, source_paths
+        )
+        if source_filtered is None:
+            return None
+        unsafe_reasons = {
+            path: (
+                "content_filter_unsupported"
+                if path in source_filtered
+                else "excluded"
+            )
+            for path in source_paths
+            if (
+                path in source_filtered
+                or self._is_excluded(path)
+                or self._is_ignored(path)
+            )
+        }
+        if not unsafe_reasons:
+            return {}
+
+        candidate_oids: dict[str, str] = {}
+        candidate_sizes: set[int] = set()
+        for path in untracked_paths:
+            if self._is_excluded(path) or self._is_ignored(path):
+                continue
+            candidate = self.repository_root / path
+            try:
+                candidate_stat = candidate.lstat()
+            except OSError:
+                return None
+            if (
+                stat.S_ISLNK(candidate_stat.st_mode)
+                or not stat.S_ISREG(candidate_stat.st_mode)
+                or candidate_stat.st_size > self.max_file_bytes
+            ):
+                continue
+            try:
+                candidate_oids[path] = _run_git(
+                    self.repository_root,
+                    "hash-object",
+                    "--no-filters",
+                    "--",
+                    path,
+                ).decode("ascii").strip()
+            except (SnapshotCaptureError, UnicodeDecodeError):
+                return None
+            candidate_sizes.add(candidate_stat.st_size)
+
+        remaining_source_bytes = self.max_snapshot_bytes
+        for path in unsafe_reasons:
+            candidate = self.repository_root / path
+            try:
+                source_stat = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return None
+            if (
+                stat.S_ISLNK(source_stat.st_mode)
+                or not stat.S_ISREG(source_stat.st_mode)
+                or source_stat.st_size not in candidate_sizes
+            ):
+                continue
+            if source_stat.st_size > remaining_source_bytes:
+                return None
+            remaining_source_bytes -= source_stat.st_size
+            try:
+                current_oid = _run_git(
+                    self.repository_root,
+                    "hash-object",
+                    "--no-filters",
+                    "--",
+                    path,
+                ).decode("ascii").strip()
+            except (SnapshotCaptureError, UnicodeDecodeError):
+                return None
+            source_oids[path].add(current_oid)
+
+        matches: dict[str, tuple[tuple[str, str], ...]] = {}
+        for destination, object_id in candidate_oids.items():
+            sources = tuple(
+                sorted(
+                    (source, unsafe_reasons[source])
+                    for source, object_ids in source_oids.items()
+                    if source in unsafe_reasons and object_id in object_ids
+                )
+            )
+            if sources:
+                matches[destination] = sources
+        return matches
 
     def _capture_diff(
         self,
@@ -783,6 +921,21 @@ class LocalPairReview:
             add_coverage(None, "untracked_path_discovery_budget")
             untracked = []
             discovery_overflow = True
+        unsafe_untracked_sources = self._untracked_unsafe_copy_sources(
+            event, base_revision, untracked
+        )
+        if unsafe_untracked_sources is None:
+            add_coverage(None, "copy_source_discovery_budget")
+            unsafe_untracked_sources = {}
+            discovery_overflow = True
+        else:
+            covered = {(issue.path, issue.reason) for issue in coverage}
+            for destination, sources in sorted(unsafe_untracked_sources.items()):
+                for source, reason in sources:
+                    if (source, reason) not in covered:
+                        add_coverage(source, reason)
+                        covered.add((source, reason))
+                add_coverage(destination, "rename_group_omitted")
         if event is not ReviewEvent.PRE_COMMIT:
             active_attribute_paths = self._tracked_attribute_candidate_paths(
                 normalized_focus
@@ -834,6 +987,7 @@ class LocalPairReview:
             tuple(tracked_groups),
             tuple(sorted(filtered_paths)),
             tuple(untracked),
+            tuple(sorted(unsafe_untracked_sources.items())),
         )
 
         def current_discovery_state():
@@ -855,6 +1009,11 @@ class LocalPairReview:
             )
             if current_untracked is None:
                 return None
+            current_unsafe_sources = self._untracked_unsafe_copy_sources(
+                event, base_revision, current_untracked
+            )
+            if current_unsafe_sources is None:
+                return None
             if event is not ReviewEvent.PRE_COMMIT:
                 active_paths = self._tracked_attribute_candidate_paths(
                     normalized_focus
@@ -875,6 +1034,7 @@ class LocalPairReview:
                 tuple(current_groups),
                 tuple(sorted(current_filtered)),
                 tuple(current_untracked),
+                tuple(sorted(current_unsafe_sources.items())),
             )
 
         def validate_path(path: str) -> Optional[str]:
@@ -889,6 +1049,8 @@ class LocalPairReview:
                 add_coverage(normalized, "excluded")
                 return None
             if normalized in filtered_paths:
+                return None
+            if normalized in unsafe_untracked_sources:
                 return None
             if self._has_content_filter(event, normalized):
                 add_coverage(normalized, "content_filter_unsupported")
