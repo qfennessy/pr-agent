@@ -398,8 +398,6 @@ class LocalPairReview:
         if event is ReviewEvent.PRE_COMMIT:
             args.append("--cached")
         args.extend(["--name-status", "-z", "--find-renames", base_revision, "--"])
-        if focus_path:
-            args.append(focus_path)
         output = _run_git_bounded(
             self.repository_root,
             *args,
@@ -416,6 +414,8 @@ class LocalPairReview:
             path_count = 2 if status.startswith(("R", "C")) else 1
             path_groups.append(tuple(fields[index:index + path_count]))
             index += path_count
+        if focus_path:
+            return [group for group in path_groups if focus_path in group]
         return path_groups
 
     def _tracked_filtered_paths(

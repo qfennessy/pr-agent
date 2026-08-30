@@ -439,6 +439,24 @@ def test_excluding_either_side_rejects_an_entire_rename(tmp_path):
     assert current.snapshot_id != snapshot.snapshot_id
 
 
+def test_file_save_rejects_a_focused_rename_with_an_excluded_source(tmp_path):
+    repo = _repo(tmp_path)
+    source = repo / "ignored.py"
+    source.write_text("secret = True\n", encoding="utf-8")
+    _git(repo, "add", "ignored.py")
+    _git(repo, "commit", "-m", "add ignored source")
+    _git(repo, "mv", "ignored.py", "allowed.py")
+
+    snapshot = LocalPairReview(str(repo), excluded_paths=["ignored.py"]).capture(
+        event="file-save", focus_path="allowed.py"
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(path="ignored.py", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="allowed.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
 def test_captured_filenames_are_literal_git_pathspecs(tmp_path):
     repo = _repo(tmp_path)
     magic = ":(glob)*.py"
