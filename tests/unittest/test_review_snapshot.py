@@ -36,7 +36,7 @@ def _repo(tmp_path: Path, name: str = "repo") -> Path:
     return repo
 
 
-def _snapshot(root: str, *, diff: str = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n", policy="v1"):
+def _snapshot(root: str, *, diff: str = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n", policy="v1", config="c1"):
     return ReviewSnapshot(
         event=ReviewEvent.FILE_SAVE,
         repository_root=root,
@@ -45,6 +45,7 @@ def _snapshot(root: str, *, diff: str = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n
         focus_path="x",
         diff=diff,
         policy_version=policy,
+        review_configuration_hash=config,
         created_at="2026-01-01T00:00:00+00:00",
     )
 
@@ -59,6 +60,7 @@ def test_snapshot_identity_is_stable_and_policy_and_repository_scoped():
     assert first.snapshot_id == recreated.snapshot_id
     assert first.snapshot_id != _snapshot("/repo/one", diff=first.diff + "\n").snapshot_id
     assert first.snapshot_id != _snapshot("/repo/one", policy="v2").snapshot_id
+    assert first.snapshot_id != _snapshot("/repo/one", config="c2").snapshot_id
     assert first.snapshot_id != _snapshot("/repo/two").snapshot_id
 
 
@@ -108,6 +110,34 @@ def test_pre_commit_coverage_inspects_the_staged_blob(tmp_path):
 
     assert snapshot.diff == ""
     assert CoverageIssue(path="tracked.py", reason="file_too_large") in snapshot.coverage_issues
+
+
+def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):
+    repo = _repo(tmp_path)
+    path = repo / "large.py"
+    path.write_text("x" * 100, encoding="utf-8")
+    _git(repo, "add", "large.py")
+    _git(repo, "commit", "-m", "add large file")
+    path.unlink()
+
+    snapshot = LocalPairReview(str(repo), max_file_bytes=20).capture(event="worktree-idle")
+
+    assert "large.py" not in snapshot.changed_paths
+    assert CoverageIssue(path="large.py", reason="file_too_large") in snapshot.coverage_issues
+
+
+def test_symlink_paths_are_preserved_and_reported_as_unsupported(tmp_path):
+    repo = _repo(tmp_path)
+    target = repo / "target.py"
+    target.write_text("inside = True\n", encoding="utf-8")
+    link = repo / "link.py"
+    link.symlink_to("target.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="file-save", focus_path="link.py")
+
+    assert snapshot.focus_path == "link.py"
+    assert snapshot.diff == ""
+    assert CoverageIssue(path="link.py", reason="symlink") in snapshot.coverage_issues
 
 
 def test_file_save_requires_a_safe_focused_path_and_captures_untracked_addition(tmp_path):

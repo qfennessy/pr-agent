@@ -75,9 +75,11 @@ class LocalPairReview:
         candidate = path if path.is_absolute() else self.repository_root / path
         # Resolve existing symlinks as well as lexical ``..``. A symlink that points
         # outside the worktree is not safe input even when its link lives inside it.
+        lexical = Path(os.path.abspath(candidate))
         resolved = candidate.resolve(strict=False)
         try:
-            relative = resolved.relative_to(self.repository_root)
+            resolved.relative_to(self.repository_root)
+            relative = lexical.relative_to(self.repository_root)
         except ValueError as exc:
             raise SnapshotCaptureError(f"path is outside repository root: {supplied_path}") from exc
         if relative == Path("."):
@@ -87,38 +89,7 @@ class LocalPairReview:
     def _is_excluded(self, path: str) -> bool:
         return any(fnmatch.fnmatch(path, pattern) for pattern in self.excluded_paths)
 
-    def _inspect_current_file(self, path: str) -> Optional[str]:
-        candidate = self.repository_root / path
-        if not candidate.exists():
-            return None  # a tracked deletion is valid input
-        if not candidate.is_file():
-            return "not_a_regular_file"
-        try:
-            size = candidate.stat().st_size
-            if size > self.max_file_bytes:
-                return "file_too_large"
-            content = candidate.read_bytes()
-        except OSError:
-            return "unreadable"
-        if b"\0" in content:
-            return "binary"
-        try:
-            content.decode("utf-8")
-        except UnicodeDecodeError:
-            return "binary"
-        return None
-
-    def _inspect_index_file(self, path: str) -> Optional[str]:
-        """Inspect the exact staged blob used by a pre-commit snapshot."""
-        process = subprocess.run(
-            ["git", "-C", str(self.repository_root), "show", f":./{path}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if process.returncode != 0:
-            return None  # a staged deletion has no index blob and is valid input
-        content = process.stdout
+    def _inspect_content(self, content: bytes) -> Optional[str]:
         if len(content) > self.max_file_bytes:
             return "file_too_large"
         if b"\0" in content:
@@ -128,6 +99,55 @@ class LocalPairReview:
         except UnicodeDecodeError:
             return "binary"
         return None
+
+    def _git_object_mode(self, revision: str, path: str) -> Optional[str]:
+        if revision == ":":
+            output = _run_git(self.repository_root, "ls-files", "--stage", "--", path)
+        else:
+            output = _run_git(self.repository_root, "ls-tree", revision, "--", path)
+        line = output.decode("utf-8", errors="replace").strip()
+        return line.split(maxsplit=1)[0] if line else None
+
+    def _inspect_revision_file(self, revision: str, path: str) -> Optional[str]:
+        if self._git_object_mode(revision, path) == "120000":
+            return "symlink"
+        process = subprocess.run(
+            ["git", "-C", str(self.repository_root), "show", f"{revision}:./{path}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if process.returncode != 0:
+            return "unreadable"
+        return self._inspect_content(process.stdout)
+
+    def _inspect_current_file(self, path: str, base_revision: str) -> Optional[str]:
+        candidate = self.repository_root / path
+        if candidate.is_symlink():
+            return "symlink"
+        if not candidate.exists():
+            return self._inspect_revision_file(base_revision, path)
+        if not candidate.is_file():
+            return "not_a_regular_file"
+        try:
+            content = candidate.read_bytes()
+        except OSError:
+            return "unreadable"
+        return self._inspect_content(content)
+
+    def _inspect_index_file(self, path: str, base_revision: str) -> Optional[str]:
+        """Inspect the exact staged blob used by a pre-commit snapshot."""
+        if self._git_object_mode(":", path) == "120000":
+            return "symlink"
+        process = subprocess.run(
+            ["git", "-C", str(self.repository_root), "show", f":./{path}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if process.returncode != 0:
+            return self._inspect_revision_file(base_revision, path)
+        return self._inspect_content(process.stdout)
 
     def _resolve_base(self, base: str) -> str:
         resolved = _run_git(self.repository_root, "rev-parse", "--verify", f"{base}^{{commit}}")
@@ -184,6 +204,7 @@ class LocalPairReview:
         focus_path: Optional[str] = None,
         task_intent: Optional[str] = None,
         deterministic_results: Iterable[Mapping[str, Any]] = (),
+        review_configuration_hash: Optional[str] = None,
         policy_version: str = "local-pair-review-v1",
         parent_snapshot_id: Optional[str] = None,
     ) -> ReviewSnapshot:
@@ -218,9 +239,9 @@ class LocalPairReview:
                 coverage.append(CoverageIssue(path=normalized, reason="excluded"))
                 continue
             file_issue = (
-                self._inspect_index_file(normalized)
+                self._inspect_index_file(normalized, base_revision)
                 if event is ReviewEvent.PRE_COMMIT
-                else self._inspect_current_file(normalized)
+                else self._inspect_current_file(normalized, base_revision)
             )
             if file_issue:
                 coverage.append(CoverageIssue(path=normalized, reason=file_issue))
@@ -261,6 +282,7 @@ class LocalPairReview:
             diff=safe_diff,
             task_intent=task_intent,
             deterministic_results=tuple(deterministic_results),
+            review_configuration_hash=review_configuration_hash,
             policy_version=policy_version,
             created_at=datetime.now(timezone.utc).isoformat(),
             parent_snapshot_id=parent_snapshot_id,
@@ -274,6 +296,7 @@ class LocalPairReview:
             focus_path=snapshot.focus_path,
             task_intent=snapshot.task_intent,
             deterministic_results=snapshot.deterministic_results,
+            review_configuration_hash=snapshot.review_configuration_hash,
             policy_version=snapshot.policy_version,
             parent_snapshot_id=snapshot.parent_snapshot_id,
         )

@@ -71,6 +71,7 @@ class ReviewSnapshot:
     focus_path: Optional[str] = None
     task_intent: Optional[str] = None
     deterministic_results: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
+    review_configuration_hash: Optional[str] = None
     parent_snapshot_id: Optional[str] = None
     schema_version: str = SNAPSHOT_SCHEMA_VERSION
     coverage_issues: tuple[CoverageIssue, ...] = field(default_factory=tuple)
@@ -90,6 +91,7 @@ class ReviewSnapshot:
             "diff": self.diff,
             "task_intent": self.task_intent,
             "deterministic_results": self.deterministic_results,
+            "review_configuration_hash": self.review_configuration_hash,
             "policy_version": self.policy_version,
         }
         digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()

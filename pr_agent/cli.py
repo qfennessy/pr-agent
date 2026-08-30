@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -168,6 +169,23 @@ def _snapshot_review_instructions(snapshot) -> str:
     return f"{existing}\n\n{snapshot_context}" if existing else snapshot_context
 
 
+def _snapshot_review_configuration_hash() -> str:
+    settings = get_settings()
+    effective = {
+        "runtime_version": get_version(),
+        "config": {
+            key: settings.get(f"config.{key}", None)
+            for key in ("model", "fallback_models", "temperature", "model_token_count_estimate")
+        },
+        "openai_deployment_id": settings.get("openai.deployment_id", None),
+        "pr_reviewer": settings.get("pr_reviewer", {}) or {},
+        "pr_review_prompt": settings.get("pr_review_prompt", {}) or {},
+        "skills": settings.get("skills", {}) or {},
+    }
+    payload = json.dumps(effective, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
     parser = _snapshot_parser()
     snapshot_args = parser.parse_args(args.rest)
@@ -195,6 +213,7 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
             focus_path=snapshot_args.focus_path,
             task_intent=snapshot_args.task_intent,
             deterministic_results=checks,
+            review_configuration_hash=_snapshot_review_configuration_hash(),
             policy_version=policy_version,
             parent_snapshot_id=snapshot_args.parent_snapshot_id,
         )
