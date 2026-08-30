@@ -62,7 +62,7 @@ async def _bounded_repo_file_fetch(git_provider, path: str, timeout_seconds: flo
         try:
             value = git_provider.get_repo_file_content(path, False)
             outcome = (value, None)
-        except BaseException as exc:
+        except Exception as exc:
             outcome = (None, exc)
         finally:
             _REPO_FETCH_SLOTS.release()
@@ -79,7 +79,7 @@ async def _bounded_repo_file_fetch(git_provider, path: str, timeout_seconds: flo
             name="pr-agent-repo-context-fetch",
             daemon=True,
         ).start()
-    except BaseException:
+    except Exception:
         _REPO_FETCH_SLOTS.release()
         raise
     return await asyncio.wait_for(result, timeout=timeout_seconds)
