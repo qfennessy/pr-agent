@@ -183,6 +183,23 @@ def test_pre_commit_snapshot_uses_only_the_index(tmp_path):
     assert "untracked.py" not in snapshot.diff
 
 
+def test_pre_commit_snapshot_supports_an_initial_commit(tmp_path):
+    repo = tmp_path / "initial-commit"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Snapshot Test")
+    (repo / "first.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "first.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="pre-commit")
+
+    assert snapshot.changed_paths == ("first.py",)
+    assert "+value = 1" in snapshot.diff
+    assert snapshot.base_selector == "HEAD"
+    assert snapshot.base_revision
+
+
 def test_pre_commit_coverage_inspects_the_staged_blob(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "tracked.py"

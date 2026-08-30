@@ -122,6 +122,7 @@ _LOCAL_PAIR_REVIEW_LIMIT_DEFAULTS = {
     "max_file_bytes": 1_000_000,
     "max_snapshot_bytes": 5_000_000,
     "max_path_discovery_bytes": 1_000_000,
+    "cache_max_entries": 50,
 }
 
 
@@ -351,8 +352,35 @@ class LocalPairReview:
         return self._inspect_git_object(mode, object_id)
 
     def _resolve_base(self, base: str) -> str:
-        resolved = _run_git(self.repository_root, "rev-parse", "--verify", f"{base}^{{commit}}")
-        return resolved.decode("ascii").strip()
+        try:
+            resolved = _run_git(
+                self.repository_root, "rev-parse", "--verify", f"{base}^{{commit}}"
+            )
+            return resolved.decode("ascii").strip()
+        except SnapshotCaptureError as exc:
+            if base != "HEAD":
+                raise
+            symbolic_head = subprocess.run(
+                ["git", "-C", str(self.repository_root), "symbolic-ref", "-q", "HEAD"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if symbolic_head.returncode != 0:
+                raise exc
+            empty_tree = subprocess.run(
+                ["git", "-C", str(self.repository_root), "hash-object", "-t", "tree", "--stdin"],
+                input=b"",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if empty_tree.returncode != 0:
+                message = empty_tree.stderr.decode("utf-8", errors="replace").strip()
+                raise SnapshotCaptureError(
+                    message or "could not resolve the empty Git tree"
+                ) from exc
+            return empty_tree.stdout.decode("ascii").strip()
 
     def _tracked_path_groups(
         self,

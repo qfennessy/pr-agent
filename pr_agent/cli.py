@@ -683,7 +683,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         outer_parser.error(f"could not apply repository settings: {type(exc).__name__}")
     settings = get_settings().get("local_pair_review", {}) or {}
     try:
-        validate_local_pair_review_limits(settings)
+        validated_limits = validate_local_pair_review_limits(settings)
     except SnapshotCaptureError as exc:
         outer_parser.error(str(exc))
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
@@ -755,7 +755,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     cache_enabled = bool(settings.get("cache_enabled", True)) and not snapshot_args.no_cache
     cache = SnapshotCache(
         reviewer.repository_root,
-        max_entries=int(settings.get("cache_max_entries", 50)),
+        max_entries=validated_limits["cache_max_entries"],
     )
 
     def current_configuration_hash(base_revision: str) -> str:

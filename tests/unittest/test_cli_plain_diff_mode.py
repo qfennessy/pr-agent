@@ -415,8 +415,12 @@ def test_review_snapshot_reports_looped_git_artifact_root(monkeypatch, tmp_path,
     assert "Traceback" not in error
 
 
-def test_review_snapshot_validates_byte_limits_before_removing_output(
-    monkeypatch, tmp_path, capsys
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    [("max_file_bytes", '"1 MB"'), ("cache_max_entries", '"many"')],
+)
+def test_review_snapshot_validates_numeric_limits_before_removing_output(
+    monkeypatch, tmp_path, capsys, setting, value
 ):
     import subprocess
 
@@ -424,7 +428,7 @@ def test_review_snapshot_validates_byte_limits_before_removing_output(
     repo.mkdir()
     subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
     (repo / ".pr_agent.toml").write_text(
-        '[local_pair_review]\nmax_file_bytes = "1 MB"\n',
+        f"[local_pair_review]\n{setting} = {value}\n",
         encoding="utf-8",
     )
     output = tmp_path / "previous-review.md"
@@ -438,7 +442,7 @@ def test_review_snapshot_validates_byte_limits_before_removing_output(
         ])
 
     error = capsys.readouterr().err
-    assert "local_pair_review.max_file_bytes must be an integer" in error
+    assert f"local_pair_review.{setting} must be an integer" in error
     assert "Traceback" not in error
     assert output.read_text(encoding="utf-8") == previous
 
