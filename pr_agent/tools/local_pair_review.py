@@ -587,9 +587,6 @@ class LocalPairReview:
         if filtered_paths is None:
             add_coverage(None, "filtered_path_discovery_budget")
             filtered_paths = set()
-        else:
-            for filtered_path in sorted(filtered_paths):
-                add_coverage(filtered_path, "content_filter_unsupported")
 
         tracked_groups = self._tracked_path_groups(
             event, base_revision, normalized_focus
@@ -598,6 +595,13 @@ class LocalPairReview:
         if tracked_groups is None:
             add_coverage(None, "tracked_path_discovery_budget")
             tracked_groups = []
+        if event is ReviewEvent.PRE_COMMIT:
+            changed_group_paths = {
+                path for group in tracked_groups for path in group
+            }
+            filtered_paths.intersection_update(changed_group_paths)
+        for filtered_path in sorted(filtered_paths):
+            add_coverage(filtered_path, "content_filter_unsupported")
         untracked = (
             []
             if event is ReviewEvent.PRE_COMMIT

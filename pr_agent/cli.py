@@ -817,6 +817,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     artifact_exclusions = _output_artifact_exclusions(
         repository_root, markdown_output, json_output
     )
+    artifact_exclusions.append(".pr_agent.toml")
     artifact_exclusions.extend(
         _extra_config_exclusions(repository_root, invocation_extra_config)
     )

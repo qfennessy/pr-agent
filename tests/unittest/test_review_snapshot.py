@@ -363,6 +363,25 @@ def test_pre_commit_uses_index_content_filter_attributes(tmp_path):
     ) in snapshot.coverage_issues
 
 
+def test_pre_commit_ignores_unchanged_filtered_paths(tmp_path):
+    repo = _repo(tmp_path, "unchanged-index-filter")
+    (repo / ".gitattributes").write_text(
+        "large.bin filter=lfs\n",
+        encoding="utf-8",
+    )
+    (repo / "large.bin").write_bytes(b"unchanged binary\n")
+    (repo / "changed.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", ".gitattributes", "large.bin", "changed.py")
+    _git(repo, "commit", "-m", "filtered fixture")
+    (repo / "changed.py").write_text("value = 2\n", encoding="utf-8")
+    _git(repo, "add", "changed.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="pre-commit")
+
+    assert snapshot.changed_paths == ("changed.py",)
+    assert snapshot.coverage_issues == ()
+
+
 def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "large.py"
