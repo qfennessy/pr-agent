@@ -20,7 +20,7 @@ from typing import Any, Mapping, Optional
 from pr_agent.algo.checkpoint_evaluation import EvaluationValidationError, content_hash
 from pr_agent.algo.review_snapshot import ReviewEvent
 
-COCOS_ADAPTER_SCHEMA_VERSION = "cocos-story-checkpoint-corpus-v1"
+COCOS_ADAPTER_SCHEMA_VERSION = "cocos-story-checkpoint-corpus-v2"
 CHECKPOINT_CONTROL_SCHEMA_VERSION = "cocos-story-checkpoint-controls-v1"
 COCOS_REPOSITORY = "sagacious-heritage/cocos-story"
 _DEFAULT_COHORT_COUNTS = {
@@ -28,6 +28,7 @@ _DEFAULT_COHORT_COUNTS = {
     "holdout": 18,
     "temporal": 10,
     "control": 16,
+    "confirmation": 16,
     "unique_snapshots": 55,
 }
 _REQUIRED_FILES = {
@@ -35,6 +36,8 @@ _REQUIRED_FILES = {
     "temporal": "temporal-backtest-ledger.json",
     "controls": "controls-ledger.json",
     "annotations": "specialist-annotations.json",
+    "confirmation": "confirmation-ledger.json",
+    "confirmation_annotations": "confirmation/specialist-annotations.json",
 }
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -63,9 +66,23 @@ def _sha256_bytes(value: bytes) -> str:
 
 
 def _read_regular_file(root: Path, relative_path: str) -> bytes:
-    if Path(relative_path).is_absolute() or ".." in Path(relative_path).parts:
+    relative = Path(relative_path)
+    if relative.is_absolute() or ".." in relative.parts:
         raise EvaluationValidationError("Cocos corpus lock paths must stay below the corpus root")
-    path = root / relative_path
+    parent = root
+    for part in relative.parts[:-1]:
+        parent /= part
+        try:
+            parent_metadata = parent.lstat()
+        except OSError as exc:
+            raise EvaluationValidationError(
+                f"missing Cocos corpus artifact directory: {relative_path}"
+            ) from exc
+        if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+            raise EvaluationValidationError(
+                f"Cocos corpus artifact directory is not a real directory: {relative_path}"
+            )
+    path = root / relative
     try:
         metadata = path.lstat()
     except OSError as exc:
@@ -83,6 +100,7 @@ class CocosCorpusLock:
     source_revision: str
     artifact_hashes: Mapping[str, str]
     assignment_hash: str
+    confirmation_assignment_hash: str
     expected_cohort_counts: Mapping[str, int] = field(default_factory=lambda: dict(_DEFAULT_COHORT_COUNTS))
     repository: str = COCOS_REPOSITORY
     schema_version: str = COCOS_ADAPTER_SCHEMA_VERSION
@@ -100,7 +118,9 @@ class CocosCorpusLock:
         for name, digest in self.artifact_hashes.items():
             if not isinstance(name, str) or not isinstance(digest, str) or not _SHA256.fullmatch(digest):
                 raise EvaluationValidationError("Cocos artifact hashes must be sha256 identities")
-        required_counts = {"calibration", "holdout", "temporal", "control", "unique_snapshots"}
+        required_counts = {
+            "calibration", "holdout", "temporal", "control", "confirmation", "unique_snapshots",
+        }
         if set(self.expected_cohort_counts) != required_counts or any(
             not isinstance(count, int) or isinstance(count, bool) or count < 1
             for count in self.expected_cohort_counts.values()
@@ -108,6 +128,13 @@ class CocosCorpusLock:
             raise EvaluationValidationError("Cocos cohort lock must contain positive exact counts")
         if not isinstance(self.assignment_hash, str) or not _SHA256.fullmatch(self.assignment_hash):
             raise EvaluationValidationError("Cocos assignment_hash must be a sha256 identity")
+        if (
+            not isinstance(self.confirmation_assignment_hash, str)
+            or not _SHA256.fullmatch(self.confirmation_assignment_hash)
+        ):
+            raise EvaluationValidationError(
+                "Cocos confirmation_assignment_hash must be a sha256 identity"
+            )
         object.__setattr__(self, "artifact_hashes", MappingProxyType(dict(self.artifact_hashes)))
         object.__setattr__(self, "expected_cohort_counts", MappingProxyType(dict(self.expected_cohort_counts)))
         object.__setattr__(self, "lock_id", content_hash(self._identity_payload()))
@@ -119,6 +146,7 @@ class CocosCorpusLock:
             "source_revision": self.source_revision,
             "artifact_hashes": dict(sorted(self.artifact_hashes.items())),
             "assignment_hash": self.assignment_hash,
+            "confirmation_assignment_hash": self.confirmation_assignment_hash,
             "expected_cohort_counts": dict(sorted(self.expected_cohort_counts.items())),
         }
 
@@ -129,7 +157,7 @@ class CocosCorpusLock:
     def from_dict(cls, value: Mapping[str, Any]) -> "CocosCorpusLock":
         allowed = {
             "schema_version", "repository", "source_revision", "artifact_hashes", "assignment_hash",
-            "expected_cohort_counts", "lock_id",
+            "confirmation_assignment_hash", "expected_cohort_counts", "lock_id",
         }
         unknown = sorted(set(value) - allowed)
         if unknown:
@@ -138,6 +166,7 @@ class CocosCorpusLock:
             source_revision=value["source_revision"],
             artifact_hashes=value["artifact_hashes"],
             assignment_hash=value["assignment_hash"],
+            confirmation_assignment_hash=value["confirmation_assignment_hash"],
             expected_cohort_counts=value.get("expected_cohort_counts", _DEFAULT_COHORT_COUNTS),
             repository=value.get("repository", COCOS_REPOSITORY),
             schema_version=value.get("schema_version", COCOS_ADAPTER_SCHEMA_VERSION),
@@ -212,6 +241,73 @@ def _assignment_payload(
             "target_sha": entry.get("target_sha"),
         })
     return sorted(assignments, key=lambda item: (str(item["split"]), str(item["id"])))
+
+
+def _confirmation_assignment_payload(
+    confirmation: Mapping[str, Any],
+    annotations: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    selection_policy = confirmation.get("selection_policy")
+    if (
+        confirmation.get("schema_version") != 1
+        or confirmation.get("cohort") != "sealed_confirmation"
+        or not isinstance(selection_policy, Mapping)
+        or selection_policy.get("prompt_development_allowed") is not False
+        or selection_policy.get("architecture_selection_allowed") is not False
+    ):
+        raise EvaluationValidationError("Cocos confirmation ledger must remain sealed")
+    entries = _object_entries(confirmation, "entries", "confirmation ledger")
+    snapshots = _object_entries(annotations, "snapshots", "confirmation annotation ledger")
+    annotation_policy = annotations.get("annotation_policy")
+    if (
+        annotations.get("schema_version") != 1
+        or annotations.get("answer_only") is not True
+        or not isinstance(annotation_policy, Mapping)
+        or annotation_policy.get("defect_targets_are_never_prompt_inputs") is not True
+    ):
+        raise EvaluationValidationError("Cocos confirmation annotations must remain answer-only")
+
+    ledger_assignments: dict[str, str] = {}
+    for entry in entries:
+        identifier = entry.get("id")
+        target_sha = entry.get("target_sha")
+        if (
+            not isinstance(identifier, str)
+            or not identifier.strip()
+            or identifier in ledger_assignments
+            or entry.get("split") != "confirmation"
+            or not isinstance(target_sha, str)
+            or not _GIT_COMMIT.fullmatch(target_sha)
+        ):
+            raise EvaluationValidationError(
+                "Cocos confirmation entries require unique ids, confirmation split, and immutable target SHAs"
+            )
+        ledger_assignments[identifier] = target_sha
+
+    annotation_assignments: dict[str, str] = {}
+    for snapshot in snapshots:
+        identifier = snapshot.get("snapshot_id")
+        target_sha = snapshot.get("target_sha")
+        if (
+            not isinstance(identifier, str)
+            or not identifier.strip()
+            or identifier in annotation_assignments
+            or snapshot.get("split") != "confirmation"
+            or not isinstance(target_sha, str)
+            or not _GIT_COMMIT.fullmatch(target_sha)
+        ):
+            raise EvaluationValidationError(
+                "Cocos confirmation annotations require unique ids, confirmation split, and immutable target SHAs"
+            )
+        annotation_assignments[identifier] = target_sha
+    if ledger_assignments != annotation_assignments:
+        raise EvaluationValidationError(
+            "Cocos sealed confirmation ledger and annotations name different assignments"
+        )
+    return [
+        {"id": identifier, "split": "confirmation", "target_sha": ledger_assignments[identifier]}
+        for identifier in sorted(ledger_assignments)
+    ]
 
 
 def _contains_forbidden_control_key(value: Any) -> bool:
@@ -344,6 +440,10 @@ def validate_cocos_story_corpus(
     temporal_entries = _object_entries(parsed["temporal"], "entries", "temporal ledger")
     control_entries = _object_entries(parsed["controls"], "entries", "control ledger")
     annotation_snapshots = _object_entries(parsed["annotations"], "snapshots", "annotation ledger")
+    confirmation_assignments = _confirmation_assignment_payload(
+        parsed["confirmation"],
+        parsed["confirmation_annotations"],
+    )
     snapshot_ids = [entry.get("snapshot_id") for entry in annotation_snapshots]
     if any(not isinstance(identifier, str) or not identifier.strip() for identifier in snapshot_ids):
         raise EvaluationValidationError("Cocos annotation snapshot ids must be non-empty strings")
@@ -354,6 +454,7 @@ def validate_cocos_story_corpus(
         "holdout": sum(entry.get("split") == "holdout" for entry in primary_entries),
         "temporal": len(temporal_entries),
         "control": len(control_entries),
+        "confirmation": len(confirmation_assignments),
         "unique_snapshots": len(annotation_snapshots),
     }
     if counts != dict(lock.expected_cohort_counts):
@@ -363,12 +464,23 @@ def validate_cocos_story_corpus(
     assignments = _assignment_payload(parsed["primary"], parsed["temporal"], parsed["controls"])
     if content_hash(assignments) != lock.assignment_hash:
         raise EvaluationValidationError("Cocos calibration, holdout, temporal, or control assignments changed")
+    if content_hash(confirmation_assignments) != lock.confirmation_assignment_hash:
+        raise EvaluationValidationError("Cocos sealed confirmation assignments changed")
+    confirmation_source_hashes = parsed["confirmation_annotations"].get("source_hashes")
+    if not isinstance(confirmation_source_hashes, Mapping) or (
+        confirmation_source_hashes.get("confirmation-ledger.json")
+        != actual_hashes["confirmation-ledger.json"].removeprefix("sha256:")
+    ):
+        raise EvaluationValidationError(
+            "Cocos confirmation annotations are not bound to the locked confirmation ledger"
+        )
 
     checkpoint_count, checkpoint_status, checkpoint_hash = _validate_checkpoint_controls(checkpoint_controls_path)
     corpus_hash = content_hash({
         "source_revision": lock.source_revision,
         "artifact_hashes": actual_hashes,
         "assignment_hash": lock.assignment_hash,
+        "confirmation_assignment_hash": lock.confirmation_assignment_hash,
         "checkpoint_control_count": checkpoint_count,
         "checkpoint_controls_hash": checkpoint_hash,
     })

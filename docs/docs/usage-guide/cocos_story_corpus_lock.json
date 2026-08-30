@@ -1,19 +1,23 @@
 {
   "artifact_hashes": {
+    "confirmation-ledger.json": "sha256:32922979b9b4c6040a1f96fa5cbdde4f0dbf267da3d5d7ac00f5852f989b9ee7",
+    "confirmation/specialist-annotations.json": "sha256:922aa68981e7b5a970880c0c78c8b6f57239b27faa087c82d7a6a7578bd3cf41",
     "controls-ledger.json": "sha256:1e9e47ba48b273fc7fb45e32e1e632058364d3b62c4dff75416f70ebc6a47d77",
     "ledger.json": "sha256:8a0ce4e2a4b46c8e653a5ea1f5f96c732e6338c83999e6d567b970b5795f15d5",
     "specialist-annotations.json": "sha256:8263935dd662a4fd3a3aaa06c3502477ba55429985508f837e5fc1de3f22e990",
     "temporal-backtest-ledger.json": "sha256:661cd710f39da98dc71e82e673de97edf315c6551cf183feb928d30876bd42cb"
   },
   "assignment_hash": "sha256:79fff80fca48719ff5152163d4aa983f76500aa3af9d979cd9c26def61dd80ca",
+  "confirmation_assignment_hash": "sha256:a7540faf176fbcb8ce5b7c927a75b0d7a3982719aee51469904e4f6018d8a6e6",
   "expected_cohort_counts": {
     "calibration": 12,
+    "confirmation": 16,
     "control": 16,
     "holdout": 18,
     "temporal": 10,
     "unique_snapshots": 55
   },
   "repository": "sagacious-heritage/cocos-story",
-  "schema_version": "cocos-story-checkpoint-corpus-v1",
+  "schema_version": "cocos-story-checkpoint-corpus-v2",
   "source_revision": "6b98bae67bae4056c4567187454e24cca78b9467"
 }

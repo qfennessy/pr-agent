@@ -800,6 +800,7 @@ def _write_json(path: Path, value) -> str:
 def test_cocos_adapter_reads_external_locked_corpus_without_copying(tmp_path, capsys):
     corpus = tmp_path / "cocos-corpus"
     corpus.mkdir()
+    (corpus / "confirmation").mkdir()
     primary = {
         "repo": "sagacious-heritage/cocos-story",
         "entries": [
@@ -820,13 +821,40 @@ def test_cocos_adapter_reads_external_locked_corpus_without_copying(tmp_path, ca
         "answer_only": True,
         "snapshots": [{"snapshot_id": "A01"}, {"snapshot_id": "B01"}],
     }
+    confirmation = {
+        "repo": "sagacious-heritage/cocos-story",
+        "schema_version": 1,
+        "cohort": "sealed_confirmation",
+        "selection_policy": {
+            "prompt_development_allowed": False,
+            "architecture_selection_allowed": False,
+        },
+        "entries": [
+            {"id": "D01", "split": "confirmation", "target_sha": "f" * 40},
+        ],
+    }
+    confirmation_hash = _write_json(corpus / "confirmation-ledger.json", confirmation)
+    confirmation_annotations = {
+        "repo": "sagacious-heritage/cocos-story",
+        "schema_version": 1,
+        "answer_only": True,
+        "annotation_policy": {"defect_targets_are_never_prompt_inputs": True},
+        "source_hashes": {
+            "confirmation-ledger.json": confirmation_hash.removeprefix("sha256:"),
+        },
+        "snapshots": [
+            {"snapshot_id": "D01", "split": "confirmation", "target_sha": "f" * 40},
+        ],
+    }
     values = {
         "ledger.json": primary,
         "temporal-backtest-ledger.json": temporal,
         "controls-ledger.json": controls,
         "specialist-annotations.json": annotations,
+        "confirmation/specialist-annotations.json": confirmation_annotations,
     }
     artifact_hashes = {name: _write_json(corpus / name, value) for name, value in values.items()}
+    artifact_hashes["confirmation-ledger.json"] = confirmation_hash
     assignment_payload = [
         {"id": "A01", "split": "calibration", "target_sha": "a" * 40},
         {"id": "C01", "split": "control", "target_sha": "d" * 40},
@@ -837,8 +865,12 @@ def test_cocos_adapter_reads_external_locked_corpus_without_copying(tmp_path, ca
         source_revision="e" * 40,
         artifact_hashes=artifact_hashes,
         assignment_hash=content_hash(assignment_payload),
+        confirmation_assignment_hash=content_hash([
+            {"id": "D01", "split": "confirmation", "target_sha": "f" * 40},
+        ]),
         expected_cohort_counts={
             "calibration": 1,
+            "confirmation": 1,
             "holdout": 1,
             "temporal": 1,
             "control": 1,
@@ -947,14 +979,52 @@ def test_cocos_adapter_reads_external_locked_corpus_without_copying(tmp_path, ca
     with pytest.raises(EvaluationValidationError, match="changed after the approved lock"):
         validate_cocos_story_corpus(corpus, lock)
 
+    _write_json(corpus / "ledger.json", primary)
+    changed_confirmation = {
+        **confirmation_annotations,
+        "snapshots": [
+            {"snapshot_id": "D02", "split": "confirmation", "target_sha": "f" * 40},
+        ],
+    }
+    _write_json(corpus / "confirmation/specialist-annotations.json", changed_confirmation)
+    changed_hashes = dict(lock.artifact_hashes)
+    changed_hashes["confirmation/specialist-annotations.json"] = _write_json(
+        corpus / "confirmation/specialist-annotations.json",
+        changed_confirmation,
+    )
+    changed_lock = CocosCorpusLock(
+        source_revision=lock.source_revision,
+        artifact_hashes=changed_hashes,
+        assignment_hash=lock.assignment_hash,
+        confirmation_assignment_hash=lock.confirmation_assignment_hash,
+        expected_cohort_counts=lock.expected_cohort_counts,
+    )
+    with pytest.raises(EvaluationValidationError, match="name different assignments"):
+        validate_cocos_story_corpus(corpus, changed_lock)
+
+    real_confirmation_directory = corpus / "confirmation-real"
+    (corpus / "confirmation").rename(real_confirmation_directory)
+    (corpus / "confirmation").symlink_to(real_confirmation_directory, target_is_directory=True)
+    with pytest.raises(EvaluationValidationError, match="not a real directory"):
+        validate_cocos_story_corpus(corpus, changed_lock)
+
 
 def test_checked_in_cocos_lock_is_schema_valid():
     lock_path = Path("docs/docs/usage-guide/cocos_story_corpus_lock.json")
     lock = CocosCorpusLock.from_dict(json.loads(lock_path.read_text(encoding="utf-8")))
 
     assert lock.source_revision == "6b98bae67bae4056c4567187454e24cca78b9467"
+    assert lock.schema_version == "cocos-story-checkpoint-corpus-v2"
+    assert lock.confirmation_assignment_hash == (
+        "sha256:a7540faf176fbcb8ce5b7c927a75b0d7a3982719aee51469904e4f6018d8a6e6"
+    )
+    assert {
+        "confirmation-ledger.json",
+        "confirmation/specialist-annotations.json",
+    } <= set(lock.artifact_hashes)
     assert lock.expected_cohort_counts == {
         "calibration": 12,
+        "confirmation": 16,
         "control": 16,
         "holdout": 18,
         "temporal": 10,

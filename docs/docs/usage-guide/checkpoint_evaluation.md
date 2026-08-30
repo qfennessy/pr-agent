@@ -48,9 +48,17 @@ rejected recursively inside model-visible metadata. A manifest cannot reuse snap
 identities, mix one lineage across cohorts, or accept a supplied content id that does not
 match its canonical JSON.
 
-These artifacts contain no source text, full diff, secret, hidden reasoning, provider
-request identifier, or credential. Snapshot content remains in the existing serialized
-snapshot store and is referenced by hash.
+Before any future runner may use a source-bearing snapshot, it must call
+`load_review_snapshot_artifact()`. The loader reads one bounded regular file without
+following symlinks, rejects duplicate keys and non-finite JSON, verifies the exact file-byte
+hash against the checkpoint, reconstructs the `ReviewSnapshot`, and then verifies its
+content-derived snapshot id and event. Unknown snapshot fields and answer-only keys in
+deterministic evidence fail closed. Loading performs no network or model call.
+
+The evaluation artifacts above contain no source text, full diff, secret, hidden reasoning,
+provider request identifier, or credential. The separate serialized `ReviewSnapshot` is
+source-bearing, stays in local source storage outside published artifact directories, and is
+referenced by its exact byte hash.
 
 ## Credential-free list and dry run
 
@@ -176,12 +184,15 @@ threshold cannot enable advice or publication.
 ## External Cocos Story corpus adapter
 
 The Cocos corpus stays in its own checkout. PR-Agent accepts a source path plus a lock that
-pins the accepted source commit, exact hashes for the primary, temporal, control, and
-answer-only specialist ledgers, the original cohort counts, and a hash of every
-`id/split/target_sha` assignment. The adapter rejects symlinks, changed bytes, changed
-assignments, wrong repositories, answer-visible annotations, or changed 12/18/10/16 and
-55-snapshot counts. Its output contains only hashes, counts, and a one-way local-root
-identity.
+pins the accepted source commit; exact hashes for the primary, temporal, control, specialist,
+sealed-confirmation, and confirmation-annotation ledgers; the original cohort counts; and
+hashes of every `id/split/target_sha` assignment. The adapter rejects symlinks (including a
+symlinked confirmation directory), changed bytes, changed assignments, wrong repositories,
+answer-visible annotations, an unsealed confirmation policy, mismatched confirmation
+ledger/annotation ids or target SHAs, or changed 12/18/10/16/16 and 55-snapshot counts. Its
+output contains only hashes, counts, and a one-way local-root identity. The 16 confirmation
+cases remain a sealed measurement cohort: their defect targets cannot be used for prompt or
+architecture selection and are never copied into a model-visible manifest.
 
 The checked-in `cocos_story_corpus_lock.json` pins the corpus accepted in Cocos Story PR
 #9425 at merge commit `6b98bae67bae4056c4567187454e24cca78b9467`. It contains hashes and counts,
@@ -226,7 +237,7 @@ continue using the incumbent reviewer. Historical evidence stays immutable. Roll
 changes a `failed` or `not_evaluable` gate to `passed`.
 
 Still required to complete issue #27: merge and bind the production arms from #26, #12,
-#11, and #9; create the independent checkpoint controls; run the frozen paid replay within an
-authorized cap; collect at least one week of opt-in live shadow telemetry; publish the
-pilot inventory, scorecard, budgets, and gate decisions; and prove that the cascade beats
-the incumbent before enabling local advice or GitHub publication.
+#11, and #9; create the independent checkpoint controls and serialized snapshots; run the
+frozen paid replay within an authorized cap; collect at least one week of opt-in live shadow
+telemetry; publish the pilot inventory, scorecard, budgets, and gate decisions; and prove
+that the cascade beats the incumbent before enabling local advice or GitHub publication.
