@@ -18,7 +18,6 @@ GitHub when changing required checks or release permissions.
 | `PR-Agent E2E tests` | Manual dispatch | Builds the test image and tests the GitHub, GitLab, and Bitbucket integrations | Provider test tokens listed below |
 | `pre-commit` | Manual dispatch | Runs the hooks in `.pre-commit-config.yaml` | Read-only checkout |
 | `PR-Agent` | A non-draft pull request is opened, reopened, or marked ready | Runs describe, review, and improve through the fork's own action | Model and Pinecone secrets; PR and issue write access |
-| `Release Drafter` | Push to `main`; pull request opened, reopened, or synchronized | Updates the draft release and applies title-based release labels | Contents and pull-request write access |
 | `Upstream provenance` | Pull request activity targeting `main` | On `sync/upstream-*` branches, verifies that the branch, title, body, head SHA, and upstream ancestry agree | Read-only checkout; network read from upstream |
 | `Upstream sync PR` | Mondays at 12:17 UTC, or manual dispatch | Pins upstream `main`, creates a local sync branch, and opens a review PR | Contents and pull-request write access |
 | `Publish` | Published GitHub release, or manual dispatch | Publishes PyPI distributions and a multi-platform Docker image matrix, records provenance, and finalizes repository release state | Release environment and publishing secrets |
@@ -128,9 +127,6 @@ earlier provider step prevents the later provider steps from running.
 
 ## Releases and publishing
 
-`.github/release-drafter.yml` maps conventional title prefixes and labels into release categories and semantic
-version levels. `release-drafter.yml` updates the draft on `main` and on pull-request activity.
-
 `publish.yml` supports two entry points:
 
 - publishing a GitHub release; or
@@ -182,6 +178,8 @@ Before treating all CI as comprehensive, account for these boundaries:
   only while `main` remains protected and reviewed.
 - The publish workflow intentionally permits Docker/repository finalization when PyPI fails. Release operators must
   treat the warning as a partial release and complete the missing registry publication.
+- `.github/release-drafter.yml` still contains categories and version-resolution rules, but no active workflow invokes
+  Release Drafter. Maintainers must not rely on automated draft updates or title-based labeling from that file.
 - Required-check selection, resolved-conversation rules, merge strategy, environment approvals, and secret scoping
   live in GitHub settings. They cannot be confirmed from these YAML files alone.
 
