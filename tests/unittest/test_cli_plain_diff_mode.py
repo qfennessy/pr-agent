@@ -714,6 +714,41 @@ def test_snapshot_repo_context_skips_oversized_git_blob_before_read(cfg, monkeyp
     assert len(calls) == 1
 
 
+def test_snapshot_repo_context_respects_secret_and_custom_exclusions(cfg, tmp_path):
+    import subprocess
+
+    from pr_agent.cli import _load_snapshot_repo_context
+
+    repo = tmp_path / "repo-context-exclusions"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    (repo / ".env").write_text("SECRET=must-not-reach-model\n", encoding="utf-8")
+    (repo / "private.md").write_text("private context\n", encoding="utf-8")
+    (repo / "AGENTS.md").write_text("safe context\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", ".env", "private.md", "AGENTS.md"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "context fixtures"],
+        check=True,
+        capture_output=True,
+    )
+    base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    cfg("config.repo_context_files", [".env", "private.md", "AGENTS.md"])
+
+    assert _load_snapshot_repo_context(repo, base, ["private.md"]) == {
+        "AGENTS.md": "safe context"
+    }
+
+
 def test_snapshot_repo_context_enforces_aggregate_blob_budget(cfg, monkeypatch, tmp_path):
     from pr_agent.cli import _load_snapshot_repo_context
 

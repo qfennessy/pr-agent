@@ -35,6 +35,7 @@ from pr_agent.tools.local_pair_review import (
     SnapshotCaptureError,
     build_snapshot_result,
     find_repository_root,
+    is_snapshot_path_excluded,
     validate_local_pair_review_limits,
 )
 
@@ -200,6 +201,21 @@ def _validate_configured_snapshot_event(
             parser.error(f"local_pair_review.events contains unsupported event: {value}")
     if event not in allowed_events:
         parser.error(f"local snapshot event is disabled by configuration: {event.value}")
+
+
+def _configured_snapshot_exclusions(settings) -> list[str]:
+    raw_exclusions = settings.get("excluded_paths", []) if hasattr(settings, "get") else []
+    if raw_exclusions is None:
+        return []
+    if isinstance(raw_exclusions, str):
+        if raw_exclusions:
+            return [raw_exclusions]
+    elif isinstance(raw_exclusions, (list, tuple)):
+        if all(isinstance(pattern, str) and pattern for pattern in raw_exclusions):
+            return list(raw_exclusions)
+    raise SnapshotCaptureError(
+        "local_pair_review.excluded_paths must contain only non-empty strings"
+    )
 
 
 def _prepare_output_parent(output_path: str) -> tuple[int, int]:
@@ -499,7 +515,11 @@ def _snapshot_review_configuration_hash(
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _load_snapshot_repo_context(repository_root: Path, base_revision: str) -> dict[str, str]:
+def _load_snapshot_repo_context(
+    repository_root: Path,
+    base_revision: str,
+    excluded_paths: tuple[str, ...] | list[str] = (),
+) -> dict[str, str]:
     configured = get_settings().get("config.repo_context_files", []) or []
     if isinstance(configured, str):
         configured = [configured]
@@ -523,6 +543,8 @@ def _load_snapshot_repo_context(repository_root: Path, base_revision: str) -> di
         if normalized.is_absolute() or ".." in normalized.parts or normalized == PurePosixPath("."):
             continue
         path = normalized.as_posix()
+        if is_snapshot_path_excluded(path, excluded_paths):
+            continue
         object_name = f"{base_revision}:{path}"
         size_process = subprocess.run(
             ["git", "-C", str(repository_root), "cat-file", "-s", object_name],
@@ -854,25 +876,10 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         outer_parser.error("local_pair_review.cache_enabled must be a boolean")
     _validate_configured_snapshot_event(event, settings, parser)
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
-    raw_exclusions = settings.get("excluded_paths", [])
-    if raw_exclusions is None:
-        raw_exclusions = []
-    if isinstance(raw_exclusions, str):
-        if not raw_exclusions:
-            outer_parser.error(
-                "local_pair_review.excluded_paths must contain non-empty strings"
-            )
-        configured_exclusions = [raw_exclusions]
-    elif isinstance(raw_exclusions, (list, tuple)):
-        if any(not isinstance(pattern, str) or not pattern for pattern in raw_exclusions):
-            outer_parser.error(
-                "local_pair_review.excluded_paths must contain only non-empty strings"
-            )
-        configured_exclusions = list(raw_exclusions)
-    else:
-        outer_parser.error(
-            "local_pair_review.excluded_paths must be a string or list of strings"
-        )
+    try:
+        configured_exclusions = _configured_snapshot_exclusions(settings)
+    except SnapshotCaptureError as exc:
+        outer_parser.error(str(exc))
     artifact_exclusions = _output_artifact_exclusions(
         repository_root, markdown_output, json_output
     )
@@ -890,7 +897,9 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
 
     def initial_configuration_hash(base_revision: str) -> str:
         repo_context_files.update(
-            _load_snapshot_repo_context(repository_root, base_revision)
+            _load_snapshot_repo_context(
+                repository_root, base_revision, configured_exclusions
+            )
         )
         return _snapshot_review_configuration_hash(skills_context, repo_context_files)
 
@@ -966,7 +975,13 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             apply_local_repo_settings(repository_root)
             return _snapshot_review_configuration_hash(
                 get_skills_context(),
-                _load_snapshot_repo_context(repository_root, base_revision),
+                _load_snapshot_repo_context(
+                    repository_root,
+                    base_revision,
+                    _configured_snapshot_exclusions(
+                        get_settings().get("local_pair_review", {}) or {}
+                    ),
+                ),
             )
         except Exception as exc:
             raise SnapshotCaptureError(

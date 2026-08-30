@@ -165,6 +165,15 @@ def _normalize_patterns(value: Optional[Sequence[str] | str]) -> tuple[str, ...]
     return tuple(pattern for pattern in value if isinstance(pattern, str) and pattern)
 
 
+def is_snapshot_path_excluded(
+    path: str,
+    additional_patterns: Optional[Sequence[str] | str] = None,
+) -> bool:
+    """Apply the mandatory and caller-configured snapshot exclusion policy."""
+    patterns = (*_DEFAULT_SECRET_EXCLUSIONS, *_normalize_patterns(additional_patterns))
+    return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+
+
 _LOCAL_PAIR_REVIEW_LIMIT_DEFAULTS = {
     "max_file_bytes": 1_000_000,
     "max_snapshot_bytes": 5_000_000,
@@ -242,12 +251,7 @@ class LocalPairReview:
         settings = get_settings().get("local_pair_review", {}) or {}
         configured_exclusions = settings.get("excluded_paths", []) if hasattr(settings, "get") else []
         self.excluded_paths = _normalize_patterns(
-            (
-                *_DEFAULT_SECRET_EXCLUSIONS,
-                *_normalize_patterns(
-                    excluded_paths if excluded_paths is not None else configured_exclusions
-                ),
-            )
+            excluded_paths if excluded_paths is not None else configured_exclusions
         )
         self.ignored_paths = _normalize_patterns(ignored_paths)
         configured_limits = validate_local_pair_review_limits(settings)
@@ -295,7 +299,7 @@ class LocalPairReview:
         return relative.as_posix()
 
     def _is_excluded(self, path: str) -> bool:
-        return any(fnmatch.fnmatch(path, pattern) for pattern in self.excluded_paths)
+        return is_snapshot_path_excluded(path, self.excluded_paths)
 
     def _is_ignored(self, path: str) -> bool:
         return path in self.ignored_paths
