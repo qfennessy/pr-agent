@@ -24,6 +24,7 @@ from pr_agent.algo.types import FilePatchInfo
 from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
+from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.tools.pr_reviewer import PRReviewer
 
 # _prepare_prediction now rejects output it cannot parse, so the model's answer can fall
@@ -40,6 +41,12 @@ def _make_reviewer(git_provider=None):
 
 def _make_prediction_reviewer(git_provider=None):
     reviewer = _make_reviewer(git_provider)
+    if isinstance(reviewer.git_provider, MagicMock):
+        raw_files = reviewer.git_provider.get_files
+        if raw_files.side_effect is None and isinstance(raw_files.return_value, MagicMock):
+            # Most unit-test providers model one complete inventory. Tests for raw
+            # inventory gaps override this with their explicit failure or mismatch.
+            raw_files.return_value = reviewer.git_provider.get_diff_files.return_value
     reviewer.token_handler = MagicMock()
     reviewer.remaining_files_list = []
     reviewer.deleted_files_list = []
@@ -366,7 +373,7 @@ def test_changed_file_metadata_failure_is_recorded_and_prevents_quick():
     decision = reviewer._prepare_review_route()
 
     assert decision.applied_depth is ReviewDepth.STANDARD
-    assert "changed_files" in decision.missing_inputs
+    assert "files[0].kind" in decision.missing_inputs
     assert "inputs_missing" in [reason.code for reason in decision.reasons]
 
 
@@ -387,6 +394,158 @@ def test_unavailable_label_metadata_is_recorded_and_prevents_quick(labels_suppor
 
     assert decision.applied_depth is ReviewDepth.STANDARD
     assert "labels" in decision.missing_inputs
+
+
+@pytest.mark.parametrize("provider_type", [GithubProvider, AzureDevopsProvider])
+def test_provider_label_failures_remain_unavailable_for_routing(provider_type):
+    provider = provider_type.__new__(provider_type)
+    if provider_type is GithubProvider:
+        exploding_labels = MagicMock()
+        type(exploding_labels).labels = property(lambda _: (_ for _ in ()).throw(RuntimeError("labels unavailable")))
+        provider.pr = exploding_labels
+    else:
+        provider.workspace_slug = "workspace"
+        provider.repo_slug = "repo"
+        provider.pr_num = 1
+        provider.azure_devops_client = MagicMock()
+        provider.azure_devops_client.get_pull_request_labels.side_effect = RuntimeError("labels unavailable")
+
+    assert provider.get_pr_labels() == []
+    assert provider.get_pr_labels_for_routing() is None
+
+
+@pytest.mark.parametrize("raw_sensitive_file", [
+    SimpleNamespace(filename="services/auth/guard.py", status="modified", additions=1, deletions=0),
+    SimpleNamespace(filename="services/auth/guard.py", status="removed", additions=0, deletions=1),
+    SimpleNamespace(old_path="services/auth/guard.py", status="deleted", additions=0, deletions=1),
+    {
+        "previous_filename": "services/auth/guard.py",
+        "status": "removed",
+        "additions": 0,
+        "deletions": 1,
+    },
+    SimpleNamespace(
+        filename="docs/old-guard.md",
+        previous_filename="services/auth/guard.py",
+        status="renamed",
+        additions=1,
+        deletions=1,
+    ),
+])
+def test_unfiltered_sensitive_path_forces_deep_when_review_diff_ignores_it(raw_sensitive_file):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.get_files.return_value = [
+        SimpleNamespace(filename="docs/guide.md", status="modified", additions=1, deletions=0),
+        raw_sensitive_file,
+    ]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+
+
+def test_unavailable_unfiltered_inventory_prevents_quick():
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.get_files.side_effect = RuntimeError("raw inventory unavailable")
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert "files[1].kind" in decision.missing_inputs
+
+
+@pytest.mark.parametrize("raw_inventory", [None, []])
+def test_empty_unfiltered_inventory_prevents_quick(raw_inventory):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.get_files.return_value = raw_inventory
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert "files[1].kind" in decision.missing_inputs
+
+
+def test_detailed_inventory_failure_still_uses_raw_sensitive_paths():
+    provider = MagicMock()
+    provider.get_diff_files.side_effect = RuntimeError("detailed inventory unavailable")
+    provider.get_files.return_value = [
+        SimpleNamespace(filename="services/auth/guard.py", status="modified", additions=1, deletions=0)
+    ]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert "files[1].kind" in decision.missing_inputs
+
+
+def test_codecommit_rename_preserves_sensitive_old_path():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = MagicMock()
+    provider.get_diff_files.side_effect = RuntimeError("detailed inventory unavailable")
+    provider.get_files.return_value = [SimpleNamespace(
+        a_path="services/auth/guard.py",
+        b_path="docs/safe.md",
+        filename="docs/safe.md",
+        edit_type=EDIT_TYPE.RENAMED,
+    )]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
 
 
 def test_sensitive_old_rename_path_forces_deep_over_docs_only_signal():
@@ -1460,7 +1619,7 @@ async def test_shadow_only_run_performs_no_provider_mutations(monkeypatch):
     from pr_agent.tools import pr_reviewer as pr_reviewer_module
 
     git_provider = MagicMock()
-    git_provider.get_files.return_value = ["app.py"]
+    git_provider.get_files.return_value = ["docs/guide.md"]
     git_provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
     git_provider.is_supported.return_value = True
     git_provider.get_pr_labels.return_value = []

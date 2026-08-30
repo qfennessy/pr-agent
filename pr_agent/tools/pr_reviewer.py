@@ -390,10 +390,7 @@ class PRReviewer:
         configuration = self._routing_configuration()
         if configuration.enabled:
             try:
-                files = tuple(
-                    self._changed_file_for_routing(file)
-                    for file in (self.git_provider.get_diff_files() or [])
-                )
+                files = self._changed_files_for_routing()
             except Exception as exc:
                 # Provider metadata is routing evidence, not a reason to abort the
                 # review. An empty immutable snapshot records the missing input and
@@ -420,9 +417,100 @@ class PRReviewer:
         self._apply_review_route(decision)
         return decision
 
+    def _changed_files_for_routing(self) -> tuple[ChangedFile, ...]:
+        """Keep ignored or unsupported files visible to the safety router.
+
+        The ordinary review diff is intentionally filtered for context quality. Risk
+        routing has a different contract: every changed path must remain available so
+        an ignore rule cannot hide a forced-deep path. Reconcile the provider's raw
+        file inventory with the richer review diff without branching on provider type.
+        """
+
+        evidence_incomplete = False
+        try:
+            detailed = tuple(
+                self._changed_file_for_routing(file)
+                for file in (self.git_provider.get_diff_files() or [])
+            )
+        except Exception as exc:
+            get_logger().warning(
+                "Review-depth routing could not read the detailed changed-file inventory",
+                artifact={"error_class": type(exc).__name__},
+            )
+            detailed = ()
+            evidence_incomplete = True
+        detailed_by_path: dict[str, int] = {}
+        for index, changed_file in enumerate(detailed):
+            for path in (changed_file.old_path, changed_file.new_path):
+                if path:
+                    detailed_by_path.setdefault(path, index)
+
+        try:
+            raw_inventory = self.git_provider.get_files()
+            raw_files = tuple(raw_inventory) if raw_inventory is not None else ()
+        except Exception as exc:
+            get_logger().warning(
+                "Review-depth routing could not read the unfiltered changed-file inventory",
+                artifact={"error_class": type(exc).__name__},
+            )
+            # Preserve the detailed evidence, but add one unknown record so missing
+            # inventory can never be mistaken for a complete low-risk-only change.
+            return (*detailed, ChangedFile(new_path=None, kind=ChangeKind.UNKNOWN))
+
+        if not raw_files:
+            # A pull request with no raw paths cannot prove that a filtered detailed
+            # diff is complete. Record the gap even when the detailed inventory exists.
+            return (*detailed, ChangedFile(new_path=None, kind=ChangeKind.UNKNOWN))
+
+        reconciled = []
+        matched_detailed = set()
+        for raw_file in raw_files:
+            raw_changed_file = self._changed_file_for_routing(raw_file)
+            detailed_index = next(
+                (
+                    detailed_by_path[path]
+                    for path in (raw_changed_file.old_path, raw_changed_file.new_path)
+                    if path in detailed_by_path
+                ),
+                None,
+            )
+            if detailed_index is None:
+                reconciled.append(raw_changed_file)
+                continue
+            reconciled.append(detailed[detailed_index])
+            matched_detailed.add(detailed_index)
+
+        unmatched_detailed = [
+            changed_file
+            for index, changed_file in enumerate(detailed)
+            if index not in matched_detailed
+        ]
+        if unmatched_detailed:
+            evidence_incomplete = True
+            reconciled.extend(unmatched_detailed)
+        if evidence_incomplete:
+            reconciled.append(ChangedFile(new_path=None, kind=ChangeKind.UNKNOWN))
+        return tuple(reconciled)
+
     @staticmethod
     def _changed_file_for_routing(file: Any) -> ChangedFile:
-        edit_type = getattr(file, "edit_type", EDIT_TYPE.UNKNOWN)
+        def value(*names: str) -> Any:
+            if isinstance(file, Mapping):
+                return next((file[name] for name in names if name in file), None)
+            return next((getattr(file, name) for name in names if hasattr(file, name)), None)
+
+        def path_value(*names: str) -> str | None:
+            for name in names:
+                candidate = file.get(name) if isinstance(file, Mapping) else getattr(file, name, None)
+                if isinstance(candidate, str) and candidate:
+                    return candidate
+            return None
+
+        if isinstance(file, str):
+            return ChangedFile(new_path=file, kind=ChangeKind.UNKNOWN)
+
+        edit_type = value("edit_type")
+        status = value("status")
         kind = {
             EDIT_TYPE.ADDED: ChangeKind.ADDED,
             EDIT_TYPE.DELETED: ChangeKind.DELETED,
@@ -430,33 +518,53 @@ class PRReviewer:
             EDIT_TYPE.RENAMED: ChangeKind.RENAMED,
             EDIT_TYPE.UNKNOWN: ChangeKind.UNKNOWN,
         }.get(edit_type, ChangeKind.UNKNOWN)
-        filename = getattr(file, "filename", None)
-        old_filename = getattr(file, "old_filename", None)
+        if kind is ChangeKind.UNKNOWN and isinstance(status, str):
+            kind = {
+                "added": ChangeKind.ADDED,
+                "removed": ChangeKind.DELETED,
+                "deleted": ChangeKind.DELETED,
+                "renamed": ChangeKind.RENAMED,
+                "modified": ChangeKind.MODIFIED,
+            }.get(status.casefold(), ChangeKind.UNKNOWN)
+        elif kind is ChangeKind.UNKNOWN:
+            if value("new_file") is True:
+                kind = ChangeKind.ADDED
+            elif value("deleted_file") is True:
+                kind = ChangeKind.DELETED
+            elif value("renamed_file") is True:
+                kind = ChangeKind.RENAMED
+
+        filename = path_value("filename", "new_path", "path", "b_path", "a_path")
+        old_filename = path_value("old_filename", "previous_filename", "old_path", "a_path")
         if kind is ChangeKind.DELETED:
-            old_path, new_path = filename, None
+            old_path, new_path = old_filename or filename, None
         elif kind is ChangeKind.RENAMED:
             old_path, new_path = old_filename, filename
         else:
             old_path, new_path = None, filename
 
-        def line_count(name: str) -> int | None:
-            value = getattr(file, name, None)
-            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+        def line_count(*names: str) -> int | None:
+            count = value(*names)
+            return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
 
         return ChangedFile(
             new_path=new_path,
             old_path=old_path,
             kind=kind,
-            additions=line_count("num_plus_lines"),
-            deletions=line_count("num_minus_lines"),
-            generated=None,
+            additions=line_count("num_plus_lines", "additions"),
+            deletions=line_count("num_minus_lines", "deletions"),
+            generated=value("generated") if isinstance(value("generated"), bool) else None,
         )
 
     def _labels_for_routing(self) -> tuple[str, ...] | None:
         try:
             if not self.git_provider.is_supported("get_labels"):
                 return None
-            labels = self.git_provider.get_pr_labels()
+            routing_getter = getattr(type(self.git_provider), "get_pr_labels_for_routing", None)
+            if callable(routing_getter):
+                labels = routing_getter(self.git_provider)
+            else:
+                labels = self.git_provider.get_pr_labels()
         except Exception as exc:
             get_logger().warning(
                 "Review-depth routing could not read pull-request labels",

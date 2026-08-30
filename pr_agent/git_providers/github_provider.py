@@ -1381,19 +1381,32 @@ class GithubProvider(GitProvider):
         except Exception as e:
             get_logger().warning(f"Failed to publish labels, error: {e}")
 
+    def _read_pr_labels(self, update=False):
+        if not update:
+            return [label.name for label in self.pr.labels]
+
+        _, labels = self.pr._requester.requestJsonAndCheck(
+            "GET", f"{self.pr.issue_url}/labels"
+        )
+        return [label["name"] for label in labels]
+
     def get_pr_labels(self, update=False):
         try:
-            if not update:
-                labels =self.pr.labels
-                return [label.name for label in labels]
-            else: # obtain the latest labels. Maybe they changed while the AI was running
-                headers, labels = self.pr._requester.requestJsonAndCheck(
-                    "GET", f"{self.pr.issue_url}/labels")
-                return [label['name'] for label in labels]
-
+            return self._read_pr_labels(update=update)
         except Exception as e:
             get_logger().exception(f"Failed to get labels, error: {e}")
+            # Preserve the provider's historical best-effort contract for callers
+            # that do not need to distinguish failure from a confirmed empty set.
             return []
+
+    def get_pr_labels_for_routing(self, update=False):
+        try:
+            return self._read_pr_labels(update=update)
+        except Exception as e:
+            get_logger().exception(f"Failed to get labels for review routing, error: {e}")
+            # Routing must distinguish unavailable evidence from a confirmed empty
+            # set so a metadata outage cannot select the quick profile.
+            return None
 
     def get_repo_labels(self):
         labels = self.repo_obj.get_labels()

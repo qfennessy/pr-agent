@@ -317,17 +317,31 @@ class AzureDevopsProvider(GitProvider):
         except Exception as e:
             get_logger().warning(f"Failed to publish labels, error: {e}")
 
+    def _read_pr_labels(self):
+        labels = self.azure_devops_client.get_pull_request_labels(
+            project=self.workspace_slug,
+            repository_id=self.repo_slug,
+            pull_request_id=self.pr_num,
+        )
+        return [label.name for label in labels]
+
     def get_pr_labels(self, update=False):
         try:
-            labels = self.azure_devops_client.get_pull_request_labels(
-                project=self.workspace_slug,
-                repository_id=self.repo_slug,
-                pull_request_id=self.pr_num,
-            )
-            return [label.name for label in labels]
+            return self._read_pr_labels()
         except Exception as e:
             get_logger().exception(f"Failed to get labels, error: {e}")
+            # Preserve the provider's historical best-effort contract for callers
+            # that do not need to distinguish failure from a confirmed empty set.
             return []
+
+    def get_pr_labels_for_routing(self, update=False):
+        try:
+            return self._read_pr_labels()
+        except Exception as e:
+            get_logger().exception(f"Failed to get labels for review routing, error: {e}")
+            # Routing must distinguish unavailable evidence from a confirmed empty
+            # set so a metadata outage cannot select the quick profile.
+            return None
 
     def is_supported(self, capability: str) -> bool:
         return True
