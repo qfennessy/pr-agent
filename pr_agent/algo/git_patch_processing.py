@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 import traceback
+from typing import Iterator
 
-from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
+from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 
@@ -11,6 +12,25 @@ from pr_agent.log import get_logger
 # in performance-critical patch processing functions.
 RE_HUNK_HEADER = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[ ]?(.*)")
+
+
+def iter_git_patch_lines(patch: str) -> Iterator[str]:
+    """Yield Git's LF-delimited patch records while preserving every other byte."""
+    start = 0
+    while start < len(patch):
+        end = patch.find("\n", start)
+        if end < 0:
+            yield patch[start:]
+            return
+        yield patch[start:end + 1]
+        start = end + 1
+
+
+def _split_file_content_lines(content: str) -> list[str]:
+    return [
+        line.removesuffix("\n").removesuffix("\r")
+        for line in iter_git_patch_lines(content)
+    ]
 
 
 def extend_patch(original_file_str, patch_str, patch_extra_lines_before=0,
@@ -62,10 +82,10 @@ def process_patch_lines(patch_str, original_file_str, patch_extra_lines_before, 
     allow_dynamic_context = get_settings().config.allow_dynamic_context
     patch_extra_lines_before_dynamic = get_settings().config.max_extra_lines_before_dynamic_context
 
-    file_original_lines = original_file_str.splitlines()
-    file_new_lines = new_file_str.splitlines() if new_file_str else []
+    file_original_lines = _split_file_content_lines(original_file_str)
+    file_new_lines = _split_file_content_lines(new_file_str) if new_file_str else []
     len_original_lines = len(file_original_lines)
-    patch_lines = patch_str.splitlines()
+    patch_lines = [line.removesuffix("\n") for line in iter_git_patch_lines(patch_str)]
     extended_patch_lines = []
 
     is_valid_hunk = True
@@ -288,7 +308,7 @@ def handle_patch_deletions(patch: str, original_file_content_str: str,
             get_logger().info(f"Processing file: {file_name}, minimizing deletion file")
         patch = None # file was deleted
     else:
-        patch_lines = patch.splitlines()
+        patch_lines = [line.removesuffix("\n") for line in iter_git_patch_lines(patch)]
         patch_new = omit_deletion_hunks(patch_lines)
         if patch != patch_new:
             if get_settings().config.verbosity_level > 0:
@@ -340,7 +360,7 @@ __old hunk__
     else:
         patch_with_lines_str = ""
 
-    patch_lines = patch.splitlines()
+    patch_lines = [line.removesuffix("\n") for line in iter_git_patch_lines(patch)]
     new_content_lines = []
     old_content_lines = []
     match = None
@@ -434,7 +454,7 @@ def extract_hunk_lines_from_patch(patch: str, file_name, line_start, line_end, s
             line_end = -1
         patch_with_lines_str = f"\n\n## File: '{file_name.strip()}'\n\n"
         selected_lines = ""
-        patch_lines = patch.splitlines()
+        patch_lines = [line.removesuffix("\n") for line in iter_git_patch_lines(patch)]
         match = None
         start1, size1, start2, size2 = -1, -1, -1, -1
         skip_hunk = False
