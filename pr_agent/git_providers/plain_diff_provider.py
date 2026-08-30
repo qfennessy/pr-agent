@@ -7,9 +7,19 @@ from unidiff.errors import UnidiffParseError
 
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.config_loader import _find_repository_root, get_settings
-from pr_agent.git_providers.diff_parsing import parse_unified_diff, reconstruct_base_file, to_hunk_only_patch
+from pr_agent.git_providers.diff_parsing import (parse_unified_diff,
+                                                 reconstruct_base_file,
+                                                 to_hunk_only_patch)
 from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.log import get_logger
+
+
+def parse_plain_diff(diff_text: str) -> List[FilePatchInfo]:
+    """Parse plain-diff input through the provider's single shared seam."""
+    try:
+        return parse_unified_diff(diff_text)
+    except UnidiffParseError as e:
+        raise ValueError(f"Failed to parse the provided diff: {e}") from e
 
 
 class PullRequestMimic:
@@ -33,6 +43,10 @@ class PlainDiffGitProvider(GitProvider):
         self.diff_text = diff_text
         self.output_path = get_settings().get("plain_diff.output_path", None)
         self.json_output_path = get_settings().get("plain_diff.json_output_path", None)
+        self.suppress_stdout = bool(get_settings().get("plain_diff.suppress_stdout", False))
+        self.disable_working_tree_enrichment = bool(
+            get_settings().get("plain_diff.disable_working_tree_enrichment", False)
+        )
         # cli.run() already forces config.publish_output=True, but apply_repo_settings()
         # runs afterwards and can overwrite it back to False from an extra/repo config
         # (tools gate all publishing on this flag). This provider is constructed after
@@ -45,22 +59,17 @@ class PlainDiffGitProvider(GitProvider):
     def get_diff_files(self) -> List[FilePatchInfo]:
         if self.diff_files is not None:
             return self.diff_files
-        try:
-            files = parse_unified_diff(self.diff_text)
-        except UnidiffParseError as e:
-            raise ValueError(f"Failed to parse the provided diff: {e}") from e
+        files = parse_plain_diff(self.diff_text)
         # Resolve diff paths against the actual repository root (not the raw CWD)
         # so working-tree enrichment still works when run from a subdirectory.
         # If there is no detectable .git root, disable enrichment entirely and
         # run patch-only: reading files from an arbitrary CWD could disclose
         # unrelated local files to the LLM.
-        repo_root = _find_repository_root()
+        repo_root = None if self.disable_working_tree_enrichment else _find_repository_root()
         root = os.path.realpath(str(repo_root)) if repo_root else None
         if root is None:
-            get_logger().info(
-                "No repository root (.git) found; running in patch-only mode "
-                "(working-tree enrichment disabled)."
-            )
+            reason = "disabled for immutable input" if self.disable_working_tree_enrichment else "no repository root"
+            get_logger().info(f"Running in patch-only mode ({reason}).")
         for f in files:
             head = ""
             if root is not None and f.filename:
@@ -103,7 +112,8 @@ class PlainDiffGitProvider(GitProvider):
         incremental.is_incremental = False
 
     def _write_output(self, content: str):
-        print(content)
+        if not self.suppress_stdout:
+            print(content)
         if self.output_path:
             # --output is always an explicit user request, so a write failure
             # must surface (fail fast) rather than be silently swallowed.

@@ -7,7 +7,9 @@ from pr_agent.config_loader import get_settings
 # diff-mode CLI path. Snapshotted and restored around every test (autouse) so
 # state never leaks, even when run() sets keys the test never touches itself.
 _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path", "plain_diff.json_output_path",
-                  "config.git_provider", "config.publish_output"]
+                  "plain_diff.suppress_stdout", "plain_diff.disable_working_tree_enrichment",
+                  "config.git_provider", "config.publish_output",
+                  "config.propagate_tool_errors"]
 
 
 @pytest.fixture(autouse=True)
@@ -108,3 +110,54 @@ def test_diff_mode_sets_json_output_path(cfg, monkeypatch, tmp_path):
     run(inargs=["--stdin", "--json-output", str(output), "review"])
 
     assert captured["json_output_path"] == str(output)
+
+
+def test_review_snapshot_cli_emits_snapshot_bound_json(cfg, monkeypatch, tmp_path, capsys):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    result_path = repo / "snapshot-result.json"
+    monkeypatch.chdir(repo)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            assert target == "local_snapshot"
+            assert request == ["review"]
+            assert get_settings().plain_diff.suppress_stdout is True
+            assert get_settings().plain_diff.disable_working_tree_enrichment is True
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({
+                    "review": {"key_issues_to_review": []},
+                    "usage": {"total_tokens": 12},
+                    "metadata": {"review_profile": "full"},
+                }),
+                encoding="utf-8",
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    result = run(inargs=[
+        "review-snapshot", "--event", "file-save", "--path", "changed.py",
+        "--no-cache", "--json-output", str(result_path),
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["snapshot_id"].startswith("sha256:")
+    assert payload["current_snapshot_id"] == payload["snapshot_id"]
+    assert payload["state"] == "no_findings"
+    assert payload["usage"] == {"total_tokens": 12}
+    assert payload["advisory"] is True
+    expected_output = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    assert result_path.read_text(encoding="utf-8") == expected_output
+    assert result.state.value == "no_findings"

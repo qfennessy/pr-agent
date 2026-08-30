@@ -7,6 +7,7 @@ from pr_agent.git_providers.plain_diff_provider import PlainDiffGitProvider
 
 # Diff-mode settings keys these tests mutate on the process-wide singleton.
 _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path",
+                  "plain_diff.disable_working_tree_enrichment",
                   "config.git_provider", "config.publish_output"]
 
 
@@ -227,6 +228,22 @@ def test_no_repo_root_disables_enrichment(cfg, tmp_path, monkeypatch):
     assert files[0].head_file == "", (
         "Enrichment must be disabled when no .git root is found (patch-only)"
     )
+    assert files[0].base_file == ""
+
+
+def test_immutable_snapshot_mode_disables_live_worktree_enrichment(cfg, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "foo.py").write_text("newer content that is not in the snapshot\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+    cfg("plain_diff.content", DIFF)
+    cfg("plain_diff.output_path", None)
+    cfg("plain_diff.disable_working_tree_enrichment", True)
+
+    files = PlainDiffGitProvider(None).get_diff_files()
+
+    assert files[0].head_file == ""
     assert files[0].base_file == ""
 
 

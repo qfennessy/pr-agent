@@ -1,23 +1,33 @@
 import argparse
 import asyncio
+import json
 import os
 import sys
+import tempfile
+from pathlib import Path
+from time import monotonic
 
 from pr_agent.agent.pr_agent import PRAgent, commands
 from pr_agent.algo.ai_handlers.litellm_helpers import (
     DEFAULT_CALLBACK_TIMEOUT_SECONDS, drain_litellm_callbacks,
     litellm_callbacks_registered)
+from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState
+from pr_agent.algo.run_details import get_run_details
 from pr_agent.algo.utils import get_version
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger, setup_logger
+from pr_agent.tools.local_pair_review import (LocalPairReview, SnapshotCache,
+                                              SnapshotCaptureError,
+                                              build_snapshot_result)
 
 log_level = os.environ.get("LOG_LEVEL", "INFO")
 setup_logger(log_level)
 
 
 def set_parser():
-    parser = argparse.ArgumentParser(description='AI based pull request analyzer', usage=
-    """\
+    parser = argparse.ArgumentParser(
+        description='AI based pull request analyzer',
+        usage="""\
     Usage: cli.py --pr_url=<URL on supported git hosting service> <command> [<args>].
     For example:
     - cli.py --pr_url=... review
@@ -46,13 +56,15 @@ def set_parser():
 
     - generate_labels
 
-    - help_docs - Ask a question, from either an issue or PR context, on a given repo (current context or a different one)
+    - help_docs - Ask a question, from either an issue or PR context,
+      on a given repo (current context or a different one)
 
 
     Configuration:
     To edit any configuration parameter from 'configuration.toml', just add -config_path=<value>.
     For example: 'python cli.py --pr_url=... review --pr_reviewer.extra_instructions="focus on the file: ..."'
-    """)
+    """,
+    )
     parser.add_argument('--version', action='version', version=f'pr-agent {get_version()}')
     parser.add_argument('--pr_url', type=str, help='The URL of the PR to review', default=None)
     parser.add_argument('--issue_url', type=str, help='The URL of the Issue to review', default=None)
@@ -77,7 +89,7 @@ def set_parser():
                         help="Write the result to this file (in addition to stdout)")
     parser.add_argument("--json-output", dest="json_output", type=str, default=None,
                         help="Write the parsed review and token usage to this JSON file")
-    parser.add_argument('command', type=str, help='The', choices=commands, default='review')
+    parser.add_argument('command', type=str, help='The', choices=commands + ['review-snapshot'], default='review')
     parser.add_argument('rest', nargs=argparse.REMAINDER, default=[])
     return parser
 
@@ -91,10 +103,166 @@ def run_command(pr_url, command):
     run(args=args)
 
 
+def _set_invocation_settings(args):
+    get_settings().set("CONFIG.CLI_MODE", True)
+    cli_branch = (getattr(args, "config_branch", None) or "").strip()
+    env_branch = (os.environ.get("PR_AGENT_CONFIG_BRANCH") or "").strip()
+    get_settings().set("CONFIG.CONFIG_BRANCH", cli_branch or env_branch or None)
+    get_settings().set("CONFIG.EXTRA_CONFIG_URL", getattr(args, "extra_config_url", None))
+
+
+def _snapshot_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="pr-agent review-snapshot")
+    parser.add_argument("--event", required=True, choices=[
+        "file-save", "file_save", "worktree-idle", "worktree_idle", "pre-commit", "pre_commit",
+    ])
+    parser.add_argument("--path", dest="focus_path", default=None)
+    parser.add_argument("--base", default="HEAD")
+    parser.add_argument("--intent", dest="task_intent", default=None)
+    parser.add_argument("--policy-version", default=None)
+    parser.add_argument("--parent-snapshot-id", default=None)
+    parser.add_argument("--deterministic-check", action="append", default=[],
+                        help="JSON object containing one deterministic check result")
+    parser.add_argument("--output", default=None, help="Optional markdown review output path")
+    parser.add_argument("--json-output", default=None, help="Optional structured snapshot result path")
+    parser.add_argument("--no-cache", action="store_true", default=False)
+    return parser
+
+
+def _parse_deterministic_checks(values: list[str], parser: argparse.ArgumentParser) -> list[dict]:
+    checks = []
+    for value in values:
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--deterministic-check must be a JSON object: {exc}")
+        if not isinstance(parsed, dict):
+            parser.error("--deterministic-check must be a JSON object")
+        checks.append(parsed)
+    return checks
+
+
+def _emit_snapshot_result(result, output_path: str | None) -> None:
+    payload = json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    print(payload, end="")
+    if output_path:
+        try:
+            Path(output_path).write_text(payload, encoding="utf-8")
+        except OSError as exc:
+            raise SnapshotCaptureError(f"could not write --json-output '{output_path}': {exc}") from exc
+
+
+def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
+    parser = _snapshot_parser()
+    snapshot_args = parser.parse_args(args.rest)
+    if args.output and snapshot_args.output:
+        parser.error("--output may be provided before or after review-snapshot, not both")
+    if args.json_output and snapshot_args.json_output:
+        parser.error("--json-output may be provided before or after review-snapshot, not both")
+    markdown_output = snapshot_args.output or args.output
+    json_output = snapshot_args.json_output or args.json_output
+    checks = _parse_deterministic_checks(snapshot_args.deterministic_check, parser)
+    event = ReviewEvent.parse(snapshot_args.event)
+    settings = get_settings().get("local_pair_review", {}) or {}
+    policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
+
+    try:
+        reviewer = LocalPairReview()
+        snapshot = reviewer.capture(
+            event=event,
+            base=snapshot_args.base,
+            focus_path=snapshot_args.focus_path,
+            task_intent=snapshot_args.task_intent,
+            deterministic_results=checks,
+            policy_version=policy_version,
+            parent_snapshot_id=snapshot_args.parent_snapshot_id,
+        )
+    except SnapshotCaptureError as exc:
+        outer_parser.error(str(exc))
+
+    cache_enabled = bool(settings.get("cache_enabled", True)) and not snapshot_args.no_cache
+    cache = SnapshotCache(
+        reviewer.repository_root,
+        max_entries=int(settings.get("cache_max_entries", 50)),
+    )
+    current = reviewer.recapture(snapshot)
+    if cache_enabled and current.snapshot_id == snapshot.snapshot_id:
+        cached_result = cache.read(snapshot.snapshot_id)
+        if cached_result is not None:
+            _emit_snapshot_result(cached_result, json_output)
+            return cached_result
+
+    started_at = monotonic()
+    structured_review = None
+    review_error = None
+    details = None
+    if snapshot.diff.strip():
+        with tempfile.TemporaryDirectory(prefix="pr-agent-snapshot-") as temp_dir:
+            structured_path = Path(temp_dir) / "review.json"
+            get_settings().set("config.git_provider", "plain-diff")
+            get_settings().set("plain_diff.content", snapshot.diff)
+            get_settings().set("plain_diff.output_path", markdown_output)
+            get_settings().set("plain_diff.json_output_path", str(structured_path))
+            get_settings().set("plain_diff.suppress_stdout", True)
+            get_settings().set("plain_diff.disable_working_tree_enrichment", True)
+            get_settings().set("config.publish_output", True)
+            get_settings().set("config.propagate_tool_errors", True)
+
+            async def inner():
+                try:
+                    await PRAgent()._handle_request("local_snapshot", ["review"])
+                finally:
+                    if litellm_callbacks_registered():
+                        await drain_litellm_callbacks(
+                            get_settings().litellm.get(
+                                "callback_timeout_seconds", DEFAULT_CALLBACK_TIMEOUT_SECONDS
+                            )
+                        )
+                return get_run_details()
+
+            try:
+                details = asyncio.run(inner())
+            except Exception as exc:
+                # The result exposes the error class, not provider text that may
+                # contain credential-shaped values or source excerpts.
+                review_error = type(exc).__name__
+            if structured_path.exists():
+                try:
+                    structured_review = json.loads(structured_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    review_error = review_error or "InvalidStructuredReview"
+
+    if structured_review is not None and details is not None:
+        metadata = dict(structured_review.get("metadata", {}))
+        metadata["model"] = details.model_used
+        metadata["cost"] = {
+            "status": details.cost_status,
+            "total_usd": str(details.total_cost_usd) if details.known_cost_call_count else None,
+            "by_model_usd": {model: str(cost) for model, cost in details.model_costs_usd.items()},
+        }
+        structured_review["metadata"] = metadata
+
+    current = reviewer.recapture(snapshot)
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=current,
+        structured_review=structured_review,
+        started_at=started_at,
+        error=review_error,
+    )
+    if cache_enabled and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}:
+        cache.write(result)
+    _emit_snapshot_result(result, json_output)
+    return result
+
+
 def run(inargs=None, args=None):
     parser = set_parser()
     if not args:
         args = parser.parse_args(inargs)
+    _set_invocation_settings(args)
+    if args.command == "review-snapshot":
+        return _run_review_snapshot(args, parser)
     diff_mode = getattr(args, "stdin", False) or getattr(args, "diff_file", None)
     if getattr(args, "json_output", None) and not diff_mode:
         parser.error("--json-output is only supported in plain-diff mode (--stdin or --diff-file)")
@@ -125,19 +293,6 @@ def run(inargs=None, args=None):
         return
 
     command = args.command.lower()
-    get_settings().set("CONFIG.CLI_MODE", True)
-    # Strip each candidate independently so a whitespace-only CLI value doesn't
-    # short-circuit the PR_AGENT_CONFIG_BRANCH env fallback before precedence.
-    cli_branch = (getattr(args, "config_branch", None) or "").strip()
-    env_branch = (os.environ.get("PR_AGENT_CONFIG_BRANCH") or "").strip()
-    # Always reconcile CONFIG.CONFIG_BRANCH with the current invocation so a value
-    # set by an earlier run() call in the same process can't leak into a later one
-    # (get_settings() is a process-wide singleton).
-    get_settings().set("CONFIG.CONFIG_BRANCH", cli_branch or env_branch or None)
-    # Always reconcile CONFIG.EXTRA_CONFIG_URL with the current invocation so a
-    # previously-set value from an earlier run() call in the same process can't
-    # leak into a later one (get_settings() is a process-wide singleton).
-    get_settings().set("CONFIG.EXTRA_CONFIG_URL", getattr(args, "extra_config_url", None))
 
     async def inner():
         if args.issue_url:
