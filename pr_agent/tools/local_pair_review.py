@@ -265,11 +265,14 @@ def _patch_model_visible_regions(patch: str) -> tuple[bytes, ...]:
                     "".join(region).encode("utf-8", errors="surrogateescape")
                 )
 
-    for line in patch.splitlines(keepends=True):
+    patch_lines = patch.split("\n")
+    for line_index, line in enumerate(patch_lines):
+        if line_index < len(patch_lines) - 1:
+            line += "\n"
         hunk_match = RE_HUNK_HEADER.match(line)
         if hunk_match:
             flush_hunk()
-            header_context = hunk_match.group(5).rstrip("\r\n")
+            header_context = hunk_match.group(5)
             if header_context:
                 regions.append(
                     header_context.encode("utf-8", errors="surrogateescape")
@@ -1236,7 +1239,7 @@ class LocalPairReview:
         for source, variants in source_contents.items():
             reason = unsafe_reasons[source]
             for content in variants.values():
-                for line in content.splitlines():
+                for line in content.split(b"\n"):
                     normalized_line = line.strip()
                     if not normalized_line:
                         continue
@@ -1277,7 +1280,7 @@ class LocalPairReview:
             matched_probes: dict[int, set[int]] = {}
             for region in regions:
                 if patch_scoped:
-                    for line in region.splitlines():
+                    for line in region.split(b"\n"):
                         normalized_line = line.strip()
                         if normalized_line:
                             sources.update(unsafe_lines.get(normalized_line, ()))

@@ -855,6 +855,85 @@ def test_modified_file_hunk_header_context_from_excluded_source_is_omitted(
     ) in snapshot.coverage_issues
 
 
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+@pytest.mark.parametrize("exposure", ["added", "deleted", "context"])
+def test_modified_file_unicode_separator_bytes_from_excluded_source_are_omitted(
+    event, unicode_separator, exposure, tmp_path
+):
+    repo = _repo(
+        tmp_path,
+        f"excluded-unicode-separator-{event}-{ord(unicode_separator)}-{exposure}",
+    )
+    unsafe_line = f"x{unicode_separator}API_TOKEN=unicode-secret"
+    (repo / ".env").write_text(
+        "SOURCE_FILLER=abcdefghijklmnopqrstuvwxyz0123456789\n"
+        "OTHER_FILLER=abcdefghijklmnopqrstuvwxyz0123456789\n"
+        f"{unsafe_line}\n",
+        encoding="utf-8",
+    )
+    destination = repo / "feature.py"
+    baseline_unsafe_line = f"{unsafe_line}\n" if exposure != "added" else ""
+    destination.write_text(
+        f"{baseline_unsafe_line}FEATURE_FLAG=disabled\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add unicode separator fixture")
+    modified_unsafe_line = f"{unsafe_line}\n" if exposure != "deleted" else ""
+    destination.write_text(
+        f"{modified_unsafe_line}FEATURE_FLAG=enabled\n", encoding="utf-8"
+    )
+    if event == "pre-commit":
+        _git(repo, "add", "feature.py")
+
+    reviewer = LocalPairReview(str(repo))
+    review_event = ReviewEvent.parse(event)
+    patch = reviewer._capture_diff(
+        review_event,
+        _git(repo, "rev-parse", "HEAD"),
+        ("feature.py",),
+        diff_stage={
+            "file-save": "combined",
+            "worktree-idle": "worktree",
+            "pre-commit": "index",
+        }[event],
+    )
+    assert patch is not None
+    assert unsafe_line in patch
+    expected_prefix = {"added": "+", "deleted": "-", "context": " "}[exposure]
+    assert f"{expected_prefix}{unsafe_line}" in patch
+    assert any(
+        unsafe_line.encode("utf-8") in region
+        for region in local_pair_review_module._patch_model_visible_regions(patch)
+    )
+
+    snapshot = reviewer.capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "unicode-secret" not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="feature.py", reason="rename_group_omitted"
+    ) in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("unicode_separator", ["\r", "\u0085", "\u2028", "\u2029"])
+def test_patch_model_visible_regions_preserve_unicode_hunk_header_context(
+    unicode_separator,
+):
+    header_context = f"def helper():{unicode_separator}API_TOKEN=header-secret"
+    patch = f"@@ -1 +1 @@ {header_context}\n-old\n+new\n"
+
+    regions = local_pair_review_module._patch_model_visible_regions(patch)
+
+    assert header_context.encode("utf-8") in regions
+
+
 def test_worktree_idle_scopes_staged_and_current_modified_variants(tmp_path):
     repo = _repo(tmp_path, "distant-existing-excluded-content-both-stages")
     (repo / ".env").write_text("API_TOKEN=existing-secret\n", encoding="utf-8")
