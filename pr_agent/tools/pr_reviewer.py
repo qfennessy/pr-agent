@@ -1,5 +1,6 @@
 import copy
 import datetime
+import json
 import re
 from functools import partial
 from typing import List, Optional, Tuple
@@ -44,6 +45,10 @@ _BUG_FINDING_HEADERS = {
     "security": "Security vulnerability",
     "performance": "Performance regression",
 }
+_GENERIC_CI_EVIDENCE_TERMS = {
+    "assert", "assertion", "build", "check", "error", "errors", "fail", "failed", "failure", "failures",
+    "job", "test", "tests", "unit",
+}
 
 
 class PRReviewer:
@@ -65,7 +70,15 @@ class PRReviewer:
         """
         self.git_provider = get_git_provider_with_context(pr_url)
         self.args = args
+        configured_profile = str(get_settings().pr_reviewer.get("review_profile", "full")).strip().lower()
+        if configured_profile not in _VALID_REVIEW_PROFILES:
+            get_logger().warning(
+                f"Unknown pr_reviewer.review_profile '{configured_profile}'; falling back to 'full'"
+            )
+            configured_profile = "full"
+        self.review_profile = configured_profile
         self.incremental = self.parse_incremental(args)  # -i command
+        self.incremental.review_profile = self.review_profile
         if self.incremental and self.incremental.is_incremental:
             self.git_provider.get_incremental_commits(self.incremental)
 
@@ -75,13 +88,6 @@ class PRReviewer:
         self.pr_url = pr_url
         self.is_answer = is_answer
         self.is_auto = is_auto
-        configured_profile = str(get_settings().pr_reviewer.get("review_profile", "full")).strip().lower()
-        if configured_profile not in _VALID_REVIEW_PROFILES:
-            get_logger().warning(
-                f"Unknown pr_reviewer.review_profile '{configured_profile}'; falling back to 'full'"
-            )
-            configured_profile = "full"
-        self.review_profile = configured_profile
 
         if self.is_answer and not self.git_provider.is_supported("get_issue_comments"):
             raise Exception(f"Answer mode is not supported for {get_settings().config.git_provider} for now")
@@ -103,6 +109,26 @@ class PRReviewer:
             get_logger().debug(f"AI metadata is disabled for this command")
 
         bugs_only = self.review_profile == "bugs_only"
+        self.ci_failure_context = (
+            self.git_provider.get_ci_failure_context()
+            if bugs_only
+            else {"status": "not_requested", "failures": []}
+        )
+        if not isinstance(self.ci_failure_context, dict):
+            self.ci_failure_context = {"status": "unavailable", "failures": []}
+        ci_failures = self.ci_failure_context.get("failures")
+        if not isinstance(ci_failures, list):
+            ci_failures = []
+            self.ci_failure_context["failures"] = ci_failures
+        self.ci_failure_evidence_by_name = {}
+        for failure in ci_failures:
+            if not isinstance(failure, dict):
+                continue
+            name = str(failure.get("name") or "").strip().casefold()
+            if not name:
+                continue
+            evidence = " ".join((str(failure.get("title") or ""), str(failure.get("summary") or ""))).strip()
+            self.ci_failure_evidence_by_name.setdefault(name, []).append(evidence)
         self.vars = {
             "title": self.git_provider.pr.title,
             "branch": self.git_provider.get_pr_branch(),
@@ -135,6 +161,7 @@ class PRReviewer:
             "related_tickets": [] if bugs_only else get_settings().get('related_tickets', []),
             'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False),
             "date": datetime.datetime.now().strftime('%Y-%m-%d'),
+            "ci_failure_context": json.dumps(self.ci_failure_context, ensure_ascii=False),
         }
 
         self.token_handler = TokenHandler(
@@ -209,6 +236,7 @@ class PRReviewer:
 
             should_publish = get_settings().config.publish_output and self._should_publish_review_no_suggestions(pr_review)
             if not should_publish:
+                self._clear_stale_persistent_bugs_only_review()
                 reason = "Review output is not published"
                 if get_settings().config.publish_output:
                     reason += ": no major issues detected."
@@ -222,21 +250,39 @@ class PRReviewer:
             review_thread_kwargs = {"as_thread": True} if self.git_provider.should_publish_review_as_thread() else {}
             if get_settings().pr_reviewer.persistent_comment and not self.incremental.is_incremental:
                 final_update_message = get_settings().pr_reviewer.final_update_message
+                identity_marker = (
+                    PRReviewIdentity.BUGS_ONLY.value
+                    if self._review_profile() == "bugs_only"
+                    else PRReviewIdentity.REGULAR.value
+                )
                 self.git_provider.publish_persistent_comment(
                     pr_review,
                     initial_header=pr_review.split("\n", 1)[0],
                     update_header=True,
                     final_update_message=final_update_message,
-                    identity_marker=PRReviewIdentity.REGULAR.value,
-                    legacy_initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
+                    name="bugs-only review" if self._review_profile() == "bugs_only" else "review",
+                    identity_marker=identity_marker,
+                    legacy_initial_header=(
+                        None
+                        if self._review_profile() == "bugs_only"
+                        else f"{PRReviewHeader.REGULAR.value} 🔍"
+                    ),
                     **review_thread_kwargs,
                 )
             else:
                 if self.git_provider.supports_review_comment_identity() is True:
                     identity_marker = (
-                        PRReviewIdentity.INCREMENTAL.value
+                        (
+                            PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value
+                            if self._review_profile() == "bugs_only"
+                            else PRReviewIdentity.FULL_INCREMENTAL.value
+                        )
                         if self.incremental.is_incremental
-                        else PRReviewIdentity.REGULAR.value
+                        else (
+                            PRReviewIdentity.BUGS_ONLY.value
+                            if self._review_profile() == "bugs_only"
+                            else PRReviewIdentity.REGULAR.value
+                        )
                     )
                     pr_review = add_pr_review_identity(pr_review, identity_marker)
                 self.git_provider.publish_comment(pr_review, **review_thread_kwargs)
@@ -266,6 +312,16 @@ class PRReviewer:
     def _review_profile(self) -> str:
         """Return the selected profile, defaulting legacy/test instances to full review."""
         return getattr(self, "review_profile", "full")
+
+    def _clear_stale_persistent_bugs_only_review(self) -> None:
+        """Remove a prior persistent defect summary after a clean bugs-only rerun."""
+        if (self._review_profile() != "bugs_only" or not get_settings().config.publish_output or
+                not get_settings().pr_reviewer.persistent_comment or self.incremental.is_incremental):
+            return
+        self.git_provider.clear_persistent_review(
+            identity_marker=PRReviewIdentity.BUGS_ONLY.value,
+            name="bugs-only review",
+        )
 
     async def _prepare_prediction(self, model: str) -> None:
         output = get_pr_diff(self.git_provider,
@@ -388,6 +444,28 @@ class PRReviewer:
                 return False
         return None
 
+    @staticmethod
+    def _specific_ci_terms(value: str) -> set[str]:
+        return {
+            term
+            for term in re.findall(r"[a-z0-9]+", value.casefold())
+            if len(term) >= 4 and term not in _GENERIC_CI_EVIDENCE_TERMS
+        }
+
+    def _ci_failure_evidences_same_defect(self, issue: dict, matching_ci_failure: str) -> bool:
+        issue_text = " ".join(
+            str(issue.get(field) or "")
+            for field in ("issue_content", "trigger", "impact", "root_cause")
+        )
+        issue_terms = self._specific_ci_terms(issue_text)
+        if len(issue_terms) < 2:
+            return False
+        evidence_by_name = getattr(self, "ci_failure_evidence_by_name", {})
+        for evidence in evidence_by_name.get(matching_ci_failure, []):
+            if len(issue_terms & self._specific_ci_terms(evidence)) >= 2:
+                return True
+        return False
+
     def _normalize_bugs_only_review(self, data: dict) -> dict:
         """Keep only complete, changed-line defect reports and collapse shared root causes."""
         if self._review_profile() != "bugs_only":
@@ -405,7 +483,9 @@ class PRReviewer:
             finding_type = str(issue.get("finding_type") or "").strip().lower()
             if finding_type not in _BUG_FINDING_HEADERS:
                 continue
-            if self._strict_bool(issue.get("duplicates_ci_failure")) is not False:
+            matching_ci_failure = str(issue.get("matching_ci_failure") or "").strip().casefold()
+            if (self._strict_bool(issue.get("duplicates_ci_failure")) is True and
+                    self._ci_failure_evidences_same_defect(issue, matching_ci_failure)):
                 continue
 
             relevant_file = str(issue.get("relevant_file") or "").strip()
