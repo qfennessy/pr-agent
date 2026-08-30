@@ -206,6 +206,7 @@ class ReviewRouteRequest:
     review_profile: ReviewOutputProfile | str = ReviewOutputProfile.FULL
     labels: tuple[str, ...] | None = None
     escalation: ReviewDepthEscalation | None = None
+    changed_files_complete: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "files", _freeze_tuple(self.files))
@@ -722,7 +723,9 @@ def _collect_file_evidence(request: ReviewRouteRequest, policy: ReviewRouterPoli
     else:
         files = request.files
 
-    if not files:
+    if not isinstance(request.changed_files_complete, bool):
+        input_errors.append("changed_files_complete")
+    if not files and request.changed_files_complete is not True:
         missing_inputs.append("changed_files")
 
     for index, changed_file in enumerate(files):

@@ -38,7 +38,9 @@ try:
     # noinspection PyUnresolvedReferences
     from azure.devops.connection import Connection
     # noinspection PyUnresolvedReferences
-    from azure.devops.released.git import (Comment, CommentThread, GitPullRequest, GitVersionDescriptor, GitClient, CommentThreadContext, CommentPosition)
+    from azure.devops.released.git import (Comment, CommentThread, GitBaseVersionDescriptor, GitPullRequest,
+                                           GitTargetVersionDescriptor, GitVersionDescriptor, GitClient,
+                                           CommentThreadContext, CommentPosition)
     from azure.devops.released.work_item_tracking import WorkItemTrackingClient
     # noinspection PyUnresolvedReferences
     from azure.identity import DefaultAzureCredential
@@ -483,36 +485,21 @@ class AzureDevopsProvider(GitProvider):
         candidate_paths = []
         routing_files = []
         routing_file_keys = set()
-        had_errors = False
-        non_merge_seen = False
-        for commit in self.incremental.commits_range:
-            if len(commit.parents) > 1:
-                get_logger().info(f"Skipping merge commit {commit.sha}")
-                continue
-            non_merge_seen = True
-            try:
-                commit_changes, incomplete = self._get_incremental_commit_changes(
-                    commit.commit_id
+        net_changes, had_errors = self._get_incremental_net_changes()
+        for change in net_changes:
+            routing_file = _azure_change_for_routing(change)
+            if routing_file is not None:
+                key = (
+                    routing_file.filename,
+                    routing_file.old_filename,
+                    routing_file.edit_type,
                 )
-            except Exception as e:
-                had_errors = True
-                get_logger().warning(f"Failed to fetch changes for {commit.commit_id}: {e}")
-                continue
-            had_errors = had_errors or incomplete
-            for change in commit_changes:
-                routing_file = _azure_change_for_routing(change)
-                if routing_file is not None:
-                    key = (
-                        routing_file.filename,
-                        routing_file.old_filename,
-                        routing_file.edit_type,
-                    )
-                    if key not in routing_file_keys:
-                        routing_file_keys.add(key)
-                        routing_files.append(routing_file)
-                path = _get_azure_change_path(change)
-                if path:
-                    candidate_paths.append(path)
+                if key not in routing_file_keys:
+                    routing_file_keys.add(key)
+                    routing_files.append(routing_file)
+            path = _get_azure_change_path(change)
+            if path:
+                candidate_paths.append(path)
 
         if had_errors:
             routing_files.append(FilePatchInfo(
@@ -532,48 +519,78 @@ class AzureDevopsProvider(GitProvider):
                     self.unreviewed_files_map[path] = path
         elif had_errors and self.incremental.commits_range:
             get_logger().warning(
-                "Failed to fetch changes for incremental commits; falling back to full review."
-            )
-            self.incremental.is_incremental = False
-        elif self.incremental.commits_range and not non_merge_seen:
-            get_logger().info(
-                "Incremental range only contains merge commits; falling back to full review."
+                "Failed to fetch the incremental net diff; falling back to full review."
             )
             self.incremental.is_incremental = False
 
-    def _get_incremental_commit_changes(self, commit_id: str) -> tuple[list, bool]:
-        """Fetch Azure change pages, retaining evidence before a later failure."""
+    def _get_incremental_net_changes(self) -> tuple[list, bool]:
+        """Fetch the baseline-to-head net diff, retaining evidence before a later failure."""
+
+        base_sha = self.incremental.last_seen_commit_sha
+        target_sha = getattr(self.pr_commits[-1], "commit_id", None) if self.pr_commits else None
+        if not base_sha or not target_sha:
+            get_logger().warning(
+                "Cannot fetch Azure incremental net diff without baseline and head commits."
+            )
+            return [], True
+
+        try:
+            base_version = GitBaseVersionDescriptor(
+                base_version=base_sha,
+                base_version_type="commit",
+            )
+            target_version = GitTargetVersionDescriptor(
+                target_version=target_sha,
+                target_version_type="commit",
+            )
+        except Exception as error:
+            get_logger().warning(
+                f"Cannot construct Azure incremental net-diff versions: {error}"
+            )
+            return [], True
         page_size = 2000
         skip = 0
         changes = []
         while True:
+            page = []
             try:
-                response = self.azure_devops_client.get_changes(
+                response = self.azure_devops_client.get_commit_diffs(
                     project=self.workspace_slug,
                     repository_id=self.repo_slug,
-                    commit_id=commit_id,
+                    diff_common_commit=False,
                     top=page_size,
                     skip=skip,
+                    base_version_descriptor=base_version,
+                    target_version_descriptor=target_version,
                 )
-                page = (
-                    response.get("changes")
-                    if isinstance(response, Mapping)
-                    else getattr(response, "changes", None)
-                ) or []
-                page = list(page)
-            except Exception:
-                if not changes:
-                    raise
+                raw_page = _get_azure_change_property(response, "changes")
+                if raw_page is None:
+                    page = []
+                elif isinstance(raw_page, (str, bytes, Mapping)):
+                    raise TypeError("Azure net diff changes must be a sequence")
+                else:
+                    page = list(raw_page)
+                changes.extend(page)
+                all_included = _get_azure_change_property(
+                    response,
+                    "allChangesIncluded",
+                    "all_changes_included",
+                )
+                if all_included is not None and not isinstance(all_included, bool):
+                    raise TypeError("Azure net diff completeness must be a boolean")
+            except Exception as error:
                 get_logger().warning(
-                    f"Failed to fetch all change pages for {commit_id}; "
-                    "preserving fetched paths and marking routing evidence incomplete."
+                    "Failed to fetch all Azure incremental net-diff pages; preserving "
+                    f"fetched paths and marking routing evidence incomplete: {error}"
                 )
                 return changes, True
-            changes.extend(page)
-            if len(page) < page_size:
-                break
+            if all_included is True:
+                return changes, False
+            if not page:
+                return changes, True
+            if all_included is None and len(page) < page_size:
+                return changes, True
             skip += len(page)
-        return changes, False
 
     def _get_commit_range(self):
         last_review_time = _to_naive_utc(getattr(self.previous_review, "created_at", None))
@@ -690,9 +707,18 @@ class AzureDevopsProvider(GitProvider):
 
     def get_files(self):
         if (isinstance(getattr(self, "incremental", None), IncrementalPR)
-                and self.incremental.is_incremental
-                and self.unreviewed_files_map):
-            return list(self.unreviewed_files_map.keys())
+                and self.incremental.is_incremental):
+            if self.unreviewed_files_map:
+                return list(self.unreviewed_files_map.keys())
+            routing_files = getattr(self, "_routing_incremental_files", None)
+            if routing_files is not None and not any(
+                file.edit_type is EDIT_TYPE.UNKNOWN for file in routing_files
+            ):
+                # A complete raw inventory may contain only ignored or unsupported
+                # paths. Keep that incremental scope empty for review input rather
+                # than silently falling back to the full PR after routing has seen
+                # the unfiltered safety evidence.
+                return []
         return self._get_files_full()
 
     def normalize_file_path_for_routing(self, path: str | None) -> str | None:
@@ -769,7 +795,10 @@ class AzureDevopsProvider(GitProvider):
             file.edit_type is EDIT_TYPE.UNKNOWN for file in routing_files
         ):
             return None
-        return True
+        # The reviewable map may be empty because ignore/extension filters removed
+        # every path. That is not an authoritative empty change set: the raw paths
+        # still need deterministic safety routing before the run can stop.
+        return not routing_files
 
     def _get_files_full(self):
         files = []

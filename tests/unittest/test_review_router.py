@@ -416,6 +416,32 @@ def test_empty_change_set_is_missing_evidence_not_a_clean_quick_change():
     assert decision.missing_inputs == ("changed_files",)
 
 
+@pytest.mark.parametrize(
+    ("requested_depth", "expected_depth"),
+    [
+        (RequestedReviewDepth.AUTO, ReviewDepth.STANDARD),
+        (RequestedReviewDepth.QUICK, ReviewDepth.QUICK),
+        (RequestedReviewDepth.STANDARD, ReviewDepth.STANDARD),
+        (RequestedReviewDepth.DEEP, ReviewDepth.DEEP),
+    ],
+)
+def test_authoritative_empty_change_set_selects_requested_profile_without_missing_evidence(
+    requested_depth,
+    expected_depth,
+):
+    request = ReviewRouteRequest(
+        files=(),
+        labels=(),
+        requested_depth=requested_depth,
+        changed_files_complete=True,
+    )
+
+    decision = route_review(request, _policy())
+
+    assert decision.applied_depth is expected_depth
+    assert decision.missing_inputs == ()
+
+
 @pytest.mark.parametrize("path", ["../auth/guard.py", "/auth/guard.py", "auth/\x00guard.py"])
 def test_invalid_paths_fail_closed_to_deep(path):
     decision = route_review(_request(_file(path)), _policy())
@@ -429,6 +455,7 @@ def test_invalid_paths_fail_closed_to_deep(path):
     [
         ReviewRouteRequest(files="src/service.py", labels=()),
         ReviewRouteRequest(files=(_file(),), labels="security"),
+        ReviewRouteRequest(files=(), labels=(), changed_files_complete="yes"),
     ],
 )
 def test_malformed_input_collections_fail_closed_to_deep(route_request):

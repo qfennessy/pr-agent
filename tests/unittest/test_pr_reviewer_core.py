@@ -95,11 +95,13 @@ def _routing_configuration(
                 "context_tokens": 24_000,
                 "max_findings": 3,
                 "model_route": "regular",
+                "shadow_only": shadow_only,
             },
             "deep": {
                 "context_tokens": 32_000,
                 "max_findings": 6,
                 "model_route": "reasoning",
+                "shadow_only": shadow_only,
             },
         },
         "sensitive_categories": list(sensitive_categories),
@@ -2373,15 +2375,14 @@ async def test_empty_incremental_provider_scope_stops_before_routing_or_models(
     provider.get_diff_files = MagicMock()
     if provider_type is AzureDevopsProvider:
         provider._get_files_full = MagicMock(return_value=["/docs/full-pr.md"])
-        provider._routing_incremental_files = (
-            _route_file("/services/auth/ignored.py"),
-        )
+        provider._routing_incremental_files = ()
     else:
         provider.git_files = ["docs/full-pr.md"]
         provider._incremental_scope_complete = True
 
     reviewer = _make_prediction_reviewer(provider)
     reviewer.incremental = provider.incremental
+    reviewer.review_profile = "full"
     reviewer.vars = {}
     reviewer._can_run_incremental_review = MagicMock(return_value=True)
     reviewer._prepare_review_route = MagicMock()
@@ -2408,6 +2409,8 @@ async def test_empty_incremental_provider_scope_stops_before_routing_or_models(
 
     reviewer._can_run_incremental_review.assert_called_once_with()
     reviewer._prepare_review_route.assert_not_called()
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.STANDARD
+    assert reviewer.review_route_request.changed_files_complete is True
     reviewer._specialist_escalation_consumption_enabled.assert_not_called()
     reviewer._run_guarded_specialist_escalation.assert_not_awaited()
     provider.get_diff_files.assert_not_called()
@@ -2416,6 +2419,232 @@ async def test_empty_incremental_provider_scope_stops_before_routing_or_models(
         provider._get_files_full.assert_not_called()
     extract_tickets.assert_not_awaited()
     run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filtered_by", ["ignore", "extension"])
+async def test_azure_filtered_sensitive_incremental_scope_routes_deep_before_stopping(
+    filtered_by,
+):
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {}
+    provider.previous_review = SimpleNamespace(html_url="https://example/review/previous")
+    provider.publish_comment = MagicMock()
+    provider.get_diff_files = MagicMock(return_value=[])
+    provider._get_files_full = MagicMock(return_value=["/docs/full-pr.md"])
+    provider._routing_incremental_files = (
+        _route_file("/services/auth/key.pem"),
+    )
+    provider.azure_devops_client = MagicMock()
+    provider.azure_devops_client.get_pull_request_labels.return_value = []
+    provider.workspace_slug = "project"
+    provider.repo_slug = "repo"
+    provider.pr_num = 1
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    reviewer._specialist_escalation_consumption_enabled = MagicMock(return_value=True)
+    reviewer._run_guarded_specialist_escalation = AsyncMock()
+
+    settings = get_settings()
+    original_publish_output = settings.config.publish_output
+    settings.set("config.publish_output", False)
+    try:
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+    finally:
+        settings.set("config.publish_output", original_publish_output)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert reviewer.review_route_decision.matched_sensitive_categories == ("authorization",)
+    assert provider.is_incremental_scope_empty() is False
+    provider.get_diff_files.assert_called_once_with()
+    provider._get_files_full.assert_not_called()
+    provider.publish_comment.assert_not_called()
+    reviewer._specialist_escalation_consumption_enabled.assert_not_called()
+    reviewer._run_guarded_specialist_escalation.assert_not_awaited()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_depth", "expected_depth"),
+    [
+        ("quick", ReviewDepth.QUICK),
+        ("standard", ReviewDepth.STANDARD),
+        ("deep", ReviewDepth.DEEP),
+    ],
+)
+async def test_empty_incremental_shadow_route_suppresses_optional_skip_publication(
+    requested_depth,
+    expected_depth,
+):
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {}
+    provider.previous_review = SimpleNamespace(html_url="https://example/review/previous")
+    provider.publish_comment = MagicMock()
+    provider.get_files = MagicMock()
+    provider.get_diff_files = MagicMock()
+    provider.get_pr_labels = MagicMock()
+    provider.is_supported = MagicMock()
+    provider._get_files_full = MagicMock(return_value=["/docs/full-pr.md"])
+    provider._routing_incremental_files = ()
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer.review_routing_configuration = _routing_configuration(
+        requested_depth=requested_depth,
+        shadow_only=True,
+    )
+    reviewer._specialist_escalation_consumption_enabled = MagicMock(return_value=True)
+    reviewer._run_guarded_specialist_escalation = AsyncMock()
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is expected_depth
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    provider.publish_comment.assert_not_called()
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider.get_pr_labels.assert_not_called()
+    provider.is_supported.assert_not_called()
+    provider._get_files_full.assert_not_called()
+    reviewer._specialist_escalation_consumption_enabled.assert_not_called()
+    reviewer._run_guarded_specialist_escalation.assert_not_awaited()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", ["local", "health", "mosaico"])
+async def test_empty_incremental_auto_shadow_clears_stale_consumer_artifact(consumer):
+    provider = GitLabProvider.__new__(GitLabProvider)
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {}
+    provider.previous_review = SimpleNamespace(html_url="https://example/review/previous")
+    provider.publish_comment = MagicMock()
+    provider.get_files = MagicMock()
+    provider.get_diff_files = MagicMock()
+    provider.get_pr_labels = MagicMock()
+    provider.is_supported = MagicMock()
+    provider.git_files = ["docs/full-pr.md"]
+    provider._incremental_scope_complete = True
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        await reviewer.run()
+        if consumer == "local":
+            artifact = settings.data["artifact"]
+        elif consumer == "health":
+            artifact = dict(settings.data)["artifact"]
+        else:
+            from pr_agent.mosaico.dispatch import _capture_artifact
+            artifact = _capture_artifact()
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.STANDARD
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    provider.publish_comment.assert_not_called()
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider.get_pr_labels.assert_not_called()
+    provider.is_supported.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_empty_incremental_disabled_routing_preserves_legacy_artifact_and_run_details():
+    provider = GitLabProvider.__new__(GitLabProvider)
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {}
+    provider.previous_review = SimpleNamespace(html_url="https://example/review/previous")
+    provider.publish_comment = MagicMock()
+    provider.get_files = MagicMock()
+    provider.get_diff_files = MagicMock()
+    provider.get_pr_labels = MagicMock()
+    provider.is_supported = MagicMock()
+    provider.git_files = ["docs/full-pr.md"]
+    provider._incremental_scope_complete = True
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = False
+        settings.data = {"artifact": "LEGACY ARTIFACT"}
+        await reviewer.run()
+        artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.routing_enabled is False
+    assert get_run_details().review_route is None
+    assert reviewer._review_shadow_only is False
+    assert artifact == "LEGACY ARTIFACT"
+    provider.publish_comment.assert_not_called()
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider.get_pr_labels.assert_not_called()
+    provider.is_supported.assert_not_called()
 
 
 @pytest.mark.asyncio

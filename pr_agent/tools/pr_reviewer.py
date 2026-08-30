@@ -228,6 +228,7 @@ class PRReviewer:
         record_review_profile(self._review_profile())
         progress_response = None
         review_failed = False
+        route_prepared = False
         try:
             if self.incremental.is_incremental:
                 can_run = self._can_run_incremental_review()
@@ -238,6 +239,7 @@ class PRReviewer:
                     self.incremental.is_incremental
                     and self.git_provider.is_incremental_scope_empty() is True
                 ):
+                    self._prepare_known_empty_incremental_route()
                     get_logger().info(
                         f"Incremental review is enabled for {self.pr_url} but there are no new files"
                     )
@@ -254,13 +256,23 @@ class PRReviewer:
                             "Incremental Review Skipped\n"
                             f"No files were changed since the [previous PR Review]({previous_review_url})"
                         )
+                    if getattr(self, "_review_shadow_only", False):
+                        get_settings().data = {"artifact": ""}
                     return None
+
+                # A provider can have a non-empty unfiltered safety inventory but
+                # no reviewable files after ignore/extension filtering. Route that
+                # evidence before the ordinary empty-file gate so a sensitive path
+                # cannot disappear without recording the required safety depth.
+                self._prepare_review_route()
+                route_prepared = True
 
             if not self.git_provider.get_files():
                 get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
                 return None
 
-            self._prepare_review_route()
+            if not route_prepared:
+                self._prepare_review_route()
             if self._specialist_escalation_consumption_enabled():
                 await self._run_guarded_specialist_escalation()
             if getattr(self, "_review_shadow_only", False):
@@ -425,6 +437,22 @@ class PRReviewer:
             requested_depth=configuration.requested_depth,
             review_profile=self._review_profile(),
             labels=labels,
+        )
+        self.review_route_request = request
+        decision = route_review(request, configuration.policy)
+        self._apply_review_route(decision)
+        return decision
+
+    def _prepare_known_empty_incremental_route(self) -> ReviewRouteDecision:
+        """Apply routing to an authoritative empty scope without provider lookups."""
+
+        configuration = self._routing_configuration()
+        request = ReviewRouteRequest(
+            files=(),
+            requested_depth=configuration.requested_depth,
+            review_profile=self._review_profile(),
+            labels=() if configuration.enabled else None,
+            changed_files_complete=True,
         )
         self.review_route_request = request
         decision = route_review(request, configuration.policy)
