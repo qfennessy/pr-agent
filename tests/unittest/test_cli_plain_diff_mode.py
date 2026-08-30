@@ -680,7 +680,10 @@ def test_review_snapshot_restores_provider_settings_for_later_hosted_run(
     run(inargs=["--pr_url", "https://example.test/pr/1", "review"])
 
 
-def test_review_snapshot_loads_repo_policy_before_capture(cfg, monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize("excluded_paths_toml", ['["secret.py"]', '"secret.py"'])
+def test_review_snapshot_loads_repo_policy_before_capture(
+    cfg, monkeypatch, tmp_path, capsys, excluded_paths_toml
+):
     import json
     import subprocess
 
@@ -695,7 +698,7 @@ def test_review_snapshot_loads_repo_policy_before_capture(cfg, monkeypatch, tmp_
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
     changed.write_text("value = 2\n", encoding="utf-8")
     (repo / ".pr_agent.toml").write_text(
-        '[local_pair_review]\nexcluded_paths = ["secret.py"]\n', encoding="utf-8"
+        f"[local_pair_review]\nexcluded_paths = {excluded_paths_toml}\n", encoding="utf-8"
     )
     monkeypatch.chdir(repo)
 

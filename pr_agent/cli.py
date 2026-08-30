@@ -649,7 +649,15 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         outer_parser.error(f"could not apply repository settings: {type(exc).__name__}")
     settings = get_settings().get("local_pair_review", {}) or {}
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
-    configured_exclusions = list(settings.get("excluded_paths", []) or [])
+    raw_exclusions = settings.get("excluded_paths", []) or []
+    if isinstance(raw_exclusions, str):
+        configured_exclusions = [raw_exclusions]
+    elif isinstance(raw_exclusions, (list, tuple)):
+        configured_exclusions = [
+            pattern for pattern in raw_exclusions if isinstance(pattern, str) and pattern
+        ]
+    else:
+        configured_exclusions = []
     git_metadata_root = SnapshotCache(repository_root).cache_dir.parents[1]
     git_artifact_root = _git_artifact_root(repository_root)
     output_parent_identities = {}

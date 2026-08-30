@@ -65,6 +65,14 @@ def _decode_z_paths(output: bytes) -> list[str]:
     return [part.decode("utf-8", errors="surrogateescape") for part in output.split(b"\0") if part]
 
 
+def _normalize_patterns(value: Optional[Sequence[str] | str]) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value,) if value else ()
+    if not isinstance(value, Sequence):
+        return ()
+    return tuple(pattern for pattern in value if isinstance(pattern, str) and pattern)
+
+
 class LocalPairReview:
     """Build exact local diffs without requiring a clean worktree or hosted PR."""
 
@@ -79,8 +87,10 @@ class LocalPairReview:
         self.repository_root = find_repository_root(repository_root)
         settings = get_settings().get("local_pair_review", {}) or {}
         configured_exclusions = settings.get("excluded_paths", []) if hasattr(settings, "get") else []
-        self.excluded_paths = tuple(excluded_paths if excluded_paths is not None else configured_exclusions)
-        self.ignored_paths = tuple(ignored_paths or ())
+        self.excluded_paths = _normalize_patterns(
+            excluded_paths if excluded_paths is not None else configured_exclusions
+        )
+        self.ignored_paths = _normalize_patterns(ignored_paths)
         configured_limit = settings.get("max_file_bytes", 1_000_000) if hasattr(settings, "get") else 1_000_000
         self.max_file_bytes = max(
             0, int(max_file_bytes if max_file_bytes is not None else configured_limit)
