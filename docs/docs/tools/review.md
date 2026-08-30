@@ -156,7 +156,11 @@ labels = ["deployment-credentials"]
 
 `model_route` is provider-neutral: `inherit` keeps the ordinary configured model route, while `regular`, `weak`, and
 `reasoning` select the existing `config.model`, `config.model_weak`, or `config.model_reasoning` settings and the normal
-fallback/deployment configuration. `max_retries` counts retries after the first attempt, so `0` means one attempt.
+fallback configuration. Azure/OpenAI installations that assign distinct deployments must also set
+`openai.deployment_id_weak` and `openai.deployment_id_reasoning` for routed weak/reasoning primaries, plus one
+`openai.fallback_deployments` entry per fallback model. A missing primary mapping or mismatched fallback mapping fails
+the route before a model request instead of sending a model to the wrong deployment. `max_retries` counts retries after
+the first attempt, so `0` means one attempt.
 For each routed model attempt, `context_tokens` is capped again by that model's actual context window, and
 `max_output_tokens` is reserved before the prompt diff is accepted or pruned. This reservation includes reasoning or
 extended-thinking tokens because providers count them inside the completion cap; when a profile inherits the output

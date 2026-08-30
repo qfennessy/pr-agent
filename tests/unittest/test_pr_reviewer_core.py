@@ -7,7 +7,7 @@ import pytest
 from pr_agent.algo.inline_comment_dedup import (body_with_markers,
                                                 get_inline_comment_store,
                                                 key_issue_fingerprint)
-from pr_agent.algo.ai_request_context import AIModelRoute
+from pr_agent.algo.ai_request_context import AIModelRoute, get_ai_request_options
 from pr_agent.algo.pr_processing import (PRDiffCoverage,
                                          retry_with_fallback_models)
 from pr_agent.algo.review_router import (
@@ -538,6 +538,497 @@ def test_profile_model_route_uses_request_local_controls_and_retry_semantics():
     assert route.attribution is None
 
 
+@pytest.mark.parametrize(
+    ("requested_depth", "path", "expected_models", "expected_deployments"),
+    [
+        ("quick", "docs/guide.md", ("weak-model", "fallback-model"),
+         ("weak-deployment", "fallback-deployment")),
+        ("standard", "src/app.py", ("regular-model", "fallback-model"),
+         ("regular-deployment", "fallback-deployment")),
+        ("deep", "services/auth/guard.py", ("reasoning-model", "fallback-model"),
+         ("reasoning-deployment", "fallback-deployment")),
+        ("auto", "docs/guide.md", ("weak-model", "fallback-model"),
+         ("weak-deployment", "fallback-deployment")),
+        ("auto", "services/auth/guard.py", ("reasoning-model", "fallback-model"),
+         ("reasoning-deployment", "fallback-deployment")),
+    ],
+)
+def test_review_depth_model_routes_pair_each_model_with_its_azure_deployment(
+    requested_depth,
+    path,
+    expected_models,
+    expected_deployments,
+):
+    provider = MagicMock()
+    provider.get_files.return_value = [_incremental_raw_file(path)]
+    provider.get_diff_files.return_value = [_route_file(path)]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(
+        requested_depth=requested_depth,
+        sensitive_categories=({
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },),
+    )
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.model_reasoning",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.deployment_id_reasoning",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.model_reasoning = "reasoning-model"
+        settings.config.fallback_models = ["fallback-model"]
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", "weak-deployment")
+        settings.set("openai.deployment_id_reasoning", "reasoning-deployment")
+        settings.set("openai.fallback_deployments", ["fallback-deployment"])
+        init_run_details()
+        reviewer._prepare_review_route()
+
+        route = reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+    assert route.models == expected_models
+    assert route.deployments == expected_deployments
+
+
+@pytest.mark.asyncio
+async def test_routed_azure_primary_and_fallback_deployments_reach_request_context():
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route="weak",
+            timeout_seconds=5,
+            max_retries=0,
+            max_output_tokens=512,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.fallback_models",
+        "config.last_used_model",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.fallback_deployments",
+    ))
+    attempts = []
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.fallback_models = ["fallback-model"]
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", "weak-deployment")
+        settings.set("openai.fallback_deployments", ["fallback-deployment"])
+        route = reviewer._review_model_route()
+
+        async def request(model):
+            options = get_ai_request_options()
+            attempts.append((model, options.deployment_id, options.max_output_tokens))
+            if model == "weak-model":
+                raise RuntimeError("try fallback")
+            return "ok"
+
+        result = await retry_with_fallback_models(request, model_route=route)
+    finally:
+        restore_settings(snapshot)
+
+    assert result == "ok"
+    assert attempts == [
+        ("weak-model", "weak-deployment", 512),
+        ("fallback-model", "fallback-deployment", 512),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_deployment", [None, ""])
+async def test_routed_azure_primary_allows_non_deployment_fallback_slot(
+    fallback_deployment,
+):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route="weak",
+            timeout_seconds=5,
+            max_retries=0,
+            max_output_tokens=512,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.fallback_models",
+        "config.last_used_model",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.fallback_deployments",
+    ))
+    attempts = []
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.fallback_models = ["anthropic/claude"]
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", "weak-deployment")
+        settings.set("openai.fallback_deployments", [fallback_deployment])
+        route = reviewer._review_model_route()
+
+        async def request(model):
+            options = get_ai_request_options()
+            attempts.append((model, options.deployment_id))
+            if model == "weak-model":
+                raise RuntimeError("try fallback")
+            return "ok"
+
+        result = await retry_with_fallback_models(request, model_route=route)
+    finally:
+        restore_settings(snapshot)
+
+    assert result == "ok"
+    assert route.deployments == ("weak-deployment", None)
+    assert attempts == [
+        ("weak-model", "weak-deployment"),
+        ("anthropic/claude", None),
+    ]
+
+
+def test_non_deployment_route_treats_empty_fallback_deployments_string_as_unset():
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route="weak",
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.fallback_models = ["fallback-model"]
+        settings.set("openai.deployment_id", None)
+        settings.set("openai.deployment_id_weak", None)
+        settings.set("openai.fallback_deployments", "")
+
+        route = reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+    assert route.deployments == (None, None)
+
+
+@pytest.mark.parametrize("route_name", ["weak", "reasoning"])
+def test_routed_azure_primary_without_matching_deployment_fails_before_request(route_name):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route=route_name,
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.model_reasoning",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.deployment_id_reasoning",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.model_reasoning = "reasoning-model"
+        settings.config.fallback_models = []
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", None)
+        settings.set("openai.deployment_id_reasoning", None)
+        settings.set("openai.fallback_deployments", [])
+
+        with pytest.raises(ValueError, match=f"openai.deployment_id_{route_name}"):
+            reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+
+@pytest.mark.parametrize(
+    ("route_name", "expected_deployment"),
+    [
+        ("weak", "weak-deployment"),
+        ("reasoning", "reasoning-deployment"),
+    ],
+)
+def test_routed_azure_deployment_uses_route_identity_when_model_names_match(
+    route_name,
+    expected_deployment,
+):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route=route_name,
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.model_reasoning",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.deployment_id_reasoning",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "shared-model"
+        settings.config.model_weak = "shared-model"
+        settings.config.model_reasoning = "shared-model"
+        settings.config.fallback_models = []
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", "weak-deployment")
+        settings.set("openai.deployment_id_reasoning", "reasoning-deployment")
+        settings.set("openai.fallback_deployments", [])
+
+        route = reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+    assert route.models == ("shared-model",)
+    assert route.deployments == (expected_deployment,)
+
+
+@pytest.mark.parametrize("route_name", ["weak", "reasoning"])
+def test_equal_model_routed_azure_primary_still_requires_route_deployment(route_name):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route=route_name,
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.model_reasoning",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.deployment_id_reasoning",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "shared-model"
+        settings.config.model_weak = "shared-model"
+        settings.config.model_reasoning = "shared-model"
+        settings.config.fallback_models = []
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", None)
+        settings.set("openai.deployment_id_reasoning", None)
+        settings.set("openai.fallback_deployments", [])
+
+        with pytest.raises(ValueError, match=f"openai.deployment_id_{route_name}"):
+            reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+
+@pytest.mark.parametrize("route_name", ["weak", "reasoning"])
+def test_routed_azure_absent_dedicated_model_reuses_regular_deployment(route_name):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route=route_name,
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.model_reasoning",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.deployment_id_reasoning",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = None
+        settings.config.model_reasoning = None
+        settings.config.fallback_models = []
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", None)
+        settings.set("openai.deployment_id_reasoning", None)
+        settings.set("openai.fallback_deployments", [])
+
+        route = reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+    assert route.models == ("regular-model",)
+    assert route.deployments == ("regular-deployment",)
+
+
+@pytest.mark.parametrize(
+    "fallback_deployments",
+    [["fallback-a"], ["fallback-a", "fallback-b", "extra"]],
+)
+def test_routed_model_rejects_mismatched_fallback_deployment_mapping(
+    fallback_deployments,
+):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route="weak",
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.fallback_models = ["fallback-a", "fallback-b"]
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", "weak-deployment")
+        settings.set("openai.fallback_deployments", fallback_deployments)
+
+        with pytest.raises(ValueError, match="must match fallback_models"):
+            reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+
+def test_routed_azure_model_rejects_missing_fallback_deployment_mapping():
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route="weak",
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.fallback_models = ["fallback-model"]
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", "weak-deployment")
+        settings.set("openai.fallback_deployments", [])
+
+        with pytest.raises(ValueError, match="requires one fallback_deployments entry"):
+            reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+
+@pytest.mark.parametrize("route_name", ["regular", "weak", "reasoning"])
+def test_non_azure_review_routes_preserve_none_deployment_parity(route_name):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route=route_name,
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.model_reasoning",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.deployment_id_reasoning",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.model_reasoning = "reasoning-model"
+        settings.config.fallback_models = ["fallback-model"]
+        settings.set("openai.deployment_id", None)
+        settings.set("openai.deployment_id_weak", None)
+        settings.set("openai.deployment_id_reasoning", None)
+        settings.set("openai.fallback_deployments", [])
+
+        route = reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+    assert route.deployments == (None, None)
+
+
 def test_quick_claude_weak_route_disables_thinking_when_cap_equals_budget():
     from pr_agent.algo import CLAUDE_EXTENDED_THINKING_MODELS
     from pr_agent.algo.ai_handlers.litellm_ai_handler import (
@@ -891,6 +1382,36 @@ def test_incremental_sensitive_path_still_forces_deep_after_patch_mutation():
 
     assert decision.applied_depth is ReviewDepth.DEEP
     assert decision.matched_sensitive_categories == ("authorization",)
+
+
+def test_github_net_incremental_inventory_ignores_reverted_history_for_routing():
+    provider = GithubProvider.__new__(GithubProvider)
+    provider.incremental = IncrementalPR(True)
+    provider._routing_incremental_files = (
+        _incremental_raw_file("docs/guide.md"),
+    )
+    provider.unreviewed_files_map = {
+        "docs/guide.md": provider._routing_incremental_files[0],
+    }
+    provider.get_diff_files = MagicMock(return_value=[_route_file("docs/guide.md")])
+    provider.pr = SimpleNamespace(labels=[])
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert decision.matched_sensitive_categories == ()
+    assert [file.new_path for file in reviewer.review_route_request.files] == [
+        "docs/guide.md"
+    ]
 
 
 def test_incremental_snapshot_preserves_deleted_and_renamed_paths():

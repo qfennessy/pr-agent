@@ -1003,16 +1003,65 @@ class PRReviewer:
         if isinstance(fallback_models, str):
             fallback_models = [model.strip() for model in fallback_models.split(",") if model.strip()]
         models = (primary, *tuple(fallback_models or ()))
-        deployment = get_settings().get("openai.deployment_id", None)
+        def deployment_setting(key: str) -> str | None:
+            value = get_settings().get(key, None)
+            if value is None or value == "":
+                return None
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{key} must be a non-blank string when configured")
+            return value.strip()
+
+        regular_deployment = deployment_setting("openai.deployment_id")
+        deployment_key = {
+            "weak": "openai.deployment_id_weak",
+            "reasoning": "openai.deployment_id_reasoning",
+        }.get(route_name)
+        dedicated_model_configured = bool(
+            deployment_key and get_settings().get(f"config.model_{route_name}", None)
+        )
+        if deployment_key is None or not dedicated_model_configured:
+            deployment = regular_deployment
+        else:
+            deployment = deployment_setting(deployment_key)
+            if regular_deployment is not None and deployment is None:
+                raise ValueError(
+                    f"review depth {route_name} model has no matching {deployment_key}"
+                )
         fallback_deployments = get_settings().get("openai.fallback_deployments", [])
         if isinstance(fallback_deployments, str):
-            fallback_deployments = [item.strip() or None for item in fallback_deployments.split(",")]
+            fallback_deployments = (
+                [item.strip() for item in fallback_deployments.split(",")]
+                if fallback_deployments.strip()
+                else []
+            )
+        if fallback_deployments is None:
+            fallback_deployments = []
+        if not isinstance(fallback_deployments, (list, tuple)):
+            raise ValueError("openai.fallback_deployments must be a list or comma-separated string")
         if fallback_deployments:
-            deployments = (deployment, *tuple(fallback_deployments))
-            if len(deployments) < len(models):
-                raise ValueError("review depth model route has fewer deployments than models")
-            deployments = deployments[:len(models)]
+            if len(fallback_deployments) != len(fallback_models or ()):
+                raise ValueError(
+                    "review depth model route fallback_deployments must match fallback_models"
+                )
+            normalized_fallback_deployments = []
+            for fallback_deployment in fallback_deployments:
+                if fallback_deployment is None:
+                    normalized_fallback_deployments.append(None)
+                elif isinstance(fallback_deployment, str):
+                    normalized_fallback_deployments.append(
+                        fallback_deployment.strip() or None
+                    )
+                else:
+                    raise ValueError(
+                        "openai.fallback_deployments entries must be strings or null"
+                    )
+            deployments = (deployment, *normalized_fallback_deployments)
         else:
+            if fallback_models and deployment is not None:
+                raise ValueError(
+                    "review depth model route requires one fallback_deployments entry "
+                    "per fallback model when deployments are configured"
+                )
             deployments = (deployment,) * len(models)
         return AIModelRoute(
             models=models,
