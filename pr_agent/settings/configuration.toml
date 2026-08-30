@@ -386,6 +386,23 @@ avoid_full_files = false
 # review_path= "path/to/review.md"
 # improve_path= "path/to/improve.md"
 
+[local_pair_review]
+# Explicit local snapshot reviews are advisory and never publish to GitHub.
+policy_version = "local-pair-review-v1"
+events = ["file_save", "worktree_idle", "pre_commit"]
+excluded_paths = [] # additional globs; built-in credential-file exclusions always apply
+max_file_bytes = 1000000 # larger files are reported as unavailable coverage
+max_snapshot_bytes = 5000000 # cumulative diff bytes retained by one immutable snapshot
+max_path_discovery_bytes = 1000000 # bound NUL-delimited changed and untracked path discovery
+cache_enabled = true
+cache_max_entries = 50 # repository-local result cache under the Git common directory
+# Reserved for the optional watcher. Explicit review-snapshot invocation does not
+# require a resident process and remains the supported integration boundary.
+file_save_debounce_ms = 1500
+worktree_idle_seconds = 15
+max_concurrency = 2
+cancel_stale_snapshots = true
+
 [gerrit]
 # endpoint to the gerrit service
 # url = "ssh://gerrit.example.com:29418"

@@ -5,22 +5,30 @@
 name: PR-Agent
 
 on:
-# pull_request:
-# issue_comment:
-  workflow_dispatch:
+  # This base-branch event gives fork PRs access to the model secret. PR-Agent
+  # reads PR data through GitHub's API; do not add a checkout of untrusted code.
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
 
 permissions:
+  contents: read
   issues: write
   pull-requests: write
 
 jobs:
   pr_agent_job:
+    if: github.event.sender.type != 'Bot' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     name: Run pr agent on every pull request
     steps:
       - name: PR Agent action step
         id: pragent
-        uses: Codium-ai/pr-agent@e13da4fdda9903c8c7d1c9ba22f671b43f56039b  # main
+        # Intentionally follow the protected fork head so CI exercises the code
+        # currently merged to qfennessy/pr-agent main.
+        uses: qfennessy/pr-agent@main
         env:
           OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
           OPENAI_ORG: ${{ secrets.OPENAI_ORG }} # optional

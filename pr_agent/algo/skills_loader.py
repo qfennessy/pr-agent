@@ -38,8 +38,10 @@ In short, this implementation supports **text-only** agent skills.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import yaml
 from starlette_context import context
@@ -61,6 +63,9 @@ _CONTEXT_CACHE_SETTINGS_KEY = "skills_context_settings"
 # directories (large markdown dumps, accidental inclusion of generated docs,
 # or a misconfigured paths entry pointing at a directory with huge files).
 _MAX_RESOURCE_FILE_BYTES = 256 * 1024
+_pinned_skills_context: ContextVar[Optional[str]] = ContextVar(
+    "pr_agent_pinned_skills_context", default=None
+)
 
 
 @dataclass(frozen=True)
@@ -315,6 +320,16 @@ def _set_cached_context(cache_settings: Tuple[bool, Tuple[object, ...], Optional
         return
 
 
+@contextmanager
+def pin_skills_context(value: str) -> Iterator[None]:
+    """Pin one rendered context across an immutable local review invocation."""
+    token = _pinned_skills_context.set(value)
+    try:
+        yield
+    finally:
+        _pinned_skills_context.reset(token)
+
+
 def get_skills_context() -> str:
     """Read settings, discover skills, and format them for prompt injection.
 
@@ -323,6 +338,10 @@ def get_skills_context() -> str:
     share a single discovery + parse + format. Returns ``''`` when skills are
     disabled, no paths are configured, or no skills are found.
     """
+    pinned = _pinned_skills_context.get()
+    if pinned is not None:
+        return pinned
+
     settings = get_settings()
     enabled = bool(settings.skills.enabled)
     paths = list(settings.skills.paths or [])

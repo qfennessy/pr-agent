@@ -646,3 +646,35 @@ def test_prompt_templates_render_configured_repo_context(prompt_name, variables)
 
     assert "Repository context:" in rendered
     assert '<file path="AGENTS.md" scope="repo-root">' in rendered
+
+
+def test_bugs_only_review_prompt_renders_ci_failure_evidence_contract():
+    variables = {
+        "bugs_only": True,
+        "ci_failure_context": (
+            '{"status": "available", "failures": [{"name": "Unit tests", '
+            '"title": "Cache isolation failed", "summary": "Tenant key omitted"}]}'
+        ),
+        "extra_instructions": "",
+        "repo_context": "",
+        "skills_context": "",
+        "require_can_be_split_review": False,
+        "related_tickets": "",
+        "require_estimate_contribution_time_cost": False,
+        "require_score": False,
+        "require_tests": False,
+        "question_str": "",
+        "require_security_review": False,
+        "require_todo_scan": False,
+        "require_estimate_effort_to_review": False,
+        "num_max_findings": 3,
+        "num_pr_files": 1,
+        "is_ai_metadata": False,
+    }
+    environment = Environment(autoescape=select_autoescape(default_for_string=False), undefined=StrictUndefined)
+
+    rendered = environment.from_string(get_settings().pr_review_prompt.system).render(variables)
+
+    assert '"name": "Unit tests"' in rendered
+    assert "matching_ci_failure: str" in rendered
+    assert 'A generic result such as "Tests failed" is insufficient' in rendered

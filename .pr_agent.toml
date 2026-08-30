@@ -36,3 +36,18 @@ enabled = true
 publish_output = true
 demand_self_review = true
 approve_pr_on_self_review = true
+
+[local_pair_review]
+# Keep this user-facing snapshot configuration mirrored with configuration.toml.
+policy_version = "local-pair-review-v1"
+events = ["file_save", "worktree_idle", "pre_commit"]
+excluded_paths = []
+max_file_bytes = 1000000
+max_snapshot_bytes = 5000000
+max_path_discovery_bytes = 1000000
+cache_enabled = true
+cache_max_entries = 50
+file_save_debounce_ms = 1500
+worktree_idle_seconds = 15
+max_concurrency = 2
+cancel_stale_snapshots = true
