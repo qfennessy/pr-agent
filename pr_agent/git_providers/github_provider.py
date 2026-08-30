@@ -461,6 +461,7 @@ class GithubProvider(GitProvider):
             "No qualifying defects found in the latest bugs-only review.",
             name,
         ):
+            super().clear_persistent_review(identity_marker, name)
             return True
         return super().clear_persistent_review(identity_marker, name)
 

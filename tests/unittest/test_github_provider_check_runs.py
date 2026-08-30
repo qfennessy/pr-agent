@@ -357,3 +357,34 @@ def test_clear_persistent_bugs_only_review_falls_back_to_matching_comment():
 
     assert result is True
     assert provider.removed_comment is comment
+
+
+def test_clear_persistent_bugs_only_review_updates_check_and_removes_fallback_comment():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    requester.set_response(
+        "GET",
+        f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs",
+        ({}, {"check_runs": [{"id": 42, "name": "PR Agent - Bugs-only review"}]}),
+    )
+    requester.set_response(
+        "PATCH",
+        f"{provider.base_url}/repos/{provider.repo}/check-runs/42",
+        ({}, {}),
+    )
+    comment = SimpleNamespace(
+        body="## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\ndefect"
+    )
+    provider.pr.get_issue_comments = lambda: [comment]
+    provider.remove_comment = lambda value: setattr(provider, "removed_comment", value)
+    original = get_settings().github.publish_as_check_run
+    try:
+        get_settings().github.publish_as_check_run = True
+
+        result = provider.clear_persistent_review("<!-- pr-agent:review:bugs-only -->", "bugs-only review")
+    finally:
+        get_settings().github.publish_as_check_run = original
+
+    assert result is True
+    assert provider.removed_comment is comment
+    assert any(call[0] == "PATCH" for call in requester.calls)
