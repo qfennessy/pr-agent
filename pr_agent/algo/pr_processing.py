@@ -64,6 +64,45 @@ def _effective_max_tokens(model: str, max_context_tokens: int | None) -> int:
     return min(model_limit, max_context_tokens)
 
 
+def _output_token_reserves(max_output_tokens: int | None) -> tuple[int, int]:
+    """Return the completion space excluded from soft and hard input limits.
+
+    Legacy callers do not declare a completion cap, so retain their historical
+    buffers. A routed call does declare its provider request cap; that exact cap
+    replaces the heuristic so prompt plus completion can never exceed the window.
+    """
+
+    if max_output_tokens is None:
+        return OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD, OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD
+    if (
+        isinstance(max_output_tokens, bool)
+        or not isinstance(max_output_tokens, int)
+        or max_output_tokens <= 0
+    ):
+        raise ValueError("max_output_tokens must be a positive integer or None")
+    return max_output_tokens, max_output_tokens
+
+
+def _validate_explicit_token_budget(
+    *,
+    model: str | None,
+    context_limit: int,
+    prompt_tokens: int,
+    max_output_tokens: int | None,
+) -> None:
+    """Reject routed budgets that leave no usable input space for a review."""
+
+    _output_token_reserves(max_output_tokens)
+    if max_output_tokens is None:
+        return
+    if prompt_tokens + max_output_tokens >= context_limit:
+        model_detail = f" for model {model!r}" if model else ""
+        raise ValueError(
+            f"review token budget is impossible{model_detail}: prompt_tokens={prompt_tokens}, "
+            f"max_output_tokens={max_output_tokens}, context_limit={context_limit}"
+        )
+
+
 def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
                 model: str,
                 add_line_numbers_to_hunks: bool = False,
@@ -71,8 +110,16 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
                 large_pr_handling=False,
                 return_remaining_files=False,
                 return_deleted_files=False,
-                max_context_tokens: int | None = None):
+                max_context_tokens: int | None = None,
+                max_output_tokens: int | None = None):
     max_tokens_model = _effective_max_tokens(model, max_context_tokens)
+    soft_output_reserve, hard_output_reserve = _output_token_reserves(max_output_tokens)
+    _validate_explicit_token_budget(
+        model=model,
+        context_limit=max_tokens_model,
+        prompt_tokens=token_handler.prompt_tokens,
+        max_output_tokens=max_output_tokens,
+    )
     if disable_extra_lines:
         PATCH_EXTRA_LINES_BEFORE = 0
         PATCH_EXTRA_LINES_AFTER = 0
@@ -102,10 +149,15 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
         patch_extra_lines_before=PATCH_EXTRA_LINES_BEFORE, patch_extra_lines_after=PATCH_EXTRA_LINES_AFTER)
 
     # if we are under the limit, return the full diff
-    if total_tokens + OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD < max_tokens_model:
-        get_logger().info(f"Tokens: {total_tokens}, total tokens under limit: {max_tokens_model}, "
+    full_diff = "\n".join(patches_extended)
+    full_diff_tokens = total_tokens
+    if max_output_tokens is not None:
+        # Cached per-patch counts omit join separators and can differ at token
+        # boundaries. Routed admission uses the exact assembled prompt instead.
+        full_diff_tokens = token_handler.prompt_tokens + token_handler.count_tokens(full_diff)
+    if full_diff_tokens + soft_output_reserve < max_tokens_model:
+        get_logger().info(f"Tokens: {full_diff_tokens}, total tokens under limit: {max_tokens_model}, "
                           f"returning full diff.")
-        full_diff = "\n".join(patches_extended)
         if return_remaining_files and return_deleted_files:
             deleted_files = [
                 file.filename
@@ -126,6 +178,7 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
             add_line_numbers_to_hunks,
             large_pr_handling,
             max_context_tokens=max_context_tokens,
+            max_output_tokens=max_output_tokens,
         )
 
     if large_pr_handling and len(patches_compressed_list) > 1:
@@ -138,9 +191,13 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
     files_in_patch = files_in_patches_list[0]
 
     # Insert additional information about added, modified, and deleted files if there is enough space
-    max_tokens = max_tokens_model - OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD
+    max_tokens = max_tokens_model - hard_output_reserve
     curr_token = total_tokens_new  # == token_handler.count_tokens(final_diff)+token_handler.prompt_tokens
     final_diff = "\n".join(patches_compressed)
+    if max_output_tokens is not None:
+        # Recount the assembled diff for routed calls. Joining patches can add
+        # wrapper/separator tokens that are not represented by cached patch counts.
+        curr_token = token_handler.prompt_tokens + token_handler.count_tokens(final_diff)
     delta_tokens = 10
     added_list_str = modified_list_str = deleted_list_str = ""
     unprocessed_files = []
@@ -169,17 +226,43 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
                     deleted_list_str = deleted_list_str + f"\n{filename}"
 
     # prune the added, modified, and deleted files lists, and add them to the final diff
-    added_list_str = clip_tokens(added_list_str, max_tokens - curr_token)
-    if added_list_str:
-        final_diff = final_diff + "\n\n" + added_list_str
-        curr_token += token_handler.count_tokens(added_list_str) + 2
-    modified_list_str = clip_tokens(modified_list_str, max_tokens - curr_token)
-    if modified_list_str:
-        final_diff = final_diff + "\n\n" + modified_list_str
-        curr_token += token_handler.count_tokens(modified_list_str) + 2
-    deleted_list_str = clip_tokens(deleted_list_str, max_tokens - curr_token)
-    if deleted_list_str:
-        final_diff = final_diff + "\n\n" + deleted_list_str
+    if max_output_tokens is not None:
+        def append_file_list(section: str) -> str:
+            nonlocal curr_token, final_diff
+            if not section:
+                return ""
+            # Reserve the visible separator before clipping, then verify the
+            # complete assembled prompt with the same tokenizer. If clipping is
+            # approximate, omission is safer than consuming completion space.
+            section = clip_tokens(section, max(max_tokens - curr_token - 2, 0))
+            if not section:
+                return ""
+            candidate_diff = final_diff + "\n\n" + section
+            candidate_tokens = (
+                token_handler.prompt_tokens + token_handler.count_tokens(candidate_diff)
+            )
+            if candidate_tokens > max_tokens:
+                return ""
+            final_diff = candidate_diff
+            curr_token = candidate_tokens
+            return section
+
+        added_list_str = append_file_list(added_list_str)
+        modified_list_str = append_file_list(modified_list_str)
+        deleted_list_str = append_file_list(deleted_list_str)
+    else:
+        # Preserve the historical disabled-routing path exactly.
+        added_list_str = clip_tokens(added_list_str, max_tokens - curr_token)
+        if added_list_str:
+            final_diff = final_diff + "\n\n" + added_list_str
+            curr_token += token_handler.count_tokens(added_list_str) + 2
+        modified_list_str = clip_tokens(modified_list_str, max_tokens - curr_token)
+        if modified_list_str:
+            final_diff = final_diff + "\n\n" + modified_list_str
+            curr_token += token_handler.count_tokens(modified_list_str) + 2
+        deleted_list_str = clip_tokens(deleted_list_str, max_tokens - curr_token)
+        if deleted_list_str:
+            final_diff = final_diff + "\n\n" + deleted_list_str
 
     get_logger().debug(f"After pruning, added_list_str: {added_list_str}, modified_list_str: {modified_list_str}, "
                        f"deleted_list_str: {deleted_list_str}")
@@ -258,7 +341,8 @@ def pr_generate_extended_diff(pr_languages: list,
 def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, model: str,
                                 convert_hunks_to_line_numbers: bool,
                                 large_pr_handling: bool,
-                                max_context_tokens: int | None = None) -> Tuple[list, list, list, list, dict, list]:
+                                max_context_tokens: int | None = None,
+                                max_output_tokens: int | None = None) -> Tuple[list, list, list, list, dict, list]:
     deleted_files_list = []
 
     for lang in top_langs:
@@ -310,6 +394,12 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, mo
                 'edit_type': file.edit_type,
             }
     max_tokens_model = _effective_max_tokens(model, max_context_tokens)
+    _validate_explicit_token_budget(
+        model=model,
+        context_limit=max_tokens_model,
+        prompt_tokens=token_handler.prompt_tokens,
+        max_output_tokens=max_output_tokens,
+    )
 
     # first iteration
     files_in_patches_list = []
@@ -317,7 +407,8 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, mo
     patches_list =[]
     total_tokens_list = []
     total_tokens, patches, remaining_files_list, files_in_patch_list = generate_full_patch(convert_hunks_to_line_numbers, file_dict,
-                                       max_tokens_model, remaining_files_list, token_handler)
+                                       max_tokens_model, remaining_files_list, token_handler,
+                                       max_output_tokens=max_output_tokens)
     patches_list.append(patches)
     total_tokens_list.append(total_tokens)
     files_in_patches_list.append(files_in_patch_list)
@@ -330,7 +421,8 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, mo
                 total_tokens, patches, remaining_files_list, files_in_patch_list = generate_full_patch(convert_hunks_to_line_numbers,
                                                                                  file_dict,
                                                                                   max_tokens_model,
-                                                                                  remaining_files_list, token_handler)
+                                                                                  remaining_files_list, token_handler,
+                                                                                  max_output_tokens=max_output_tokens)
                 if patches:
                     patches_list.append(patches)
                     total_tokens_list.append(total_tokens)
@@ -341,7 +433,15 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, mo
     return patches_list, total_tokens_list, deleted_files_list, remaining_files_list, file_dict, files_in_patches_list
 
 
-def generate_full_patch(convert_hunks_to_line_numbers, file_dict, max_tokens_model,remaining_files_list_prev, token_handler):
+def generate_full_patch(convert_hunks_to_line_numbers, file_dict, max_tokens_model,remaining_files_list_prev,
+                        token_handler, max_output_tokens: int | None = None):
+    soft_output_reserve, hard_output_reserve = _output_token_reserves(max_output_tokens)
+    _validate_explicit_token_budget(
+        model=None,
+        context_limit=max_tokens_model,
+        prompt_tokens=token_handler.prompt_tokens,
+        max_output_tokens=max_output_tokens,
+    )
     total_tokens = token_handler.prompt_tokens # initial tokens
     patches = []
     remaining_files_list_new = []
@@ -351,17 +451,35 @@ def generate_full_patch(convert_hunks_to_line_numbers, file_dict, max_tokens_mod
             continue
 
         patch = data['patch']
-        new_patch_tokens = data['tokens']
         edit_type = data['edit_type']
 
+        if not patch:
+            continue
+        if not convert_hunks_to_line_numbers:
+            patch_final = f"\n\n## File: '{filename.strip()}'\n\n{patch.strip()}\n"
+        else:
+            patch_final = "\n\n" + patch.strip()
+
+        if max_output_tokens is None:
+            # Keep the legacy admission calculation byte-for-byte when routing is
+            # disabled. Routed calls count the actual wrapped patch below so the
+            # filename/header cannot consume completion-reserved context space.
+            new_patch_tokens = data['tokens']
+            candidate_total_tokens = total_tokens + new_patch_tokens
+        else:
+            candidate_total_tokens = (
+                token_handler.prompt_tokens
+                + token_handler.count_tokens("\n".join((*patches, patch_final)))
+            )
+
         # Hard Stop, no more tokens
-        if total_tokens > max_tokens_model - OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD:
+        if total_tokens > max_tokens_model - hard_output_reserve:
             get_logger().warning(f"File was fully skipped, no more tokens: {filename}.")
             remaining_files_list_new.append(filename)
             continue
 
         # If the patch is too large, just show the file name
-        if total_tokens + new_patch_tokens > max_tokens_model - OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD:
+        if candidate_total_tokens > max_tokens_model - soft_output_reserve:
             # Current logic is to skip the patch if it's too large
             # TODO: Option for alternative logic to remove hunks from the patch to reduce the number of tokens
             #  until we meet the requirements
@@ -370,16 +488,14 @@ def generate_full_patch(convert_hunks_to_line_numbers, file_dict, max_tokens_mod
             remaining_files_list_new.append(filename)
             continue
 
-        if patch:
-            if not convert_hunks_to_line_numbers:
-                patch_final = f"\n\n## File: '{filename.strip()}'\n\n{patch.strip()}\n"
-            else:
-                patch_final = "\n\n" + patch.strip()
-            patches.append(patch_final)
+        patches.append(patch_final)
+        if max_output_tokens is None:
             total_tokens += token_handler.count_tokens(patch_final)
-            files_in_patch_list.append(filename)
-            if get_settings().config.verbosity_level >= 2:
-                get_logger().info(f"Tokens: {total_tokens}, last filename: {filename}")
+        else:
+            total_tokens = candidate_total_tokens
+        files_in_patch_list.append(filename)
+        if get_settings().config.verbosity_level >= 2:
+            get_logger().info(f"Tokens: {total_tokens}, last filename: {filename}")
     return total_tokens, patches, remaining_files_list_new, files_in_patch_list
 
 

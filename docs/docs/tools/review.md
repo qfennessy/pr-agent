@@ -157,6 +157,14 @@ labels = ["deployment-credentials"]
 `model_route` is provider-neutral: `inherit` keeps the ordinary configured model route, while `regular`, `weak`, and
 `reasoning` select the existing `config.model`, `config.model_weak`, or `config.model_reasoning` settings and the normal
 fallback/deployment configuration. `max_retries` counts retries after the first attempt, so `0` means one attempt.
+For each routed model attempt, `context_tokens` is capped again by that model's actual context window, and
+`max_output_tokens` is reserved before the prompt diff is accepted or pruned. This reservation includes reasoning or
+extended-thinking tokens because providers count them inside the completion cap; when a profile inherits the output
+cap, the positive global `config.max_output_tokens` value is reserved instead. Fallback attempts rebuild the diff
+against their own model window. A profile whose output cap is not smaller than its context cap is invalid, while a
+model whose smaller window cannot hold the prompt plus the configured completion fails that attempt safely and moves
+through the normal fallback route. Routed OpenRouter numeric reasoning also requires a bounded total output cap;
+otherwise the attempt fails before reading or sending the diff. Disabled routing retains the legacy token-buffer behavior.
 `max_findings` bounds generated candidates, and `max_published_findings` is enforced before structured or Markdown
 publication. `max_verification_candidates` is a request-local budget for guarded verifier stages and is recorded even
 when no verifier is enabled; it does not launch an independent model by itself. `publication_threshold` is supplied to

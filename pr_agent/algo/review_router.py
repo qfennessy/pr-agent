@@ -1052,6 +1052,17 @@ def _validate_budget(depth: ReviewDepth, budget: Any) -> list[str]:
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
             errors.append(f"{prefix}.{field_name} must be a positive integer or null")
 
+    if (
+        isinstance(budget.context_tokens, int)
+        and not isinstance(budget.context_tokens, bool)
+        and isinstance(budget.max_output_tokens, int)
+        and not isinstance(budget.max_output_tokens, bool)
+        and budget.max_output_tokens >= budget.context_tokens
+    ):
+        errors.append(
+            f"{prefix}.max_output_tokens must be smaller than context_tokens"
+        )
+
     if budget.timeout_seconds is not None and (
         isinstance(budget.timeout_seconds, bool)
         or not isinstance(budget.timeout_seconds, (int, float))

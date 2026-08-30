@@ -30,6 +30,84 @@ MODEL_RETRIES = 2
 DUMMY_LITELLM_API_KEY = "dummy_key"  # placeholder set when no OpenAI key is configured
 
 
+def _positive_token_cap(value) -> int | None:
+    try:
+        cap = int(value)
+    except (TypeError, ValueError):
+        return None
+    return cap if cap > 0 else None
+
+
+def get_effective_litellm_output_token_cap(
+    model: str,
+    request_max_output_tokens: int | None = None,
+    *,
+    claude_extended_thinking_models: list[str] | None = None,
+    require_bounded_reasoning: bool = False,
+) -> int | None:
+    """Return the largest completion LiteLLM can request for this attempt.
+
+    Request-local controls take precedence over the generic global cap. Claude
+    extended thinking and OpenRouter can also establish or reduce ``max_tokens``;
+    include those provider controls so prompt pruning reserves the same bound.
+    """
+
+    settings = get_settings()
+    cap = _positive_token_cap(
+        request_max_output_tokens
+        if request_max_output_tokens is not None
+        else settings.config.get("max_output_tokens", 0)
+    )
+
+    if claude_extended_thinking_models is None:
+        override = settings.config.get("claude_extended_thinking_models_override", []) or []
+        claude_extended_thinking_models = (
+            [value.strip() for value in override]
+            if override
+            and isinstance(override, list)
+            and all(isinstance(value, str) and value.strip() for value in override)
+            else CLAUDE_EXTENDED_THINKING_MODELS
+        )
+    if (
+        request_max_output_tokens is None
+        and model in claude_extended_thinking_models
+        and settings.config.get("enable_claude_extended_thinking", False)
+    ):
+        thinking_budget = settings.config.get("extended_thinking_budget_tokens", 2048)
+        thinking_cap = settings.config.get("extended_thinking_max_output_tokens", 4096)
+        if not isinstance(thinking_budget, int) or thinking_budget <= 0:
+            raise ValueError(
+                f"extended_thinking_budget_tokens must be a positive integer, got {thinking_budget}"
+            )
+        if not isinstance(thinking_cap, int) or thinking_cap <= 0:
+            raise ValueError(
+                f"extended_thinking_max_output_tokens must be a positive integer, got {thinking_cap}"
+            )
+        if thinking_cap < thinking_budget:
+            raise ValueError(
+                f"extended_thinking_max_output_tokens ({thinking_cap}) must be greater than or equal to "
+                f"extended_thinking_budget_tokens ({thinking_budget})"
+            )
+        # Extended thinking sets max_tokens before the generic global cap uses
+        # setdefault, so this is the actual inherited cap for that model.
+        cap = thinking_cap
+
+    if model.startswith("openrouter/"):
+        openrouter_settings = settings.get("openrouter", {}) or {}
+        openrouter_cap = _positive_token_cap(openrouter_settings.get("max_tokens", 0))
+        if openrouter_cap is not None:
+            cap = min(cap, openrouter_cap) if cap is not None else openrouter_cap
+        reasoning_cap = _positive_token_cap(
+            openrouter_settings.get("reasoning_max_tokens", 0)
+        )
+        if require_bounded_reasoning and reasoning_cap is not None and cap is None:
+            raise ValueError(
+                "routed OpenRouter reasoning_max_tokens requires a positive total "
+                "max_output_tokens or openrouter.max_tokens cap"
+            )
+    return cap
+
+
 def _model_retries_stop(retry_state) -> bool:
     """Stop condition for chat_completion's @retry, read from config at call time.
 
@@ -867,20 +945,15 @@ class LiteLLMAIHandler(BaseAiHandler):
                 # Optional output token limit; 0 = unset. Without max_tokens some
                 # providers apply a low service-side default (Bedrock Converse: 4096,
                 # which reasoning can fully consume, returning empty content).
-                configured_max_output_tokens = (
+                request_max_output_tokens = (
                     request_options.max_output_tokens
                     if request_options is not None and request_options.max_output_tokens is not None
-                    else get_settings().config.get("max_output_tokens", 0)
-                )
-                try:
-                    max_output_tokens = int(configured_max_output_tokens)
-                except (TypeError, ValueError):
-                    max_output_tokens = 0
-
-                request_max_output_tokens = (
-                    max_output_tokens
-                    if request_options is not None and request_options.max_output_tokens is not None
                     else None
+                )
+                max_output_tokens = get_effective_litellm_output_token_cap(
+                    model,
+                    request_max_output_tokens,
+                    claude_extended_thinking_models=self.claude_extended_thinking_models,
                 )
                 if (model in self.claude_extended_thinking_models) and get_settings().config.get("enable_claude_extended_thinking", False):
                     kwargs = self._configure_claude_extended_thinking(
@@ -889,7 +962,7 @@ class LiteLLMAIHandler(BaseAiHandler):
                         request_max_output_tokens=request_max_output_tokens,
                     )
 
-                if max_output_tokens > 0:
+                if max_output_tokens is not None:
                     if request_max_output_tokens is not None:
                         kwargs["max_tokens"] = min(kwargs.get("max_tokens", max_output_tokens), max_output_tokens)
                     else:
@@ -1075,6 +1148,31 @@ class LiteLLMAIHandler(BaseAiHandler):
                         kwargs["max_tokens"] = min(existing, max_tokens) if existing > 0 else max_tokens
                     effective_max_tokens = _as_int(kwargs.get("max_tokens", 0))
                     effective_reasoning_max_tokens = _as_int(reasoning.get("max_tokens", 0))
+                    if effective_reasoning_max_tokens > 0 and effective_max_tokens > 0:
+                        # OpenRouter counts reasoning inside the request's completion
+                        # allowance. Never emit a numeric reasoning budget larger
+                        # than that allowance; Anthropic additionally requires at
+                        # least one token of non-thinking output headroom.
+                        reasoning_ceiling = effective_max_tokens
+                        if model.startswith("openrouter/anthropic/"):
+                            reasoning_ceiling = max(effective_max_tokens - 1, 0)
+                        if effective_reasoning_max_tokens > reasoning_ceiling:
+                            if reasoning_ceiling > 0:
+                                get_logger().warning(
+                                    f"Clamping OpenRouter reasoning_max_tokens "
+                                    f"({effective_reasoning_max_tokens}) to {reasoning_ceiling} "
+                                    f"within max_tokens ({effective_max_tokens})."
+                                )
+                                reasoning["max_tokens"] = reasoning_ceiling
+                                effective_reasoning_max_tokens = reasoning_ceiling
+                            else:
+                                get_logger().warning(
+                                    "Disabling OpenRouter reasoning because max_tokens "
+                                    "leaves no reasoning budget."
+                                )
+                                reasoning.clear()
+                                reasoning["enabled"] = False
+                                effective_reasoning_max_tokens = 0
                     if (
                         model.startswith("openrouter/anthropic/")
                         and effective_reasoning_max_tokens > 0

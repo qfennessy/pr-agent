@@ -447,6 +447,7 @@ def test_malformed_input_collections_fail_closed_to_deep(route_request):
         _policy(deep=ReviewBudgetPolicy(timeout_seconds=float("nan"))),
         _policy(deep=ReviewBudgetPolicy(max_retries=-1)),
         _policy(deep=ReviewBudgetPolicy(max_output_tokens=0)),
+        _policy(deep=ReviewBudgetPolicy(context_tokens=8_192, max_output_tokens=8_192)),
         _policy(deep=ReviewBudgetPolicy(max_published_findings=-1)),
         _policy(deep=ReviewBudgetPolicy(model_route="")),
         _policy(deep=ReviewBudgetPolicy(publication_threshold="urgent")),

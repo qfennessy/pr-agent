@@ -9,8 +9,9 @@ from typing import Any, List, Mapping, Optional, Tuple
 from jinja2 import Environment, StrictUndefined
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
-from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
-from pr_agent.algo.ai_request_context import AIModelRoute
+from pr_agent.algo.ai_handlers.litellm_ai_handler import (
+    LiteLLMAIHandler, get_effective_litellm_output_token_cap)
+from pr_agent.algo.ai_request_context import AIModelRoute, get_ai_request_options
 from pr_agent.algo.git_patch_processing import iter_git_patch_lines, split_git_file_lines
 from pr_agent.algo.inline_comment_dedup import (
     InlineCommentStore, can_verify_inline_comment_publication,
@@ -835,6 +836,28 @@ class PRReviewer:
         context_tokens = getattr(self, "_review_context_tokens", None)
         if context_tokens is not None:
             diff_kwargs["max_context_tokens"] = context_tokens
+        if decision is not None and decision.routing_enabled:
+            request_options = get_ai_request_options()
+            requested_max_output_tokens = (
+                request_options.max_output_tokens
+                if request_options is not None and request_options.max_output_tokens is not None
+                else decision.applied_budget.max_output_tokens
+            )
+            max_output_tokens = get_effective_litellm_output_token_cap(
+                model,
+                requested_max_output_tokens,
+                claude_extended_thinking_models=getattr(
+                    getattr(self, "ai_handler", None),
+                    "claude_extended_thinking_models",
+                    None,
+                ),
+                require_bounded_reasoning=True,
+            )
+            if max_output_tokens is not None:
+                # This is the same request-local cap sent to the model. Passing it
+                # through diff construction keeps each fallback model's input plus
+                # completion within that model's own effective context window.
+                diff_kwargs["max_output_tokens"] = max_output_tokens
         output = get_pr_diff(
             self.git_provider,
             self.token_handler,

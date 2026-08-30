@@ -4,9 +4,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import pr_agent.algo.pr_processing as pr_processing
 from pr_agent.algo.inline_comment_dedup import (body_with_markers,
                                                 get_inline_comment_store,
                                                 key_issue_fingerprint)
+from pr_agent.algo.ai_request_context import AIModelRoute
 from pr_agent.algo.pr_processing import PRDiffCoverage
 from pr_agent.algo.review_router import (
     ReviewDepth,
@@ -186,7 +188,180 @@ async def test_routed_prediction_applies_context_budget_and_model_specific_token
         return_remaining_files=True,
         return_deleted_files=True,
         max_context_tokens=8_000,
+        max_output_tokens=2_048,
     )
+
+
+@pytest.mark.asyncio
+async def test_routed_prediction_reserves_inherited_global_output_cap():
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(max_output_tokens=None),
+    )
+    reviewer._review_context_tokens = 32_000
+    reviewer.vars = {}
+    reviewer._specialists_started = True
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
+    settings = get_settings()
+    previous_cap = settings.config.get("max_output_tokens", 0)
+
+    try:
+        settings.set("config.max_output_tokens", "8192")
+        with (
+            patch("pr_agent.tools.pr_reviewer.TokenHandler", return_value=MagicMock()),
+            patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value="diff") as get_pr_diff,
+        ):
+            await reviewer._prepare_prediction("reasoning-model")
+    finally:
+        settings.set("config.max_output_tokens", previous_cap)
+
+    assert get_pr_diff.call_args.kwargs["max_context_tokens"] == 32_000
+    assert get_pr_diff.call_args.kwargs["max_output_tokens"] == 8_192
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "settings_updates", "expected_cap"),
+    [
+        (
+            "claude-3-7-sonnet-20250219",
+            {
+                "config.enable_claude_extended_thinking": True,
+                "config.extended_thinking_budget_tokens": 2_048,
+                "config.extended_thinking_max_output_tokens": 4_096,
+            },
+            4_096,
+        ),
+        (
+            "openrouter/google/gemini-2.5-pro",
+            {"openrouter.max_tokens": 3_072},
+            3_072,
+        ),
+    ],
+)
+async def test_routed_prediction_reserves_inherited_provider_output_cap(
+    model, settings_updates, expected_cap
+):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(max_output_tokens=None),
+    )
+    reviewer._review_context_tokens = 32_000
+    reviewer.vars = {}
+    reviewer._specialists_started = True
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
+    settings = get_settings()
+    keys = ("config.max_output_tokens", *settings_updates)
+    previous = {key: settings.get(key, None) for key in keys}
+
+    try:
+        settings.set("config.max_output_tokens", 0)
+        for key, value in settings_updates.items():
+            settings.set(key, value)
+        with (
+            patch("pr_agent.tools.pr_reviewer.TokenHandler", return_value=MagicMock()),
+            patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value="diff") as get_pr_diff,
+        ):
+            await reviewer._prepare_prediction(model)
+    finally:
+        for key, value in previous.items():
+            settings.set(key, value)
+
+    assert get_pr_diff.call_args.kwargs["max_output_tokens"] == expected_cap
+
+
+@pytest.mark.asyncio
+async def test_routed_prediction_rejects_unbounded_openrouter_reasoning_before_diff():
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(max_output_tokens=None),
+    )
+    reviewer._review_context_tokens = 32_000
+    reviewer.vars = {}
+    reviewer._specialists_started = True
+    settings = get_settings()
+    keys = (
+        "config.max_output_tokens",
+        "openrouter.max_tokens",
+        "openrouter.reasoning_max_tokens",
+    )
+    previous = {key: settings.get(key, None) for key in keys}
+
+    try:
+        settings.set("config.max_output_tokens", 0)
+        settings.set("openrouter.max_tokens", 0)
+        settings.set("openrouter.reasoning_max_tokens", 2_048)
+        with patch("pr_agent.tools.pr_reviewer.get_pr_diff") as get_pr_diff:
+            with pytest.raises(ValueError, match="requires a positive total"):
+                await reviewer._prepare_prediction("openrouter/google/gemini-2.5-pro")
+    finally:
+        for key, value in previous.items():
+            settings.set(key, value)
+
+    get_pr_diff.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_routed_fallback_rebuilds_diff_for_each_model_context(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.get_diff_files.return_value = []
+    provider.get_languages.return_value = {}
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(max_output_tokens=8_192),
+    )
+    reviewer._review_context_tokens = 32_000
+    reviewer._specialists_started = True
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
+
+    routed_token_handler = MagicMock()
+    routed_token_handler.prompt_tokens = 1_000
+    routed_token_handler.count_tokens.side_effect = lambda value: len(value.split())
+    monkeypatch.setattr(pr_reviewer_module, "TokenHandler", lambda *args, **kwargs: routed_token_handler)
+    monkeypatch.setattr(pr_processing, "sort_files_by_main_languages", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        pr_processing,
+        "pr_generate_extended_diff",
+        lambda *args, **kwargs: (["fallback-safe diff"], 2_000, [1_000]),
+    )
+    monkeypatch.setattr(
+        pr_processing,
+        "get_max_tokens",
+        lambda model: {"small-window": 8_192, "larger-window": 16_000}[model],
+    )
+    real_get_pr_diff = pr_reviewer_module.get_pr_diff
+    attempts = []
+
+    def recording_get_pr_diff(provider, token_handler, model, **kwargs):
+        attempts.append((model, kwargs["max_context_tokens"], kwargs["max_output_tokens"]))
+        return real_get_pr_diff(provider, token_handler, model, **kwargs)
+
+    monkeypatch.setattr(pr_reviewer_module, "get_pr_diff", recording_get_pr_diff)
+    route = AIModelRoute(
+        models=("small-window", "larger-window"),
+        deployments=(None, None),
+        max_output_tokens=8_192,
+    )
+
+    await pr_processing.retry_with_fallback_models(
+        reviewer._prepare_prediction,
+        model_route=route,
+    )
+
+    assert attempts == [
+        ("small-window", 32_000, 8_192),
+        ("larger-window", 32_000, 8_192),
+    ]
+    assert reviewer.patches_diff == "fallback-safe diff"
+    assert reviewer.prediction == VALID_PREDICTION
 
 
 def test_profile_model_route_uses_request_local_controls_and_retry_semantics():

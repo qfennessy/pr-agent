@@ -35,6 +35,202 @@ def test_effective_context_budget_caps_model_limit_without_mutating_settings(mon
         pr_processing._effective_max_tokens("model", 0)
 
 
+def test_routed_output_budget_replaces_legacy_completion_heuristic():
+    assert pr_processing._output_token_reserves(None) == (
+        pr_processing.OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+        pr_processing.OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD,
+    )
+    assert pr_processing._output_token_reserves(8_192) == (8_192, 8_192)
+    with pytest.raises(ValueError, match="positive integer"):
+        pr_processing._output_token_reserves(True)
+
+
+def test_deep_32k_route_prunes_before_reserved_8192_completion(monkeypatch):
+    provider = FakeProvider([])
+    token_handler = FakeTokenHandler(prompt_tokens=1_000)
+    token_handler.count_tokens = (
+        lambda value: 24_000 if value == "unsafe full diff" else len(value.split())
+    )
+    monkeypatch.setattr(
+        pr_processing,
+        "pr_generate_extended_diff",
+        lambda *args, **kwargs: (["unsafe full diff"], 25_000, [24_000]),
+    )
+    observed = {}
+
+    def compressed(*args, **kwargs):
+        observed.update(kwargs)
+        return ([['safe pruned diff']], [20_000], [], [], {}, [[]])
+
+    monkeypatch.setattr(pr_processing, "pr_generate_compressed_diff", compressed)
+    monkeypatch.setattr(pr_processing, "get_max_tokens", lambda model: 32_000)
+
+    output = pr_processing.get_pr_diff(
+        provider,
+        token_handler,
+        "deep-32k-model",
+        max_context_tokens=32_000,
+        max_output_tokens=8_192,
+    )
+
+    assert output == "safe pruned diff"
+    assert observed["max_context_tokens"] == 32_000
+    assert observed["max_output_tokens"] == 8_192
+    assert 20_000 + 8_192 < 32_000
+
+
+def test_output_cap_including_extended_thinking_is_reserved_from_input(monkeypatch):
+    """Thinking tokens share the configured completion cap and context window."""
+
+    provider = FakeProvider([])
+    token_handler = FakeTokenHandler(prompt_tokens=1_000)
+    token_handler.count_tokens = (
+        lambda value: 27_500 if value == "unsafe thinking diff" else len(value.split())
+    )
+    monkeypatch.setattr(
+        pr_processing,
+        "pr_generate_extended_diff",
+        lambda *args, **kwargs: (["unsafe thinking diff"], 28_500, [27_500]),
+    )
+    monkeypatch.setattr(
+        pr_processing,
+        "pr_generate_compressed_diff",
+        lambda *args, **kwargs: ([['thinking-safe diff']], [24_000], [], [], {}, [[]]),
+    )
+    monkeypatch.setattr(pr_processing, "get_max_tokens", lambda model: 32_000)
+
+    output = pr_processing.get_pr_diff(
+        provider,
+        token_handler,
+        "extended-thinking-model",
+        max_context_tokens=32_000,
+        max_output_tokens=4_096,
+    )
+
+    assert output == "thinking-safe diff"
+    assert 24_000 + 4_096 < 32_000
+
+
+def test_routed_full_diff_recounts_joined_prompt_before_admission(monkeypatch):
+    class CharacterTokenHandler(FakeTokenHandler):
+        def count_tokens(self, patch):
+            return len(patch)
+
+    provider = FakeProvider([])
+    token_handler = CharacterTokenHandler(prompt_tokens=1)
+    monkeypatch.setattr(
+        pr_processing,
+        "pr_generate_extended_diff",
+        lambda *args, **kwargs: (["aaaa", "bbbb", "cccc"], 14, [4, 4, 4]),
+    )
+    monkeypatch.setattr(
+        pr_processing,
+        "pr_generate_compressed_diff",
+        lambda *args, **kwargs: ([["safe"]], [5], [], [], {}, [[]]),
+    )
+    monkeypatch.setattr(pr_processing, "get_max_tokens", lambda model: 20)
+
+    output = pr_processing.get_pr_diff(
+        provider,
+        token_handler,
+        "small-model",
+        max_context_tokens=20,
+        max_output_tokens=5,
+    )
+
+    assert output == "safe"
+    assert token_handler.prompt_tokens + token_handler.count_tokens(output) + 5 < 20
+
+
+def test_routed_compressed_patch_counts_filename_wrapper_before_admission():
+    token_handler = FakeTokenHandler(prompt_tokens=2)
+    file_dict = {
+        "very-long-filename.py": {
+            "patch": " ".join(f"token-{index}" for index in range(13)),
+            "tokens": 13,
+            "edit_type": EDIT_TYPE.MODIFIED,
+        }
+    }
+
+    total_tokens, patches, remaining, included = pr_processing.generate_full_patch(
+        False,
+        file_dict,
+        max_tokens_model=20,
+        remaining_files_list_prev=["very-long-filename.py"],
+        token_handler=token_handler,
+        max_output_tokens=5,
+    )
+
+    assert total_tokens == 2
+    assert patches == []
+    assert remaining == ["very-long-filename.py"]
+    assert included == []
+
+
+def test_routed_omitted_file_summary_reserves_separator_tokens(monkeypatch):
+    provider = FakeProvider([])
+    token_handler = FakeTokenHandler(prompt_tokens=2)
+    monkeypatch.setattr(
+        pr_processing,
+        "pr_generate_extended_diff",
+        lambda *args, **kwargs: (["oversized full diff"], 9, [7]),
+    )
+    monkeypatch.setattr(
+        pr_processing,
+        "pr_generate_compressed_diff",
+        lambda *args, **kwargs: (
+            [["base"]],
+            [3],
+            [],
+            ["omitted.py"],
+            {
+                "omitted.py": {
+                    "patch": "unused",
+                    "tokens": 1,
+                    "edit_type": EDIT_TYPE.ADDED,
+                }
+            },
+            [[]],
+        ),
+    )
+    monkeypatch.setattr(pr_processing, "get_max_tokens", lambda model: 10)
+
+    output = pr_processing.get_pr_diff(
+        provider,
+        token_handler,
+        "small-model",
+        max_context_tokens=10,
+        max_output_tokens=5,
+    )
+
+    assert output == "base"
+    assert token_handler.prompt_tokens + token_handler.count_tokens(output) + 5 < 10
+
+
+@pytest.mark.parametrize(
+    ("context_limit", "prompt_tokens", "max_output_tokens"),
+    [
+        (4_096, 2_048, 2_048),
+        (8_192, 1_000, 8_192),
+    ],
+)
+def test_impossible_routed_budget_fails_before_provider_read(
+    monkeypatch, context_limit, prompt_tokens, max_output_tokens
+):
+    provider = FakeProvider([])
+    provider.get_diff_files = pytest.fail
+    monkeypatch.setattr(pr_processing, "get_max_tokens", lambda model: context_limit)
+
+    with pytest.raises(ValueError, match="review token budget is impossible"):
+        pr_processing.get_pr_diff(
+            provider,
+            FakeTokenHandler(prompt_tokens=prompt_tokens),
+            "small-model",
+            max_context_tokens=32_000,
+            max_output_tokens=max_output_tokens,
+        )
+
+
 def test_get_pr_diff_reports_pruned_deletions_separately(monkeypatch):
     provider = FakeProvider([])
     token_handler = FakeTokenHandler(prompt_tokens=100)
