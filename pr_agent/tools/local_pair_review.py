@@ -491,6 +491,7 @@ class LocalPairReview:
                 "-z",
                 "--find-copies",
                 "--find-copies-harder",
+                "-l0",
                 base_revision,
                 "--",
             ]
@@ -527,6 +528,7 @@ class LocalPairReview:
     def _tracked_filtered_paths(
         self,
         event: ReviewEvent,
+        base_revision: str,
         focus_path: Optional[str] = None,
     ) -> Optional[set[str]]:
         tracked_args = ["--literal-pathspecs", "ls-files", "-z", "--"]
@@ -545,22 +547,36 @@ class LocalPairReview:
         if event is ReviewEvent.PRE_COMMIT:
             attribute_args.append("--cached")
         attribute_args.extend(["-z", "--stdin", "filter"])
-        attributes = _run_git_bounded(
+        current_attributes = _run_git_bounded(
             self.repository_root,
             *attribute_args,
             max_output_bytes=self.max_path_discovery_bytes,
             stdin_bytes=tracked,
         )
-        if attributes is None:
+        base_attributes = _run_git_bounded(
+            self.repository_root,
+            "--literal-pathspecs",
+            "check-attr",
+            f"--source={base_revision}",
+            "-z",
+            "--stdin",
+            "filter",
+            max_output_bytes=self.max_path_discovery_bytes,
+            stdin_bytes=tracked,
+        )
+        if current_attributes is None or base_attributes is None:
             return None
-        fields = _decode_z_paths(attributes)
-        if len(fields) % 3:
-            raise SnapshotCaptureError("git check-attr returned malformed path data")
-        return {
-            fields[index]
-            for index in range(0, len(fields), 3)
-            if fields[index + 2].lower() not in {"unspecified", "unset"}
-        }
+        filtered_paths = set()
+        for attributes in (current_attributes, base_attributes):
+            fields = _decode_z_paths(attributes)
+            if len(fields) % 3:
+                raise SnapshotCaptureError("git check-attr returned malformed path data")
+            filtered_paths.update(
+                fields[index]
+                for index in range(0, len(fields), 3)
+                if fields[index + 2].lower() not in {"unspecified", "unset"}
+            )
+        return filtered_paths
 
     def _untracked_paths(self, focus_path: Optional[str] = None) -> Optional[list[str]]:
         args = [
@@ -673,7 +689,9 @@ class LocalPairReview:
             fingerprint = self._path_fingerprint(event, path, base_revision) if path else None
             coverage.append(CoverageIssue(path=path, reason=reason, fingerprint=fingerprint))
 
-        filtered_paths = self._tracked_filtered_paths(event, normalized_focus)
+        filtered_paths = self._tracked_filtered_paths(
+            event, base_revision, normalized_focus
+        )
         discovery_overflow = filtered_paths is None
         if filtered_paths is None:
             add_coverage(None, "filtered_path_discovery_budget")

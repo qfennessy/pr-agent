@@ -382,6 +382,35 @@ def test_pre_commit_ignores_unchanged_filtered_paths(tmp_path):
     assert snapshot.coverage_issues == ()
 
 
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_removed_filter_assignment_remains_excluded_from_base(event, tmp_path):
+    repo = _repo(tmp_path, f"removed-base-filter-{event}")
+    tracked = repo / "tracked.py"
+    tracked.write_text("encrypted = True\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text(
+        "tracked.py filter=crypt\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "tracked.py", ".gitattributes")
+    _git(repo, "commit", "-m", "filtered fixture")
+    tracked.write_text("decrypted = True\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text("", encoding="utf-8")
+    if event == "pre-commit":
+        _git(repo, "add", "tracked.py", ".gitattributes")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="tracked.py" if event == "file-save" else None,
+    )
+
+    assert "tracked.py" not in snapshot.changed_paths
+    assert "decrypted" not in snapshot.diff
+    assert CoverageIssue(
+        path="tracked.py",
+        reason="content_filter_unsupported",
+    ) in snapshot.coverage_issues
+
+
 def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "large.py"
@@ -536,6 +565,35 @@ def test_pre_commit_rejects_a_copy_from_an_unchanged_excluded_source(tmp_path):
     assert snapshot.changed_paths == ()
     assert CoverageIssue(path="secrets.txt", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="public.txt", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+def test_copy_detection_ignores_repository_rename_limit(tmp_path):
+    repo = _repo(tmp_path, "unlimited-copy-detection")
+    source_paths = []
+    destination_paths = []
+    for index in range(4):
+        source = repo / f"secret_{index}.txt"
+        destination = repo / f"public_{index}.txt"
+        source.write_text((f"secret-{index}\n" * 100) + "source\n", encoding="utf-8")
+        source_paths.append(source)
+        destination_paths.append(destination)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "add copy sources")
+    _git(repo, "config", "diff.renameLimit", "1")
+    for source, destination in zip(source_paths, destination_paths, strict=True):
+        destination.write_bytes(source.read_bytes().replace(b"source\n", b"copied\n"))
+    _git(repo, "add", ".")
+
+    snapshot = LocalPairReview(str(repo), excluded_paths=["secret_*.txt"]).capture(
+        event="pre-commit"
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert {
+        issue.path for issue in snapshot.coverage_issues
+        if issue.reason == "rename_group_omitted"
+    } == {path.name for path in destination_paths}
 
 
 def test_captured_filenames_are_literal_git_pathspecs(tmp_path):
