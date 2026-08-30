@@ -152,7 +152,9 @@ Language guidance should be small modules under these domain specialists, not se
 
 ## Snapshot and context contract
 
-Every run receives an immutable `ReviewSnapshot` so that results can be cancelled or reproduced:
+Local file-save, worktree-idle, and pre-commit runs now receive the shipped immutable
+`ReviewSnapshot` contract documented in [Local snapshot review](../usage-guide/local_snapshot_review.md).
+Hosted and specialist stages should converge on the same envelope so results can be cancelled or reproduced:
 
 ```json
 {
@@ -252,7 +254,9 @@ The small model may perform the first cleanup pass, but a model must never be th
 
 ## Illustrative configuration
 
-This example describes the intended configuration surface. It is not accepted by current PR-Agent code.
+The `[local_pair_review]` snapshot, event, exclusion, cache, size, and stale-result settings
+are shipped. The specialist model, context, and publication settings below remain an
+illustrative target until their owning workstreams land.
 
 ```toml
 [specialist_pipeline]

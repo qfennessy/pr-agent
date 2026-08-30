@@ -12,7 +12,8 @@ from pr_agent.algo.inline_comment_dedup import (
     InlineCommentStore, can_verify_inline_comment_publication,
     get_inline_comment_store, key_issue_body_with_markers,
     key_issue_fingerprint, key_issue_location_fingerprint)
-from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
+from pr_agent.algo.pr_processing import (PRDiffCoverage,
+                                         add_ai_metadata_to_diff_files,
                                          get_pr_diff,
                                          retry_with_fallback_models)
 from pr_agent.algo.repo_context import build_repo_context
@@ -88,6 +89,7 @@ class PRReviewer:
         self.ai_handler.main_pr_language = self.main_language
         self.patches_diff = None
         self.remaining_files_list = []
+        self.deleted_files_list = []
         self.prediction = None
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
@@ -271,12 +273,16 @@ class PRReviewer:
                              model,
                              add_line_numbers_to_hunks=True,
                              disable_extra_lines=False,
-                             return_remaining_files=True,)
-        if isinstance(output, tuple):
-            self.patches_diff, self.remaining_files_list = output
+                             return_remaining_files=True,
+                             return_deleted_files=True,)
+        if isinstance(output, PRDiffCoverage):
+            self.patches_diff = output.diff
+            self.remaining_files_list = output.remaining_files
+            self.deleted_files_list = output.deleted_files
         else:
             self.patches_diff = output
             self.remaining_files_list = []
+            self.deleted_files_list = []
 
         if self.patches_diff:
             get_logger().debug(f"PR diff", diff=self.patches_diff)
@@ -467,7 +473,11 @@ class PRReviewer:
                     "total_tokens": details.total_tokens,
                 }
             structured_data["usage"] = usage
-            structured_data["metadata"] = {"review_profile": self._review_profile()}
+            structured_data["metadata"] = {
+                "review_profile": self._review_profile(),
+                "omitted_files": sorted(set(self.remaining_files_list)),
+                "deleted_files": sorted(set(getattr(self, "deleted_files_list", []))),
+            }
             structured_publisher(structured_data)
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary

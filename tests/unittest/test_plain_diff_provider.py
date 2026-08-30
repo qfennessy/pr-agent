@@ -3,10 +3,11 @@ import pytest
 from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import _GIT_PROVIDERS
-from pr_agent.git_providers.plain_diff_provider import PlainDiffGitProvider
+from pr_agent.git_providers.plain_diff_provider import PlainDiffGitProvider, parse_plain_diff
 
 # Diff-mode settings keys these tests mutate on the process-wide singleton.
 _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path",
+                  "plain_diff.disable_working_tree_enrichment",
                   "config.git_provider", "config.publish_output"]
 
 
@@ -62,6 +63,48 @@ def test_get_diff_files(cfg):
     assert len(files) == 1
     assert files[0].filename == "foo.py"
     assert files[0].edit_type == EDIT_TYPE.MODIFIED
+
+
+def test_literal_quotes_in_a_unified_diff_filename_are_preserved():
+    diff = '''diff --git a/"foo" b/"foo"
+--- a/"foo"
++++ b/"foo"
+@@ -1 +1 @@
+-old
++new
+'''
+
+    files = parse_plain_diff(diff)
+
+    assert files[0].filename == '"foo"'
+
+
+def test_literal_quoted_filename_starting_with_git_prefix_is_preserved():
+    diff = '''diff --git a/"a/foo" b/"a/foo"
+--- a/"a/foo"
++++ b/"a/foo"
+@@ -1 +1 @@
+-old
++new
+'''
+
+    files = parse_plain_diff(diff)
+
+    assert files[0].filename == '"a/foo"'
+
+
+def test_git_c_quoted_prefixed_filename_is_decoded():
+    diff = '''diff --git "a/foo\\tbar.py" "b/foo\\tbar.py"
+--- "a/foo\\tbar.py"
++++ "b/foo\\tbar.py"
+@@ -1 +1 @@
+-old
++new
+'''
+
+    files = parse_plain_diff(diff)
+
+    assert files[0].filename == "foo\tbar.py"
 
 
 _MULTI_LANG_DIFF = """diff --git a/foo.py b/foo.py
@@ -227,6 +270,22 @@ def test_no_repo_root_disables_enrichment(cfg, tmp_path, monkeypatch):
     assert files[0].head_file == "", (
         "Enrichment must be disabled when no .git root is found (patch-only)"
     )
+    assert files[0].base_file == ""
+
+
+def test_immutable_snapshot_mode_disables_live_worktree_enrichment(cfg, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "foo.py").write_text("newer content that is not in the snapshot\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+    cfg("plain_diff.content", DIFF)
+    cfg("plain_diff.output_path", None)
+    cfg("plain_diff.disable_working_tree_enrichment", True)
+
+    files = PlainDiffGitProvider(None).get_diff_files()
+
+    assert files[0].head_file == ""
     assert files[0].base_file == ""
 
 

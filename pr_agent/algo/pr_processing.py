@@ -4,6 +4,7 @@ import os
 import re
 import time
 import traceback
+from dataclasses import dataclass
 from typing import Callable, List, Tuple
 
 from github import RateLimitExceededException
@@ -33,6 +34,13 @@ OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD = 1000
 MAX_EXTRA_LINES = 10
 
 
+@dataclass(frozen=True)
+class PRDiffCoverage:
+    diff: str
+    remaining_files: list[str]
+    deleted_files: list[str]
+
+
 def cap_and_log_extra_lines(value, direction) -> int:
     try:
         value = int(value)
@@ -51,7 +59,8 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
                 add_line_numbers_to_hunks: bool = False,
                 disable_extra_lines: bool = False,
                 large_pr_handling=False,
-                return_remaining_files=False):
+                return_remaining_files=False,
+                return_deleted_files=False):
     if disable_extra_lines:
         PATCH_EXTRA_LINES_BEFORE = 0
         PATCH_EXTRA_LINES_AFTER = 0
@@ -84,7 +93,15 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
     if total_tokens + OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD < get_max_tokens(model):
         get_logger().info(f"Tokens: {total_tokens}, total tokens under limit: {get_max_tokens(model)}, "
                           f"returning full diff.")
-        return "\n".join(patches_extended)
+        full_diff = "\n".join(patches_extended)
+        if return_remaining_files and return_deleted_files:
+            deleted_files = [
+                file.filename
+                for file in diff_files
+                if file.edit_type == EDIT_TYPE.DELETED
+            ]
+            return PRDiffCoverage(full_diff, [], deleted_files)
+        return full_diff
 
     # if we are over the limit, start pruning (If we got here, we will not extend the patches with extra lines)
     get_logger().info(f"Tokens: {total_tokens}, total tokens over limit: {get_max_tokens(model)}, "
@@ -149,8 +166,9 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
                        f"deleted_list_str: {deleted_list_str}")
     if not return_remaining_files:
         return final_diff
-    else:
-        return final_diff, remaining_files_list
+    if return_deleted_files:
+        return PRDiffCoverage(final_diff, remaining_files_list, deleted_files_list)
+    return final_diff, remaining_files_list
 
 
 def get_pr_diff_multiple_patchs(git_provider: GitProvider, token_handler: TokenHandler, model: str,
@@ -257,14 +275,25 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, mo
         # if file.ai_file_summary and get_settings().config.get('config.is_auto_command', False):
         #     patch = add_ai_summary_top_patch(file, patch)
 
-        new_patch_tokens = token_handler.count_tokens(patch)
-        file_dict[file.filename] = {'patch': patch, 'tokens': new_patch_tokens, 'edit_type': file.edit_type}
-
+        existing = file_dict.get(file.filename)
+        if existing is not None:
+            combined_patch = f"{existing['patch'].rstrip()}\n\n{patch.lstrip()}"
+            existing["patch"] = combined_patch
+            existing["tokens"] = token_handler.count_tokens(combined_patch)
+            if existing["edit_type"] != file.edit_type:
+                existing["edit_type"] = EDIT_TYPE.MODIFIED
+        else:
+            new_patch_tokens = token_handler.count_tokens(patch)
+            file_dict[file.filename] = {
+                'patch': patch,
+                'tokens': new_patch_tokens,
+                'edit_type': file.edit_type,
+            }
     max_tokens_model = get_max_tokens(model)
 
     # first iteration
     files_in_patches_list = []
-    remaining_files_list =  [file.filename for file in sorted_files]
+    remaining_files_list = list(file_dict)
     patches_list =[]
     total_tokens_list = []
     total_tokens, patches, remaining_files_list, files_in_patch_list = generate_full_patch(convert_hunks_to_line_numbers, file_dict,

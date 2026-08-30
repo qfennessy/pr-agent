@@ -5,11 +5,80 @@ from typing import List, Optional
 
 from unidiff.errors import UnidiffParseError
 
-from pr_agent.algo.types import FilePatchInfo
+from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.config_loader import _find_repository_root, get_settings
 from pr_agent.git_providers.diff_parsing import parse_unified_diff, reconstruct_base_file, to_hunk_only_patch
 from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.log import get_logger
+
+
+def _decode_git_c_quoted_path(path: str, *, c_quoted_header: bool) -> str:
+    if not c_quoted_header:
+        return path
+    if len(path) < 2 or not (path.startswith('"') and path.endswith('"')):
+        return path
+    raw = path[1:-1]
+    if not raw.startswith(("a/", "b/")):
+        return path
+    decoded = bytearray()
+    index = 0
+    escapes = {
+        "a": b"\a", "b": b"\b", "f": b"\f", "n": b"\n",
+        "r": b"\r", "t": b"\t", "v": b"\v", "\\": b"\\", '"': b'"',
+    }
+    while index < len(raw):
+        character = raw[index]
+        if character != "\\":
+            decoded.extend(character.encode("utf-8", errors="surrogateescape"))
+            index += 1
+            continue
+        index += 1
+        if index >= len(raw):
+            decoded.extend(b"\\")
+            break
+        escaped = raw[index]
+        if escaped in escapes:
+            decoded.extend(escapes[escaped])
+            index += 1
+            continue
+        if escaped in "01234567":
+            end = index
+            while end < min(index + 3, len(raw)) and raw[end] in "01234567":
+                end += 1
+            decoded.append(int(raw[index:end], 8))
+            index = end
+            continue
+        decoded.extend(escaped.encode("utf-8", errors="surrogateescape"))
+        index += 1
+    value = decoded.decode("utf-8", errors="surrogateescape")
+    return value[2:]
+
+
+def _header_is_c_quoted(patch: str, prefix: str) -> bool:
+    for line in patch.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):].startswith('"')
+    return False
+
+
+def parse_plain_diff(diff_text: str) -> List[FilePatchInfo]:
+    """Parse plain-diff input through the provider's single shared seam."""
+    try:
+        files = parse_unified_diff(diff_text)
+    except UnidiffParseError as e:
+        raise ValueError(f"Failed to parse the provided diff: {e}") from e
+    for item in files:
+        filename_header = "--- " if item.edit_type is EDIT_TYPE.DELETED else "+++ "
+        item.filename = _decode_git_c_quoted_path(
+            item.filename,
+            c_quoted_header=_header_is_c_quoted(item.patch, filename_header),
+        )
+        if item.old_filename:
+            item.old_filename = _decode_git_c_quoted_path(
+                item.old_filename,
+                c_quoted_header=_header_is_c_quoted(item.patch, "--- "),
+            )
+    return files
 
 
 class PullRequestMimic:
@@ -33,6 +102,10 @@ class PlainDiffGitProvider(GitProvider):
         self.diff_text = diff_text
         self.output_path = get_settings().get("plain_diff.output_path", None)
         self.json_output_path = get_settings().get("plain_diff.json_output_path", None)
+        self.suppress_stdout = bool(get_settings().get("plain_diff.suppress_stdout", False))
+        self.disable_working_tree_enrichment = bool(
+            get_settings().get("plain_diff.disable_working_tree_enrichment", False)
+        )
         # cli.run() already forces config.publish_output=True, but apply_repo_settings()
         # runs afterwards and can overwrite it back to False from an extra/repo config
         # (tools gate all publishing on this flag). This provider is constructed after
@@ -45,22 +118,17 @@ class PlainDiffGitProvider(GitProvider):
     def get_diff_files(self) -> List[FilePatchInfo]:
         if self.diff_files is not None:
             return self.diff_files
-        try:
-            files = parse_unified_diff(self.diff_text)
-        except UnidiffParseError as e:
-            raise ValueError(f"Failed to parse the provided diff: {e}") from e
+        files = parse_plain_diff(self.diff_text)
         # Resolve diff paths against the actual repository root (not the raw CWD)
         # so working-tree enrichment still works when run from a subdirectory.
         # If there is no detectable .git root, disable enrichment entirely and
         # run patch-only: reading files from an arbitrary CWD could disclose
         # unrelated local files to the LLM.
-        repo_root = _find_repository_root()
+        repo_root = None if self.disable_working_tree_enrichment else _find_repository_root()
         root = os.path.realpath(str(repo_root)) if repo_root else None
         if root is None:
-            get_logger().info(
-                "No repository root (.git) found; running in patch-only mode "
-                "(working-tree enrichment disabled)."
-            )
+            reason = "disabled for immutable input" if self.disable_working_tree_enrichment else "no repository root"
+            get_logger().info(f"Running in patch-only mode ({reason}).")
         for f in files:
             head = ""
             if root is not None and f.filename:
@@ -88,6 +156,10 @@ class PlainDiffGitProvider(GitProvider):
         self.diff_files = files
         return files
 
+    def get_repo_file_content(self, file_path: str, from_default_branch: bool = False):
+        files = get_settings().get("plain_diff.repo_context_files", {}) or {}
+        return files.get(file_path) if hasattr(files, "get") else None
+
     def get_files(self) -> List[str]:
         return [f.filename for f in self.get_diff_files()]
 
@@ -103,7 +175,8 @@ class PlainDiffGitProvider(GitProvider):
         incremental.is_incremental = False
 
     def _write_output(self, content: str):
-        print(content)
+        if not self.suppress_stdout:
+            print(content)
         if self.output_path:
             # --output is always an explicit user request, so a write failure
             # must surface (fail fast) rather than be silently swallowed.
