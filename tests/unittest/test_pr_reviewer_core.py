@@ -160,6 +160,27 @@ def test_prepare_pr_review_leaves_original_content_unchanged_without_remaining_f
     assert "Review coverage" not in review
 
 
+def test_prepare_pr_review_publishes_omitted_files_in_structured_metadata():
+    git_provider = MagicMock()
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.prediction = "review: {}"
+    reviewer.remaining_files_list = ["src/two.py", "src/one.py", "src/two.py"]
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    git_provider.get_diff_files.return_value = []
+    git_provider.is_supported.return_value = False
+    reviewer.set_review_labels = MagicMock()
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.load_yaml", return_value={"review": {}}),
+        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", return_value="review"),
+    ):
+        reviewer._prepare_pr_review()
+
+    structured = git_provider.publish_structured_review.call_args.args[0]
+    assert structured["metadata"]["omitted_files"] == ["src/one.py", "src/two.py"]
+
+
 def test_prepare_pr_review_limits_coverage_footer_to_50_files():
     reviewer = _make_prediction_reviewer()
     remaining_files = [f"file_{index}.py" for index in range(51)]
@@ -961,7 +982,7 @@ def test_prepare_review_publishes_provider_neutral_structured_data(monkeypatch):
             "security_concerns": False,
         },
         "usage": {"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42},
-        "metadata": {"review_profile": "full"},
+        "metadata": {"review_profile": "full", "omitted_files": []},
     })
     # Assert key order to prove the snapshot is isolated: _prepare_pr_review moves
     # key_issues_to_review to the end of its own dict after the hook fires, so an
@@ -988,7 +1009,7 @@ def test_bugs_only_publishes_structured_empty_list_but_no_markdown():
     reviewer.git_provider.publish_structured_review.assert_called_once_with({
         "review": {"key_issues_to_review": []},
         "usage": {},
-        "metadata": {"review_profile": "bugs_only"},
+        "metadata": {"review_profile": "bugs_only", "omitted_files": []},
     })
 
 

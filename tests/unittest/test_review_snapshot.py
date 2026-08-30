@@ -118,6 +118,23 @@ def test_pre_commit_coverage_inspects_the_staged_blob(tmp_path):
     assert CoverageIssue(path="tracked.py", reason="file_too_large") in snapshot.coverage_issues
 
 
+def test_git_blob_size_is_checked_before_content_is_read(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, "bounded-git-blob")
+    reviewer = LocalPairReview(str(repo), max_file_bytes=4)
+    calls = []
+
+    def fake_run_git(repository_root, *args, **kwargs):
+        calls.append(args)
+        if args == ("cat-file", "-s", "blob-id"):
+            return b"5\n"
+        raise AssertionError("oversized Git blob content must not be materialized")
+
+    monkeypatch.setattr("pr_agent.tools.local_pair_review._run_git", fake_run_git)
+
+    assert reviewer._inspect_git_object("100644", "blob-id") == "file_too_large"
+    assert calls == [("cat-file", "-s", "blob-id")]
+
+
 def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "large.py"
@@ -328,6 +345,23 @@ def test_partial_coverage_cannot_be_reported_as_clean():
 
     assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
     assert result.review is None
+
+
+def test_token_budget_omissions_cannot_be_reported_as_clean():
+    snapshot = _snapshot("/repo/one")
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={
+            "review": {"key_issues_to_review": []},
+            "metadata": {"omitted_files": ["large.py"]},
+        },
+        started_at=monotonic(),
+    )
+
+    assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert result.review is None
+    assert CoverageIssue(path="large.py", reason="token_budget_omitted") in result.coverage_issues
 
 
 def test_cache_is_repository_local_and_does_not_store_unavailable_results(tmp_path):

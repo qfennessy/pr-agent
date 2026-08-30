@@ -380,6 +380,41 @@ def test_review_snapshot_bypasses_structured_cache_when_markdown_is_requested(
     assert json.loads(capsys.readouterr().out)["state"] == "no_findings"
 
 
+def test_review_snapshot_materializes_requested_clean_markdown(cfg, monkeypatch, tmp_path, capsys):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo-clean-output"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    output = repo / "review.md"
+    monkeypatch.chdir(repo)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    result = run(inargs=[
+        "review-snapshot", "--event", "worktree-idle", "--output", str(output), "--no-cache",
+    ])
+
+    assert result.state.value == "no_findings"
+    assert output.read_text(encoding="utf-8") == "## PR Review\n\nNo findings.\n"
+    assert json.loads(capsys.readouterr().out)["state"] == "no_findings"
+
+
 def test_worktree_snapshot_excludes_requested_output_artifacts(cfg, monkeypatch, tmp_path, capsys):
     import json
     import subprocess

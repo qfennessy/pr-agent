@@ -467,7 +467,10 @@ class PRReviewer:
                     "total_tokens": details.total_tokens,
                 }
             structured_data["usage"] = usage
-            structured_data["metadata"] = {"review_profile": self._review_profile()}
+            structured_data["metadata"] = {
+                "review_profile": self._review_profile(),
+                "omitted_files": sorted(set(self.remaining_files_list)),
+            }
             structured_publisher(structured_data)
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary

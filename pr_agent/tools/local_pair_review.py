@@ -142,25 +142,26 @@ class LocalPairReview:
             return "binary"
         return None
 
-    def _git_object_mode(self, revision: str, path: str) -> Optional[str]:
-        mode, _ = self._git_object_identity(revision, path)
-        return mode
-
-    def _inspect_revision_file(self, revision: str, path: str) -> Optional[str]:
-        mode = self._git_object_mode(revision, path)
-        if mode is None:
+    def _inspect_git_object(self, mode: Optional[str], object_id: Optional[str]) -> Optional[str]:
+        """Inspect an immutable Git blob without materializing an oversized object."""
+        if mode is None or object_id is None:
             return None
         if mode == "120000":
             return "symlink"
-        process = subprocess.run(
-            ["git", "-C", str(self.repository_root), "show", f"{revision}:./{path}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if process.returncode != 0:
+        try:
+            size = int(_run_git(self.repository_root, "cat-file", "-s", object_id).strip())
+        except (SnapshotCaptureError, ValueError):
             return "unreadable"
-        return self._inspect_content(process.stdout)
+        if size > self.max_file_bytes:
+            return "file_too_large"
+        try:
+            content = _run_git(self.repository_root, "cat-file", "blob", object_id)
+        except SnapshotCaptureError:
+            return "unreadable"
+        return self._inspect_content(content)
+
+    def _inspect_revision_file(self, revision: str, path: str) -> Optional[str]:
+        return self._inspect_git_object(*self._git_object_identity(revision, path))
 
     def _inspect_current_file(self, path: str, base_revision: str) -> Optional[str]:
         base_issue = self._inspect_revision_file(base_revision, path)
@@ -185,17 +186,10 @@ class LocalPairReview:
         base_issue = self._inspect_revision_file(base_revision, path)
         if base_issue:
             return base_issue
-        if self._git_object_mode(":", path) == "120000":
-            return "symlink"
-        process = subprocess.run(
-            ["git", "-C", str(self.repository_root), "show", f":./{path}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if process.returncode != 0:
+        mode, object_id = self._git_object_identity(":", path)
+        if object_id is None:
             return self._inspect_revision_file(base_revision, path)
-        return self._inspect_content(process.stdout)
+        return self._inspect_git_object(mode, object_id)
 
     def _resolve_base(self, base: str) -> str:
         resolved = _run_git(self.repository_root, "rev-parse", "--verify", f"{base}^{{commit}}")
@@ -455,6 +449,14 @@ def build_snapshot_result(
     error: Optional[str] = None,
 ) -> ReviewSnapshotResult:
     coverage = list(snapshot.coverage_issues)
+    metadata = structured_review.get("metadata", {}) if isinstance(structured_review, Mapping) else {}
+    omitted_files = metadata.get("omitted_files", []) if isinstance(metadata, Mapping) else []
+    if isinstance(omitted_files, Sequence) and not isinstance(omitted_files, (str, bytes)):
+        coverage.extend(
+            CoverageIssue(path=str(path), reason="token_budget_omitted")
+            for path in omitted_files
+            if isinstance(path, str) and path
+        )
     if current_snapshot.snapshot_id != snapshot.snapshot_id:
         return ReviewSnapshotResult(
             snapshot_id=snapshot.snapshot_id,
@@ -484,7 +486,6 @@ def build_snapshot_result(
     if not findings and coverage:
         state = ReviewResultState.COVERAGE_UNAVAILABLE
         review = None
-    metadata = structured_review.get("metadata", {}) if isinstance(structured_review, Mapping) else {}
     return ReviewSnapshotResult(
         snapshot_id=snapshot.snapshot_id,
         state=state,

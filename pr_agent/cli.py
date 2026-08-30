@@ -362,6 +362,8 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
         started_at=started_at,
         error=review_error,
     )
+    if markdown_output and pending_markdown is None and result.state is ReviewResultState.NO_FINDINGS:
+        pending_markdown = b"## PR Review\n\nNo findings.\n"
     if cache_enabled and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}:
         cache.write(result)
     if (
