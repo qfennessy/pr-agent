@@ -32,6 +32,31 @@ from pr_agent.git_providers.diff_parsing import to_hunk_only_patch
 from pr_agent.git_providers.plain_diff_provider import parse_plain_diff
 from pr_agent.log import get_logger
 
+_DEFAULT_SECRET_EXCLUSIONS = (
+    ".env",
+    ".env.*",
+    "**/.env",
+    "**/.env.*",
+    "*.pem",
+    "**/*.pem",
+    "*.key",
+    "**/*.key",
+    "credentials.json",
+    "**/credentials.json",
+    "service-account*.json",
+    "**/service-account*.json",
+    ".npmrc",
+    "**/.npmrc",
+    ".pypirc",
+    "**/.pypirc",
+    ".netrc",
+    "**/.netrc",
+    "id_rsa",
+    "**/id_rsa",
+    "id_ed25519",
+    "**/id_ed25519",
+)
+
 
 class SnapshotCaptureError(ValueError):
     pass
@@ -158,7 +183,12 @@ class LocalPairReview:
         settings = get_settings().get("local_pair_review", {}) or {}
         configured_exclusions = settings.get("excluded_paths", []) if hasattr(settings, "get") else []
         self.excluded_paths = _normalize_patterns(
-            excluded_paths if excluded_paths is not None else configured_exclusions
+            (
+                *_DEFAULT_SECRET_EXCLUSIONS,
+                *_normalize_patterns(
+                    excluded_paths if excluded_paths is not None else configured_exclusions
+                ),
+            )
         )
         self.ignored_paths = _normalize_patterns(ignored_paths)
         configured_limits = validate_local_pair_review_limits(settings)
@@ -394,7 +424,7 @@ class LocalPairReview:
         event: ReviewEvent,
         base_revision: str,
         focus_path: Optional[str] = None,
-    ) -> Optional[list[tuple[str, ...]]]:
+    ) -> Optional[list[tuple[str, tuple[str, ...]]]]:
         args = [
             *self._diff_filter_overrides(),
             "--literal-pathspecs",
@@ -428,10 +458,19 @@ class LocalPairReview:
             status = fields[index]
             index += 1
             path_count = 2 if status.startswith(("R", "C")) else 1
-            path_groups.append(tuple(fields[index:index + path_count]))
+            paths = tuple(fields[index:index + path_count])
+            path_groups.append((status, paths))
             index += path_count
         if focus_path:
-            return [group for group in path_groups if focus_path in group]
+            return [
+                group
+                for group in path_groups
+                if (
+                    focus_path == group[1][-1]
+                    if group[0].startswith("C")
+                    else focus_path in group[1]
+                )
+            ]
         return path_groups
 
     def _tracked_filtered_paths(
@@ -597,7 +636,7 @@ class LocalPairReview:
             tracked_groups = []
         if event is ReviewEvent.PRE_COMMIT:
             changed_group_paths = {
-                path for group in tracked_groups for path in group
+                path for _, group in tracked_groups for path in group
             }
             filtered_paths.intersection_update(changed_group_paths)
         for filtered_path in sorted(filtered_paths):
@@ -658,7 +697,7 @@ class LocalPairReview:
 
         # A rename/copy is one security unit. If either side is unavailable or
         # excluded, selecting the other side alone can expose the full source.
-        for group in tracked_groups:
+        for _, group in tracked_groups:
             if any(path in filtered_paths for path in group):
                 covered_paths = {issue.path for issue in coverage}
                 for raw_path in group:

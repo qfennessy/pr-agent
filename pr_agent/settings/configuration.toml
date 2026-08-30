@@ -378,7 +378,7 @@ avoid_full_files = false
 # Explicit local snapshot reviews are advisory and never publish to GitHub.
 policy_version = "local-pair-review-v1"
 events = ["file_save", "worktree_idle", "pre_commit"]
-excluded_paths = [] # glob patterns relative to the repository root
+excluded_paths = [] # additional globs; built-in credential-file exclusions always apply
 max_file_bytes = 1000000 # larger files are reported as unavailable coverage
 max_snapshot_bytes = 5000000 # cumulative diff bytes retained by one immutable snapshot
 max_path_discovery_bytes = 1000000 # bound NUL-delimited changed and untracked path discovery

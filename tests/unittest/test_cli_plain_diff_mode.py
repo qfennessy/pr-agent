@@ -805,6 +805,47 @@ def test_review_snapshot_rejects_output_tracked_during_review(
     capsys.readouterr()
 
 
+def test_review_snapshot_rejects_prior_artifact_tracked_during_review(
+    cfg, monkeypatch, tmp_path, capsys
+):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo-prior-output-tracked-race"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    output = repo / "result.json"
+    prior = json.dumps({"artifact_type": "pr-agent-review-snapshot", "state": "stale"})
+    output.write_text(prior, encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            subprocess.run(["git", "add", "result.json"], check=True)
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    with pytest.raises(SnapshotCaptureError, match="output target became tracked"):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--no-cache", "--json-output", str(output),
+        ])
+
+    assert output.read_text(encoding="utf-8") == prior
+    capsys.readouterr()
+
+
 def test_review_snapshot_rejects_output_parent_swapped_during_review(
     cfg, monkeypatch, tmp_path, capsys
 ):

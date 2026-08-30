@@ -53,6 +53,11 @@ cumulative captured diff; paths beyond that budget are reported with
 `snapshot_byte_budget` coverage. `local_pair_review.max_path_discovery_bytes` separately
 bounds Git's changed and untracked path listings; if either listing exceeds that limit,
 the snapshot reports stage-level path-discovery coverage instead of buffering the list.
+Common credential files are always excluded before inference, including `.env` files,
+PEM/private-key files, credential and service-account JSON files, package-registry
+credentials, `.netrc`, and standard SSH private-key names. Add repository-specific secret
+paths with `local_pair_review.excluded_paths`; excluded paths are reported as unavailable
+coverage rather than a clean review.
 
 Successful identical snapshots can use a bounded cache under the repository's Git common
 directory. The key includes repository identity, exact diff content, event, base revision,

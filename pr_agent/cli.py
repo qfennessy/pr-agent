@@ -292,11 +292,25 @@ def _validate_output_target(
         )
 
 
+def _validate_output_untracked(
+    destination: Path,
+    repository_root: Path | None,
+) -> None:
+    if (
+        repository_root is not None
+        and _is_tracked_repository_path(destination, repository_root)
+    ):
+        raise SnapshotCaptureError(
+            f"output target became tracked before publication: {destination}"
+        )
+
+
 def _portable_atomic_replace_bytes(
     destination: Path,
     content: bytes,
     parent_identity: tuple[int, int],
     target_identity: tuple[int, int, int, int, int, int] | None,
+    repository_root: Path | None = None,
 ) -> None:
     """Publish atomically on platforms without descriptor-relative filesystem calls."""
     _validate_output_parent(destination, parent_identity, "publication")
@@ -310,6 +324,7 @@ def _portable_atomic_replace_bytes(
             handle.write(content)
         _validate_output_parent(destination, parent_identity, "publication")
         _validate_output_target(destination, target_identity)
+        _validate_output_untracked(destination, repository_root)
         os.replace(temporary_path, destination)
         temporary_path = None
     finally:
@@ -324,10 +339,15 @@ def _atomic_replace_bytes(
     content: bytes,
     parent_identity: tuple[int, int],
     target_identity: tuple[int, int, int, int, int, int] | None,
+    repository_root: Path | None = None,
 ) -> None:
     if not _supports_descriptor_relative_publication():
         _portable_atomic_replace_bytes(
-            destination, content, parent_identity, target_identity
+            destination,
+            content,
+            parent_identity,
+            target_identity,
+            repository_root,
         )
         return
     parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
@@ -350,6 +370,7 @@ def _atomic_replace_bytes(
             target_identity,
             parent_fd=parent_fd,
         )
+        _validate_output_untracked(destination, repository_root)
         os.replace(
             temporary_name,
             destination.name,
@@ -390,6 +411,7 @@ def _emit_snapshot_result(
     output_path: str | None,
     parent_identity: tuple[int, int] | None = None,
     target_identity: tuple[int, int, int, int, int, int] | None = None,
+    repository_root: Path | None = None,
 ) -> None:
     payload_data = result.to_dict()
     payload_data["artifact_type"] = _SNAPSHOT_ARTIFACT_TYPE
@@ -409,6 +431,7 @@ def _emit_snapshot_result(
                 payload.encode("utf-8"),
                 identity,
                 expected_target,
+                repository_root,
             )
         except (OSError, SnapshotCaptureError) as exc:
             raise SnapshotCaptureError(f"could not write --json-output '{output_path}': {exc}") from exc
@@ -928,6 +951,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             json_output,
             output_parent_identities.get(json_output),
             output_target_identities.get(json_output),
+            repository_root,
         )
         return stale_result
     # Cached structured results cannot reproduce the exact Markdown rendering.
@@ -945,6 +969,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
                 json_output,
                 output_parent_identities.get(json_output),
                 output_target_identities.get(json_output),
+                repository_root,
             )
             return cached_result
 
@@ -1055,6 +1080,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
                 pending_markdown,
                 output_parent_identities[markdown_output],
                 output_target_identities[markdown_output],
+                repository_root,
             )
         except (OSError, SnapshotCaptureError) as exc:
             raise SnapshotCaptureError(f"could not publish --output '{markdown_output}': {exc}") from exc
@@ -1063,6 +1089,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         json_output,
         output_parent_identities.get(json_output),
         output_target_identities.get(json_output),
+        repository_root,
     )
     return result
 

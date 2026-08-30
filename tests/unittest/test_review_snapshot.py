@@ -458,6 +458,21 @@ def test_excluding_either_side_rejects_an_entire_rename(tmp_path):
     assert current.snapshot_id != snapshot.snapshot_id
 
 
+def test_default_secret_paths_never_enter_snapshot_input(tmp_path):
+    repo = _repo(tmp_path, "default-secret-exclusions")
+    (repo / "credentials.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+    (repo / "signing.pem").write_text("PRIVATE KEY\n", encoding="utf-8")
+    (repo / "visible.py").write_text("value = 1\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo), excluded_paths=[]).capture(event="worktree-idle")
+
+    assert snapshot.changed_paths == ("visible.py",)
+    assert "secret" not in snapshot.diff
+    assert "PRIVATE KEY" not in snapshot.diff
+    assert CoverageIssue(path="credentials.json", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="signing.pem", reason="excluded") in snapshot.coverage_issues
+
+
 def test_file_save_rejects_a_focused_rename_with_an_excluded_source(tmp_path):
     repo = _repo(tmp_path)
     source = repo / "ignored.py"
@@ -474,6 +489,29 @@ def test_file_save_rejects_a_focused_rename_with_an_excluded_source(tmp_path):
     assert snapshot.changed_paths == ()
     assert CoverageIssue(path="ignored.py", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="allowed.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+def test_file_save_does_not_select_a_copy_by_its_unchanged_source(tmp_path):
+    repo = _repo(tmp_path, "file-save-copy-source")
+    source = repo / "source.txt"
+    source.write_text("shared content\n", encoding="utf-8")
+    _git(repo, "add", "source.txt")
+    _git(repo, "commit", "-m", "add source")
+    destination = repo / "other.txt"
+    destination.write_bytes(source.read_bytes())
+    _git(repo, "add", "other.txt")
+
+    source_snapshot = LocalPairReview(str(repo)).capture(
+        event="file-save", focus_path="source.txt"
+    )
+    destination_snapshot = LocalPairReview(str(repo)).capture(
+        event="file-save", focus_path="other.txt"
+    )
+
+    assert source_snapshot.changed_paths == ()
+    assert source_snapshot.diff == ""
+    assert destination_snapshot.changed_paths == ("other.txt",)
+    assert "+shared content" in destination_snapshot.diff
 
 
 def test_pre_commit_rejects_a_copy_from_an_unchanged_excluded_source(tmp_path):
