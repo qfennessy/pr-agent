@@ -24,6 +24,7 @@ global_settings = Dynaconf(
         "settings/language_extensions.toml",
         "settings/pr_reviewer_prompts.toml",
         "settings/pr_reviewer_verification_prompts.toml",
+        "settings/review_specialist_prompts.toml",
         "settings/pr_questions_prompts.toml",
         "settings/pr_line_questions_prompts.toml",
         "settings/pr_description_prompts.toml",

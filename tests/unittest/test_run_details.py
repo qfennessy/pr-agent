@@ -3,10 +3,18 @@ from decimal import Decimal
 
 import pytest
 
-from pr_agent.algo.run_details import (RunDetails, add_token_usage,
-                                       get_run_details, init_run_details,
-                                       record_ai_call, record_model_used,
-                                       record_review_profile)
+from pr_agent.algo.ai_request_context import AIRequestOptions, use_ai_request_options
+from pr_agent.algo.run_details import (
+    RunDetails,
+    add_token_usage,
+    get_run_details,
+    init_run_details,
+    record_ai_call,
+    record_model_used,
+    record_review_profile,
+    record_specialist_result,
+    specialist_runs_to_dict,
+)
 
 
 class _Usage:
@@ -177,6 +185,53 @@ def test_record_ai_call_marks_partial_and_unavailable_cost_without_fabricating_z
     assert details.known_cost_call_count == 0
     assert details.cost_status == "unavailable"
     assert details.model_costs_usd == {}
+
+
+def test_specialist_usage_is_attributed_without_changing_primary_totals():
+    init_run_details()
+    record_model_used("main-model", is_fallback=False)
+    record_ai_call(_Usage(100, 10, 110), model="main-model", cost_usd="0.01")
+
+    with use_ai_request_options(
+        AIRequestOptions(deployment_id="risk-deployment", attribution="risk_recommendation")
+    ):
+        record_ai_call(_Usage(20, 3, 23), model="risk-model", cost_usd="0.002")
+    record_model_used(
+        "risk-model",
+        is_fallback=True,
+        attribution="risk_recommendation",
+        deployment_id="risk-deployment",
+    )
+    record_specialist_result(
+        "risk_recommendation",
+        prompt_version="risk-prompt-v1",
+        input_schema_version="risk-input-v1",
+        schema_version="risk-output-v1",
+        state="success",
+        latency_seconds=0.4,
+        confidence=0.8,
+        input_token_reservation=20,
+        output_token_reservation=100,
+        output={"recommendation": "escalate"},
+    )
+
+    details = get_run_details()
+    assert details.model_used == "main-model"
+    assert details.fallback_used is False
+    assert details.num_ai_calls == 1
+    assert details.total_tokens == 110
+    record = specialist_runs_to_dict()["risk_recommendation"]
+    assert record["model"] == "risk-model"
+    assert record["deployment"] == "risk-deployment"
+    assert record["fallback_used"] is True
+    assert record["input_schema_version"] == "risk-input-v1"
+    assert record["usage"] == {
+        "prompt_tokens": 20,
+        "completion_tokens": 3,
+        "total_tokens": 23,
+        "ai_calls": 1,
+    }
+    assert record["cost"]["total_usd"] == "0.002"
 
 
 @pytest.mark.asyncio

@@ -57,6 +57,54 @@ If you want to edit [configurations](#configuration-options), add the relevant o
 /review --pr_reviewer.some_config1=... --pr_reviewer.some_config2=...
 ```
 
+#### Shadow review specialists
+
+PR-Agent includes a disabled-by-default shadow stage for three narrow tasks: change classification, an upward-only
+risk recommendation, and diff-hunk prioritization. Shadow output is structured telemetry only. It cannot change the
+main review's depth, prompt diff, findings, labels, comments, or approval state.
+
+Enable the pipeline and only the roles you want to measure in `.pr_agent.toml`:
+
+```toml
+[specialist_pipeline]
+enabled = true
+mode = "shadow"
+aggregate_timeout_seconds = 8
+aggregate_token_budget = 12000
+
+[specialist_pipeline.change_classification]
+enabled = true
+model = "openai/compatible-small-model"
+deployment = "classification-deployment"
+fallback_models = []
+timeout_seconds = 5
+model_retries = 1
+input_token_budget = 4000
+output_token_budget = 600
+minimum_confidence = 0.6
+
+[specialist_pipeline.risk_recommendation]
+enabled = false
+
+[specialist_pipeline.diff_prioritization]
+enabled = false
+```
+
+Each role has independent input/output schema versions, model/deployment, fallback, timeout, retry, input/output
+budget, confidence, and enablement settings. Compatible tuned endpoints use the same versioned role contracts as
+prompted models. Calls share one
+immutable input and reserve their worst-case token budget before concurrent execution. A failed, timed-out, malformed,
+low-confidence, or stale role is recorded separately and never blocks the ordinary review.
+
+Worst-case reservation includes every configured fallback model, model attempt, and provider retry. GitHub and GitLab
+reviews use a refreshable head commit for stale-run cancellation, while local file-save reviews use their immutable
+snapshot. Other hosted providers record `unavailable` role evidence and make no specialist calls until their adapter can
+provide a stable, refreshable head identity; they are never silently treated as successful shadow runs.
+
+Issue #11 is the only consumer of upward risk recommendations. Issue #9 is the only consumer of ranked hunks and
+context requests. Those guarded consumers remain disabled until issue #27 completes the frozen benchmark, target-repo
+pilot, live-shadow evidence window, and rollout decisions.
+
 ### Automatic triggering
 
 To run the `review` automatically when a PR is opened, define in a [configuration file](../usage-guide/configuration_options.md#local-configuration-file):

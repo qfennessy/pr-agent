@@ -735,6 +735,11 @@ class GitProvider(ABC):
     def get_latest_commit_url(self) -> str:
         return ""
 
+    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
+        """Return a stable current head identity when the provider supports it."""
+
+        return None
+
     def auto_approve(self) -> bool:
         return False
 
