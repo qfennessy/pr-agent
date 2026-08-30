@@ -291,6 +291,11 @@ class LocalPairReview:
         except OSError:
             return None
         mode, object_id = self._git_object_identity(base_revision, path)
+        if mode == "160000" and candidate.is_dir():
+            # The parent repository's base gitlink cannot describe the live
+            # submodule HEAD or dirty worktree. Returning no fingerprint makes
+            # result publication fail closed until submodules are supported.
+            return None
         return f"git:{mode}:{object_id}" if object_id else None
 
     def _inspect_content(self, content: bytes) -> Optional[str]:

@@ -570,6 +570,54 @@ def test_unfingerprintable_coverage_suppresses_findings(tmp_path):
     assert CoverageIssue(reason="unfingerprintable_coverage") in result.coverage_issues
 
 
+def test_modified_submodule_coverage_is_unfingerprintable(tmp_path):
+    submodule_source = tmp_path / "submodule-source"
+    submodule_source.mkdir()
+    _git(submodule_source, "init")
+    _git(submodule_source, "config", "user.email", "test@example.com")
+    _git(submodule_source, "config", "user.name", "Snapshot Test")
+    (submodule_source / "nested.py").write_text("value = 1\n", encoding="utf-8")
+    _git(submodule_source, "add", "nested.py")
+    _git(submodule_source, "commit", "-m", "initial submodule")
+
+    repo = _repo(tmp_path, "submodule-parent")
+    _git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(submodule_source),
+        "vendor",
+    )
+    _git(repo, "commit", "-am", "add submodule")
+    (repo / "vendor" / "nested.py").write_text("value = 2\n", encoding="utf-8")
+    (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+
+    reviewer = LocalPairReview(str(repo))
+    snapshot = reviewer.capture(event="worktree-idle")
+    current = reviewer.recapture(snapshot)
+    submodule_issue = next(
+        issue for issue in snapshot.coverage_issues if issue.path == "vendor"
+    )
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=current,
+        structured_review={"review": {"key_issues_to_review": [{
+            "relevant_file": "tracked.py",
+            "issue_header": "Bug",
+            "issue_content": "The changed value is incorrect.",
+            "start_line": 1,
+            "end_line": 1,
+        }]}},
+        started_at=monotonic(),
+    )
+
+    assert submodule_issue.fingerprint is None
+    assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert result.review is None
+
+
 def test_outside_symlink_target_change_invalidates_snapshot_identity(tmp_path):
     repo = _repo(tmp_path, "outside-symlink")
     link = repo / "outside-link"
