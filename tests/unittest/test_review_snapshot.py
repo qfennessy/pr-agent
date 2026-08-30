@@ -667,7 +667,13 @@ def test_result_states_distinguish_findings_clean_and_unavailable():
     findings = build_snapshot_result(
         snapshot,
         current_snapshot=snapshot,
-        structured_review={"review": {"key_issues_to_review": [{"issue": "bug"}]}},
+        structured_review={"review": {"key_issues_to_review": [{
+            "relevant_file": "app.py",
+            "issue_header": "Bug",
+            "issue_content": "The wrong value is returned.",
+            "start_line": 1,
+            "end_line": 1,
+        }]}},
         started_at=monotonic(),
     )
     clean = build_snapshot_result(
@@ -749,6 +755,13 @@ def test_deleted_files_have_distinct_unsupported_coverage():
         {},
         {"key_issues_to_review": {}},
         {"key_issues_to_review": "none"},
+        {"key_issues_to_review": [None]},
+        {"key_issues_to_review": [{}]},
+        {"key_issues_to_review": [{
+            "relevant_file": "app.py",
+            "issue_header": "Bug",
+            "issue_content": "Missing line coordinates.",
+        }]},
     ],
 )
 def test_malformed_finding_collection_cannot_be_reported_as_clean(review):

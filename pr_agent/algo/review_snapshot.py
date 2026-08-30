@@ -148,4 +148,23 @@ def finding_count(structured_review: Optional[Mapping[str, Any]]) -> Optional[in
     if not isinstance(review, Mapping):
         return None
     findings = review.get("key_issues_to_review")
-    return len(findings) if isinstance(findings, list) else None
+    if not isinstance(findings, list):
+        return None
+    if not all(_is_usable_finding(finding) for finding in findings):
+        return None
+    return len(findings)
+
+
+def _is_usable_finding(finding: object) -> bool:
+    if not isinstance(finding, Mapping):
+        return False
+    for key in ("relevant_file", "issue_header", "issue_content"):
+        value = finding.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    try:
+        start_line = int(str(finding.get("start_line", "")).strip())
+        end_line = int(str(finding.get("end_line", "")).strip())
+    except ValueError:
+        return False
+    return start_line > 0 and end_line >= start_line

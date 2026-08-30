@@ -506,6 +506,9 @@ def _reject_existing_repository_outputs(
         resolved_metadata = resolved.is_relative_to(git_metadata_root)
         lexical_artifact = lexical.is_relative_to(git_artifact_root)
         resolved_artifact = resolved.is_relative_to(git_artifact_root)
+        tracked_worktree_path = lexical_worktree and _is_tracked_repository_path(
+            lexical, repository_root
+        )
         if (
             (resolved_worktree and not lexical_worktree)
             or (lexical_worktree and resolved_worktree and lexical != resolved)
@@ -523,10 +526,15 @@ def _reject_existing_repository_outputs(
                 f"output destination aliases an existing repository path: {supplied_path}"
             )
         if (
-            exists
-            and lexical_worktree
-            and not _is_repeatable_snapshot_artifact(
-                lexical, repository_root, artifact_kind
+            lexical_worktree
+            and (
+                tracked_worktree_path
+                or (
+                    exists
+                    and not _is_repeatable_snapshot_artifact(
+                        lexical, repository_root, artifact_kind
+                    )
+                )
             )
         ):
             raise SnapshotCaptureError(

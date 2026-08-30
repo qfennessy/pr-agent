@@ -359,6 +359,44 @@ def test_review_snapshot_rejects_direct_git_metadata_file(monkeypatch, tmp_path,
     assert git_config.read_bytes() == original
 
 
+def test_review_snapshot_rejects_tracked_deleted_output(monkeypatch, tmp_path, capsys):
+    import subprocess
+
+    repo = tmp_path / "repo-tracked-deleted-output"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True
+    )
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    output = repo / "result.json"
+    output.write_text("tracked content\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "changed.py", "result.json"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "initial"],
+        check=True,
+        capture_output=True,
+    )
+    changed.write_text("value = 2\n", encoding="utf-8")
+    output.unlink()
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--json-output", "result.json", "--no-cache",
+        ])
+
+    assert "aliases an existing repository path" in capsys.readouterr().err
+    assert not output.exists()
+
+
 def test_git_artifact_root_uses_linked_worktree_git_directory(tmp_path):
     import os
     import subprocess
