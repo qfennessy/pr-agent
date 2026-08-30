@@ -76,6 +76,59 @@ async def test_prepare_prediction_accepts_full_diff_string_when_token_budget_is_
 
 
 @pytest.mark.asyncio
+async def test_disabled_specialists_do_not_construct_or_call_coordinator():
+    reviewer = _make_prediction_reviewer()
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
+    settings = get_settings()
+    original_enabled = settings.get("specialist_pipeline.enabled", False)
+    settings.set("specialist_pipeline.enabled", False)
+    try:
+        with (
+            patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value="exact diff"),
+            patch(
+                "pr_agent.tools.pr_reviewer.load_specialist_pipeline_config",
+                side_effect=AssertionError("disabled specialists must not be constructed"),
+            ),
+            patch("pr_agent.tools.pr_reviewer.run_shadow_specialists", new_callable=AsyncMock) as run_shadow,
+        ):
+            await reviewer._prepare_prediction("model")
+    finally:
+        settings.set("specialist_pipeline.enabled", original_enabled)
+
+    run_shadow.assert_not_awaited()
+    reviewer._get_prediction.assert_awaited_once_with("model")
+    assert reviewer.patches_diff == "exact diff"
+    assert reviewer.prediction == VALID_PREDICTION
+
+
+@pytest.mark.asyncio
+async def test_enabled_shadow_specialists_run_at_most_once_across_main_fallback_attempts():
+    reviewer = _make_prediction_reviewer()
+    reviewer._specialists_started = False
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
+    settings = get_settings()
+    original_enabled = settings.get("specialist_pipeline.enabled", False)
+    settings.set("specialist_pipeline.enabled", True)
+
+    async def mark_started():
+        reviewer._specialists_started = True
+
+    reviewer._run_shadow_specialists_once = AsyncMock(side_effect=mark_started)
+    try:
+        with patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value="exact diff"):
+            await reviewer._prepare_prediction("primary")
+            await reviewer._prepare_prediction("fallback")
+    finally:
+        settings.set("specialist_pipeline.enabled", original_enabled)
+
+    reviewer._run_shadow_specialists_once.assert_awaited_once_with()
+    assert reviewer._get_prediction.await_args_list == [
+        (("primary",), {}),
+        (("fallback",), {}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_prepare_prediction_keeps_incremental_review_compatible_with_tuple_result():
     reviewer = _make_prediction_reviewer()
     reviewer.incremental = SimpleNamespace(is_incremental=True)

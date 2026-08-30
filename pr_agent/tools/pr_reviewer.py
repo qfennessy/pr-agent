@@ -18,6 +18,13 @@ from pr_agent.algo.pr_processing import (PRDiffCoverage,
                                          get_pr_diff,
                                          retry_with_fallback_models)
 from pr_agent.algo.repo_context import build_repo_context
+from pr_agent.algo.review_specialists import (
+    build_specialist_input,
+    get_specialist_snapshot_context,
+    load_specialist_pipeline_config,
+    run_shadow_specialists,
+    specialists_enabled,
+)
 from pr_agent.algo.run_details import (get_run_details, init_run_details,
                                        record_review_profile)
 from pr_agent.algo.skills_loader import get_skills_context
@@ -97,6 +104,8 @@ class PRReviewer:
         self.remaining_files_list = []
         self.deleted_files_list = []
         self.prediction = None
+        self.specialist_shadow_result = None
+        self._specialists_started = False
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
             self.git_provider.get_pr_description(split_changes_walkthrough=True))
@@ -342,11 +351,55 @@ class PRReviewer:
 
         if self.patches_diff:
             get_logger().debug(f"PR diff", diff=self.patches_diff)
+            if specialists_enabled() and not getattr(self, "_specialists_started", False):
+                await self._run_shadow_specialists_once()
             self.prediction = await self._get_prediction(model)
             self._reject_unparsable_prediction(model)
         else:
             get_logger().warning(f"Empty diff for PR: {self.pr_url}")
             self.prediction = None
+
+    async def _run_shadow_specialists_once(self) -> None:
+        """Run the configured shadow batch once without changing review inputs or output."""
+
+        self._specialists_started = True
+        try:
+            pipeline = load_specialist_pipeline_config()
+            snapshot_context = get_specialist_snapshot_context()
+            if snapshot_context is not None:
+                snapshot = snapshot_context.snapshot
+                head_sha = snapshot.snapshot_id
+                current_identity = snapshot_context.current_snapshot_id
+            else:
+                snapshot = None
+                head_sha = self.git_provider.get_pr_head_sha(refresh=False)
+                if not head_sha:
+                    get_logger().warning(
+                        "Skipping specialist shadow batch because the provider has no stable head identity"
+                    )
+                    return
+                def current_identity():
+                    return self.git_provider.get_pr_head_sha(refresh=True)
+            specialist_input = build_specialist_input(
+                title=self.vars["title"],
+                description=self.pr_description,
+                diff_files=self.git_provider.get_diff_files() or [],
+                head_sha=head_sha,
+                snapshot=snapshot,
+            )
+            self.specialist_shadow_result = await run_shadow_specialists(
+                specialist_input,
+                pipeline,
+                self.ai_handler,
+                current_identity=current_identity,
+            )
+        except Exception as exc:
+            # Shadow infrastructure is observational. Configuration/provider failures
+            # remain telemetry and can never block or alter the ordinary review.
+            get_logger().warning(
+                "Specialist shadow batch failed; continuing the ordinary review",
+                artifact={"error_class": type(exc).__name__},
+            )
 
     def _reject_unparsable_prediction(self, model: str) -> None:
         """Treat a prediction that will not parse as a failure of this model.
@@ -558,6 +611,9 @@ class PRReviewer:
                 "omitted_files": sorted(set(self.remaining_files_list)),
                 "deleted_files": sorted(set(getattr(self, "deleted_files_list", []))),
             }
+            specialist_shadow_result = getattr(self, "specialist_shadow_result", None)
+            if specialist_shadow_result is not None:
+                structured_data["metadata"]["specialist_shadow"] = specialist_shadow_result.to_dict()
             structured_publisher(structured_data)
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary

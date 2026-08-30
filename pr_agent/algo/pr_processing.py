@@ -9,6 +9,7 @@ from typing import Callable, List, Tuple
 
 from github import RateLimitExceededException
 
+from pr_agent.algo.ai_request_context import AIModelRoute, use_ai_request_options
 from pr_agent.algo.file_filter import filter_ignored
 from pr_agent.algo.git_patch_processing import (
     decouple_and_convert_to_hunks_with_lines_numbers, extend_patch,
@@ -363,26 +364,48 @@ def generate_full_patch(convert_hunks_to_line_numbers, file_dict, max_tokens_mod
     return total_tokens, patches, remaining_files_list_new, files_in_patch_list
 
 
-async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelType.REGULAR):
-    all_models = _get_all_models(model_type)
-    all_deployments = _get_all_deployments(all_models)
+async def retry_with_fallback_models(
+    f: Callable,
+    model_type: ModelType = ModelType.REGULAR,
+    model_route: AIModelRoute | None = None,
+):
+    """Call ``f`` through the configured model/fallback route.
+
+    ``model_route`` snapshots role-specific controls into a coroutine-local context.
+    The existing call shape remains unchanged, while concurrent callers no longer
+    rewrite ``openai.deployment_id`` in shared Dynaconf state.
+    """
+
+    request_local_route = model_route is not None
+    if model_route is None:
+        all_models = tuple(_get_all_models(model_type))
+        all_deployments = tuple(_get_all_deployments(list(all_models)))
+        model_route = AIModelRoute(models=all_models, deployments=all_deployments)
+    all_models = model_route.models
+    all_deployments = model_route.deployments
     attempts: List[dict] = []
     # try each (model, deployment_id) pair until one is successful, otherwise raise exception
-    for i, (model, deployment_id) in enumerate(zip(all_models, all_deployments)):
+    for i, (model, deployment_id) in enumerate(zip(all_models, all_deployments, strict=True)):
         started_at = time.monotonic()
         try:
             get_logger().debug(
                 f"Generating prediction with {model} (attempt {i + 1}/{len(all_models)})"
                 f"{(' from deployment ' + deployment_id) if deployment_id else ''}"
             )
-            get_settings().set("openai.deployment_id", deployment_id)
-            result = await f(model)
+            request_options = model_route.options_for_attempt(i)
+            if request_local_route:
+                with use_ai_request_options(request_options):
+                    result = await f(model)
+            else:
+                # Preserve the legacy route exactly while the specialist pipeline is off.
+                get_settings().set("openai.deployment_id", deployment_id)
+                result = await f(model)
         except Exception as e:
             elapsed = round(time.monotonic() - started_at, 1)
             attempt = {
                 "attempt": f"{i + 1}/{len(all_models)}",
                 "model": model,
-                "ai_timeout": get_settings().config.get("ai_timeout", None),
+                "ai_timeout": model_route.timeout_seconds or get_settings().config.get("ai_timeout", None),
                 "error_class": type(e).__name__,
                 "elapsed_seconds": elapsed,
             }
@@ -393,14 +416,21 @@ async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelT
                 artifact={"error": e, **attempt},
             )
             if i == len(all_models) - 1:  # If it's the last iteration
-                _publish_model_failure_summary(attempts, str(e))
+                if model_route.attribution is None:
+                    _publish_model_failure_summary(attempts, str(e))
                 raise Exception(f"Failed to generate prediction with any model of {all_models}") from e
         else:
             # Keep both attribution surfaces in sync: run details power the optional
             # telemetry footer, while persistent multi-review comments display the model
             # that actually answered when a fallback succeeds.
-            get_settings().set("config.last_used_model", model)
-            record_model_used(model, is_fallback=i > 0)
+            if model_route.attribution is None:
+                get_settings().set("config.last_used_model", model)
+            record_model_used(
+                model,
+                is_fallback=i > 0,
+                attribution=model_route.attribution,
+                deployment_id=deployment_id,
+            )
             return result
 
 
@@ -473,7 +503,7 @@ def _get_all_models(model_type: ModelType = ModelType.REGULAR) -> List[str]:
     return all_models
 
 
-def _get_all_deployments(all_models: List[str]) -> List[str]:
+def _get_all_deployments(all_models: List[str]) -> List[str | None]:
     deployment_id = get_settings().get("openai.deployment_id", None)
     fallback_deployments = get_settings().get("openai.fallback_deployments", [])
     if not isinstance(fallback_deployments, list) and fallback_deployments:

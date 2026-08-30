@@ -255,7 +255,11 @@ The small model may perform the first cleanup pass, but a model must never be th
 ## Illustrative configuration
 
 The `[local_pair_review]` snapshot, event, exclusion, cache, size, and stale-result settings
-are shipped. The specialist model, context, and publication settings below remain an
+are shipped. The three versioned classifier, upward-risk, and diff-prioritization contracts
+also ship behind a disabled `specialist_pipeline.enabled` shadow gate. Their validated output
+is telemetry only: #11 owns risk consumption, #9 owns ranked-hunk/context consumption, and #27
+owns the frozen benchmark, target-repository pilot, live-shadow evidence, and rollout decisions.
+The broader specialist, verifier, escalation, and publication settings below remain an
 illustrative target until their owning workstreams land.
 
 ```toml

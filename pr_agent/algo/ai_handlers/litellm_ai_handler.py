@@ -16,10 +16,11 @@ from pr_agent.algo import (CLAUDE_EXTENDED_THINKING_MODELS,
                            STREAMING_REQUIRED_MODELS,
                            SUPPORT_REASONING_EFFORT_MODELS,
                            USER_MESSAGE_ONLY_MODELS)
-from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_helpers import (
     _get_azure_ad_token, _handle_streaming_response,
     _process_litellm_extra_body, _response_field)
+from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
+from pr_agent.algo.ai_request_context import get_ai_request_options
 from pr_agent.algo.run_details import _as_decimal_cost, record_ai_call
 from pr_agent.algo.utils import ReasoningEffort, get_version
 from pr_agent.config_loader import get_settings
@@ -49,8 +50,14 @@ def _model_retries_stop(retry_state) -> bool:
     Example:
         >>> get_settings().set("config.model_retries", 1)  # single attempt per model
     """
+    request_options = get_ai_request_options()
+    configured_attempts = (
+        request_options.model_retries
+        if request_options is not None and request_options.model_retries is not None
+        else get_settings().config.get("model_retries", MODEL_RETRIES)
+    )
     try:
-        attempts = int(get_settings().config.get("model_retries", MODEL_RETRIES))
+        attempts = int(configured_attempts)
     except (TypeError, ValueError):
         get_logger().warning(
             f"Invalid config.model_retries; using default {MODEL_RETRIES}"
@@ -622,6 +629,9 @@ class LiteLLMAIHandler(BaseAiHandler):
         """
         Returns the deployment ID for the OpenAI API.
         """
+        request_options = get_ai_request_options()
+        if request_options is not None:
+            return request_options.deployment_id
         return get_settings().get("OPENAI.DEPLOYMENT_ID", None)
 
     @staticmethod
@@ -761,11 +771,17 @@ class LiteLLMAIHandler(BaseAiHandler):
                 # api_base configured by another provider (OpenRouter/Ollama/Azure AD/OpenAI) during
                 # __init__ override it in multi-provider configs. None lets LiteLLM read the env var.
                 api_base = os.environ.get("DATABRICKS_API_BASE") if is_databricks else self.api_base
+                request_options = get_ai_request_options()
+                timeout = (
+                    request_options.timeout_seconds
+                    if request_options is not None and request_options.timeout_seconds is not None
+                    else get_settings().config.ai_timeout
+                )
                 kwargs = {
                         "model": model,
                         "deployment_id": deployment_id,
                         "messages": messages,
-                        "timeout": get_settings().config.ai_timeout,
+                        "timeout": timeout,
                         "api_base": api_base,
                     }
 
@@ -775,7 +791,11 @@ class LiteLLMAIHandler(BaseAiHandler):
                 # clock. Left unset, this multiplies with the tenacity attempts above and
                 # with fallback_models, so a hung endpoint can burn tens of minutes before
                 # anything is published. None keeps LiteLLM's default.
-                provider_max_retries = get_settings().config.get("ai_provider_max_retries", None)
+                provider_max_retries = (
+                    request_options.provider_retries
+                    if request_options is not None and request_options.provider_retries is not None
+                    else get_settings().config.get("ai_provider_max_retries", None)
+                )
                 if provider_max_retries is not None:
                     try:
                         kwargs["max_retries"] = max(0, int(provider_max_retries))
@@ -835,8 +855,13 @@ class LiteLLMAIHandler(BaseAiHandler):
                 # providers apply a low service-side default (Bedrock Converse: 4096,
                 # which reasoning can fully consume, returning empty content).
                 # setdefault keeps the extended-thinking limit authoritative.
+                configured_max_output_tokens = (
+                    request_options.max_output_tokens
+                    if request_options is not None and request_options.max_output_tokens is not None
+                    else get_settings().config.get("max_output_tokens", 0)
+                )
                 try:
-                    max_output_tokens = int(get_settings().config.get("max_output_tokens", 0))
+                    max_output_tokens = int(configured_max_output_tokens)
                 except (TypeError, ValueError):
                     max_output_tokens = 0
                 if max_output_tokens > 0:

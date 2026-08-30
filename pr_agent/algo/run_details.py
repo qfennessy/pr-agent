@@ -9,13 +9,84 @@ stay isolated between concurrent requests.
 
 import time
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Optional
+from typing import Any, Mapping, Optional
+
+from pr_agent.algo.ai_request_context import get_ai_request_options
 
 _run_details: ContextVar[Optional["RunDetails"]] = ContextVar(
     "pr_agent_run_details", default=None
 )
+
+
+@dataclass
+class SpecialistRunDetails:
+    """Telemetry for one shadow specialist, separate from the main review footer."""
+
+    role: str
+    model_used: Optional[str] = None
+    deployment_id: Optional[str] = None
+    fallback_used: bool = False
+    prompt_version: Optional[str] = None
+    input_schema_version: Optional[str] = None
+    schema_version: Optional[str] = None
+    state: Optional[str] = None
+    latency_seconds: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    num_ai_calls: int = 0
+    total_cost_usd: Decimal = field(default_factory=lambda: Decimal("0"))
+    known_cost_call_count: int = 0
+    model_costs_usd: dict[str, Decimal] = field(default_factory=dict)
+    confidence: Optional[float] = None
+    failure_reason: Optional[str] = None
+    cached: bool = False
+    input_token_reservation: int = 0
+    output_token_reservation: int = 0
+    output: Optional[Mapping[str, Any]] = None
+
+    @property
+    def cost_status(self) -> str:
+        if self.known_cost_call_count == 0:
+            return "unavailable"
+        if self.known_cost_call_count == self.num_ai_calls:
+            return "complete"
+        return "partial"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "model": self.model_used,
+            "deployment": self.deployment_id,
+            "fallback_used": self.fallback_used,
+            "prompt_version": self.prompt_version,
+            "input_schema_version": self.input_schema_version,
+            "schema_version": self.schema_version,
+            "state": self.state,
+            "latency_seconds": self.latency_seconds,
+            "usage": {
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": self.total_tokens,
+                "ai_calls": self.num_ai_calls,
+            },
+            "cost": {
+                "status": self.cost_status,
+                "total_usd": str(self.total_cost_usd) if self.known_cost_call_count else None,
+                "by_model_usd": {model: str(cost) for model, cost in self.model_costs_usd.items()},
+            },
+            "confidence": self.confidence,
+            "failure_reason": self.failure_reason,
+            "cached": self.cached,
+            "reservation": {
+                "input_tokens": self.input_token_reservation,
+                "output_tokens": self.output_token_reservation,
+            },
+            "output": deepcopy(self.output),
+        }
 
 
 @dataclass
@@ -54,6 +125,9 @@ class RunDetails:
     total_cost_usd: Decimal = field(default_factory=lambda: Decimal("0"))
     known_cost_call_count: int = 0
     model_costs_usd: dict[str, Decimal] = field(default_factory=dict)
+    # Shadow specialists are intentionally excluded from the aggregate fields above.
+    # Otherwise enabling shadow mode would change the published main-review footer.
+    specialist_runs: dict[str, SpecialistRunDetails] = field(default_factory=dict)
     # Monotonic reference taken when the collector is installed, i.e. at the top of the
     # tool's run(). Monotonic so that wall-clock adjustments cannot yield a negative duration.
     start_time: float = field(default_factory=time.monotonic)
@@ -92,10 +166,30 @@ def get_run_details() -> Optional[RunDetails]:
     return _run_details.get()
 
 
-def record_model_used(model: str, is_fallback: bool) -> None:
+def _get_specialist_details(attribution: str) -> Optional[SpecialistRunDetails]:
+    details = get_run_details()
+    if details is None:
+        return None
+    return details.specialist_runs.setdefault(attribution, SpecialistRunDetails(role=attribution))
+
+
+def record_model_used(
+    model: str,
+    is_fallback: bool,
+    attribution: Optional[str] = None,
+    deployment_id: Optional[str] = None,
+) -> None:
     """Record the model that produced a successful completion."""
     details = get_run_details()
     if details is None:
+        return
+    if attribution:
+        specialist = _get_specialist_details(attribution)
+        if specialist is not None:
+            specialist.model_used = model
+            specialist.deployment_id = deployment_id
+            if is_fallback:
+                specialist.fallback_used = True
         return
     details.model_used = model
     if is_fallback:
@@ -118,11 +212,7 @@ def _read_token_field(usage, name: str) -> int:
     return value if isinstance(value, int) else 0
 
 
-def add_token_usage(usage) -> None:
-    """Accumulate token counts from a litellm usage object or dict."""
-    details = get_run_details()
-    if details is None or usage is None:
-        return
+def _add_token_usage(details, usage) -> None:
     prompt_tokens = _read_token_field(usage, "prompt_tokens")
     completion_tokens = _read_token_field(usage, "completion_tokens")
     total_tokens = _read_token_field(usage, "total_tokens") or (
@@ -131,6 +221,14 @@ def add_token_usage(usage) -> None:
     details.prompt_tokens += prompt_tokens
     details.completion_tokens += completion_tokens
     details.total_tokens += total_tokens
+
+
+def add_token_usage(usage) -> None:
+    """Accumulate token counts from a litellm usage object or dict."""
+    details = get_run_details()
+    if details is None or usage is None:
+        return
+    _add_token_usage(details, usage)
 
 
 def _as_decimal_cost(cost_usd) -> Optional[Decimal]:
@@ -152,17 +250,78 @@ def _as_decimal_cost(cost_usd) -> Optional[Decimal]:
     return cost
 
 
-def record_ai_call(usage=None, model: Optional[str] = None, cost_usd=None) -> None:
+def record_ai_call(
+    usage=None,
+    model: Optional[str] = None,
+    cost_usd=None,
+    attribution: Optional[str] = None,
+) -> None:
     """Count one successful AI call and accumulate usage and known cost."""
     details = get_run_details()
     if details is None:
         return
-    details.num_ai_calls += 1
+    request_options = get_ai_request_options()
+    attribution = attribution or (request_options.attribution if request_options is not None else None)
+    target = _get_specialist_details(attribution) if attribution else details
+    if target is None:
+        return
+    target.num_ai_calls += 1
     if usage is not None:
-        add_token_usage(usage)
+        _add_token_usage(target, usage)
     cost = _as_decimal_cost(cost_usd)
     if cost is not None:
-        details.total_cost_usd += cost
-        details.known_cost_call_count += 1
+        target.total_cost_usd += cost
+        target.known_cost_call_count += 1
         model_name = model or "unknown"
-        details.model_costs_usd[model_name] = details.model_costs_usd.get(model_name, Decimal("0")) + cost
+        target.model_costs_usd[model_name] = target.model_costs_usd.get(model_name, Decimal("0")) + cost
+
+
+def record_specialist_result(
+    role: str,
+    *,
+    prompt_version: str,
+    input_schema_version: str,
+    schema_version: str,
+    state: str,
+    latency_seconds: float,
+    confidence: Optional[float] = None,
+    failure_reason: Optional[str] = None,
+    cached: bool = False,
+    input_token_reservation: int = 0,
+    output_token_reservation: int = 0,
+    output: Optional[Mapping[str, Any]] = None,
+    model: Optional[str] = None,
+    deployment_id: Optional[str] = None,
+    fallback_used: Optional[bool] = None,
+) -> None:
+    """Finish one role record without changing primary-review telemetry."""
+
+    specialist = _get_specialist_details(role)
+    if specialist is None:
+        return
+    specialist.prompt_version = prompt_version
+    specialist.input_schema_version = input_schema_version
+    specialist.schema_version = schema_version
+    specialist.state = state
+    specialist.latency_seconds = max(0.0, float(latency_seconds))
+    specialist.confidence = confidence
+    specialist.failure_reason = failure_reason
+    specialist.cached = cached
+    specialist.input_token_reservation = max(0, int(input_token_reservation))
+    specialist.output_token_reservation = max(0, int(output_token_reservation))
+    specialist.output = deepcopy(output) if output is not None else None
+    if model is not None:
+        specialist.model_used = model
+    if deployment_id is not None:
+        specialist.deployment_id = deployment_id
+    if fallback_used is not None:
+        specialist.fallback_used = fallback_used
+
+
+def specialist_runs_to_dict(details: Optional[RunDetails] = None) -> dict[str, dict[str, Any]]:
+    """Serialize the versioned shadow records for structured telemetry."""
+
+    details = details or get_run_details()
+    if details is None:
+        return {}
+    return {role: run.to_dict() for role, run in sorted(details.specialist_runs.items())}
