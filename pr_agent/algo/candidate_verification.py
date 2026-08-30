@@ -128,13 +128,15 @@ def telemetry_safe_artifact(artifact: dict) -> dict:
     safe = {}
     scalar_keys = {
         "enabled", "status", "model_calls", "verifier_attempts", "candidate_count",
-        "verified_count", "model",
+        "verified_count", "model", "proposal_source", "proposal_shape",
+        "proposed_candidate_count", "accepted_model_candidate_count",
+        "sensitive_candidate_count", "candidate_rejection_count",
         "verifier_verified_count", "finding_limit_dropped", "rejected_count", "failure",
         "verifier_latency_seconds", "publication_safe",
     }
     mapping_keys = {
         "specialist_prioritization", "sensitive_audit_coverage", "prompt_budget",
-        "verifier_usage", "verifier_cost",
+        "verifier_usage", "verifier_cost", "model_candidate_coverage",
     }
     for key in scalar_keys:
         if key in artifact and isinstance(artifact[key], (str, int, float, bool, type(None))):
@@ -661,9 +663,6 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
 
     model_candidate_count = 0
     for index, raw_candidate in enumerate(raw_candidates):
-        if model_candidate_count >= max_candidates:
-            rejected.append({"candidate_id": f"candidate-{index + 1}", "reason": "candidate_budget_exhausted"})
-            continue
         if not isinstance(raw_candidate, dict):
             rejected.append({"candidate_id": f"candidate-{index + 1}", "reason": "invalid_candidate"})
             continue
@@ -674,29 +673,67 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
         candidate["candidate_id"] = f"candidate-{index + 1}"
         candidate["candidate_type"] = "model_finding"
         candidate["sensitive_path"] = False
+        proposed_side_value = candidate.get("side", "new")
+        proposed_side = (
+            proposed_side_value.strip().lower()
+            if isinstance(proposed_side_value, str) else ""
+        )
+        start_line = candidate.get("start_line")
+        end_line = candidate.get("end_line")
+        required_text = ("issue_header", "issue_content", "trigger", "impact", "root_cause")
+        required_text_valid = all(
+            isinstance(candidate.get(key), str) and candidate[key].strip()
+            for key in required_text
+        )
+        context_files_present = "context_files" in candidate
+        context_symbols_present = "context_symbols" in candidate
+        context_files = candidate.get("context_files")
+        context_symbols = candidate.get("context_symbols")
+        normalized_context_files = (
+            [safe_repo_path(value) for value in context_files]
+            if isinstance(context_files, list) else []
+        )
+        context_files_valid = (
+            context_files_present
+            and isinstance(context_files, list)
+            and all(normalized_context_files)
+        )
+        context_symbols_valid = (
+            context_symbols_present
+            and isinstance(context_symbols, list)
+            and all(isinstance(value, str) and value.strip() for value in context_symbols)
+        )
         candidate["side"] = "new"
         candidate["relevant_file"] = safe_repo_path(candidate.get("relevant_file"))
-        try:
-            candidate["start_line"] = int(candidate.get("start_line"))
-            candidate["end_line"] = int(candidate.get("end_line"))
-        except (TypeError, ValueError):
-            candidate["start_line"] = 0
-            candidate["end_line"] = 0
-        required_text = ("issue_header", "issue_content", "trigger", "impact", "root_cause")
+        candidate["start_line"] = start_line
+        candidate["end_line"] = end_line
+        candidate["context_files"] = normalized_context_files
+        candidate["context_symbols"] = [
+            value.strip() for value in context_symbols
+        ] if context_symbols_valid else []
         diff_file = diff_by_file.get(candidate["relevant_file"])
         changed_line_ranges = _added_line_ranges(getattr(diff_file, "patch", "")) if diff_file else []
         trusted_side_line_count = _trusted_side_line_count(diff_file, "new")
-        if (not candidate["relevant_file"] or not diff_file or
+        if (proposed_side != "new" or not isinstance(start_line, int) or
+                isinstance(start_line, bool) or not isinstance(end_line, int) or
+                isinstance(end_line, bool) or not required_text_valid or
+                not context_files_valid or not context_symbols_valid or
+                not candidate["relevant_file"] or not diff_file or
                 not _line_is_changed(candidate["start_line"], changed_line_ranges) or
                 candidate["end_line"] < candidate["start_line"] or
                 (trusted_side_line_count is not None
-                 and candidate["end_line"] > trusted_side_line_count) or
-                any(not str(candidate.get(key) or "").strip() for key in required_text)):
+                 and candidate["end_line"] > trusted_side_line_count)):
             rejected.append({"candidate_id": candidate["candidate_id"], "reason": "invalid_candidate"})
             continue
         key = _candidate_key(candidate)
         if key in seen:
             rejected.append({"candidate_id": candidate["candidate_id"], "reason": "duplicate_candidate"})
+            continue
+        if model_candidate_count >= max_candidates:
+            rejected.append({
+                "candidate_id": candidate["candidate_id"],
+                "reason": "candidate_budget_exhausted",
+            })
             continue
         seen.add(key)
         candidate["_changed_line_ranges"] = changed_line_ranges

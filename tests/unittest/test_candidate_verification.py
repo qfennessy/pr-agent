@@ -3061,6 +3061,425 @@ async def test_orchestration_exposes_verifier_failure_and_does_not_publish_candi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("case", "candidate"),
+    [
+        ("missing field", _candidate(impact="")),
+        ("bad path", _candidate(relevant_file="../private/service.py")),
+        ("bad side", _candidate(side="old")),
+        ("bad line", _candidate(start_line=99, end_line=99)),
+        ("bad range", _candidate(start_line=12, end_line=9_999)),
+        ("boolean lines", _candidate(start_line=True, end_line=True)),
+        ("float lines", _candidate(start_line=12.0, end_line=12.0)),
+        ("mapping text", _candidate(issue_content={"private": "model text"})),
+        ("list text", _candidate(trigger=["private model text"])),
+        ("mapping context files", _candidate(context_files={"src/caller.py": True})),
+        ("mapping context symbols", _candidate(context_symbols={"call_service": True})),
+        ("non-string context file", _candidate(context_files=[{"path": "src/caller.py"}])),
+        ("non-string context symbol", _candidate(context_symbols=[12])),
+        (
+            "missing context files",
+            {key: value for key, value in _candidate().items() if key != "context_files"},
+        ),
+        (
+            "missing context symbols",
+            {key: value for key, value in _candidate().items() if key != "context_symbols"},
+        ),
+    ],
+)
+async def test_all_invalid_first_pass_candidates_fail_closed_without_false_clean_publication(
+    case, candidate
+):
+    secret = f"private model prose for {case}"
+    candidate["root_cause"] = secret
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.publish_structured_review = MagicMock()
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._parse_review_prediction = MagicMock(return_value=_review_data(candidate))
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.github_action_output") as action_output,
+        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2") as markdown,
+    ):
+        review = reviewer._prepare_pr_review()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "candidate_validation_incomplete"
+    assert artifact["publication_safe"] is False
+    assert artifact["proposal_source"] == "first_pass_review"
+    assert artifact["proposal_shape"] == "list"
+    assert artifact["proposed_candidate_count"] == 1
+    assert artifact["accepted_model_candidate_count"] == 0
+    assert artifact["sensitive_candidate_count"] == 0
+    assert artifact["candidate_rejection_count"] == 1
+    assert artifact["model_candidate_coverage"] == {
+        "status": "incomplete",
+        "proposed_count": 1,
+        "accepted_count": 0,
+        "rejected_count": 1,
+    }
+    assert artifact["candidate_rejections"] == [
+        {"candidate_id": "candidate-1", "reason": "invalid_candidate"}
+    ]
+    assert artifact["model_calls"] == 0
+    assert reviewer.verified_review_data["review"]["key_issues_to_review"] == []
+    assert reviewer._candidate_verification_blocks_publication() is True
+    assert reviewer._should_publish_review_no_suggestions("No major issues detected") is False
+    reviewer._clear_stale_persistent_bugs_only_review()
+    provider.clear_persistent_review.assert_not_called()
+    reviewer.ai_handler.chat_completion.assert_not_awaited()
+    action_output.assert_not_called()
+    markdown.assert_not_called()
+    assert review == ""
+    structured = provider.publish_structured_review.call_args.args[0]
+    assert structured["review"]["key_issues_to_review"] == []
+    assert structured["candidate_verification"] == telemetry_safe_artifact(artifact)
+    assert structured["candidate_verification"]["publication_safe"] is False
+    assert secret not in json.dumps(structured)
+
+
+@pytest.mark.asyncio
+async def test_invalid_first_pass_candidate_container_fails_closed_before_candidate_generation():
+    provider = MagicMock()
+    provider.publish_structured_review = MagicMock()
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._parse_review_prediction = MagicMock(return_value={
+        "review": {"key_issues_to_review": {"private model key": "private model value"}}
+    })
+
+    with patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()):
+        await reviewer._run_candidate_verification()
+
+    with patch("pr_agent.tools.pr_reviewer.github_action_output") as action_output:
+        assert reviewer._prepare_pr_review() == ""
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "candidate_input_invalid"
+    assert artifact["proposal_shape"] == "invalid"
+    assert artifact["proposed_candidate_count"] == 0
+    assert artifact["publication_safe"] is False
+    provider.supports_repo_file_fetching.assert_not_called()
+    reviewer.ai_handler.chat_completion.assert_not_awaited()
+    action_output.assert_not_called()
+    assert "private model" not in json.dumps(
+        provider.publish_structured_review.call_args.args[0]["candidate_verification"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_genuinely_empty_first_pass_candidate_list_is_a_safe_no_candidate_result():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._parse_review_prediction = MagicMock(return_value=_review_data())
+
+    with patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "no_candidates"
+    assert artifact["publication_safe"] is True
+    assert artifact["proposed_candidate_count"] == 0
+    assert artifact["accepted_model_candidate_count"] == 0
+    assert artifact["candidate_rejection_count"] == 0
+    assert artifact["model_candidate_coverage"] == {
+        "status": "complete",
+        "proposed_count": 0,
+        "accepted_count": 0,
+        "rejected_count": 0,
+    }
+    reviewer.ai_handler.chat_completion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_candidate", [
+    _candidate(start_line=99, end_line=99, root_cause="different invalid cause"),
+    _candidate(),
+])
+async def test_mixed_or_duplicate_candidate_rejection_keeps_valid_candidate_verifiable(
+    second_candidate
+):
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._parse_review_prediction = MagicMock(return_value=_review_data(
+        _candidate(), second_candidate
+    ))
+    reviewer.ai_handler.chat_completion = AsyncMock(
+        return_value=(_rejected_verification_response("candidate-1"), None)
+    )
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "complete"
+    assert artifact["publication_safe"] is True
+    assert artifact["proposed_candidate_count"] == 2
+    assert artifact["accepted_model_candidate_count"] == 1
+    assert artifact["candidate_rejection_count"] == 1
+    assert artifact["model_candidate_coverage"] == {
+        "status": "partial",
+        "proposed_count": 2,
+        "accepted_count": 1,
+        "rejected_count": 1,
+    }
+    assert artifact["candidate_rejections"][0]["reason"] in {
+        "invalid_candidate", "duplicate_candidate"
+    }
+    reviewer.ai_handler.chat_completion.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_invalid_model_candidate", [False, True])
+async def test_sensitive_generated_candidates_preserve_first_pass_coverage_state(
+    include_invalid_model_candidate
+):
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    diff_file = _diff_file("auth/policy.py")
+    provider.get_diff_files.return_value = [diff_file]
+    provider.get_repo_file_content.return_value = diff_file.head_file
+    reviewer = _reviewer_for_orchestration(provider)
+    raw_candidates = (
+        [_candidate(relevant_file="src/missing.py")]
+        if include_invalid_model_candidate else []
+    )
+    reviewer._parse_review_prediction = MagicMock(return_value=_review_data(*raw_candidates))
+    reviewer.ai_handler.chat_completion = AsyncMock(
+        return_value=(_rejected_verification_response("sensitive-1"), None)
+    )
+    settings = _verification_settings()
+    settings.pr_reviewer["candidate_verification_sensitive_path_globs"] = ["auth/**"]
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["proposed_candidate_count"] == int(include_invalid_model_candidate)
+    assert artifact["accepted_model_candidate_count"] == 0
+    assert artifact["sensitive_candidate_count"] == 1
+    assert artifact["candidate_rejection_count"] == int(include_invalid_model_candidate)
+    assert artifact["status"] == (
+        "candidate_validation_incomplete" if include_invalid_model_candidate else "complete"
+    )
+    assert artifact["publication_safe"] is (not include_invalid_model_candidate)
+    reviewer.ai_handler.chat_completion.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_verified_sensitive_finding_cannot_escape_an_all_invalid_model_candidate_failure():
+    secret = "private invalid model candidate explanation"
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    diff_file = _diff_file("auth/policy.py")
+    provider.get_diff_files.return_value = [diff_file]
+    provider.get_repo_file_content.return_value = diff_file.head_file
+    provider.publish_structured_review = MagicMock()
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._parse_review_prediction = MagicMock(return_value=_review_data(
+        _candidate(relevant_file="src/missing.py", root_cause=secret)
+    ))
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        "verification:\n  decisions:\n    - candidate_id: sensitive-1\n"
+        "      verdict: verified\n      relevant_file: auth/policy.py\n"
+        "      start_line: 12\n      end_line: 12\n"
+        "      issue_header: Sensitive regression\n"
+        "      issue_content: The changed policy permits unauthorized access.\n"
+        "      trigger: A request reaches the changed policy.\n"
+        "      impact: Unauthorized access is allowed.\n"
+        "      evidence_paths: [auth/policy.py]\n",
+        "stop",
+    ))
+    settings = _verification_settings()
+    settings.pr_reviewer["candidate_verification_sensitive_path_globs"] = ["auth/**"]
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    with patch("pr_agent.tools.pr_reviewer.github_action_output") as action_output:
+        assert reviewer._prepare_pr_review() == ""
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "candidate_validation_incomplete"
+    assert artifact["publication_safe"] is False
+    assert artifact["verifier_verified_count"] == 1
+    assert artifact["verified_count"] == 0
+    assert artifact["finding_limit_dropped"] == 1
+    assert reviewer.verified_review_data["review"]["key_issues_to_review"] == []
+    assert provider.publish_structured_review.call_args.args[0]["review"][
+        "key_issues_to_review"
+    ] == []
+    assert secret not in json.dumps(provider.publish_structured_review.call_args.args[0])
+    action_output.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("candidate_count", [3, 4])
+@pytest.mark.parametrize("verdict", ["rejected", "verified"])
+async def test_model_candidate_budget_has_exact_fail_closed_boundary(
+    candidate_count, verdict
+):
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    provider.publish_structured_review = MagicMock()
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._parse_review_prediction = MagicMock(return_value=_review_data(*[
+        _candidate(
+            start_line=12 + index,
+            end_line=12 + index,
+            root_cause=f"distinct root cause {index}",
+            context_files=[],
+        )
+        for index in range(candidate_count)
+    ]))
+    decisions = []
+    for index in range(3):
+        candidate_id = f"candidate-{index + 1}"
+        if verdict == "rejected":
+            decisions.append(
+                f"    - candidate_id: {candidate_id}\n"
+                "      verdict: rejected\n"
+                "      reason: disproved by repository evidence"
+            )
+        else:
+            line = 12 + index
+            decisions.append(
+                f"    - candidate_id: {candidate_id}\n"
+                "      verdict: verified\n"
+                "      relevant_file: src/service.py\n"
+                f"      start_line: {line}\n"
+                f"      end_line: {line}\n"
+                "      issue_header: Verified bug\n"
+                "      issue_content: The changed code has a verified defect.\n"
+                "      trigger: The changed branch executes.\n"
+                "      impact: The request fails.\n"
+                "      evidence_paths: [src/service.py]"
+            )
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        "verification:\n  decisions:\n" + "\n".join(decisions),
+        "stop",
+    ))
+    settings = _verification_settings()
+    settings.pr_reviewer["candidate_verification_max_lines_per_file"] = 100
+    settings.pr_reviewer["candidate_verification_max_total_lines"] = 600
+    settings.pr_reviewer["candidate_verification_max_context_tokens"] = 10_000
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    with patch("pr_agent.tools.pr_reviewer.github_action_output") as action_output:
+        review = reviewer._prepare_pr_review()
+
+    artifact = reviewer.candidate_verification_artifact
+    expected_incomplete = candidate_count == 4
+    assert artifact["proposed_candidate_count"] == candidate_count
+    assert artifact["accepted_model_candidate_count"] == 3
+    assert artifact["candidate_rejection_count"] == int(expected_incomplete)
+    assert artifact["model_candidate_coverage"]["status"] == (
+        "incomplete" if expected_incomplete else "complete"
+    )
+    assert artifact["status"] == (
+        "candidate_validation_incomplete" if expected_incomplete else "complete"
+    )
+    assert artifact["publication_safe"] is (not expected_incomplete)
+    if expected_incomplete:
+        assert artifact["candidate_rejections"] == [{
+            "candidate_id": "candidate-4",
+            "reason": "candidate_budget_exhausted",
+        }]
+        assert artifact["verified_count"] == 0
+        assert reviewer.verified_review_data["review"]["key_issues_to_review"] == []
+        assert provider.publish_structured_review.call_args.args[0]["review"][
+            "key_issues_to_review"
+        ] == []
+        assert review == ""
+        action_output.assert_not_called()
+    else:
+        assert artifact["candidate_rejections"] == []
+        assert artifact["verified_count"] == (3 if verdict == "verified" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_candidate_kind", ["duplicate", "invalid"])
+async def test_semantic_rejection_after_full_candidate_budget_does_not_create_coverage_loss(
+    final_candidate_kind
+):
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    accepted = [
+        _candidate(
+            start_line=12 + index,
+            end_line=12 + index,
+            root_cause=f"distinct root cause {index}",
+            context_files=[],
+        )
+        for index in range(3)
+    ]
+    final_candidate = (
+        dict(accepted[0])
+        if final_candidate_kind == "duplicate"
+        else _candidate(start_line=True, end_line=True, root_cause="invalid fourth candidate")
+    )
+    reviewer._parse_review_prediction = MagicMock(return_value=_review_data(
+        *accepted, final_candidate
+    ))
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        _rejected_verification_response("candidate-1", "candidate-2", "candidate-3"),
+        "stop",
+    ))
+    settings = _verification_settings()
+    settings.pr_reviewer["candidate_verification_max_lines_per_file"] = 100
+    settings.pr_reviewer["candidate_verification_max_total_lines"] = 600
+    settings.pr_reviewer["candidate_verification_max_context_tokens"] = 10_000
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["proposed_candidate_count"] == 4
+    assert artifact["accepted_model_candidate_count"] == 3
+    assert artifact["candidate_rejection_count"] == 1
+    assert artifact["model_candidate_coverage"]["status"] == "partial"
+    assert artifact["status"] == "complete"
+    assert artifact["publication_safe"] is True
+    assert artifact["candidate_rejections"][0]["reason"] in {
+        "duplicate_candidate", "invalid_candidate"
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("failure_mode", "expected_status", "expected_failure"),
     [
         ("unsupported", "unsupported_provider", None),

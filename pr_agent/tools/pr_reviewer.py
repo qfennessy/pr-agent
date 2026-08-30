@@ -858,8 +858,29 @@ class PRReviewer:
             if not isinstance(review_data, dict) or not isinstance(review_data.get("review"), dict):
                 artifact.update({"status": "candidate_parse_failed", "verified_count": 0})
                 return
+            raw_candidate_input = review_data["review"].get("key_issues_to_review")
+            raw_candidate_list_valid = isinstance(raw_candidate_input, list)
+            proposed_candidate_count = (
+                len(raw_candidate_input) if raw_candidate_list_valid else 0
+            )
+            artifact.update({
+                "proposal_source": "first_pass_review",
+                "proposal_shape": "list" if raw_candidate_list_valid else "invalid",
+                "proposed_candidate_count": proposed_candidate_count,
+            })
             self.verified_review_data = copy.deepcopy(review_data)
             self.verified_review_data["review"]["key_issues_to_review"] = []
+
+            if not raw_candidate_list_valid:
+                artifact.update({
+                    "status": "candidate_input_invalid",
+                    "candidate_count": 0,
+                    "accepted_model_candidate_count": 0,
+                    "candidate_rejection_count": 0,
+                    "verified_count": 0,
+                    "publication_safe": False,
+                })
+                return
 
             capability = getattr(self.git_provider, "supports_repo_file_fetching", None)
             if not callable(capability) or not capability():
@@ -890,6 +911,33 @@ class PRReviewer:
             sensitive_candidates = [
                 candidate for candidate in candidates if candidate.get("sensitive_path")
             ]
+            accepted_model_candidate_count = sum(
+                1 for candidate in candidates if not candidate.get("sensitive_path")
+            )
+            model_candidate_rejection_count = sum(
+                1 for rejection in candidate_rejections
+                if not rejection.get("sensitive_path")
+            )
+            model_candidate_budget_exhausted = any(
+                rejection.get("reason") == "candidate_budget_exhausted"
+                for rejection in candidate_rejections
+                if not rejection.get("sensitive_path")
+            )
+            model_candidate_coverage_incomplete = bool(
+                proposed_candidate_count
+                and (
+                    not accepted_model_candidate_count
+                    or model_candidate_budget_exhausted
+                )
+            )
+            if proposed_candidate_count == 0:
+                model_candidate_coverage_status = "complete"
+            elif model_candidate_coverage_incomplete:
+                model_candidate_coverage_status = "incomplete"
+            elif model_candidate_rejection_count:
+                model_candidate_coverage_status = "partial"
+            else:
+                model_candidate_coverage_status = "complete"
             sensitive_rejections = [
                 rejection for rejection in candidate_rejections
                 if rejection.get("sensitive_path")
@@ -939,6 +987,15 @@ class PRReviewer:
                     artifact["specialist_prioritization"] = prioritization_artifact
             artifact.update({
                 "candidate_count": len(candidates),
+                "accepted_model_candidate_count": accepted_model_candidate_count,
+                "sensitive_candidate_count": len(sensitive_candidates),
+                "candidate_rejection_count": len(candidate_rejections),
+                "model_candidate_coverage": {
+                    "status": model_candidate_coverage_status,
+                    "proposed_count": proposed_candidate_count,
+                    "accepted_count": accepted_model_candidate_count,
+                    "rejected_count": model_candidate_rejection_count,
+                },
                 "candidate_rejections": candidate_rejections,
                 "verified_count": 0,
             })
@@ -946,6 +1003,11 @@ class PRReviewer:
                 if sensitive_coverage_incomplete:
                     artifact.update({
                         "status": "sensitive_audit_coverage_incomplete",
+                        "publication_safe": False,
+                    })
+                elif model_candidate_coverage_incomplete:
+                    artifact.update({
+                        "status": "candidate_validation_incomplete",
                         "publication_safe": False,
                     })
                 else:
@@ -1178,7 +1240,10 @@ class PRReviewer:
                 retrieval_requests=retrieval_artifact["requests"],
             )
             max_findings = max(0, int(config.get("num_max_findings", 3)))
-            published_findings = verified_findings[:max_findings]
+            published_findings = (
+                [] if model_candidate_coverage_incomplete
+                else verified_findings[:max_findings]
+            )
             self.verified_review_data["review"]["key_issues_to_review"] = published_findings
             verifier_claimed_ids = {
                 str(decision.get("candidate_id") or "").strip()
@@ -1191,7 +1256,8 @@ class PRReviewer:
                 for decision in decisions
             )
             verification_status = "partial" if (
-                sensitive_coverage_incomplete
+                model_candidate_coverage_incomplete
+                or sensitive_coverage_incomplete
                 or rejected_verified_claim
                 or retrieval_artifact["budget_exhausted"]
                 or any(
@@ -1200,9 +1266,13 @@ class PRReviewer:
                 )
             ) else "complete"
             artifact.update({
-                "status": verification_status,
+                "status": (
+                    "candidate_validation_incomplete"
+                    if model_candidate_coverage_incomplete else verification_status
+                ),
                 "publication_safe": (
-                    not sensitive_coverage_incomplete
+                    not model_candidate_coverage_incomplete
+                    and not sensitive_coverage_incomplete
                     and (verification_status == "complete" or bool(published_findings))
                 ),
                 "decisions": decisions,
