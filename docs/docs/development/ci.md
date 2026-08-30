@@ -17,7 +17,7 @@ no-op jobs or update the ruleset so documentation-only PRs do not wait forever f
 | --- | --- | --- | --- |
 | `Build-and-test` | Non-documentation push or pull request targeting `main` | Builds the `test` target in `docker/Dockerfile` and runs `tests/unittest` | Read-only checkout |
 | `CodeQL` | Non-documentation push or pull request targeting `main`; Mondays at 06:00 UTC | Scans Python with the extended security and quality query suites | `security-events: write` |
-| `docs-ci` | Pull requests changing `docs/**`; documentation pushes to `main` or `add-docs-portal` | Validates documentation on pull requests and deploys pushes to GitHub Pages | Read access for validation; `contents: write` for deployment |
+| `docs-ci` | Pull requests changing `docs/**` or Markdown; documentation pushes to `main` or `add-docs-portal` | Validates documentation on pull requests and deploys site changes to GitHub Pages | Read access for validation; `contents: write` for deployment |
 | `PR-Agent E2E tests` | Manual dispatch | Builds the test image and tests the GitHub, GitLab, and Bitbucket integrations | Provider test tokens listed below |
 | `pre-commit` | Manual dispatch | Runs the hooks in `.pre-commit-config.yaml` | Read-only checkout |
 | `PR-Agent` | A non-draft pull request is opened, reopened, or marked ready | Runs describe, review, and improve through the fork's own action | Model and Pinecone secrets; PR and issue write access |
@@ -105,10 +105,11 @@ The merge policy and post-merge verification steps are documented in the reposit
 
 ## Documentation deployment
 
-`docs-ci.yaml` validates documentation changes on pull requests targeting `main` and deploys them after a push to
-`main` or `add-docs-portal`. Both paths install MkDocs Material, its imaging extras, and `mkdocs-glightbox`. Pull
-requests run `mkdocs build`; pushes run `mkdocs gh-deploy --force`. Only the deployment job receives `contents: write`.
-Its cache is keyed by the UTC week number.
+`docs-ci.yaml` validates changes under `docs/**` and all Markdown changes on pull requests targeting `main`. It
+deploys only changes under `docs/**` after a push to `main` or `add-docs-portal`, so a root README change does not
+republish the site. Both paths install MkDocs Material, its imaging extras, and `mkdocs-glightbox`. Pull requests run
+`mkdocs build`; pushes run `mkdocs gh-deploy --force`. Only the deployment job receives `contents: write`. Its cache
+is keyed by the UTC week number.
 
 Preview changes locally with:
 
