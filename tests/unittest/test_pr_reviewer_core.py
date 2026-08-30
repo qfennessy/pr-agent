@@ -4,13 +4,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import pr_agent.algo.pr_processing as pr_processing
 from pr_agent.algo.inline_comment_dedup import (body_with_markers,
                                                 get_inline_comment_store,
                                                 key_issue_fingerprint)
 from pr_agent.algo.ai_request_context import AIModelRoute
-from pr_agent.algo.pr_processing import PRDiffCoverage
+from pr_agent.algo.pr_processing import (PRDiffCoverage,
+                                         retry_with_fallback_models)
 from pr_agent.algo.review_router import (
+    ChangedFile,
+    ChangeKind,
     ReviewDepth,
     load_review_routing_configuration,
     review_route_decision_to_dict,
@@ -112,6 +114,45 @@ def _route_file(
         old_filename=old_filename,
         num_plus_lines=additions,
         num_minus_lines=deletions,
+    )
+
+
+class _MutatingIncrementalProvider:
+    """Model GitHub's incremental map changing from file objects to patches."""
+
+    def __init__(self, raw_files, detailed_files=None):
+        self.unreviewed_files_map = {file.filename: file for file in raw_files}
+        self._detailed_files = tuple(detailed_files or ())
+        self.calls = []
+
+    def get_files(self):
+        self.calls.append("raw")
+        return self.unreviewed_files_map.values()
+
+    def get_diff_files(self):
+        self.calls.append("detailed")
+        detailed = self._detailed_files or tuple(
+            _route_file(file.filename) for file in self.unreviewed_files_map.values()
+        )
+        for filename, file in tuple(self.unreviewed_files_map.items()):
+            self.unreviewed_files_map[filename] = getattr(file, "patch", None) or "@@ patch body"
+        return detailed
+
+    def is_supported(self, capability):
+        return capability == "get_labels"
+
+    def get_pr_labels(self):
+        return []
+
+
+def _incremental_raw_file(filename, *, status="modified", previous_filename=None):
+    return SimpleNamespace(
+        filename=filename,
+        previous_filename=previous_filename,
+        status=status,
+        additions=1,
+        deletions=1 if status in {"removed", "renamed"} else 0,
+        patch="@@ -1 +1 @@\n-old\n+new",
     )
 
 
@@ -326,15 +367,16 @@ async def test_routed_fallback_rebuilds_diff_for_each_model_context(monkeypatch)
     routed_token_handler.prompt_tokens = 1_000
     routed_token_handler.count_tokens.side_effect = lambda value: len(value.split())
     monkeypatch.setattr(pr_reviewer_module, "TokenHandler", lambda *args, **kwargs: routed_token_handler)
-    monkeypatch.setattr(pr_processing, "sort_files_by_main_languages", lambda *args, **kwargs: [])
     monkeypatch.setattr(
-        pr_processing,
-        "pr_generate_extended_diff",
+        "pr_agent.algo.pr_processing.sort_files_by_main_languages",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "pr_agent.algo.pr_processing.pr_generate_extended_diff",
         lambda *args, **kwargs: (["fallback-safe diff"], 2_000, [1_000]),
     )
     monkeypatch.setattr(
-        pr_processing,
-        "get_max_tokens",
+        "pr_agent.algo.pr_processing.get_max_tokens",
         lambda model: {"small-window": 8_192, "larger-window": 16_000}[model],
     )
     real_get_pr_diff = pr_reviewer_module.get_pr_diff
@@ -351,7 +393,7 @@ async def test_routed_fallback_rebuilds_diff_for_each_model_context(monkeypatch)
         max_output_tokens=8_192,
     )
 
-    await pr_processing.retry_with_fallback_models(
+    await retry_with_fallback_models(
         reviewer._prepare_prediction,
         model_route=route,
     )
@@ -532,6 +574,127 @@ def test_deterministic_route_runs_from_provider_metadata_and_records_structured_
     assert reviewer.vars["max_verification_candidates"] == 1
     assert reviewer._review_context_tokens == 8_000
     assert get_run_details().review_route == review_route_decision_to_dict(decision)
+
+
+@pytest.mark.parametrize("file_count", [1, 12, 13])
+def test_incremental_docs_inventory_is_snapshotted_before_patch_mutation(file_count):
+    raw_files = [
+        _incremental_raw_file(f"docs/guide-{index}.md")
+        for index in range(file_count)
+    ]
+    provider = _MutatingIncrementalProvider(raw_files)
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert provider.calls == ["raw", "detailed"]
+    assert all(isinstance(value, str) for value in provider.unreviewed_files_map.values())
+    assert len(reviewer.review_route_request.files) == file_count
+    assert all(file.kind is not ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+
+
+def test_incremental_sensitive_path_still_forces_deep_after_patch_mutation():
+    raw_files = [
+        _incremental_raw_file("docs/guide.md"),
+        _incremental_raw_file("services/auth/guard.py"),
+    ]
+    provider = _MutatingIncrementalProvider(raw_files)
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+
+
+def test_incremental_snapshot_preserves_deleted_and_renamed_paths():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    raw_files = [
+        _incremental_raw_file("docs/deleted.md", status="removed"),
+        _incremental_raw_file(
+            "docs/new-name.md",
+            status="renamed",
+            previous_filename="services/auth/old-name.py",
+        ),
+    ]
+    detailed_files = [
+        _route_file("docs/deleted.md", edit_type=EDIT_TYPE.DELETED),
+        _route_file(
+            "docs/new-name.md",
+            edit_type=EDIT_TYPE.RENAMED,
+            old_filename="services/auth/old-name.py",
+        ),
+    ]
+    reviewer = _make_prediction_reviewer(
+        _MutatingIncrementalProvider(raw_files, detailed_files)
+    )
+
+    changed_files = reviewer._changed_files_for_routing()
+
+    assert changed_files[0].kind is ChangeKind.DELETED
+    assert changed_files[0].old_path == "docs/deleted.md"
+    assert changed_files[0].new_path is None
+    assert changed_files[1].kind is ChangeKind.RENAMED
+    assert changed_files[1].old_path == "services/auth/old-name.py"
+    assert changed_files[1].new_path == "docs/new-name.md"
+
+
+def test_incremental_detailed_raw_mismatch_keeps_fail_safe_unknown_floor():
+    raw_files = [_incremental_raw_file("docs/guide.md")]
+    detailed_files = [
+        _route_file("docs/guide.md"),
+        _route_file("src/unmatched.py"),
+    ]
+    provider = _MutatingIncrementalProvider(raw_files, detailed_files)
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+    assert [file.new_path for file in reviewer.review_route_request.files].count("docs/guide.md") == 1
+
+
+def test_nonincremental_provider_inventory_remains_provider_neutral_and_deduplicated():
+    provider = MagicMock()
+    raw_file = SimpleNamespace(
+        filename="docs/guide.md",
+        status="modified",
+        additions=1,
+        deletions=0,
+    )
+    provider.get_files.return_value = [raw_file]
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    reviewer = _make_prediction_reviewer(provider)
+
+    changed_files = reviewer._changed_files_for_routing()
+
+    assert changed_files == (ChangedFile(
+        new_path="docs/guide.md",
+        kind=ChangeKind.MODIFIED,
+        additions=2,
+        deletions=1,
+    ),)
+    provider.get_files.assert_called_once_with()
+    provider.get_diff_files.assert_called_once_with()
 
 
 def test_changed_file_metadata_failure_is_recorded_and_prevents_quick():

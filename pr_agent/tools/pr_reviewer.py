@@ -428,6 +428,25 @@ class PRReviewer:
         """
 
         evidence_incomplete = False
+        # Snapshot the raw inventory before asking a provider to materialize
+        # detailed patches. Some incremental providers reuse mutable inventory
+        # containers while loading diffs; retaining an immutable tuple here keeps
+        # authoritative paths stable without provider-specific branching.
+        try:
+            raw_inventory = self.git_provider.get_files()
+            raw_files = (
+                tuple(self._changed_file_for_routing(file) for file in raw_inventory)
+                if raw_inventory is not None
+                else ()
+            )
+        except Exception as exc:
+            get_logger().warning(
+                "Review-depth routing could not read the unfiltered changed-file inventory",
+                artifact={"error_class": type(exc).__name__},
+            )
+            raw_files = None
+            evidence_incomplete = True
+
         try:
             detailed = tuple(
                 self._changed_file_for_routing(file)
@@ -446,14 +465,7 @@ class PRReviewer:
                 if path:
                     detailed_by_path.setdefault(path, index)
 
-        try:
-            raw_inventory = self.git_provider.get_files()
-            raw_files = tuple(raw_inventory) if raw_inventory is not None else ()
-        except Exception as exc:
-            get_logger().warning(
-                "Review-depth routing could not read the unfiltered changed-file inventory",
-                artifact={"error_class": type(exc).__name__},
-            )
+        if raw_files is None:
             # Preserve the detailed evidence, but add one unknown record so missing
             # inventory can never be mistaken for a complete low-risk-only change.
             return (*detailed, ChangedFile(new_path=None, kind=ChangeKind.UNKNOWN))
@@ -465,8 +477,7 @@ class PRReviewer:
 
         reconciled = []
         matched_detailed = set()
-        for raw_file in raw_files:
-            raw_changed_file = self._changed_file_for_routing(raw_file)
+        for raw_changed_file in raw_files:
             detailed_index = next(
                 (
                     detailed_by_path[path]
