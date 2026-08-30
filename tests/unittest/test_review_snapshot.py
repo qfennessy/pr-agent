@@ -408,10 +408,12 @@ def test_captured_filenames_are_literal_git_pathspecs(tmp_path):
     magic = ":(glob)*.py"
     (repo / magic).write_text("magic = 1\n", encoding="utf-8")
     (repo / "excluded.py").write_text("secret = 1\n", encoding="utf-8")
-    _git(repo, "--literal-pathspecs", "add", "--", magic, "excluded.py")
+    (repo / "other.py").write_text("other = 1\n", encoding="utf-8")
+    _git(repo, "--literal-pathspecs", "add", "--", magic, "excluded.py", "other.py")
     _git(repo, "commit", "-m", "add pathspec fixture")
     (repo / magic).write_text("magic = 2\n", encoding="utf-8")
     (repo / "excluded.py").write_text("secret = 2\n", encoding="utf-8")
+    (repo / "other.py").write_text("other = 2\n", encoding="utf-8")
 
     snapshot = LocalPairReview(str(repo), excluded_paths=["excluded.py"]).capture(
         event="file-save", focus_path=magic
@@ -419,6 +421,21 @@ def test_captured_filenames_are_literal_git_pathspecs(tmp_path):
 
     assert snapshot.changed_paths == (magic,)
     assert "excluded.py" not in snapshot.diff
+    assert "other.py" not in snapshot.diff
+
+
+def test_untracked_focus_is_a_literal_git_pathspec(tmp_path):
+    repo = _repo(tmp_path, "untracked-literal-focus")
+    magic = ":(glob)*.md"
+    (repo / magic).write_text("focused\n", encoding="utf-8")
+    (repo / "other.md").write_text("unrelated\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event="file-save", focus_path=magic
+    )
+
+    assert snapshot.changed_paths == (magic,)
+    assert "other.md" not in snapshot.diff
 
 
 def test_operational_ignores_are_literal_paths(tmp_path):
@@ -620,6 +637,22 @@ def test_changed_path_discovery_is_bounded_and_reports_stage_coverage(tmp_path):
     assert snapshot.changed_paths == ()
     assert CoverageIssue(reason="tracked_path_discovery_budget") in snapshot.coverage_issues
     assert CoverageIssue(reason="untracked_path_discovery_budget") in snapshot.coverage_issues
+
+
+def test_one_discovery_overflow_discards_the_other_stage_diff(tmp_path):
+    repo = _repo(tmp_path, "partial-path-overflow")
+    (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+    (repo / "u").write_text("untracked\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(
+        str(repo),
+        max_path_discovery_bytes=3,
+    ).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(reason="tracked_path_discovery_budget") in snapshot.coverage_issues
+    assert CoverageIssue(reason="untracked_path_discovery_budget") not in snapshot.coverage_issues
 
 
 def test_superseded_snapshot_is_stale_and_suppresses_review(tmp_path):

@@ -352,7 +352,13 @@ class LocalPairReview:
         base_revision: str,
         focus_path: Optional[str] = None,
     ) -> Optional[list[tuple[str, ...]]]:
-        args = [*self._diff_filter_overrides(), "diff", "--no-ext-diff", "--no-textconv"]
+        args = [
+            *self._diff_filter_overrides(),
+            "--literal-pathspecs",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+        ]
         if event is ReviewEvent.PRE_COMMIT:
             args.append("--cached")
         args.extend(["--name-status", "-z", "--find-renames", base_revision, "--"])
@@ -377,7 +383,14 @@ class LocalPairReview:
         return path_groups
 
     def _untracked_paths(self, focus_path: Optional[str] = None) -> Optional[list[str]]:
-        args = ["ls-files", "--others", "--exclude-standard", "-z", "--"]
+        args = [
+            "--literal-pathspecs",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ]
         if focus_path:
             args.append(focus_path)
         output = _run_git_bounded(
@@ -476,6 +489,7 @@ class LocalPairReview:
         tracked_groups = self._tracked_path_groups(
             event, base_revision, normalized_focus
         )
+        discovery_overflow = tracked_groups is None
         if tracked_groups is None:
             add_coverage(None, "tracked_path_discovery_budget")
             tracked_groups = []
@@ -487,6 +501,27 @@ class LocalPairReview:
         if untracked is None:
             add_coverage(None, "untracked_path_discovery_budget")
             untracked = []
+            discovery_overflow = True
+        if discovery_overflow:
+            # An incomplete path set cannot safely produce feedback. Discard the
+            # other discovery stage as well so omitted repository state can never
+            # be hidden behind a current-looking partial review.
+            return ReviewSnapshot(
+                event=event,
+                repository_root=str(self.repository_root),
+                base_selector=base_selector or base,
+                base_revision=base_revision,
+                changed_paths=(),
+                focus_path=normalized_focus,
+                diff="",
+                task_intent=task_intent,
+                deterministic_results=tuple(deterministic_results),
+                review_configuration_hash=review_configuration_hash,
+                policy_version=policy_version,
+                created_at=datetime.now(timezone.utc).isoformat(),
+                parent_snapshot_id=parent_snapshot_id,
+                coverage_issues=tuple(coverage),
+            )
 
         def validate_path(path: str) -> Optional[str]:
             try:
