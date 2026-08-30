@@ -193,9 +193,17 @@ def telemetry_safe_artifact(artifact: dict) -> dict:
                     continue
                 summary = {
                     key: item[key]
-                    for key in ("candidate_id", "source", "path", "start_line", "end_line")
+                    for key in (
+                        "candidate_id", "candidate_ids", "source", "path", "start_line", "end_line",
+                    )
                     if key in item and isinstance(item[key], (str, int, float, bool, type(None)))
                 }
+                candidate_ids = item.get("candidate_ids")
+                if isinstance(candidate_ids, list):
+                    summary["candidate_ids"] = [
+                        candidate_id for candidate_id in candidate_ids
+                        if isinstance(candidate_id, str)
+                    ]
                 summary["content_characters"] = len(str(item.get("content") or ""))
                 safe_retrieval["retrieved_evidence"].append(summary)
         safe["retrieval"] = safe_retrieval
@@ -852,6 +860,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
     changed_evidence_count = 0
     added_context_head_available = {}
     incomplete_changed_context = set()
+    shared_repo_evidence = {}
     diff_by_file = {
         path: diff_file
         for diff_file in (diff_files or [])
@@ -1047,6 +1056,54 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 request["status"] = "context_budget_exhausted"
                 budget_exhausted = True
                 continue
+            source = "pr_head_file" if prefer_pr_head else "repository_file"
+            fetch_path = path if prefer_pr_head else _base_fetch_path(path, diff_by_file.get(path))
+            cache_key = ("pr_head" if prefer_pr_head else "base", fetch_path)
+            shared_item = None
+            cached_content = cache.get(cache_key)
+            if isinstance(cached_content, bytes):
+                cached_content = cached_content.decode("utf-8", errors="replace")
+            resolved_anchor = _excerpt_anchor_line(
+                str(cached_content or ""), candidate, path
+            )
+            for existing in shared_repo_evidence.get((source, path), ()):
+                try:
+                    visible_start = int(existing.get("start_line"))
+                    visible_end = int(existing.get("end_line"))
+                except (TypeError, ValueError):
+                    continue
+                visible_lines = split_git_file_lines(str(existing.get("content") or ""))
+                source_lines = split_git_file_lines(str(cached_content or ""))
+                visible_anchor_index = resolved_anchor - visible_start
+                if (
+                    resolved_anchor > 0
+                    and resolved_anchor == existing.get("anchor_start_line")
+                    and resolved_anchor == existing.get("anchor_end_line")
+                    and visible_start <= resolved_anchor <= visible_end
+                    and 0 <= visible_anchor_index < len(visible_lines)
+                    and resolved_anchor <= len(source_lines)
+                    and visible_lines[visible_anchor_index] == source_lines[resolved_anchor - 1]
+                ):
+                    shared_item = existing
+                    break
+            if shared_item is not None:
+                candidate_ids = shared_item.get("candidate_ids")
+                if not isinstance(candidate_ids, list):
+                    candidate_ids = [shared_item.pop("candidate_id")]
+                    shared_item["candidate_ids"] = candidate_ids
+                if candidate_id not in candidate_ids:
+                    candidate_ids.append(candidate_id)
+                shared_item["required_evidence"] = bool(
+                    shared_item.get("required_evidence") or request.get("required")
+                )
+                request.update({
+                    "status": "retrieved",
+                    "source": source,
+                    "start_line": shared_item["start_line"],
+                    "end_line": shared_item["end_line"],
+                    "evidence_id": shared_item["evidence_id"],
+                })
+                continue
             if path not in unique_files and len(unique_files) >= budgets.max_files:
                 request["status"] = "file_budget_exhausted"
                 budget_exhausted = True
@@ -1061,8 +1118,6 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 budget_exhausted = True
                 continue
             unique_files.add(path)
-            fetch_path = path if prefer_pr_head else _base_fetch_path(path, diff_by_file.get(path))
-            cache_key = ("pr_head" if prefer_pr_head else "base", fetch_path)
             if cache_key not in cache:
                 try:
                     cache[cache_key] = await _bounded_repo_file_fetch(
@@ -1087,7 +1142,6 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 continue
             if isinstance(content, bytes):
                 content = content.decode("utf-8", errors="replace")
-            source = "pr_head_file" if prefer_pr_head else "repository_file"
             evidence_id = _retrieval_evidence_id(candidate_id, path, source)
             anchor_line = _excerpt_anchor_line(str(content), candidate, path)
             evidence_item = {
@@ -1107,6 +1161,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 )
                 continue
             appended = evidence[before]
+            shared_repo_evidence.setdefault((source, path), []).append(appended)
             request.update({
                 "status": "retrieved",
                 "source": source,
@@ -1252,7 +1307,11 @@ def apply_verification_decisions(
     candidates_by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
     evidence_by_candidate = {}
     for item in evidence:
-        evidence_by_candidate.setdefault(item.get("candidate_id"), []).append(item)
+        candidate_ids = item.get("candidate_ids")
+        if not isinstance(candidate_ids, list):
+            candidate_ids = [item.get("candidate_id")]
+        for candidate_id in candidate_ids:
+            evidence_by_candidate.setdefault(candidate_id, []).append(item)
     requests_by_candidate = {}
     for request in retrieval_requests if isinstance(retrieval_requests, list) else []:
         if isinstance(request, dict):

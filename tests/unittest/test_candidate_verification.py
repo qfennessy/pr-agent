@@ -32,6 +32,7 @@ from pr_agent.algo.review_specialists import (
 )
 from pr_agent.algo.token_handler import TokenEncoder
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
+from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
 from pr_agent.tools.pr_reviewer import PRReviewer
 
 
@@ -1046,6 +1047,48 @@ async def test_incremental_retrieval_reads_earlier_changed_context_from_current_
 
 
 @pytest.mark.asyncio
+async def test_azure_incremental_retrieval_reads_earlier_helper_from_head_commit():
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.repo_slug = "repo"
+    provider.workspace_slug = "project"
+    provider.pr = SimpleNamespace(
+        last_merge_commit=SimpleNamespace(commit_id="head-sha")
+    )
+    provider.azure_devops_client = MagicMock()
+    provider.azure_devops_client.get_item.return_value = SimpleNamespace(
+        content="def helper(): return 'current Azure PR behavior'"
+    )
+    diff_file = _diff_file("src/caller.py")
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            relevant_file="src/caller.py",
+            context_files=["src/helper.py"],
+            context_symbols=["helper"],
+        )),
+        [diff_file],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(),
+        [],
+        diff_files=[diff_file],
+        prefer_pr_head=True,
+    )
+
+    call = provider.azure_devops_client.get_item.call_args.kwargs
+    assert call["path"] == "src/helper.py"
+    assert call["version_descriptor"].version == "head-sha"
+    helper = next(item for item in evidence if item["path"] == "src/helper.py")
+    assert helper["source"] == "pr_head_file"
+    assert helper["content"] == "def helper(): return 'current Azure PR behavior'"
+    assert artifact["requests"][1]["status"] == "retrieved"
+
+
+@pytest.mark.asyncio
 async def test_incremental_retrieval_fails_closed_when_pr_head_context_is_unsupported():
     provider = MagicMock()
     provider.get_repo_file_content.return_value = "stale helper from target branch"
@@ -1089,6 +1132,271 @@ async def test_incremental_retrieval_fails_closed_when_pr_head_context_is_unsupp
     assert artifact["requests"][1]["status"] == "missing"
     assert findings == []
     assert decisions[0]["reason"] == "required_context_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_retrieval_shares_identical_required_context_across_candidates():
+    provider = MagicMock()
+    helper_lines = [f"helper line {line}" for line in range(1, 201)]
+    helper_lines[99] = "def shared_helper(): return current_behavior"
+    provider.get_repo_file_content.return_value = "\n".join(helper_lines)
+    first_diff = _diff_file("src/first_caller.py")
+    second_diff = _diff_file("src/second_caller.py")
+    candidates, _ = prepare_candidates(
+        _review_data(
+            _candidate(
+                relevant_file="src/first_caller.py",
+                root_cause="first caller trusts the shared helper",
+                context_files=["src/helper.py"],
+                context_symbols=["shared_helper"],
+            ),
+            _candidate(
+                relevant_file="src/second_caller.py",
+                root_cause="second caller trusts the shared helper",
+                context_files=["src/helper.py"],
+                context_symbols=["missing_local_symbol", "shared_helper"],
+            ),
+        ),
+        [first_diff, second_diff],
+        [],
+        3,
+    )
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=3,
+            max_lines_per_file=10,
+            max_total_lines=40,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[first_diff, second_diff],
+    )
+    helper_evidence = [item for item in evidence if item["path"] == "src/helper.py"]
+    helper_requests = [
+        request for request in artifact["requests"] if request["path"] == "src/helper.py"
+    ]
+    verification = {"verification": {"decisions": [
+        {
+            "candidate_id": candidate["candidate_id"],
+            "verdict": "verified",
+            "relevant_file": candidate["relevant_file"],
+            "start_line": 12,
+            "end_line": 12,
+            "evidence_paths": ["src/helper.py"],
+        }
+        for candidate in candidates
+    ]}}
+
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    assert len(helper_evidence) == 1
+    assert helper_evidence[0]["candidate_ids"] == ["candidate-1", "candidate-2"]
+    assert helper_evidence[0]["content"].count("\n") + 1 == 10
+    assert [request["status"] for request in helper_requests] == ["retrieved", "retrieved"]
+    assert helper_requests[0]["evidence_id"] == helper_requests[1]["evidence_id"]
+    # Each caller keeps its four changed lines plus six changed-head lines; the
+    # ten-line shared helper is charged only once.
+    assert artifact["lines_retrieved"] == 30
+    assert artifact["context_tokens"] == sum(
+        len(item["content"].encode("utf-8")) for item in evidence
+    )
+    safe_helper = next(
+        item
+        for item in telemetry_safe_artifact({"retrieval": artifact})["retrieval"][
+            "retrieved_evidence"
+        ]
+        if item["path"] == "src/helper.py"
+    )
+    assert safe_helper["candidate_ids"] == ["candidate-1", "candidate-2"]
+    assert "content" not in safe_helper
+    assert len(findings) == 2
+    assert [decision["verdict"] for decision in decisions] == ["verified", "verified"]
+
+
+@pytest.mark.asyncio
+async def test_retrieval_shares_token_clipped_context_by_resolved_anchor():
+    provider = MagicMock()
+    helper_lines = [f"helper line {line}" for line in range(1, 201)]
+    helper_lines[99] = "def shared_helper(): return current_behavior"
+    provider.get_repo_file_content.return_value = "\n".join(helper_lines)
+    first_diff = _diff_file("src/first_caller.py")
+    second_diff = _diff_file("src/second_caller.py")
+    candidates, _ = prepare_candidates(
+        _review_data(
+            _candidate(
+                relevant_file="src/first_caller.py",
+                root_cause="first caller trusts the shared helper",
+                context_files=["src/helper.py"],
+                context_symbols=["shared_helper"],
+            ),
+            _candidate(
+                relevant_file="src/second_caller.py",
+                root_cause="second caller trusts the shared helper",
+                context_files=["src/helper.py"],
+                context_symbols=["missing_local_symbol", "shared_helper"],
+            ),
+        ),
+        [first_diff, second_diff],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=3,
+            max_lines_per_file=10,
+            max_total_lines=40,
+            max_context_tokens=100,
+        ),
+        [],
+        diff_files=[first_diff, second_diff],
+    )
+
+    helper_evidence = [item for item in evidence if item["path"] == "src/helper.py"]
+    helper_requests = [
+        request for request in artifact["requests"] if request["path"] == "src/helper.py"
+    ]
+    assert len(helper_evidence) == 1
+    assert helper_evidence[0]["candidate_ids"] == ["candidate-1", "candidate-2"]
+    assert helper_evidence[0]["anchor_start_line"] == 100
+    assert helper_evidence[0]["anchor_end_line"] == 100
+    assert [request["status"] for request in helper_requests] == ["retrieved", "retrieved"]
+    assert helper_requests[0]["evidence_id"] == helper_requests[1]["evidence_id"]
+    assert artifact["context_tokens"] <= 100
+
+
+@pytest.mark.asyncio
+async def test_required_context_does_not_reuse_optional_excerpt_missing_its_anchor():
+    provider = MagicMock()
+    helper_lines = [f"helper line {line}" for line in range(1, 201)]
+    helper_lines[99] = "def shared_helper(): return current_behavior"
+    provider.get_repo_file_content.return_value = "\n".join(helper_lines)
+    first_diff = _diff_file("src/first_caller.py")
+    second_diff = _diff_file("src/second_caller.py")
+    candidates, _ = prepare_candidates(
+        _review_data(
+            _candidate(
+                relevant_file="src/first_caller.py",
+                root_cause="optional helper hint",
+                context_files=["src/helper.py"],
+                context_symbols=["shared_helper"],
+            ),
+            _candidate(
+                relevant_file="src/second_caller.py",
+                root_cause="required helper proof",
+                context_files=["src/helper.py"],
+                context_symbols=["shared_helper"],
+            ),
+        ),
+        [first_diff, second_diff],
+        [],
+        3,
+    )
+    candidates[0]["_specialist_optional_context_files"] = ["src/helper.py"]
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=3,
+            max_lines_per_file=10,
+            max_total_lines=40,
+            max_context_tokens=45,
+        ),
+        [],
+        diff_files=[first_diff, second_diff],
+    )
+    helper_requests = [
+        request for request in artifact["requests"] if request["path"] == "src/helper.py"
+    ]
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-2",
+        "verdict": "verified",
+        "relevant_file": "src/second_caller.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/helper.py"],
+    }]}}
+
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    assert [(request["required"], request["status"]) for request in helper_requests] == [
+        (False, "retrieved"),
+        (True, "context_budget_exhausted"),
+    ]
+    assert findings == []
+    second_decision = next(
+        decision for decision in decisions if decision["candidate_id"] == "candidate-2"
+    )
+    assert second_decision["reason"] == "required_context_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_shared_context_counts_unique_lines_but_distinct_context_obeys_global_budget():
+    provider = MagicMock()
+    provider.get_repo_file_content.side_effect = lambda path, _: {
+        "src/first_helper.py": "\n".join(f"first {line}" for line in range(1, 21)),
+        "src/second_helper.py": "\n".join(f"second {line}" for line in range(1, 21)),
+    }[path]
+    first_diff = _diff_file("src/first_caller.py")
+    second_diff = _diff_file("src/second_caller.py")
+    candidates, _ = prepare_candidates(
+        _review_data(
+            _candidate(
+                relevant_file="src/first_caller.py",
+                root_cause="first independent cause",
+                context_files=["src/first_helper.py"],
+                context_symbols=[],
+            ),
+            _candidate(
+                relevant_file="src/second_caller.py",
+                root_cause="second independent cause",
+                context_files=["src/second_helper.py"],
+                context_symbols=[],
+            ),
+        ),
+        [first_diff, second_diff],
+        [],
+        3,
+    )
+
+    _, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=3,
+            max_lines_per_file=4,
+            max_total_lines=12,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[first_diff, second_diff],
+    )
+
+    helper_requests = [
+        request for request in artifact["requests"]
+        if request["path"].endswith("_helper.py")
+    ]
+    assert [request["status"] for request in helper_requests] == [
+        "retrieved",
+        "context_budget_exhausted",
+    ]
+    assert artifact["lines_retrieved"] == 12
+    assert artifact["budget_exhausted"] is True
 
 
 @pytest.mark.asyncio

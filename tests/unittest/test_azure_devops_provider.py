@@ -66,6 +66,31 @@ class TestAzureDevopsProviderRepoContext:
         with pytest.raises(Exception, match="500 status code"):
             provider.get_repo_file_content("AGENTS.md")
 
+    def test_get_pr_head_file_content_reads_from_current_head_commit(self):
+        provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+        provider.repo_slug = "my-repo"
+        provider.workspace_slug = "my-project"
+        provider.pr = MagicMock()
+        provider.pr.last_merge_commit.commit_id = "head-sha"
+        provider.azure_devops_client = MagicMock()
+        provider.azure_devops_client.get_item.return_value = MagicMock(content="current helper")
+
+        content = provider.get_pr_head_file_content("src/helper.py")
+
+        assert content == "current helper"
+        _, kwargs = provider.azure_devops_client.get_item.call_args
+        assert kwargs["path"] == "src/helper.py"
+        assert kwargs["version_descriptor"].version == "head-sha"
+        assert kwargs["version_descriptor"].version_type == "commit"
+
+    def test_get_pr_head_file_content_fails_closed_without_a_head_commit(self):
+        provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+        provider.pr = SimpleNamespace(last_merge_commit=None)
+        provider.azure_devops_client = MagicMock()
+
+        assert provider.get_pr_head_file_content("src/helper.py") == ""
+        provider.azure_devops_client.get_item.assert_not_called()
+
 
 class TestAzureDevopsProviderFiles:
     @staticmethod
