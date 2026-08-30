@@ -4,9 +4,14 @@ from decimal import Decimal
 import pytest
 
 from pr_agent.algo import run_details
-from pr_agent.algo.run_details import (get_run_details, init_run_details,
-                                       record_ai_call, record_model_used,
-                                       record_review_profile)
+from pr_agent.algo.run_details import (
+    get_run_details,
+    init_run_details,
+    record_ai_call,
+    record_model_used,
+    record_review_profile,
+    record_review_route,
+)
 from pr_agent.algo.utils import show_run_details
 from pr_agent.config_loader import get_settings
 
@@ -60,6 +65,16 @@ def test_renders_review_profile_when_recorded():
     output = show_run_details(gfm_supported=True)
 
     assert "Review profile: bugs_only" in output
+
+
+def test_renders_applied_review_depth_when_recorded():
+    init_run_details()
+    record_model_used("openai/gpt-5.4", is_fallback=False)
+    record_review_route({"applied_depth": "deep"})
+
+    output = show_run_details(gfm_supported=True)
+
+    assert "Review depth: deep" in output
 
 
 def test_omits_token_components_the_provider_did_not_report():

@@ -275,6 +275,21 @@ class BitbucketProvider(GitProvider):
                 self.git_files = [_gef_filename(diff) for diff in self.pr.diffstat()]
             return self.git_files
 
+    def get_files_for_routing(self):
+        """Return unfiltered Bitbucket diffstat metadata, including rename origins."""
+        files = []
+        for diff in self.pr.diffstat():
+            status = diff.data.get("status", "")
+            old_path = getattr(diff.old, "path", None)
+            files.append({
+                "filename": _gef_filename(diff),
+                "previous_filename": old_path if status == "renamed" else None,
+                "status": status,
+                "additions": diff.data.get("lines_added"),
+                "deletions": diff.data.get("lines_removed"),
+            })
+        return files
+
     def get_diff_files(self) -> list[FilePatchInfo]:
         if self.diff_files:
             return self.diff_files
@@ -406,6 +421,7 @@ class BitbucketProvider(GitProvider):
                 file_patch_canonic_structure.edit_type = EDIT_TYPE.MODIFIED
             elif diff.data['status'] == 'renamed':
                 file_patch_canonic_structure.edit_type = EDIT_TYPE.RENAMED
+                file_patch_canonic_structure.old_filename = getattr(diff.old, "path", None)
             diff_files.append(file_patch_canonic_structure)
 
         if invalid_files_names:

@@ -128,13 +128,14 @@ class TestGetIncrementalCommits:
         prev = _comment("## PR Reviewer Guide\nbody", review_time)
         provider.get_issue_comments = MagicMock(return_value=[prev])
 
-        changes_obj = MagicMock()
-        changes_obj.changes = [
-            {"item": {"path": "/foo.py", "gitObjectType": "blob"}},
-            {"item": {"path": "/bar.py", "gitObjectType": "blob"}},
-            {"item": {"path": "/somedir", "gitObjectType": "tree"}},
-        ]
-        provider.azure_devops_client.get_changes = MagicMock(return_value=changes_obj)
+        provider.azure_devops_client.get_commit_diffs = MagicMock(return_value=SimpleNamespace(
+            all_changes_included=True,
+            changes=[
+                {"item": {"path": "/foo.py", "gitObjectType": "blob"}, "changeType": "edit"},
+                {"item": {"path": "/bar.py", "gitObjectType": "blob"}, "changeType": "edit"},
+                {"item": {"path": "/somedir", "gitObjectType": "tree"}, "changeType": "edit"},
+            ],
+        ))
 
         inc = IncrementalPR(True)
         provider.get_incremental_commits(inc)
@@ -148,6 +149,11 @@ class TestGetIncrementalCommits:
         assert "/bar.py" in provider.unreviewed_files_map
         assert "/somedir" not in provider.unreviewed_files_map
         assert prev.html_url == provider.get_comment_url(prev)
+        kwargs = provider.azure_devops_client.get_commit_diffs.call_args.kwargs
+        assert kwargs["base_version_descriptor"].base_version == "old1"
+        assert kwargs["target_version_descriptor"].target_version == "new2"
+        assert kwargs["diff_common_commit"] is False
+        provider.azure_devops_client.get_changes.assert_not_called()
 
     def test_populates_files_from_sdk_change_objects(self):
         provider = self._make_provider()
@@ -164,17 +170,20 @@ class TestGetIncrementalCommits:
             return_value=[_comment("## PR Reviewer Guide\nbody", review_time)]
         )
 
-        changes_obj = MagicMock()
-        changes_obj.changes = [
-            SimpleNamespace(item=SimpleNamespace(path="/src/sdk.py")),
-        ]
-        provider.azure_devops_client.get_changes = MagicMock(return_value=changes_obj)
+        provider.azure_devops_client.get_commit_diffs = MagicMock(return_value=SimpleNamespace(
+            all_changes_included=True,
+            changes=[SimpleNamespace(
+                item=SimpleNamespace(path="/src/sdk.py"),
+                change_type="edit",
+            )],
+        ))
 
         provider.get_incremental_commits(IncrementalPR(True))
 
         assert "/src/sdk.py" in provider.unreviewed_files_map
+        provider.azure_devops_client.get_changes.assert_not_called()
 
-    def test_skips_merge_commits(self):
+    def test_merge_commit_range_uses_authoritative_net_diff(self):
         provider = self._make_provider()
         review_time = _dt.datetime(2024, 6, 1, tzinfo=_dt.timezone.utc)
         merge = _raw_commit(
@@ -188,9 +197,19 @@ class TestGetIncrementalCommits:
         provider.get_issue_comments = MagicMock(
             return_value=[_comment("## PR Reviewer Guide", review_time)]
         )
-        provider.azure_devops_client.get_changes = MagicMock()
+        provider.azure_devops_client.get_commit_diffs = MagicMock(return_value=SimpleNamespace(
+            all_changes_included=True,
+            changes=[{
+                "item": {"path": "/src/merged.py", "gitObjectType": "blob"},
+                "changeType": "edit",
+            }],
+        ))
 
         provider.get_incremental_commits(IncrementalPR(True))
+
+        assert provider.incremental.is_incremental is True
+        assert provider.unreviewed_files_map == {"/src/merged.py": "/src/merged.py"}
+        provider.azure_devops_client.get_commit_diffs.assert_called_once()
         provider.azure_devops_client.get_changes.assert_not_called()
 
     def test_all_merge_commits_falls_back_to_full(self):
@@ -215,6 +234,7 @@ class TestGetIncrementalCommits:
         provider.get_incremental_commits(IncrementalPR(True))
 
         assert provider.incremental.is_incremental is False
+        provider.azure_devops_client.get_commit_diffs.assert_not_called()
         provider.azure_devops_client.get_changes.assert_not_called()
 
     def test_all_commits_newer_than_review_falls_back_to_full(self):
@@ -237,6 +257,7 @@ class TestGetIncrementalCommits:
         assert provider.incremental.is_incremental is False
         assert provider.incremental.commits_range is None
         assert provider.incremental.last_seen_commit is None
+        provider.azure_devops_client.get_commit_diffs.assert_not_called()
         provider.azure_devops_client.get_changes.assert_not_called()
 
     def test_missing_date_commit_after_baseline_is_included(self):
@@ -257,9 +278,13 @@ class TestGetIncrementalCommits:
         provider.get_issue_comments = MagicMock(
             return_value=[_comment("## PR Reviewer Guide", review_time)]
         )
-        changes_obj = MagicMock()
-        changes_obj.changes = [{"item": {"path": "/x.py", "gitObjectType": "blob"}}]
-        provider.azure_devops_client.get_changes = MagicMock(return_value=changes_obj)
+        provider.azure_devops_client.get_commit_diffs = MagicMock(return_value=SimpleNamespace(
+            all_changes_included=True,
+            changes=[{
+                "item": {"path": "/x.py", "gitObjectType": "blob"},
+                "changeType": "edit",
+            }],
+        ))
 
         provider.get_incremental_commits(IncrementalPR(True))
 
@@ -268,6 +293,10 @@ class TestGetIncrementalCommits:
         assert [c.sha for c in provider.incremental.commits_range] == ["mid", "new"]
         assert provider.incremental.last_seen_commit.sha == "old1"
         assert provider.incremental.first_new_commit.sha == "mid"
+        kwargs = provider.azure_devops_client.get_commit_diffs.call_args.kwargs
+        assert kwargs["base_version_descriptor"].base_version == "old1"
+        assert kwargs["target_version_descriptor"].target_version == "new"
+        provider.azure_devops_client.get_changes.assert_not_called()
 
     def test_incremental_resets_stale_diff_cache(self):
         # Regression for Qodo #1: switching a reused provider into incremental mode must

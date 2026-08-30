@@ -1,10 +1,12 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from pr_agent.algo.types import FilePatchInfo
+from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
+from pr_agent.git_providers import azuredevops_provider as azuredevops_provider_module
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
+from pr_agent.git_providers.git_provider import IncrementalPR
 
 
 class TestAzureDevopsProviderRepoContext:
@@ -68,6 +70,27 @@ class TestAzureDevopsProviderRepoContext:
 
 
 class TestAzureDevopsProviderFiles:
+    @pytest.fixture(autouse=True)
+    def _install_version_descriptor(self, monkeypatch):
+        monkeypatch.setattr(
+            azuredevops_provider_module,
+            "GitBaseVersionDescriptor",
+            lambda *, base_version, base_version_type: SimpleNamespace(
+                base_version=base_version,
+                base_version_type=base_version_type,
+            ),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            azuredevops_provider_module,
+            "GitTargetVersionDescriptor",
+            lambda *, target_version, target_version_type: SimpleNamespace(
+                target_version=target_version,
+                target_version_type=target_version_type,
+            ),
+            raising=False,
+        )
+
     @staticmethod
     def _provider():
         provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
@@ -118,6 +141,648 @@ class TestAzureDevopsProviderFiles:
         ])
 
         assert provider._get_files_full() == ["/src/app.py"]
+
+    def test_routing_inventory_uses_net_iteration_and_preserves_change_shapes(self):
+        provider = self._provider()
+        provider.incremental = None
+        provider.unreviewed_files_map = {}
+        provider._latest_pr_iteration_changes = None
+        provider.azure_devops_client.get_pull_request_iterations.return_value = [
+            SimpleNamespace(id=4)
+        ]
+        provider.azure_devops_client.get_pull_request_iteration_changes.return_value = (
+            SimpleNamespace(
+                change_entries=[
+                    SimpleNamespace(additional_properties={
+                        "item": {"path": "/docs/new.md"},
+                        "changeType": "edit, rename",
+                        "originalPath": "/services/auth/old.py",
+                    }),
+                    SimpleNamespace(additional_properties={
+                        "item": {"path": "/docs/deleted.md"},
+                        "changeType": "delete",
+                    }),
+                ],
+                next_skip=0,
+            )
+        )
+
+        files = provider.get_files_for_routing()
+
+        assert [(file.filename, file.old_filename, file.edit_type) for file in files] == [
+            ("/docs/new.md", "/services/auth/old.py", EDIT_TYPE.RENAMED),
+            ("/docs/deleted.md", None, EDIT_TYPE.DELETED),
+        ]
+        assert provider.normalize_file_path_for_routing(files[0].filename) == "docs/new.md"
+        provider.azure_devops_client.get_pull_request_commits.assert_not_called()
+        provider.azure_devops_client.get_pull_request_iteration_changes.assert_called_once_with(
+            repository_id="my-repo",
+            pull_request_id=1,
+            iteration_id=4,
+            project="my-project",
+            top=2000,
+            skip=0,
+            compare_to=0,
+        )
+
+    @pytest.mark.parametrize("next_skip", [None, False, "0", -1])
+    def test_routing_inventory_marks_malformed_iteration_pagination_incomplete(self, next_skip):
+        provider = self._provider()
+        provider.incremental = None
+        provider.unreviewed_files_map = {}
+        provider._latest_pr_iteration_changes = None
+        provider._latest_pr_iteration_changes_incomplete = None
+        provider.azure_devops_client.get_pull_request_iterations.return_value = [
+            SimpleNamespace(id=4)
+        ]
+        provider.azure_devops_client.get_pull_request_iteration_changes.return_value = (
+            SimpleNamespace(
+                change_entries=[{
+                    "item": {"path": "/docs/known.md"},
+                    "changeType": "edit",
+                }],
+                next_skip=next_skip,
+            )
+        )
+
+        files = provider.get_files_for_routing()
+
+        assert [(file.filename, file.edit_type) for file in files] == [
+            ("/docs/known.md", EDIT_TYPE.MODIFIED),
+            ("", EDIT_TYPE.UNKNOWN),
+        ]
+        assert provider._latest_pr_iteration_changes_incomplete is True
+
+    def test_incremental_routing_inventory_precedes_ignore_and_extension_filters(self):
+        provider = self._provider()
+        commit = SimpleNamespace(
+            commit_id="head",
+            sha="head",
+            parents=[SimpleNamespace(commit_id="base")],
+        )
+        provider.pr_commits = [commit]
+        provider.previous_review = None
+        provider.get_previous_review = MagicMock(return_value=SimpleNamespace())
+        provider._get_commit_range = MagicMock(return_value=[commit])
+        provider.incremental = IncrementalPR(True)
+        provider.incremental.last_seen_commit = SimpleNamespace(sha="base")
+        provider.unreviewed_files_map = {}
+        provider._routing_incremental_files = None
+        provider.azure_devops_client.get_commit_diffs.return_value = SimpleNamespace(
+            all_changes_included=True,
+            changes=[
+            {"item": {"path": "/docs/guide.md"}, "changeType": "edit"},
+            {
+                "item": {"path": "/generated/guard.md"},
+                "changeType": "rename",
+                "originalPath": "/services/auth/guard.py",
+            },
+            SimpleNamespace(
+                item=SimpleNamespace(path="/services/auth/key.pem"),
+                change_type="edit",
+            ),
+            {"item": {"path": "/docs/deleted.md"}, "changeType": "delete"},
+            {"item": {"path": "/docs", "gitObjectType": "tree"}, "changeType": "edit"},
+        ])
+        provider._latest_pr_iteration_changes = tuple(
+            provider.azure_devops_client.get_commit_diffs.return_value.changes
+        )
+        provider._latest_pr_iteration_changes_incomplete = False
+
+        with (
+            patch(
+                "pr_agent.git_providers.azuredevops_provider.filter_ignored",
+                return_value=["/docs/guide.md", "/services/auth/key.pem", "/docs/deleted.md"],
+            ),
+            patch(
+                "pr_agent.git_providers.azuredevops_provider.is_valid_file",
+                side_effect=lambda path: path != "/services/auth/key.pem",
+            ),
+        ):
+            provider._get_incremental_commits()
+
+        assert provider.unreviewed_files_map == {
+            "/docs/guide.md": "/docs/guide.md",
+            "/docs/deleted.md": "/docs/deleted.md",
+        }
+        routing_files = provider.get_files_for_routing()
+        assert [
+            (file.filename, file.old_filename, file.edit_type)
+            for file in routing_files
+        ] == [
+            ("/docs/guide.md", None, EDIT_TYPE.MODIFIED),
+            ("/generated/guard.md", "/services/auth/guard.py", EDIT_TYPE.RENAMED),
+            ("/services/auth/key.pem", None, EDIT_TYPE.MODIFIED),
+            ("/docs/deleted.md", None, EDIT_TYPE.DELETED),
+        ]
+
+    @pytest.mark.parametrize("filtered_by", ["ignore", "extension"])
+    def test_filtered_only_incremental_scope_is_routed_before_review_skip(self, filtered_by):
+        provider = self._provider()
+        commit = SimpleNamespace(commit_id="head", sha="head", parents=[SimpleNamespace()])
+        provider.pr_commits = [commit]
+        provider.get_previous_review = MagicMock(return_value=SimpleNamespace())
+        provider._get_commit_range = MagicMock(return_value=[commit])
+        provider.incremental = IncrementalPR(True)
+        provider.incremental.last_seen_commit = SimpleNamespace(sha="base")
+        provider.unreviewed_files_map = {}
+        provider._routing_incremental_files = None
+        provider.azure_devops_client.get_commit_diffs.return_value = SimpleNamespace(
+            all_changes_included=True,
+            changes=[{
+                "item": {"path": "/services/auth/key.pem"},
+                "changeType": "edit",
+            }],
+        )
+        provider._latest_pr_iteration_changes = tuple(
+            provider.azure_devops_client.get_commit_diffs.return_value.changes
+        )
+        provider._latest_pr_iteration_changes_incomplete = False
+        filtered = [] if filtered_by == "ignore" else ["/services/auth/key.pem"]
+
+        with (
+            patch(
+                "pr_agent.git_providers.azuredevops_provider.filter_ignored",
+                return_value=filtered,
+            ),
+            patch(
+                "pr_agent.git_providers.azuredevops_provider.is_valid_file",
+                return_value=False,
+            ),
+        ):
+            provider._get_incremental_commits()
+
+        assert provider.unreviewed_files_map == {}
+        assert provider.is_incremental_scope_empty() is False
+        assert [file.filename for file in provider.get_files_for_routing()] == [
+            "/services/auth/key.pem"
+        ]
+        provider._get_files_full = MagicMock(return_value=["/docs/full-pr.md"])
+        assert provider.get_files() == []
+        provider._get_files_full.assert_not_called()
+
+    def test_incremental_routing_inventory_marks_partial_change_fetch_as_unknown(self):
+        provider = self._provider()
+        commits = [SimpleNamespace(commit_id="head", sha="head", parents=[SimpleNamespace()])]
+        provider.pr_commits = commits
+        provider.get_previous_review = MagicMock(return_value=SimpleNamespace())
+        provider._get_commit_range = MagicMock(return_value=commits)
+        provider.incremental = IncrementalPR(True)
+        provider.incremental.last_seen_commit = SimpleNamespace(sha="base")
+        provider.unreviewed_files_map = {}
+        provider._routing_incremental_files = None
+        filler = {"item": {"path": "/docs/filler.md"}, "changeType": "edit"}
+        provider.azure_devops_client.get_commit_diffs.side_effect = [
+            SimpleNamespace(
+                all_changes_included=False,
+                changes=[{
+                    "item": {"path": "/docs/guide.md"},
+                    "changeType": "edit",
+                }, *([filler] * 1999)],
+            ),
+            RuntimeError("page unavailable"),
+        ]
+
+        provider._get_incremental_commits()
+
+        routing_files = provider.get_files_for_routing()
+        assert routing_files[0].filename == "/docs/guide.md"
+        assert routing_files[-1].filename == ""
+        assert routing_files[-1].edit_type is EDIT_TYPE.UNKNOWN
+
+    def test_incremental_routing_inventory_reads_all_mapping_and_sdk_pages(self):
+        provider = self._provider()
+        commit = SimpleNamespace(commit_id="head", sha="head", parents=[SimpleNamespace()])
+        provider.pr_commits = [commit]
+        provider.get_previous_review = MagicMock(return_value=SimpleNamespace())
+        provider._get_commit_range = MagicMock(return_value=[commit])
+        provider.incremental = IncrementalPR(True)
+        provider.incremental.last_seen_commit = SimpleNamespace(sha="base")
+        provider.unreviewed_files_map = {}
+        provider._routing_incremental_files = None
+        docs_change = {"item": {"path": "/docs/guide.md"}, "changeType": "edit"}
+        provider.azure_devops_client.get_commit_diffs.side_effect = [
+            {"changes": [docs_change] * 2000, "allChangesIncluded": False},
+            SimpleNamespace(
+                all_changes_included=True,
+                changes=[{
+                    "item": {"path": "/services/auth/guard.py"},
+                    "changeType": "edit",
+                }],
+            ),
+        ]
+        provider._latest_pr_iteration_changes = (
+            docs_change,
+            {
+                "item": {"path": "/services/auth/guard.py"},
+                "changeType": "edit",
+            },
+        )
+        provider._latest_pr_iteration_changes_incomplete = False
+
+        provider._get_incremental_commits()
+
+        assert [file.filename for file in provider.get_files_for_routing()] == [
+            "/docs/guide.md",
+            "/services/auth/guard.py",
+        ]
+        assert provider.unreviewed_files_map == {
+            "/docs/guide.md": "/docs/guide.md",
+            "/services/auth/guard.py": "/services/auth/guard.py",
+        }
+        base = SimpleNamespace(base_version="base", base_version_type="commit")
+        target = SimpleNamespace(target_version="head", target_version_type="commit")
+        assert provider.azure_devops_client.get_commit_diffs.call_args_list == [
+            call(
+                project="my-project",
+                repository_id="my-repo",
+                diff_common_commit=False,
+                top=2000,
+                skip=0,
+                base_version_descriptor=base,
+                target_version_descriptor=target,
+            ),
+            call(
+                project="my-project",
+                repository_id="my-repo",
+                diff_common_commit=False,
+                top=2000,
+                skip=2000,
+                base_version_descriptor=base,
+                target_version_descriptor=target,
+            ),
+        ]
+        provider.azure_devops_client.get_changes.assert_not_called()
+
+    def test_incremental_inventory_excludes_target_merge_noise_from_current_pr_scope(self):
+        provider = self._provider()
+        commits = [
+            SimpleNamespace(
+                commit_id=f"commit-{index}",
+                sha=f"commit-{index}",
+                parents=[SimpleNamespace()],
+            )
+            for index in range(25)
+        ]
+        provider.pr_commits = commits
+        provider.get_previous_review = MagicMock(return_value=SimpleNamespace())
+        provider._get_commit_range = MagicMock(return_value=commits)
+        provider.incremental = IncrementalPR(True)
+        provider.incremental.last_seen_commit = SimpleNamespace(sha="base")
+        provider.unreviewed_files_map = {}
+        provider._routing_incremental_files = None
+        provider.azure_devops_client.get_changes.return_value = SimpleNamespace(changes=[{
+            "item": {"path": "/services/auth/reverted.py"},
+            "changeType": "edit",
+        }])
+        target_only_changes = [
+            {
+                "item": {"path": "/services/auth/target-only.py"},
+                "changeType": "edit",
+            },
+            *[
+                {
+                    "item": {"path": f"/target-only/noise-{index}.py"},
+                    "changeType": "edit",
+                }
+                for index in range(24)
+            ],
+        ]
+        provider.azure_devops_client.get_commit_diffs.return_value = SimpleNamespace(
+            all_changes_included=True,
+            changes=[{
+                "item": {"path": "/docs/remaining.md"},
+                "changeType": "edit",
+            }, *target_only_changes],
+        )
+        provider._latest_pr_iteration_changes = ({
+            "item": {"path": "/docs/remaining.md"},
+            "changeType": "edit",
+        },)
+        provider._latest_pr_iteration_changes_incomplete = False
+
+        provider._get_incremental_commits()
+
+        assert provider.unreviewed_files_map == {
+            "/docs/remaining.md": "/docs/remaining.md",
+        }
+        assert [file.filename for file in provider.get_files_for_routing()] == [
+            "/docs/remaining.md"
+        ]
+        provider.azure_devops_client.get_changes.assert_not_called()
+        kwargs = provider.azure_devops_client.get_commit_diffs.call_args.kwargs
+        assert kwargs["base_version_descriptor"].base_version == "base"
+        assert kwargs["base_version_descriptor"].base_version_type == "commit"
+        assert kwargs["target_version_descriptor"].target_version == "commit-24"
+        assert kwargs["target_version_descriptor"].target_version_type == "commit"
+        assert kwargs["diff_common_commit"] is False
+
+    @pytest.mark.parametrize("iteration_state", ["unavailable", "partial"])
+    def test_incremental_pr_scope_failure_preserves_net_evidence_and_unknown(self, iteration_state):
+        provider = self._provider()
+        commit = SimpleNamespace(commit_id="head", sha="head", parents=[SimpleNamespace()])
+        provider.pr_commits = [commit]
+        provider.get_previous_review = MagicMock(return_value=SimpleNamespace())
+        provider._get_commit_range = MagicMock(return_value=[commit])
+        provider.incremental = IncrementalPR(True)
+        provider.incremental.last_seen_commit = SimpleNamespace(sha="base")
+        provider.unreviewed_files_map = {}
+        provider._routing_incremental_files = None
+        provider._latest_pr_iteration_changes = None
+        provider._latest_pr_iteration_changes_incomplete = None
+        provider.azure_devops_client.get_commit_diffs.return_value = SimpleNamespace(
+            all_changes_included=True,
+            changes=[
+                {"item": {"path": "/docs/remaining.md"}, "changeType": "edit"},
+                {
+                    "item": {"path": "/services/auth/target-only.py"},
+                    "changeType": "edit",
+                },
+            ],
+        )
+        if iteration_state == "unavailable":
+            provider.azure_devops_client.get_pull_request_iterations.side_effect = (
+                RuntimeError("iteration unavailable")
+            )
+        else:
+            provider.azure_devops_client.get_pull_request_iterations.return_value = [
+                SimpleNamespace(id=4)
+            ]
+            filler = {"item": {"path": "/docs/filler.md"}, "changeType": "edit"}
+            provider.azure_devops_client.get_pull_request_iteration_changes.side_effect = [
+                SimpleNamespace(
+                    change_entries=[
+                        {"item": {"path": "/docs/remaining.md"}, "changeType": "edit"},
+                        *([filler] * 1999),
+                    ],
+                    next_skip=2000,
+                ),
+                RuntimeError("later iteration page unavailable"),
+            ]
+
+        provider._get_incremental_commits()
+
+        assert [file.filename for file in provider.get_files_for_routing()] == [
+            "/docs/remaining.md",
+            "/services/auth/target-only.py",
+            "",
+        ]
+        assert provider.get_files_for_routing()[-1].edit_type is EDIT_TYPE.UNKNOWN
+        assert provider.unreviewed_files_map == {
+            "/docs/remaining.md": "/docs/remaining.md",
+            "/services/auth/target-only.py": "/services/auth/target-only.py",
+        }
+
+    def test_incremental_current_pr_empty_drops_target_only_merge_changes(self):
+        provider = self._provider()
+        commit = SimpleNamespace(commit_id="head", sha="head", parents=[SimpleNamespace()])
+        provider.pr_commits = [commit]
+        provider.get_previous_review = MagicMock(return_value=SimpleNamespace())
+        provider._get_commit_range = MagicMock(return_value=[commit])
+        provider.incremental = IncrementalPR(True)
+        provider.incremental.last_seen_commit = SimpleNamespace(sha="base")
+        provider.unreviewed_files_map = {}
+        provider._routing_incremental_files = None
+        provider._latest_pr_iteration_changes = None
+        provider._latest_pr_iteration_changes_incomplete = None
+        provider.azure_devops_client.get_commit_diffs.return_value = SimpleNamespace(
+            all_changes_included=True,
+            changes=[{
+                "item": {"path": "/services/auth/target-only.py"},
+                "changeType": "edit",
+            }],
+        )
+        provider.azure_devops_client.get_pull_request_iterations.return_value = [
+            SimpleNamespace(id=4)
+        ]
+        provider.azure_devops_client.get_pull_request_iteration_changes.return_value = (
+            SimpleNamespace(change_entries=[], next_skip=0)
+        )
+
+        provider._get_incremental_commits()
+
+        assert provider.unreviewed_files_map == {}
+        assert provider.get_files_for_routing() == []
+        assert provider.is_incremental_scope_empty() is True
+
+    def test_incremental_net_diff_total_failure_falls_back_to_full_review(self):
+        provider = self._provider()
+        commit = SimpleNamespace(commit_id="head", sha="head", parents=[SimpleNamespace()])
+        provider.pr_commits = [commit]
+        provider.get_previous_review = MagicMock(return_value=SimpleNamespace())
+        provider._get_commit_range = MagicMock(return_value=[commit])
+        provider.incremental = IncrementalPR(True)
+        provider.incremental.last_seen_commit = SimpleNamespace(sha="base")
+        provider.unreviewed_files_map = {}
+        provider._routing_incremental_files = None
+        provider.azure_devops_client.get_commit_diffs.side_effect = RuntimeError("diff unavailable")
+
+        provider._get_incremental_commits()
+
+        assert provider.incremental.is_incremental is False
+        assert provider._routing_incremental_files[-1].edit_type is EDIT_TYPE.UNKNOWN
+        provider.azure_devops_client.get_changes.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            None,
+            SimpleNamespace(changes=None, all_changes_included=None),
+            {},
+            {"changes": []},
+        ],
+        ids=["none", "sdk-empty-unknown", "mapping-missing", "mapping-empty-unknown"],
+    )
+    def test_incremental_net_diff_empty_without_positive_completeness_falls_back(self, response):
+        provider = self._provider()
+        commit = SimpleNamespace(commit_id="head", sha="head", parents=[SimpleNamespace()])
+        provider.pr_commits = [commit]
+        provider.get_previous_review = MagicMock(return_value=SimpleNamespace())
+        provider._get_commit_range = MagicMock(return_value=[commit])
+        provider.incremental = IncrementalPR(True)
+        provider.incremental.last_seen_commit = SimpleNamespace(sha="base")
+        provider.unreviewed_files_map = {}
+        provider._routing_incremental_files = None
+        provider.azure_devops_client.get_commit_diffs.return_value = response
+
+        provider._get_incremental_commits()
+
+        assert provider.incremental.is_incremental is False
+        assert provider._routing_incremental_files[-1].edit_type is EDIT_TYPE.UNKNOWN
+        provider.azure_devops_client.get_changes.assert_not_called()
+
+    def test_incremental_net_diff_retains_page_when_completeness_metadata_is_malformed(self):
+        provider = self._provider()
+        commit = SimpleNamespace(commit_id="head", sha="head", parents=[SimpleNamespace()])
+        provider.pr_commits = [commit]
+        provider.get_previous_review = MagicMock(return_value=SimpleNamespace())
+        provider._get_commit_range = MagicMock(return_value=[commit])
+        provider.incremental = IncrementalPR(True)
+        provider.incremental.last_seen_commit = SimpleNamespace(sha="base")
+        provider.unreviewed_files_map = {}
+        provider._routing_incremental_files = None
+        provider.azure_devops_client.get_commit_diffs.return_value = SimpleNamespace(
+            all_changes_included="false",
+            changes=[{
+                "item": {"path": "/services/auth/guard.py"},
+                "changeType": "edit",
+            }],
+        )
+
+        provider._get_incremental_commits()
+
+        assert provider.incremental.is_incremental is True
+        assert provider.unreviewed_files_map == {
+            "/services/auth/guard.py": "/services/auth/guard.py",
+        }
+        assert [
+            (file.filename, file.edit_type)
+            for file in provider.get_files_for_routing()
+        ] == [
+            ("/services/auth/guard.py", EDIT_TYPE.MODIFIED),
+            ("", EDIT_TYPE.UNKNOWN),
+        ]
+
+    def test_incremental_routing_inventory_retains_first_page_on_later_failure(self):
+        provider = self._provider()
+        commits = [
+            SimpleNamespace(commit_id="docs", sha="docs", parents=[SimpleNamespace()]),
+            SimpleNamespace(commit_id="head", sha="head", parents=[SimpleNamespace()]),
+        ]
+        provider.pr_commits = commits
+        provider.get_previous_review = MagicMock(return_value=SimpleNamespace())
+        provider._get_commit_range = MagicMock(return_value=commits)
+        provider.incremental = IncrementalPR(True)
+        provider.incremental.last_seen_commit = SimpleNamespace(sha="base")
+        provider.unreviewed_files_map = {}
+        provider._routing_incremental_files = None
+        rename_change = {
+            "item": {"path": "/generated/guard.md"},
+            "changeType": "rename",
+            "originalPath": "/services/auth/guard.py",
+        }
+        delete_change = {
+            "item": {"path": "/services/auth/deleted.py"},
+            "changeType": "delete",
+        }
+        filler_change = {"item": {"path": "/docs/filler.md"}, "changeType": "edit"}
+        provider.azure_devops_client.get_commit_diffs.side_effect = [
+            {
+                "changes": [rename_change, delete_change, *([filler_change] * 1998)],
+                "allChangesIncluded": False,
+            },
+            RuntimeError("later page unavailable"),
+        ]
+
+        with patch(
+            "pr_agent.git_providers.azuredevops_provider.filter_ignored",
+            return_value=[],
+        ):
+            provider._get_incremental_commits()
+
+        routing_files = provider.get_files_for_routing()
+        assert [
+            (file.filename, file.old_filename, file.edit_type)
+            for file in routing_files
+        ] == [
+            ("/generated/guard.md", "/services/auth/guard.py", EDIT_TYPE.RENAMED),
+            ("/services/auth/deleted.py", None, EDIT_TYPE.DELETED),
+            ("/docs/filler.md", None, EDIT_TYPE.MODIFIED),
+            ("", None, EDIT_TYPE.UNKNOWN),
+        ]
+        assert provider.get_files_for_routing() == routing_files
+        base = SimpleNamespace(base_version="base", base_version_type="commit")
+        target = SimpleNamespace(target_version="head", target_version_type="commit")
+        assert provider.azure_devops_client.get_commit_diffs.call_args_list == [
+            call(
+                project="my-project",
+                repository_id="my-repo",
+                diff_common_commit=False,
+                top=2000,
+                skip=0,
+                base_version_descriptor=base,
+                target_version_descriptor=target,
+            ),
+            call(
+                project="my-project",
+                repository_id="my-repo",
+                diff_common_commit=False,
+                top=2000,
+                skip=2000,
+                base_version_descriptor=base,
+                target_version_descriptor=target,
+            ),
+        ]
+        assert provider.unreviewed_files_map == {}
+        provider.azure_devops_client.get_changes.assert_not_called()
+
+    def test_routing_normalization_only_strips_one_documented_provider_root(self):
+        provider = self._provider()
+
+        assert provider.normalize_file_path_for_routing("/docs/guide.md") == "docs/guide.md"
+        assert provider.normalize_file_path_for_routing("docs/guide.md") == "docs/guide.md"
+        assert provider.normalize_file_path_for_routing("//outside") == "/outside"
+
+    def test_routing_inventory_retains_malformed_blob_but_ignores_tree(self):
+        provider = self._provider()
+        provider.incremental = None
+        provider.unreviewed_files_map = {}
+        provider._latest_pr_iteration_changes = (
+            SimpleNamespace(additional_properties={
+                "item": {"path": "/docs/guide.md", "gitObjectType": "blob"},
+                "changeType": "edit",
+            }),
+            SimpleNamespace(additional_properties={
+                "item": {"gitObjectType": "blob"},
+                "changeType": "edit",
+            }),
+            SimpleNamespace(additional_properties={
+                "item": {"path": "/docs", "gitObjectType": "tree"},
+                "changeType": "edit",
+            }),
+        )
+
+        files = provider.get_files_for_routing()
+
+        assert [(file.filename, file.edit_type) for file in files] == [
+            ("/docs/guide.md", EDIT_TYPE.MODIFIED),
+            ("", EDIT_TYPE.UNKNOWN),
+        ]
+
+    def test_detailed_net_rename_keeps_original_path_for_routing_reconciliation(self):
+        provider = self._provider()
+        provider.diff_files = None
+        provider._diff_path_map = None
+        provider.incremental = None
+        provider.unreviewed_files_map = {}
+        provider.pr = SimpleNamespace(
+            last_merge_commit=SimpleNamespace(commit_id="head"),
+            last_merge_target_commit=SimpleNamespace(commit_id="base"),
+        )
+        provider._latest_pr_iteration_changes = (
+            SimpleNamespace(additional_properties={
+                "item": {"path": "/docs/new.md"},
+                "changeType": "rename",
+                "originalPath": "/services/auth/old.py",
+            }),
+        )
+        provider.azure_devops_client.get_item.return_value = SimpleNamespace(content="new")
+
+        with patch(
+            "pr_agent.git_providers.azuredevops_provider.filter_ignored",
+            side_effect=lambda files, _kind: files,
+        ), patch(
+            "pr_agent.git_providers.azuredevops_provider.is_valid_file",
+            return_value=True,
+        ), patch(
+            "pr_agent.git_providers.azuredevops_provider.load_large_diff",
+            return_value="@@ -0,0 +1 @@\n+new\n",
+        ):
+            diff_file = provider.get_diff_files()[0]
+
+        assert diff_file.edit_type is EDIT_TYPE.RENAMED
+        assert diff_file.filename == "/docs/new.md"
+        assert diff_file.old_filename == "/services/auth/old.py"
 
 
 def _provider_with_diff(*filenames):

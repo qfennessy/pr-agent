@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -6,12 +7,40 @@ import pytest
 from pr_agent.algo.inline_comment_dedup import (body_with_markers,
                                                 get_inline_comment_store,
                                                 key_issue_fingerprint)
-from pr_agent.algo.pr_processing import PRDiffCoverage
-from pr_agent.algo.types import FilePatchInfo
-from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity
+from pr_agent.algo.ai_request_context import AIModelRoute, get_ai_request_options
+from pr_agent.algo.pr_processing import (PRDiffCoverage,
+                                         retry_with_fallback_models)
+from pr_agent.algo.review_router import (
+    ChangedFile,
+    ChangeKind,
+    ReviewDepth,
+    load_review_routing_configuration,
+    review_route_decision_to_dict,
+)
+from pr_agent.algo.review_specialists import (
+    RoleExecution,
+    SpecialistBatchResult,
+    SpecialistRole,
+    SpecialistState,
+    unavailable_specialist_batch,
+)
+from pr_agent.algo.run_details import (get_run_details, init_run_details,
+                                       record_model_used)
+from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
+from pr_agent.algo.utils import (PRReviewHeader, PRReviewIdentity,
+                                 show_run_details)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
+from pr_agent.git_providers.bitbucket_provider import BitbucketProvider
+from pr_agent.git_providers.bitbucket_server_provider import BitbucketServerProvider
+from pr_agent.git_providers.gerrit_provider import GerritProvider
+from pr_agent.git_providers.gitea_provider import GiteaProvider
+from pr_agent.git_providers.git_provider import IncrementalPR
+from pr_agent.git_providers.github_provider import GithubProvider
+from pr_agent.git_providers.gitlab_provider import GitLabProvider
 from pr_agent.tools.pr_reviewer import PRReviewer
+from tests.unittest._settings_helpers import (restore_settings,
+                                              snapshot_settings)
 
 # _prepare_prediction now rejects output it cannot parse, so the model's answer can fall
 # back to another model instead of failing after every retry is spent.
@@ -27,12 +56,214 @@ def _make_reviewer(git_provider=None):
 
 def _make_prediction_reviewer(git_provider=None):
     reviewer = _make_reviewer(git_provider)
+    if isinstance(reviewer.git_provider, MagicMock):
+        raw_files = reviewer.git_provider.get_files
+        if raw_files.side_effect is None and isinstance(raw_files.return_value, MagicMock):
+            # Most unit-test providers model one complete inventory. Tests for raw
+            # inventory gaps override this with their explicit failure or mismatch.
+            raw_files.return_value = reviewer.git_provider.get_diff_files.return_value
     reviewer.token_handler = MagicMock()
     reviewer.remaining_files_list = []
     reviewer.deleted_files_list = []
     reviewer.incremental = SimpleNamespace(is_incremental=False)
     reviewer.prediction = None
     return reviewer
+
+
+def _routing_configuration(
+    *, consume=False, requested_depth="auto", sensitive_categories=(), shadow_only=False
+):
+    return load_review_routing_configuration({
+        "enabled": True,
+        "requested_depth": requested_depth,
+        "consume_specialist_escalation": consume,
+        "specialist_escalation_depth": "deep",
+        "profiles": {
+            "quick": {
+                "context_tokens": 8_000,
+                "max_findings": 2,
+                "max_verification_candidates": 1,
+                "model_route": "weak",
+                "timeout_seconds": 30,
+                "max_retries": 0,
+                "max_output_tokens": 2_048,
+                "max_published_findings": 2,
+                "publication_threshold": "high",
+                "shadow_only": shadow_only,
+            },
+            "standard": {
+                "context_tokens": 24_000,
+                "max_findings": 3,
+                "model_route": "regular",
+                "shadow_only": shadow_only,
+            },
+            "deep": {
+                "context_tokens": 32_000,
+                "max_findings": 6,
+                "model_route": "reasoning",
+                "shadow_only": shadow_only,
+            },
+        },
+        "sensitive_categories": list(sensitive_categories),
+    })
+
+
+def _route_file(
+    filename="docs/guide.md",
+    *,
+    edit_type=None,
+    old_filename=None,
+    additions=2,
+    deletions=1,
+):
+    from pr_agent.algo.types import EDIT_TYPE
+
+    return FilePatchInfo(
+        base_file="old\n",
+        head_file="new\n",
+        patch="@@ -1 +1 @@\n-old\n+new",
+        filename=filename,
+        edit_type=edit_type or EDIT_TYPE.MODIFIED,
+        old_filename=old_filename,
+        num_plus_lines=additions,
+        num_minus_lines=deletions,
+    )
+
+
+class _MutatingIncrementalProvider:
+    """Model GitHub's incremental map changing from file objects to patches."""
+
+    def __init__(self, raw_files, detailed_files=None):
+        self.unreviewed_files_map = {file.filename: file for file in raw_files}
+        self._detailed_files = tuple(detailed_files or ())
+        self.calls = []
+
+    def get_files(self):
+        self.calls.append("raw")
+        return self.unreviewed_files_map.values()
+
+    def get_diff_files(self):
+        self.calls.append("detailed")
+        detailed = self._detailed_files or tuple(
+            _route_file(file.filename) for file in self.unreviewed_files_map.values()
+        )
+        for filename, file in tuple(self.unreviewed_files_map.items()):
+            self.unreviewed_files_map[filename] = getattr(file, "patch", None) or "@@ patch body"
+        return detailed
+
+    def is_supported(self, capability):
+        return capability == "get_labels"
+
+    def get_pr_labels(self):
+        return []
+
+
+def _incremental_raw_file(filename, *, status="modified", previous_filename=None):
+    return SimpleNamespace(
+        filename=filename,
+        previous_filename=previous_filename,
+        status=status,
+        additions=1,
+        deletions=1 if status in {"removed", "renamed"} else 0,
+        patch="@@ -1 +1 @@\n-old\n+new",
+    )
+
+
+def _azure_net_change(path, *, change_type="edit", original_path=None):
+    properties = {"item": {"path": path}, "changeType": change_type}
+    if original_path is not None:
+        properties["originalPath"] = original_path
+    return SimpleNamespace(additional_properties=properties)
+
+
+def _azure_routing_provider(net_changes, detailed_files):
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.repo_slug = "repo"
+    provider.workspace_slug = "project"
+    provider.pr_num = 1
+    provider.incremental = None
+    provider.unreviewed_files_map = {}
+    provider._latest_pr_iteration_changes = None
+    provider.azure_devops_client = MagicMock()
+    provider.azure_devops_client.get_pull_request_iterations.return_value = [
+        SimpleNamespace(id=3)
+    ]
+    provider.azure_devops_client.get_pull_request_iteration_changes.return_value = (
+        SimpleNamespace(change_entries=list(net_changes), next_skip=0)
+    )
+    provider.azure_devops_client.get_pull_request_labels.return_value = []
+    provider.get_diff_files = MagicMock(return_value=list(detailed_files))
+    return provider
+
+
+def _gitlab_routing_provider(raw_changes, detailed_files, *, incremental=False):
+    provider = GitLabProvider.__new__(GitLabProvider)
+    provider.incremental = SimpleNamespace(is_incremental=incremental)
+    provider.unreviewed_files_map = (
+        {
+            change.get("new_path", f"unknown-{index}"): change
+            for index, change in enumerate(raw_changes)
+        }
+        if incremental
+        else {}
+    )
+    provider._get_merge_request_changes = MagicMock(
+        return_value={"changes": list(raw_changes)}
+    )
+    provider._expand_submodule_changes = MagicMock(side_effect=lambda files: files)
+    provider.get_diff_files = MagicMock(return_value=list(detailed_files))
+    provider.is_supported = MagicMock(return_value=True)
+    provider.get_pr_labels = MagicMock(return_value=[])
+    return provider
+
+
+def _gitlab_change(old_path, new_path, *, renamed=True):
+    return {
+        "old_path": old_path,
+        "new_path": new_path,
+        "renamed_file": renamed,
+        "new_file": False,
+        "deleted_file": False,
+        "diff": "@@ patch",
+    }
+
+
+def _remaining_rich_routing_provider(provider_type, old_path, new_path, detailed_files):
+    if provider_type is GitLabProvider:
+        return _gitlab_routing_provider(
+            [_gitlab_change(old_path, new_path)],
+            detailed_files,
+        )
+    if provider_type is BitbucketServerProvider:
+        provider = BitbucketServerProvider.__new__(BitbucketServerProvider)
+        provider.workspace_slug = "project"
+        provider.repo_slug = "repo"
+        provider.pr_num = 1
+        provider.bitbucket_client = MagicMock()
+        provider.bitbucket_client.get_pull_requests_changes.return_value = [{
+            "path": {"toString": new_path} if new_path else {},
+            "srcPath": {"toString": old_path} if old_path else {},
+            "type": "MOVE",
+        }]
+    elif provider_type is GerritProvider:
+        provider = GerritProvider.__new__(GerritProvider)
+        diff = SimpleNamespace(
+            a_path=old_path,
+            b_path=new_path,
+            renamed_file=True,
+            new_file=False,
+            deleted_file=False,
+        )
+        commit = MagicMock()
+        commit.parents = [SimpleNamespace()]
+        commit.diff.return_value = [diff]
+        provider.repo = SimpleNamespace(head=SimpleNamespace(commit=commit))
+    else:
+        raise AssertionError(f"unsupported provider type: {provider_type}")
+    provider.get_diff_files = MagicMock(return_value=list(detailed_files))
+    provider.is_supported = MagicMock(return_value=True)
+    provider.get_pr_labels = MagicMock(return_value=[])
+    return provider
 
 
 @pytest.mark.asyncio
@@ -73,6 +304,826 @@ async def test_prepare_prediction_accepts_full_diff_string_when_token_budget_is_
     assert reviewer.remaining_files_list == []
     assert reviewer.deleted_files_list == []
     assert reviewer.prediction == VALID_PREDICTION
+
+
+@pytest.mark.asyncio
+async def test_routed_prediction_applies_context_budget_and_model_specific_token_handler():
+    provider = MagicMock()
+    provider.pr = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+    reviewer._prepare_review_route()
+    reviewer._specialists_started = True
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
+    routed_token_handler = MagicMock()
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.TokenHandler", return_value=routed_token_handler) as token_handler,
+        patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value="diff") as get_pr_diff,
+    ):
+        await reviewer._prepare_prediction("weak-model")
+
+    assert token_handler.call_args.kwargs["model"] == "weak-model"
+    get_pr_diff.assert_called_once_with(
+        provider,
+        routed_token_handler,
+        "weak-model",
+        add_line_numbers_to_hunks=True,
+        disable_extra_lines=False,
+        return_remaining_files=True,
+        return_deleted_files=True,
+        max_context_tokens=8_000,
+        max_output_tokens=2_048,
+    )
+
+
+@pytest.mark.asyncio
+async def test_routed_prediction_reserves_inherited_global_output_cap():
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(max_output_tokens=None),
+    )
+    reviewer._review_context_tokens = 32_000
+    reviewer.vars = {}
+    reviewer._specialists_started = True
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
+    settings = get_settings()
+    previous_cap = settings.config.get("max_output_tokens", 0)
+
+    try:
+        settings.set("config.max_output_tokens", "8192")
+        with (
+            patch("pr_agent.tools.pr_reviewer.TokenHandler", return_value=MagicMock()),
+            patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value="diff") as get_pr_diff,
+        ):
+            await reviewer._prepare_prediction("reasoning-model")
+    finally:
+        settings.set("config.max_output_tokens", previous_cap)
+
+    assert get_pr_diff.call_args.kwargs["max_context_tokens"] == 32_000
+    assert get_pr_diff.call_args.kwargs["max_output_tokens"] == 8_192
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "settings_updates", "expected_cap"),
+    [
+        (
+            "claude-3-7-sonnet-20250219",
+            {
+                "config.enable_claude_extended_thinking": True,
+                "config.extended_thinking_budget_tokens": 2_048,
+                "config.extended_thinking_max_output_tokens": 4_096,
+            },
+            4_096,
+        ),
+        (
+            "openrouter/google/gemini-2.5-pro",
+            {"openrouter.max_tokens": 3_072},
+            3_072,
+        ),
+    ],
+)
+async def test_routed_prediction_reserves_inherited_provider_output_cap(
+    model, settings_updates, expected_cap
+):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(max_output_tokens=None),
+    )
+    reviewer._review_context_tokens = 32_000
+    reviewer.vars = {}
+    reviewer._specialists_started = True
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
+    settings = get_settings()
+    keys = ("config.max_output_tokens", *settings_updates)
+    previous = {key: settings.get(key, None) for key in keys}
+
+    try:
+        settings.set("config.max_output_tokens", 0)
+        for key, value in settings_updates.items():
+            settings.set(key, value)
+        with (
+            patch("pr_agent.tools.pr_reviewer.TokenHandler", return_value=MagicMock()),
+            patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value="diff") as get_pr_diff,
+        ):
+            await reviewer._prepare_prediction(model)
+    finally:
+        for key, value in previous.items():
+            settings.set(key, value)
+
+    assert get_pr_diff.call_args.kwargs["max_output_tokens"] == expected_cap
+
+
+@pytest.mark.asyncio
+async def test_routed_prediction_rejects_unbounded_openrouter_reasoning_before_diff():
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(max_output_tokens=None),
+    )
+    reviewer._review_context_tokens = 32_000
+    reviewer.vars = {}
+    reviewer._specialists_started = True
+    settings = get_settings()
+    keys = (
+        "config.max_output_tokens",
+        "openrouter.max_tokens",
+        "openrouter.reasoning_max_tokens",
+    )
+    previous = {key: settings.get(key, None) for key in keys}
+
+    try:
+        settings.set("config.max_output_tokens", 0)
+        settings.set("openrouter.max_tokens", 0)
+        settings.set("openrouter.reasoning_max_tokens", 2_048)
+        with patch("pr_agent.tools.pr_reviewer.get_pr_diff") as get_pr_diff:
+            with pytest.raises(ValueError, match="requires a positive total"):
+                await reviewer._prepare_prediction("openrouter/google/gemini-2.5-pro")
+    finally:
+        for key, value in previous.items():
+            settings.set(key, value)
+
+    get_pr_diff.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_routed_fallback_rebuilds_diff_for_each_model_context(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.get_diff_files.return_value = []
+    provider.get_languages.return_value = {}
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(max_output_tokens=8_192),
+    )
+    reviewer._review_context_tokens = 32_000
+    reviewer._specialists_started = True
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
+
+    routed_token_handler = MagicMock()
+    routed_token_handler.prompt_tokens = 1_000
+    routed_token_handler.count_tokens.side_effect = lambda value: len(value.split())
+    monkeypatch.setattr(pr_reviewer_module, "TokenHandler", lambda *args, **kwargs: routed_token_handler)
+    monkeypatch.setattr(
+        "pr_agent.algo.pr_processing.sort_files_by_main_languages",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "pr_agent.algo.pr_processing.pr_generate_extended_diff",
+        lambda *args, **kwargs: (["fallback-safe diff"], 2_000, [1_000]),
+    )
+    monkeypatch.setattr(
+        "pr_agent.algo.pr_processing.get_max_tokens",
+        lambda model: {"small-window": 8_192, "larger-window": 16_000}[model],
+    )
+    real_get_pr_diff = pr_reviewer_module.get_pr_diff
+    attempts = []
+
+    def recording_get_pr_diff(provider, token_handler, model, **kwargs):
+        attempts.append((model, kwargs["max_context_tokens"], kwargs["max_output_tokens"]))
+        return real_get_pr_diff(provider, token_handler, model, **kwargs)
+
+    monkeypatch.setattr(pr_reviewer_module, "get_pr_diff", recording_get_pr_diff)
+    route = AIModelRoute(
+        models=("small-window", "larger-window"),
+        deployments=(None, None),
+        max_output_tokens=8_192,
+    )
+
+    await retry_with_fallback_models(
+        reviewer._prepare_prediction,
+        model_route=route,
+    )
+
+    assert attempts == [
+        ("small-window", 32_000, 8_192),
+        ("larger-window", 32_000, 8_192),
+    ]
+    assert reviewer.patches_diff == "fallback-safe diff"
+    assert reviewer.prediction == VALID_PREDICTION
+
+
+def test_profile_model_route_uses_request_local_controls_and_retry_semantics():
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+    reviewer._prepare_review_route()
+
+    with patch("pr_agent.tools.pr_reviewer.get_model", return_value="weak-model"):
+        route = reviewer._review_model_route()
+
+    assert route.models[0] == "weak-model"
+    assert route.timeout_seconds == 30
+    assert route.model_retries == 1
+    assert route.max_output_tokens == 2_048
+    assert route.attribution is None
+
+
+@pytest.mark.parametrize(
+    ("requested_depth", "path", "expected_models", "expected_deployments"),
+    [
+        ("quick", "docs/guide.md", ("weak-model", "fallback-model"),
+         ("weak-deployment", "fallback-deployment")),
+        ("standard", "src/app.py", ("regular-model", "fallback-model"),
+         ("regular-deployment", "fallback-deployment")),
+        ("deep", "services/auth/guard.py", ("reasoning-model", "fallback-model"),
+         ("reasoning-deployment", "fallback-deployment")),
+        ("auto", "docs/guide.md", ("weak-model", "fallback-model"),
+         ("weak-deployment", "fallback-deployment")),
+        ("auto", "services/auth/guard.py", ("reasoning-model", "fallback-model"),
+         ("reasoning-deployment", "fallback-deployment")),
+    ],
+)
+def test_review_depth_model_routes_pair_each_model_with_its_azure_deployment(
+    requested_depth,
+    path,
+    expected_models,
+    expected_deployments,
+):
+    provider = MagicMock()
+    provider.get_files.return_value = [_incremental_raw_file(path)]
+    provider.get_diff_files.return_value = [_route_file(path)]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(
+        requested_depth=requested_depth,
+        sensitive_categories=({
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },),
+    )
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.model_reasoning",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.deployment_id_reasoning",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.model_reasoning = "reasoning-model"
+        settings.config.fallback_models = ["fallback-model"]
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", "weak-deployment")
+        settings.set("openai.deployment_id_reasoning", "reasoning-deployment")
+        settings.set("openai.fallback_deployments", ["fallback-deployment"])
+        init_run_details()
+        reviewer._prepare_review_route()
+
+        route = reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+    assert route.models == expected_models
+    assert route.deployments == expected_deployments
+
+
+@pytest.mark.asyncio
+async def test_routed_azure_primary_and_fallback_deployments_reach_request_context():
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route="weak",
+            timeout_seconds=5,
+            max_retries=0,
+            max_output_tokens=512,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.fallback_models",
+        "config.last_used_model",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.fallback_deployments",
+    ))
+    attempts = []
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.fallback_models = ["fallback-model"]
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", "weak-deployment")
+        settings.set("openai.fallback_deployments", ["fallback-deployment"])
+        route = reviewer._review_model_route()
+
+        async def request(model):
+            options = get_ai_request_options()
+            attempts.append((model, options.deployment_id, options.max_output_tokens))
+            if model == "weak-model":
+                raise RuntimeError("try fallback")
+            return "ok"
+
+        result = await retry_with_fallback_models(request, model_route=route)
+    finally:
+        restore_settings(snapshot)
+
+    assert result == "ok"
+    assert attempts == [
+        ("weak-model", "weak-deployment", 512),
+        ("fallback-model", "fallback-deployment", 512),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_deployment", [None, ""])
+async def test_routed_azure_primary_allows_non_deployment_fallback_slot(
+    fallback_deployment,
+):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route="weak",
+            timeout_seconds=5,
+            max_retries=0,
+            max_output_tokens=512,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.fallback_models",
+        "config.last_used_model",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.fallback_deployments",
+    ))
+    attempts = []
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.fallback_models = ["anthropic/claude"]
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", "weak-deployment")
+        settings.set("openai.fallback_deployments", [fallback_deployment])
+        route = reviewer._review_model_route()
+
+        async def request(model):
+            options = get_ai_request_options()
+            attempts.append((model, options.deployment_id))
+            if model == "weak-model":
+                raise RuntimeError("try fallback")
+            return "ok"
+
+        result = await retry_with_fallback_models(request, model_route=route)
+    finally:
+        restore_settings(snapshot)
+
+    assert result == "ok"
+    assert route.deployments == ("weak-deployment", None)
+    assert attempts == [
+        ("weak-model", "weak-deployment"),
+        ("anthropic/claude", None),
+    ]
+
+
+def test_non_deployment_route_treats_empty_fallback_deployments_string_as_unset():
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route="weak",
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.fallback_models = ["fallback-model"]
+        settings.set("openai.deployment_id", None)
+        settings.set("openai.deployment_id_weak", None)
+        settings.set("openai.fallback_deployments", "")
+
+        route = reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+    assert route.deployments == (None, None)
+
+
+@pytest.mark.parametrize("route_name", ["weak", "reasoning"])
+def test_routed_azure_primary_without_matching_deployment_fails_before_request(route_name):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route=route_name,
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.model_reasoning",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.deployment_id_reasoning",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.model_reasoning = "reasoning-model"
+        settings.config.fallback_models = []
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", None)
+        settings.set("openai.deployment_id_reasoning", None)
+        settings.set("openai.fallback_deployments", [])
+
+        with pytest.raises(ValueError, match=f"openai.deployment_id_{route_name}"):
+            reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+
+@pytest.mark.parametrize(
+    ("route_name", "expected_deployment"),
+    [
+        ("weak", "weak-deployment"),
+        ("reasoning", "reasoning-deployment"),
+    ],
+)
+def test_routed_azure_deployment_uses_route_identity_when_model_names_match(
+    route_name,
+    expected_deployment,
+):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route=route_name,
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.model_reasoning",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.deployment_id_reasoning",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "shared-model"
+        settings.config.model_weak = "shared-model"
+        settings.config.model_reasoning = "shared-model"
+        settings.config.fallback_models = []
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", "weak-deployment")
+        settings.set("openai.deployment_id_reasoning", "reasoning-deployment")
+        settings.set("openai.fallback_deployments", [])
+
+        route = reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+    assert route.models == ("shared-model",)
+    assert route.deployments == (expected_deployment,)
+
+
+@pytest.mark.parametrize("route_name", ["weak", "reasoning"])
+def test_equal_model_routed_azure_primary_still_requires_route_deployment(route_name):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route=route_name,
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.model_reasoning",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.deployment_id_reasoning",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "shared-model"
+        settings.config.model_weak = "shared-model"
+        settings.config.model_reasoning = "shared-model"
+        settings.config.fallback_models = []
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", None)
+        settings.set("openai.deployment_id_reasoning", None)
+        settings.set("openai.fallback_deployments", [])
+
+        with pytest.raises(ValueError, match=f"openai.deployment_id_{route_name}"):
+            reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+
+@pytest.mark.parametrize("route_name", ["weak", "reasoning"])
+def test_routed_azure_absent_dedicated_model_reuses_regular_deployment(route_name):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route=route_name,
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.model_reasoning",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.deployment_id_reasoning",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = None
+        settings.config.model_reasoning = None
+        settings.config.fallback_models = []
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", None)
+        settings.set("openai.deployment_id_reasoning", None)
+        settings.set("openai.fallback_deployments", [])
+
+        route = reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+    assert route.models == ("regular-model",)
+    assert route.deployments == ("regular-deployment",)
+
+
+@pytest.mark.parametrize(
+    "fallback_deployments",
+    [["fallback-a"], ["fallback-a", "fallback-b", "extra"]],
+)
+def test_routed_model_rejects_mismatched_fallback_deployment_mapping(
+    fallback_deployments,
+):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route="weak",
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.fallback_models = ["fallback-a", "fallback-b"]
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", "weak-deployment")
+        settings.set("openai.fallback_deployments", fallback_deployments)
+
+        with pytest.raises(ValueError, match="must match fallback_models"):
+            reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+
+def test_routed_azure_model_rejects_missing_fallback_deployment_mapping():
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route="weak",
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.fallback_models = ["fallback-model"]
+        settings.set("openai.deployment_id", "regular-deployment")
+        settings.set("openai.deployment_id_weak", "weak-deployment")
+        settings.set("openai.fallback_deployments", [])
+
+        with pytest.raises(ValueError, match="requires one fallback_deployments entry"):
+            reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+
+@pytest.mark.parametrize("route_name", ["regular", "weak", "reasoning"])
+def test_non_azure_review_routes_preserve_none_deployment_parity(route_name):
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_route_decision = SimpleNamespace(
+        routing_enabled=True,
+        applied_budget=SimpleNamespace(
+            model_route=route_name,
+            timeout_seconds=None,
+            max_retries=None,
+            max_output_tokens=None,
+        ),
+    )
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.model",
+        "config.model_weak",
+        "config.model_reasoning",
+        "config.fallback_models",
+        "openai.deployment_id",
+        "openai.deployment_id_weak",
+        "openai.deployment_id_reasoning",
+        "openai.fallback_deployments",
+    ))
+    try:
+        settings.config.model = "regular-model"
+        settings.config.model_weak = "weak-model"
+        settings.config.model_reasoning = "reasoning-model"
+        settings.config.fallback_models = ["fallback-model"]
+        settings.set("openai.deployment_id", None)
+        settings.set("openai.deployment_id_weak", None)
+        settings.set("openai.deployment_id_reasoning", None)
+        settings.set("openai.fallback_deployments", [])
+
+        route = reviewer._review_model_route()
+    finally:
+        restore_settings(snapshot)
+
+    assert route.deployments == (None, None)
+
+
+def test_quick_claude_weak_route_disables_thinking_when_cap_equals_budget():
+    from pr_agent.algo import CLAUDE_EXTENDED_THINKING_MODELS
+    from pr_agent.algo.ai_handlers.litellm_ai_handler import (
+        LiteLLMAIHandler,
+        get_effective_litellm_output_token_cap,
+    )
+
+    provider = MagicMock()
+    provider.get_files.return_value = ["docs/guide.md"]
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+    reviewer._prepare_review_route()
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.enable_claude_extended_thinking",
+        "config.extended_thinking_budget_tokens",
+        "config.extended_thinking_max_output_tokens",
+    ))
+
+    try:
+        settings.set("config.enable_claude_extended_thinking", True)
+        settings.set("config.extended_thinking_budget_tokens", 2_048)
+        settings.set("config.extended_thinking_max_output_tokens", 4_096)
+        model = "claude-3-7-sonnet-20250219"
+        with patch("pr_agent.tools.pr_reviewer.get_model", return_value=model):
+            route = reviewer._review_model_route()
+        effective_cap = get_effective_litellm_output_token_cap(
+            model,
+            route.max_output_tokens,
+            claude_extended_thinking_models=CLAUDE_EXTENDED_THINKING_MODELS,
+        )
+        handler = LiteLLMAIHandler.__new__(LiteLLMAIHandler)
+        handler.claude_extended_thinking_models = CLAUDE_EXTENDED_THINKING_MODELS
+        kwargs = handler._configure_claude_extended_thinking(
+            model,
+            {},
+            effective_max_output_tokens=effective_cap,
+        )
+    finally:
+        restore_settings(snapshot)
+
+    assert route.models[0] == model
+    assert route.max_output_tokens == 2_048
+    assert effective_cap == 2_048
+    assert "thinking" not in kwargs
+
+
+def test_publication_budget_clamps_findings_and_shadow_profile_never_publishes_markdown():
+    reviewer = _make_prediction_reviewer()
+    reviewer._review_max_published_findings = 1
+    reviewer._review_shadow_only = True
+    data = {
+        "review": {
+            "key_issues_to_review": [
+                {"issue_header": "one"},
+                {"issue_header": "two"},
+            ]
+        }
+    }
+
+    limited = reviewer._apply_publication_budget(data)
+
+    assert [issue["issue_header"] for issue in limited["review"]["key_issues_to_review"]] == ["one"]
+    assert len(data["review"]["key_issues_to_review"]) == 2
+    assert reviewer._should_publish_review_no_suggestions("review") is False
+
+
+def test_generated_and_publication_finding_budgets_are_independent_and_immutable():
+    reviewer = _make_prediction_reviewer()
+    reviewer._review_max_findings = 2
+    reviewer._review_max_published_findings = 1
+    data = {
+        "review": {
+            "key_issues_to_review": [
+                {"issue_header": "one"},
+                {"issue_header": "two"},
+                {"issue_header": "three"},
+            ]
+        }
+    }
+
+    generated = reviewer._apply_finding_budget(data)
+    published = reviewer._apply_publication_budget(generated)
+
+    assert [issue["issue_header"] for issue in generated["review"]["key_issues_to_review"]] == [
+        "one", "two",
+    ]
+    assert [issue["issue_header"] for issue in published["review"]["key_issues_to_review"]] == ["one"]
+    assert len(data["review"]["key_issues_to_review"]) == 3
 
 
 @pytest.mark.asyncio
@@ -126,6 +1177,2535 @@ async def test_enabled_shadow_specialists_run_at_most_once_across_main_fallback_
         (("primary",), {}),
         (("fallback",), {}),
     ]
+
+
+@pytest.mark.parametrize(
+    ("edit_type", "filename", "old_filename", "expected_kind", "old_path", "new_path"),
+    [
+        ("ADDED", "new.py", None, "added", None, "new.py"),
+        ("DELETED", "old.py", None, "deleted", "old.py", None),
+        ("MODIFIED", "same.py", None, "modified", None, "same.py"),
+        ("RENAMED", "new.py", "old.py", "renamed", "old.py", "new.py"),
+        ("UNKNOWN", "maybe.py", None, "unknown", None, "maybe.py"),
+    ],
+)
+def test_file_patch_info_conversion_preserves_edit_identity(
+    edit_type, filename, old_filename, expected_kind, old_path, new_path
+):
+    from pr_agent.algo.types import EDIT_TYPE
+
+    changed = PRReviewer._changed_file_for_routing(_route_file(
+        filename,
+        edit_type=getattr(EDIT_TYPE, edit_type),
+        old_filename=old_filename,
+        additions=-1,
+        deletions=-1,
+    ))
+
+    assert changed.kind.value == expected_kind
+    assert changed.old_path == old_path
+    assert changed.new_path == new_path
+    assert changed.additions is None
+    assert changed.deletions is None
+
+
+def test_deterministic_route_runs_from_provider_metadata_and_records_structured_decision():
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert reviewer.vars["num_max_findings"] == 2
+    assert reviewer.vars["publication_threshold"] == "high"
+    assert reviewer.vars["max_verification_candidates"] == 1
+    assert reviewer._review_context_tokens == 8_000
+    assert get_run_details().review_route == review_route_decision_to_dict(decision)
+
+
+@pytest.mark.parametrize(
+    ("raw_configuration", "configuration_name"),
+    [(None, "absent"), ({"enabled": False}, "disabled")],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_disabled_or_absent_routing_preserves_run_details_byte_for_byte(
+    monkeypatch, raw_configuration, configuration_name
+):
+    from pr_agent.algo import run_details
+
+    monkeypatch.setattr(run_details.time, "monotonic", lambda: 108.2)
+    provider = MagicMock()
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = load_review_routing_configuration(raw_configuration)
+
+    baseline_details = init_run_details()
+    baseline_details.start_time = 100.0
+    record_model_used("model-a", is_fallback=False)
+    baseline = show_run_details(gfm_supported=True)
+
+    routed_details = init_run_details()
+    routed_details.start_time = 100.0
+    record_model_used("model-a", is_fallback=False)
+    decision = reviewer._prepare_review_route()
+    routed = show_run_details(gfm_supported=True)
+
+    assert configuration_name in {"absent", "disabled"}
+    assert decision.routing_enabled is False
+    assert get_run_details().review_route is None
+    assert routed == baseline
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider.get_pr_labels.assert_not_called()
+
+
+def test_enabled_standard_route_is_recorded_and_rendered():
+    provider = MagicMock()
+    provider.get_files.return_value = ["docs/guide.md"]
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(requested_depth="standard")
+    init_run_details()
+    record_model_used("model-a", is_fallback=False)
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.routing_enabled is True
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert get_run_details().review_route == review_route_decision_to_dict(decision)
+    assert "Review depth: standard" in show_run_details(gfm_supported=True)
+
+
+@pytest.mark.asyncio
+async def test_disabled_routing_adds_no_provider_inventory_or_model_calls(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.get_files.return_value = ["docs/guide.md"]
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = False
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
+
+    async def fake_retry(prepare_fn, model_type=None):
+        reviewer.prediction = VALID_PREDICTION
+
+    retry = AsyncMock(side_effect=fake_retry)
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", AsyncMock())
+    monkeypatch.setattr(pr_reviewer_module, "convert_to_markdown_v2", MagicMock(return_value="legacy review"))
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.publish_output",
+        "config.is_auto_command",
+        "config.output_run_details",
+        "data",
+        "pr_reviewer.enable_help_text",
+    ))
+    try:
+        settings.config.publish_output = False
+        settings.config.is_auto_command = False
+        settings.config.output_run_details = True
+        settings.pr_reviewer.enable_help_text = False
+        settings.data = {"artifact": ""}
+
+        await reviewer.run()
+        artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert artifact == "legacy review"
+    assert get_run_details().review_route is None
+    assert reviewer._review_model_route() is None
+    retry.assert_awaited_once()
+    assert provider.get_files.call_count == 1
+    assert provider.get_diff_files.call_count == 1
+    provider.get_pr_labels.assert_not_called()
+    structured = provider.publish_structured_review.call_args.args[0]
+    assert "review_route" not in structured["metadata"]
+
+
+@pytest.mark.parametrize("file_count", [1, 12, 13])
+def test_incremental_docs_inventory_is_snapshotted_before_patch_mutation(file_count):
+    raw_files = [
+        _incremental_raw_file(f"docs/guide-{index}.md")
+        for index in range(file_count)
+    ]
+    provider = _MutatingIncrementalProvider(raw_files)
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert provider.calls == ["raw", "detailed"]
+    assert all(isinstance(value, str) for value in provider.unreviewed_files_map.values())
+    assert len(reviewer.review_route_request.files) == file_count
+    assert all(file.kind is not ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+
+
+def test_incremental_sensitive_path_still_forces_deep_after_patch_mutation():
+    raw_files = [
+        _incremental_raw_file("docs/guide.md"),
+        _incremental_raw_file("services/auth/guard.py"),
+    ]
+    provider = _MutatingIncrementalProvider(raw_files)
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+
+
+def test_github_net_incremental_inventory_ignores_reverted_history_for_routing():
+    provider = GithubProvider.__new__(GithubProvider)
+    provider.incremental = IncrementalPR(True)
+    provider._routing_incremental_files = (
+        _incremental_raw_file("docs/guide.md"),
+    )
+    provider.unreviewed_files_map = {
+        "docs/guide.md": provider._routing_incremental_files[0],
+    }
+    provider.get_diff_files = MagicMock(return_value=[_route_file("docs/guide.md")])
+    provider.pr = SimpleNamespace(labels=[])
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert decision.matched_sensitive_categories == ()
+    assert [file.new_path for file in reviewer.review_route_request.files] == [
+        "docs/guide.md"
+    ]
+
+
+def test_incremental_snapshot_preserves_deleted_and_renamed_paths():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    raw_files = [
+        _incremental_raw_file("docs/deleted.md", status="removed"),
+        _incremental_raw_file(
+            "docs/new-name.md",
+            status="renamed",
+            previous_filename="services/auth/old-name.py",
+        ),
+    ]
+    detailed_files = [
+        _route_file("docs/deleted.md", edit_type=EDIT_TYPE.DELETED),
+        _route_file(
+            "docs/new-name.md",
+            edit_type=EDIT_TYPE.RENAMED,
+            old_filename="services/auth/old-name.py",
+        ),
+    ]
+    reviewer = _make_prediction_reviewer(
+        _MutatingIncrementalProvider(raw_files, detailed_files)
+    )
+
+    changed_files = reviewer._changed_files_for_routing()
+
+    assert changed_files[0].kind is ChangeKind.DELETED
+    assert changed_files[0].old_path == "docs/deleted.md"
+    assert changed_files[0].new_path is None
+    assert changed_files[1].kind is ChangeKind.RENAMED
+    assert changed_files[1].old_path == "services/auth/old-name.py"
+    assert changed_files[1].new_path == "docs/new-name.md"
+
+
+def test_incremental_detailed_raw_mismatch_keeps_fail_safe_unknown_floor():
+    raw_files = [_incremental_raw_file("docs/guide.md")]
+    detailed_files = [
+        _route_file("docs/guide.md"),
+        _route_file("src/unmatched.py"),
+    ]
+    provider = _MutatingIncrementalProvider(raw_files, detailed_files)
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+    assert [file.new_path for file in reviewer.review_route_request.files].count("docs/guide.md") == 1
+
+
+def test_nonincremental_provider_inventory_remains_provider_neutral_and_deduplicated():
+    provider = MagicMock()
+    raw_file = SimpleNamespace(
+        filename="docs/guide.md",
+        status="modified",
+        additions=1,
+        deletions=0,
+    )
+    provider.get_files.return_value = [raw_file]
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    reviewer = _make_prediction_reviewer(provider)
+
+    changed_files = reviewer._changed_files_for_routing()
+
+    assert changed_files == (ChangedFile(
+        new_path="docs/guide.md",
+        kind=ChangeKind.MODIFIED,
+        additions=2,
+        deletions=1,
+    ),)
+    provider.get_files.assert_called_once_with()
+    provider.get_diff_files.assert_called_once_with()
+
+
+def test_azure_provider_rooted_docs_only_inventory_routes_quick():
+    provider = _azure_routing_provider(
+        [_azure_net_change("/docs/guide.md")],
+        [_route_file("/docs/guide.md")],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert reviewer.review_route_request.files[0].new_path == "docs/guide.md"
+    assert "input_invalid" not in [reason.code for reason in decision.reasons]
+
+
+def test_azure_sensitive_net_path_still_forces_deep():
+    provider = _azure_routing_provider(
+        [_azure_net_change("/services/auth/guard.py")],
+        [_route_file("/services/auth/guard.py")],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+
+
+def test_azure_historical_union_does_not_inflate_net_pr_routing():
+    provider = _azure_routing_provider(
+        [_azure_net_change("/docs/guide.md")],
+        [_route_file("/docs/guide.md")],
+    )
+    provider.azure_devops_client.get_pull_request_commits.return_value = [
+        SimpleNamespace(commit_id=f"commit-{index}") for index in range(25)
+    ]
+    provider.azure_devops_client.get_changes.return_value = SimpleNamespace(changes=[
+        {"item": {"path": "/services/auth/reverted.py"}},
+    ])
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert [file.new_path for file in reviewer.review_route_request.files] == ["docs/guide.md"]
+    provider.azure_devops_client.get_pull_request_commits.assert_not_called()
+    provider.azure_devops_client.get_changes.assert_not_called()
+
+
+def test_azure_net_inventory_preserves_rename_delete_and_drops_reverted_history():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = _azure_routing_provider(
+        [
+            _azure_net_change(
+                "/docs/new-name.md",
+                change_type="edit, rename",
+                original_path="/services/auth/old-name.py",
+            ),
+            _azure_net_change("/docs/deleted.md", change_type="delete"),
+        ],
+        [
+            _route_file(
+                "/docs/new-name.md",
+                edit_type=EDIT_TYPE.RENAMED,
+                old_filename="/services/auth/old-name.py",
+            ),
+            _route_file("/docs/deleted.md", edit_type=EDIT_TYPE.DELETED),
+        ],
+    )
+    provider.azure_devops_client.get_pull_request_commits.return_value = [
+        SimpleNamespace(commit_id="historical")
+    ]
+    provider.azure_devops_client.get_changes.return_value = SimpleNamespace(changes=[
+        {"item": {"path": "/services/auth/reverted.py"}},
+    ])
+    reviewer = _make_prediction_reviewer(provider)
+
+    changed_files = reviewer._changed_files_for_routing()
+
+    assert changed_files == (
+        ChangedFile(
+            new_path="docs/new-name.md",
+            old_path="services/auth/old-name.py",
+            kind=ChangeKind.RENAMED,
+            additions=2,
+            deletions=1,
+        ),
+        ChangedFile(
+            new_path=None,
+            old_path="docs/deleted.md",
+            kind=ChangeKind.DELETED,
+            additions=2,
+            deletions=1,
+        ),
+    )
+    assert all("reverted.py" not in (file.old_path or "") for file in changed_files)
+    provider.azure_devops_client.get_pull_request_commits.assert_not_called()
+
+
+def test_azure_ignored_sensitive_net_path_remains_visible_to_router():
+    provider = _azure_routing_provider(
+        [
+            _azure_net_change("/docs/guide.md"),
+            _azure_net_change("/services/auth/ignored.py"),
+        ],
+        [_route_file("/docs/guide.md")],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert {file.new_path for file in reviewer.review_route_request.files} == {
+        "docs/guide.md",
+        "services/auth/ignored.py",
+    }
+
+
+@pytest.mark.parametrize(
+    "sensitive_file",
+    [
+        FilePatchInfo(
+            base_file="",
+            head_file="",
+            patch="",
+            filename="/generated/guard.md",
+            edit_type=EDIT_TYPE.RENAMED,
+            old_filename="/services/auth/guard.py",
+        ),
+        FilePatchInfo(
+            base_file="",
+            head_file="",
+            patch="",
+            filename="/services/auth/key.pem",
+            edit_type=EDIT_TYPE.MODIFIED,
+        ),
+    ],
+    ids=["ignored-rename-source", "invalid-extension-path"],
+)
+def test_azure_incremental_unfiltered_inventory_forces_deep_when_detail_is_filtered(
+    sensitive_file,
+):
+    provider = _azure_routing_provider(
+        [],
+        [_route_file("/docs/guide.md")],
+    )
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {"/docs/guide.md": "@@ patch"}
+    provider._routing_incremental_files = (
+        FilePatchInfo(
+            base_file="",
+            head_file="",
+            patch="",
+            filename="/docs/guide.md",
+            edit_type=EDIT_TYPE.MODIFIED,
+        ),
+        sensitive_file,
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert any(
+        path and "services/auth/" in path
+        for file in reviewer.review_route_request.files
+        for path in (file.old_path, file.new_path)
+    )
+
+
+def test_azure_incremental_uninitialized_routing_inventory_fails_safe():
+    provider = _azure_routing_provider(
+        [],
+        [_route_file("/docs/guide.md")],
+    )
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {"/docs/guide.md": "@@ patch"}
+    provider._routing_incremental_files = None
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+
+
+def test_azure_malformed_non_tree_net_entry_prevents_quick():
+    provider = _azure_routing_provider(
+        [
+            _azure_net_change("/docs/guide.md"),
+            SimpleNamespace(additional_properties={
+                "item": {"gitObjectType": "blob"},
+                "changeType": "edit",
+            }),
+        ],
+        [_route_file("/docs/guide.md")],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+    assert "files[1].kind" in decision.missing_inputs
+    assert "files[1].path" in decision.missing_inputs
+
+
+def test_azure_tree_entry_is_intentionally_ignored_without_blocking_quick():
+    provider = _azure_routing_provider(
+        [
+            _azure_net_change("/docs/guide.md"),
+            SimpleNamespace(additional_properties={
+                "item": {"path": "/docs", "gitObjectType": "tree"},
+                "changeType": "edit",
+            }),
+        ],
+        [_route_file("/docs/guide.md")],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert len(reviewer.review_route_request.files) == 1
+
+
+def test_untrusted_provider_absolute_paths_remain_invalid_and_force_deep():
+    provider = MagicMock()
+    provider.get_files.return_value = [
+        SimpleNamespace(filename="/docs/guide.md", status="modified", additions=2, deletions=1)
+    ]
+    provider.get_diff_files.return_value = [_route_file("/docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert "input_invalid" in [reason.code for reason in decision.reasons]
+    assert reviewer.review_route_request.files[0].new_path == "/docs/guide.md"
+
+
+@pytest.mark.parametrize("provider_type", [GiteaProvider, BitbucketProvider])
+def test_provider_rich_inventory_restores_sensitive_old_rename_path(provider_type):
+    from pr_agent.algo.types import EDIT_TYPE
+
+    old_path = "services/auth/guard.py"
+    new_path = "docs/guard.md"
+    if provider_type is GiteaProvider:
+        provider = GiteaProvider.__new__(GiteaProvider)
+        provider._routing_git_files = ({
+            "filename": new_path,
+            "previous_filename": old_path,
+            "status": "renamed",
+            "additions": 2,
+            "deletions": 1,
+        },)
+        provider.git_files = [{"filename": new_path, "status": "renamed"}]
+        provider.pr = SimpleNamespace(labels=[])
+        provider.logger = MagicMock()
+    else:
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        diffstat = SimpleNamespace(
+            new=SimpleNamespace(path=new_path),
+            old=SimpleNamespace(path=old_path),
+            data={
+                "status": "renamed",
+                "lines_added": 2,
+                "lines_removed": 1,
+            },
+        )
+        provider.pr = MagicMock()
+        provider.pr.diffstat.return_value = [diffstat]
+    provider.get_diff_files = MagicMock(return_value=[
+        _route_file(new_path, edit_type=EDIT_TYPE.RENAMED, old_filename=None)
+    ])
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert reviewer.review_route_request.files[0].old_path == old_path
+    assert reviewer.review_route_request.files[0].new_path == new_path
+
+
+@pytest.mark.parametrize(
+    ("new_path", "detailed_files", "incremental"),
+    [
+        ("generated/guard.md", [], False),
+        (
+            "docs/guard.md",
+            [_route_file(
+                "docs/guard.md",
+                edit_type=EDIT_TYPE.RENAMED,
+                old_filename=None,
+            )],
+            True,
+        ),
+    ],
+    ids=["ignored-destination", "safe-destination-incremental"],
+)
+def test_gitlab_rich_inventory_preserves_sensitive_rename_source(
+    new_path, detailed_files, incremental
+):
+    provider = _gitlab_routing_provider(
+        [_gitlab_change("services/auth/guard.py", new_path)],
+        detailed_files,
+        incremental=incremental,
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    renamed = reviewer.review_route_request.files[0]
+    assert renamed.kind is ChangeKind.RENAMED
+    assert renamed.old_path == "services/auth/guard.py"
+    assert renamed.new_path == new_path
+
+
+def test_gitlab_filtered_detailed_inventory_keeps_all_raw_paths_visible():
+    provider = _gitlab_routing_provider(
+        [
+            _gitlab_change("docs/guide.md", "docs/guide.md", renamed=False),
+            _gitlab_change("services/auth/guard.py", "generated/guard.md"),
+        ],
+        [_route_file("docs/guide.md")],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert {file.new_path for file in reviewer.review_route_request.files} == {
+        "docs/guide.md",
+        "generated/guard.md",
+    }
+
+
+def test_gitlab_malformed_rename_inventory_fails_safe_without_inventing_source():
+    provider = _gitlab_routing_provider(
+        [_gitlab_change(None, "docs/guard.md")],
+        [],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert reviewer.review_route_request.files[0].old_path is None
+    assert "files[0].old_path" in decision.missing_inputs
+
+
+def test_gitlab_conflicting_rename_sources_retain_both_and_fail_safe():
+    provider = _gitlab_routing_provider(
+        [_gitlab_change("services/auth/guard.py", "docs/guard.md")],
+        [_route_file(
+            "docs/guard.md",
+            edit_type=EDIT_TYPE.RENAMED,
+            old_filename="docs/other-old.md",
+        )],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+    assert {file.old_path for file in reviewer.review_route_request.files if file.old_path} == {
+        "services/auth/guard.py",
+        "docs/other-old.md",
+    }
+
+
+@pytest.mark.parametrize("provider_type", [GerritProvider, BitbucketServerProvider])
+def test_remaining_rich_providers_preserve_sensitive_source_when_detail_is_filtered(
+    provider_type,
+):
+    provider = _remaining_rich_routing_provider(
+        provider_type,
+        "services/auth/guard.py",
+        "generated/guard.md",
+        [],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    renamed = reviewer.review_route_request.files[0]
+    assert renamed.old_path == "services/auth/guard.py"
+    assert renamed.new_path == "generated/guard.md"
+
+
+@pytest.mark.parametrize("provider_type", [GerritProvider, BitbucketServerProvider])
+def test_remaining_rich_providers_preserve_sensitive_destination_when_detail_is_filtered(
+    provider_type,
+):
+    provider = _remaining_rich_routing_provider(
+        provider_type,
+        "docs/guard.md",
+        "services/auth/guard.py",
+        [],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    renamed = reviewer.review_route_request.files[0]
+    assert renamed.old_path == "docs/guard.md"
+    assert renamed.new_path == "services/auth/guard.py"
+
+
+@pytest.mark.parametrize(
+    "provider_type",
+    [GitLabProvider, GerritProvider, BitbucketServerProvider],
+)
+def test_rich_provider_malformed_rename_endpoint_cannot_route_quick(provider_type):
+    provider = _remaining_rich_routing_provider(
+        provider_type,
+        None,
+        "docs/guard.md",
+        [],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert "files[0].old_path" in decision.missing_inputs
+
+
+@pytest.mark.parametrize(
+    "provider_type",
+    [GitLabProvider, GerritProvider, BitbucketServerProvider],
+)
+def test_rich_provider_complete_docs_rename_can_still_route_quick(provider_type):
+    provider = _remaining_rich_routing_provider(
+        provider_type,
+        "docs/old-guide.md",
+        "docs/new-guide.md",
+        [_route_file(
+            "docs/new-guide.md",
+            edit_type=EDIT_TYPE.RENAMED,
+            old_filename="docs/old-guide.md",
+        )],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert reviewer.review_route_request.files == (
+        ChangedFile(
+            new_path="docs/new-guide.md",
+            old_path="docs/old-guide.md",
+            kind=ChangeKind.RENAMED,
+            additions=2,
+            deletions=1,
+        ),
+    )
+
+
+def test_incomplete_rename_provenance_prevents_quick_without_inventing_old_path():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = MagicMock()
+    provider.get_files.return_value = [{
+        "filename": "docs/guard.md",
+        "status": "renamed",
+        "additions": 2,
+        "deletions": 1,
+    }]
+    provider.get_diff_files.return_value = [
+        _route_file("docs/guard.md", edit_type=EDIT_TYPE.RENAMED, old_filename=None)
+    ]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert reviewer.review_route_request.files[0].old_path is None
+    assert "files[0].old_path" in decision.missing_inputs
+
+
+def test_malformed_old_rename_path_remains_invalid_and_forces_deep():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = MagicMock()
+    provider.get_files.return_value = [{
+        "filename": "docs/guard.md",
+        "previous_filename": "/services/auth/guard.py",
+        "status": "renamed",
+        "additions": 2,
+        "deletions": 1,
+    }]
+    provider.get_diff_files.return_value = [
+        _route_file("docs/guard.md", edit_type=EDIT_TYPE.RENAMED, old_filename=None)
+    ]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert reviewer.review_route_request.files[0].old_path == "/services/auth/guard.py"
+    assert "input_invalid" in [reason.code for reason in decision.reasons]
+
+
+def test_conflicting_old_rename_paths_retain_both_and_fail_safe():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = MagicMock()
+    provider.get_files.return_value = [{
+        "filename": "docs/guard.md",
+        "previous_filename": "services/auth/guard.py",
+        "status": "renamed",
+        "additions": 2,
+        "deletions": 1,
+    }]
+    provider.get_diff_files.return_value = [
+        _route_file(
+            "docs/guard.md",
+            edit_type=EDIT_TYPE.RENAMED,
+            old_filename="docs/other-old.md",
+        )
+    ]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+    assert {file.old_path for file in reviewer.review_route_request.files if file.old_path} == {
+        "services/auth/guard.py",
+        "docs/other-old.md",
+    }
+
+
+def test_same_old_and_new_rename_path_is_incomplete_and_prevents_quick():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = MagicMock()
+    provider.get_files.return_value = [{
+        "filename": "docs/guard.md",
+        "previous_filename": "docs/guard.md",
+        "status": "renamed",
+        "additions": 2,
+        "deletions": 1,
+    }]
+    provider.get_diff_files.return_value = [
+        _route_file("docs/guard.md", edit_type=EDIT_TYPE.RENAMED, old_filename=None)
+    ]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+
+
+def test_changed_file_metadata_failure_is_recorded_and_prevents_quick():
+    provider = MagicMock()
+    provider.get_diff_files.side_effect = RuntimeError("metadata unavailable")
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert "files[0].kind" in decision.missing_inputs
+    assert "inputs_missing" in [reason.code for reason in decision.reasons]
+
+
+@pytest.mark.parametrize("labels_supported", [False, True])
+def test_unavailable_label_metadata_is_recorded_and_prevents_quick(labels_supported):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = labels_supported
+    if labels_supported:
+        provider.get_pr_labels.side_effect = RuntimeError("labels unavailable")
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert "labels" in decision.missing_inputs
+
+
+@pytest.mark.parametrize("provider_type", [GithubProvider, AzureDevopsProvider])
+def test_provider_label_failures_remain_unavailable_for_routing(provider_type):
+    provider = provider_type.__new__(provider_type)
+    if provider_type is GithubProvider:
+        exploding_labels = MagicMock()
+        type(exploding_labels).labels = property(lambda _: (_ for _ in ()).throw(RuntimeError("labels unavailable")))
+        provider.pr = exploding_labels
+    else:
+        provider.workspace_slug = "workspace"
+        provider.repo_slug = "repo"
+        provider.pr_num = 1
+        provider.azure_devops_client = MagicMock()
+        provider.azure_devops_client.get_pull_request_labels.side_effect = RuntimeError("labels unavailable")
+
+    assert provider.get_pr_labels() == []
+    assert provider.get_pr_labels_for_routing() is None
+
+
+@pytest.mark.parametrize("raw_sensitive_file", [
+    SimpleNamespace(filename="services/auth/guard.py", status="modified", additions=1, deletions=0),
+    SimpleNamespace(filename="services/auth/guard.py", status="removed", additions=0, deletions=1),
+    SimpleNamespace(old_path="services/auth/guard.py", status="deleted", additions=0, deletions=1),
+    {
+        "previous_filename": "services/auth/guard.py",
+        "status": "removed",
+        "additions": 0,
+        "deletions": 1,
+    },
+    SimpleNamespace(
+        filename="docs/old-guard.md",
+        previous_filename="services/auth/guard.py",
+        status="renamed",
+        additions=1,
+        deletions=1,
+    ),
+])
+def test_unfiltered_sensitive_path_forces_deep_when_review_diff_ignores_it(raw_sensitive_file):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.get_files.return_value = [
+        SimpleNamespace(filename="docs/guide.md", status="modified", additions=1, deletions=0),
+        raw_sensitive_file,
+    ]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+
+
+def test_unavailable_unfiltered_inventory_prevents_quick():
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.get_files.side_effect = RuntimeError("raw inventory unavailable")
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert "files[1].kind" in decision.missing_inputs
+
+
+@pytest.mark.parametrize("raw_inventory", [None, []])
+def test_empty_unfiltered_inventory_prevents_quick(raw_inventory):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.get_files.return_value = raw_inventory
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert "files[1].kind" in decision.missing_inputs
+
+
+def test_detailed_inventory_failure_still_uses_raw_sensitive_paths():
+    provider = MagicMock()
+    provider.get_diff_files.side_effect = RuntimeError("detailed inventory unavailable")
+    provider.get_files.return_value = [
+        SimpleNamespace(filename="services/auth/guard.py", status="modified", additions=1, deletions=0)
+    ]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert "files[1].kind" in decision.missing_inputs
+
+
+def test_codecommit_rename_preserves_sensitive_old_path():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = MagicMock()
+    provider.get_diff_files.side_effect = RuntimeError("detailed inventory unavailable")
+    provider.get_files.return_value = [SimpleNamespace(
+        a_path="services/auth/guard.py",
+        b_path="docs/safe.md",
+        filename="docs/safe.md",
+        edit_type=EDIT_TYPE.RENAMED,
+    )]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+
+
+def test_sensitive_old_rename_path_forces_deep_over_docs_only_signal():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file(
+        "docs/guide.md",
+        edit_type=EDIT_TYPE.RENAMED,
+        old_filename="services/auth/guard.py",
+    )]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+
+
+def _install_specialist_result(
+    reviewer,
+    *,
+    state,
+    recommendation="escalate",
+    identity="head",
+    risk_enabled=True,
+    include_risk_record=True,
+):
+    specialist_input = SimpleNamespace(
+        snapshot_id="snapshot",
+        head_sha="head",
+        input_hash="input-hash",
+    )
+    prompt = SimpleNamespace(schema_version="risk-recommendation-output-v1")
+    pipeline = SimpleNamespace(
+        configuration_hash="configuration-hash",
+        prompt=lambda role: prompt,
+        roles=(SimpleNamespace(role=SpecialistRole.RISK_RECOMMENDATION, enabled=risk_enabled),),
+    )
+    output = {
+        "schema_version": prompt.schema_version,
+        "confidence": 0.9,
+        "recommendation": recommendation,
+        "reasons": [{
+            "reason": "untrusted specialist prose must not reach routing",
+            "evidence": [{"source": "pull_request", "field": "title"}],
+        }],
+    }
+    reviewer._specialist_input = specialist_input
+    reviewer._specialist_pipeline = pipeline
+    records = ()
+    if include_risk_record:
+        records = (RoleExecution(
+            role=SpecialistRole.RISK_RECOMMENDATION,
+            state=state,
+            output=output,
+            confidence=0.9,
+        ),)
+    reviewer.specialist_shadow_result = SpecialistBatchResult(
+        snapshot_id="snapshot",
+        head_sha=identity,
+        input_hash="input-hash",
+        configuration_hash="configuration-hash",
+        records=records,
+        role_records={},
+        changed_path_count=1,
+        hunk_count=1,
+    )
+
+
+def _unavailable_specialist_fixture():
+    role = SpecialistRole.RISK_RECOMMENDATION
+    reason = "stable_head_identity_unavailable"
+    prompt = SimpleNamespace(
+        prompt_version="risk-v1",
+        input_schema_version="specialist-input-v1",
+        schema_version="specialist-output-v1",
+    )
+    pipeline = SimpleNamespace(
+        configuration_hash="configuration-hash",
+        roles=(SimpleNamespace(role=role, enabled=True),),
+        prompt=lambda requested_role: prompt if requested_role is role else None,
+    )
+    batch = unavailable_specialist_batch(pipeline, failure_reason=reason)
+    return pipeline, batch
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "recommendation", "expected_depth"),
+    [
+        (SpecialistState.SUCCESS, "escalate", ReviewDepth.DEEP),
+        (SpecialistState.CACHED, "none", ReviewDepth.QUICK),
+        (SpecialistState.LOW_CONFIDENCE, "escalate", ReviewDepth.STANDARD),
+        (SpecialistState.TIMEOUT, "escalate", ReviewDepth.STANDARD),
+        (SpecialistState.MALFORMED_OUTPUT, "escalate", ReviewDepth.DEEP),
+    ],
+)
+async def test_guarded_specialist_consumer_only_escalates_validated_success(
+    monkeypatch, state, recommendation, expected_depth
+):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(reviewer, state=state, recommendation=recommendation)
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is expected_depth
+    serialized_reasons = review_route_decision_to_dict(reviewer.review_route_decision)["reasons"]
+    assert "untrusted specialist prose" not in str(serialized_reasons)
+    if recommendation == "escalate" and state in {SpecialistState.SUCCESS, SpecialistState.CACHED}:
+        assert "pull_request:title" in str(serialized_reasons)
+
+
+@pytest.mark.asyncio
+async def test_guarded_specialist_consumer_treats_disabled_omission_as_unavailable(monkeypatch):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(
+        reviewer,
+        state=SpecialistState.DISABLED,
+        risk_enabled=False,
+        include_risk_record=False,
+    )
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.STANDARD
+    reason_codes = [reason.code for reason in reviewer.review_route_decision.reasons]
+    assert "escalation_unavailable" in reason_codes
+    assert "escalation_invalid" not in reason_codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "expected_depth"),
+    [
+        ("docs/guide.md", ReviewDepth.STANDARD),
+        ("services/auth/guard.py", ReviewDepth.DEEP),
+    ],
+)
+async def test_no_stable_head_specialist_batch_is_unavailable_not_malformed(
+    monkeypatch, filename, expected_depth
+):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file(filename)]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    provider.get_pr_head_sha.return_value = None
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {"title": "Change behavior"}
+    reviewer.pr_description = "Description"
+    reviewer.ai_handler = MagicMock()
+    reviewer.review_routing_configuration = _routing_configuration(
+        consume=True,
+        sensitive_categories=({
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },),
+    )
+    init_run_details()
+    reviewer._prepare_review_route()
+    pipeline, batch = _unavailable_specialist_fixture()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.load_specialist_pipeline_config", return_value=pipeline),
+        patch("pr_agent.tools.pr_reviewer.get_specialist_snapshot_context", return_value=None),
+        patch("pr_agent.tools.pr_reviewer.unavailable_specialist_batch", return_value=batch),
+    ):
+        await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is expected_depth
+    reason_codes = [reason.code for reason in reviewer.review_route_decision.reasons]
+    assert "escalation_unavailable" in reason_codes
+    assert "escalation_invalid" not in reason_codes
+    assert not hasattr(reviewer, "_specialist_input")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "configuration",
+        "failure_reason",
+        "record_cached",
+        "record_model",
+        "record_tokens",
+        "role_records",
+        "role_record_cached",
+        "role_record_output",
+        "stale",
+    ],
+)
+async def test_tampered_unavailable_specialist_batch_still_fails_closed(
+    monkeypatch, corruption
+):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    pipeline, batch = _unavailable_specialist_fixture()
+    if corruption == "configuration":
+        batch = replace(batch, configuration_hash="other")
+    elif corruption == "failure_reason":
+        batch = replace(
+            batch,
+            records=(replace(batch.records[0], failure_reason="provider_failure"),),
+        )
+    elif corruption == "record_cached":
+        batch = replace(batch, records=(replace(batch.records[0], cached=True),))
+    elif corruption == "record_model":
+        batch = replace(batch, records=(replace(batch.records[0], model="tampered"),))
+    elif corruption == "record_tokens":
+        batch = replace(batch, records=(replace(batch.records[0], input_tokens=99),))
+    elif corruption == "role_records":
+        batch = replace(batch, role_records={})
+    elif corruption == "role_record_cached":
+        role_records = {key: dict(value) for key, value in batch.role_records.items()}
+        role_records[SpecialistRole.RISK_RECOMMENDATION.value]["cached"] = True
+        batch = replace(batch, role_records=role_records)
+    elif corruption == "role_record_output":
+        role_records = {key: dict(value) for key, value in batch.role_records.items()}
+        role_records[SpecialistRole.RISK_RECOMMENDATION.value]["output"] = {
+            "recommendation": "deep"
+        }
+        batch = replace(batch, role_records=role_records)
+    elif corruption == "stale":
+        batch = replace(batch, stale=True)
+    reviewer._specialist_pipeline = pipeline
+    reviewer.specialist_shadow_result = batch
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert "escalation_invalid" in [
+        reason.code for reason in reviewer.review_route_decision.reasons
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completed_specialist_batch_without_input_still_fails_closed(monkeypatch):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(reviewer, state=SpecialistState.SUCCESS)
+    del reviewer._specialist_input
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert "escalation_invalid" in [
+        reason.code for reason in reviewer.review_route_decision.reasons
+    ]
+
+
+def test_non_consuming_routing_does_not_validate_specialist_evidence():
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_routing_configuration = _routing_configuration(consume=False)
+    reviewer.specialist_shadow_result = object()
+
+    assert reviewer._specialist_escalation_consumption_enabled() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corruption",
+    ["disabled_record", "enabled_omission", "duplicate", "wrong_role", "missing_config"],
+)
+async def test_guarded_specialist_consumer_rejects_contradictory_batches(monkeypatch, corruption):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(
+        reviewer,
+        state=SpecialistState.SUCCESS,
+        risk_enabled=corruption != "disabled_record",
+        include_risk_record=corruption not in {"enabled_omission", "wrong_role", "missing_config"},
+    )
+    batch = reviewer.specialist_shadow_result
+    if corruption == "duplicate":
+        reviewer.specialist_shadow_result = replace(batch, records=(batch.records[0], batch.records[0]))
+    elif corruption == "wrong_role":
+        reviewer._specialist_pipeline.roles = (
+            *reviewer._specialist_pipeline.roles,
+            SimpleNamespace(role=SpecialistRole.CHANGE_CLASSIFICATION, enabled=True),
+        )
+        reviewer.specialist_shadow_result = replace(
+            batch,
+            records=(RoleExecution(
+                role=SpecialistRole.CHANGE_CLASSIFICATION,
+                state=SpecialistState.SUCCESS,
+                output={},
+                confidence=0.9,
+            ),),
+        )
+    elif corruption == "missing_config":
+        reviewer._specialist_pipeline.roles = ()
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert "escalation_invalid" in [reason.code for reason in reviewer.review_route_decision.reasons]
+
+
+@pytest.mark.asyncio
+async def test_specialist_identity_mismatch_fails_closed_to_deep(monkeypatch):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(
+        reviewer,
+        state=SpecialistState.SUCCESS,
+        identity="different-head",
+    )
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert "escalation_invalid" in [reason.code for reason in reviewer.review_route_decision.reasons]
+
+
+@pytest.mark.asyncio
+async def test_specialist_none_cannot_lower_a_deterministic_forced_deep_route(monkeypatch):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("services/auth/guard.py")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "bugs_only"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(
+        consume=True,
+        sensitive_categories=({
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },),
+    )
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(
+        reviewer,
+        state=SpecialistState.SUCCESS,
+        recommendation="none",
+    )
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert reviewer.review_route_decision.review_profile == "bugs_only"
+    assert reviewer.review_route_decision.matched_sensitive_categories == ("authorization",)
+
+
+@pytest.mark.asyncio
+async def test_malformed_specialist_record_fails_closed_without_reading_raw_output(monkeypatch):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(reviewer, state=SpecialistState.SUCCESS)
+    reviewer.specialist_shadow_result = replace(
+        reviewer.specialist_shadow_result,
+        records=(object(),),
+    )
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert "escalation_invalid" in [reason.code for reason in reviewer.review_route_decision.reasons]
+
+
+@pytest.mark.asyncio
+async def test_run_orders_routing_and_guarded_escalation_before_ticket_and_main_model():
+    events = []
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.git_provider.get_files.return_value = [object()]
+    reviewer._prepare_review_route = MagicMock(side_effect=lambda: events.append("route"))
+    reviewer._specialist_escalation_consumption_enabled = MagicMock(return_value=True)
+    reviewer._run_guarded_specialist_escalation = AsyncMock(
+        side_effect=lambda: events.append("specialist")
+    )
+    reviewer._review_model_route = MagicMock(return_value=None)
+    reviewer._prepare_pr_review = MagicMock(return_value="review")
+    reviewer._should_publish_review_no_suggestions = MagicMock(return_value=False)
+    reviewer._clear_stale_persistent_bugs_only_review = MagicMock()
+
+    async def extract_tickets(*args, **kwargs):
+        events.append("ticket")
+
+    async def run_main_model(*args, **kwargs):
+        events.append("main")
+        reviewer.prediction = VALID_PREDICTION
+
+    settings = get_settings()
+    original_publish_output = settings.config.publish_output
+    settings.set("config.publish_output", False)
+    try:
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                side_effect=extract_tickets,
+            ),
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                side_effect=run_main_model,
+            ),
+        ):
+            await reviewer.run()
+    finally:
+        settings.set("config.publish_output", original_publish_output)
+
+    assert events == ["route", "specialist", "ticket", "main"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_type", [AzureDevopsProvider, GitLabProvider])
+async def test_empty_incremental_provider_scope_stops_before_routing_or_models(
+    provider_type,
+):
+    provider = provider_type.__new__(provider_type)
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {}
+    provider.previous_review = SimpleNamespace(html_url="https://example/review/previous")
+    provider.publish_comment = MagicMock()
+    provider.get_diff_files = MagicMock()
+    if provider_type is AzureDevopsProvider:
+        provider._get_files_full = MagicMock(return_value=["/docs/full-pr.md"])
+        provider._routing_incremental_files = ()
+    else:
+        provider.git_files = ["docs/full-pr.md"]
+        provider._incremental_scope_complete = True
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer._prepare_review_route = MagicMock()
+    reviewer._specialist_escalation_consumption_enabled = MagicMock(return_value=True)
+    reviewer._run_guarded_specialist_escalation = AsyncMock()
+
+    settings = get_settings()
+    original_publish_output = settings.config.publish_output
+    settings.set("config.publish_output", False)
+    try:
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+    finally:
+        settings.set("config.publish_output", original_publish_output)
+
+    reviewer._can_run_incremental_review.assert_called_once_with()
+    reviewer._prepare_review_route.assert_not_called()
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.STANDARD
+    assert reviewer.review_route_request.changed_files_complete is True
+    reviewer._specialist_escalation_consumption_enabled.assert_not_called()
+    reviewer._run_guarded_specialist_escalation.assert_not_awaited()
+    provider.get_diff_files.assert_not_called()
+    provider.publish_comment.assert_not_called()
+    if provider_type is AzureDevopsProvider:
+        provider._get_files_full.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filtered_by", ["ignore", "extension"])
+async def test_azure_filtered_sensitive_incremental_scope_routes_deep_before_stopping(
+    filtered_by,
+):
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {}
+    provider.previous_review = SimpleNamespace(html_url="https://example/review/previous")
+    provider.publish_comment = MagicMock()
+    provider.get_diff_files = MagicMock(return_value=[])
+    provider._get_files_full = MagicMock(return_value=["/docs/full-pr.md"])
+    provider._routing_incremental_files = (
+        _route_file("/services/auth/key.pem"),
+    )
+    provider.azure_devops_client = MagicMock()
+    provider.azure_devops_client.get_pull_request_labels.return_value = []
+    provider.workspace_slug = "project"
+    provider.repo_slug = "repo"
+    provider.pr_num = 1
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer.review_routing_configuration = _routing_configuration(
+        sensitive_categories=({
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },),
+        shadow_only=True,
+    )
+    reviewer._specialist_escalation_consumption_enabled = MagicMock(return_value=True)
+    reviewer._run_guarded_specialist_escalation = AsyncMock()
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = False
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert reviewer.review_route_decision.matched_sensitive_categories == ("authorization",)
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    assert provider.is_incremental_scope_empty() is False
+    provider.get_diff_files.assert_called_once_with()
+    provider._get_files_full.assert_not_called()
+    provider.publish_comment.assert_not_called()
+    reviewer._specialist_escalation_consumption_enabled.assert_not_called()
+    reviewer._run_guarded_specialist_escalation.assert_not_awaited()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_depth", "expected_depth"),
+    [
+        ("quick", ReviewDepth.QUICK),
+        ("standard", ReviewDepth.STANDARD),
+        ("deep", ReviewDepth.DEEP),
+    ],
+)
+async def test_empty_incremental_shadow_route_suppresses_optional_skip_publication(
+    requested_depth,
+    expected_depth,
+):
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {}
+    provider.previous_review = SimpleNamespace(html_url="https://example/review/previous")
+    provider.publish_comment = MagicMock()
+    provider.get_files = MagicMock()
+    provider.get_diff_files = MagicMock()
+    provider.get_pr_labels = MagicMock()
+    provider.is_supported = MagicMock(return_value=True)
+    provider.azure_devops_client = MagicMock()
+    provider.azure_devops_client.get_pull_request_labels.return_value = []
+    provider.workspace_slug = "project"
+    provider.repo_slug = "repo"
+    provider.pr_num = 1
+    provider._get_files_full = MagicMock(return_value=["/docs/full-pr.md"])
+    provider._routing_incremental_files = ()
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer.review_routing_configuration = _routing_configuration(
+        requested_depth=requested_depth,
+        shadow_only=True,
+    )
+    reviewer._specialist_escalation_consumption_enabled = MagicMock(return_value=True)
+    reviewer._run_guarded_specialist_escalation = AsyncMock()
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is expected_depth
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    provider.publish_comment.assert_not_called()
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider.get_pr_labels.assert_not_called()
+    provider.is_supported.assert_called_once_with("get_labels")
+    provider.azure_devops_client.get_pull_request_labels.assert_called_once_with(
+        project="project",
+        repository_id="repo",
+        pull_request_id=1,
+    )
+    provider._get_files_full.assert_not_called()
+    reviewer._specialist_escalation_consumption_enabled.assert_not_called()
+    reviewer._run_guarded_specialist_escalation.assert_not_awaited()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", ["local", "health", "mosaico"])
+async def test_empty_incremental_auto_shadow_clears_stale_consumer_artifact(consumer):
+    provider = GitLabProvider.__new__(GitLabProvider)
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {}
+    provider.previous_review = SimpleNamespace(html_url="https://example/review/previous")
+    provider.publish_comment = MagicMock()
+    provider.get_files = MagicMock()
+    provider.get_diff_files = MagicMock()
+    provider.get_pr_labels = MagicMock(return_value=[])
+    provider.is_supported = MagicMock(return_value=True)
+    provider.git_files = ["docs/full-pr.md"]
+    provider._incremental_scope_complete = True
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        await reviewer.run()
+        if consumer == "local":
+            artifact = settings.data["artifact"]
+        elif consumer == "health":
+            artifact = dict(settings.data)["artifact"]
+        else:
+            from pr_agent.mosaico.dispatch import _capture_artifact
+            artifact = _capture_artifact()
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.STANDARD
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    provider.publish_comment.assert_not_called()
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider.get_pr_labels.assert_called_once_with()
+    provider.is_supported.assert_called_once_with("get_labels")
+
+
+@pytest.mark.asyncio
+async def test_empty_incremental_sensitive_label_forces_deep_shadow_without_publication():
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {}
+    provider.previous_review = SimpleNamespace(html_url="https://example/review/previous")
+    provider.publish_comment = MagicMock()
+    provider.get_files = MagicMock()
+    provider.get_diff_files = MagicMock()
+    provider.is_supported = MagicMock(return_value=True)
+    provider.azure_devops_client = MagicMock()
+    provider.azure_devops_client.get_pull_request_labels.return_value = [
+        SimpleNamespace(name="security"),
+    ]
+    provider.workspace_slug = "project"
+    provider.repo_slug = "repo"
+    provider.pr_num = 1
+    provider._get_files_full = MagicMock(return_value=["/docs/full-pr.md"])
+    provider._routing_incremental_files = ()
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer.review_routing_configuration = _routing_configuration(
+        shadow_only=True,
+        sensitive_categories=({
+            "name": "security",
+            "path_patterns": [],
+            "labels": ["security"],
+        },),
+    )
+    reviewer._specialist_escalation_consumption_enabled = MagicMock(return_value=True)
+    reviewer._run_guarded_specialist_escalation = AsyncMock()
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert reviewer.review_route_decision.matched_sensitive_categories == ("security",)
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    provider.publish_comment.assert_not_called()
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider._get_files_full.assert_not_called()
+    provider.azure_devops_client.get_pull_request_labels.assert_called_once_with(
+        project="project",
+        repository_id="repo",
+        pull_request_id=1,
+    )
+    reviewer._specialist_escalation_consumption_enabled.assert_not_called()
+    reviewer._run_guarded_specialist_escalation.assert_not_awaited()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_incremental_unavailable_labels_fail_safe_without_publication():
+    provider = MagicMock()
+    provider.is_incremental_scope_empty.return_value = True
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.side_effect = RuntimeError("labels unavailable")
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=True)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.STANDARD
+    assert "labels" in reviewer.review_route_decision.missing_inputs
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    provider.get_pr_labels.assert_called_once_with()
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider.publish_comment.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_incremental_no_new_commit_clears_shadow_artifact_before_return():
+    provider = MagicMock()
+    provider.is_incremental_scope_empty.return_value = True
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = SimpleNamespace(
+        is_incremental=True,
+        first_new_commit_sha=None,
+    )
+    reviewer.is_auto = True
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=False)
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision is not None
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    provider.get_pr_labels.assert_called_once_with()
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider.publish_comment.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.parametrize("scope_empty", [False, None])
+@pytest.mark.asyncio
+async def test_auto_incremental_missing_commit_marker_routes_available_sensitive_evidence(scope_empty):
+    provider = MagicMock()
+    provider.is_incremental_scope_empty.return_value = scope_empty
+    provider.get_files.return_value = ["services/auth/key.pem"]
+    provider.get_diff_files.return_value = [_route_file("services/auth/key.pem")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = SimpleNamespace(
+        is_incremental=True,
+        first_new_commit_sha=None,
+    )
+    reviewer.is_auto = True
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=False)
+    reviewer.review_routing_configuration = _routing_configuration(
+        shadow_only=True,
+        sensitive_categories=({
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },),
+    )
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert reviewer.review_route_decision.matched_sensitive_categories == ("authorization",)
+    assert artifact == ""
+    provider.is_incremental_scope_empty.assert_called_once_with()
+    provider.get_files.assert_called_once_with()
+    provider.get_diff_files.assert_called_once_with()
+    provider.publish_comment.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nonincremental_empty_pr_clears_shadow_artifact_before_return():
+    provider = MagicMock()
+    provider.get_files.return_value = []
+    provider.get_diff_files.return_value = []
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision is not None
+    assert reviewer._review_shadow_only is True
+    assert artifact == ""
+    provider.get_files.assert_called_once_with()
+    provider.get_diff_files.assert_not_called()
+    provider.get_pr_labels.assert_called_once_with()
+    provider.publish_comment.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nonincremental_filtered_empty_gitea_routes_unfiltered_sensitive_path_deep():
+    provider = GiteaProvider.__new__(GiteaProvider)
+    provider.git_files = []
+    provider._routing_git_files = [{
+        "filename": "services/auth/key.pem",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 0,
+    }]
+    provider.get_diff_files = MagicMock(return_value=[])
+    provider.is_supported = MagicMock(return_value=True)
+    provider.get_pr_labels = MagicMock(return_value=[])
+    provider.publish_comment = MagicMock()
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(
+        shadow_only=True,
+        sensitive_categories=({
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },),
+    )
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert reviewer.review_route_decision.matched_sensitive_categories == ("authorization",)
+    assert artifact == ""
+    provider.get_diff_files.assert_called_once_with()
+    provider.get_pr_labels.assert_called_once_with()
+    provider.publish_comment.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nonincremental_empty_with_unavailable_rich_inventory_records_unknown_evidence():
+    class UnavailableRoutingProvider:
+        def get_files(self):
+            return []
+
+        def get_files_for_routing(self):
+            return None
+
+    provider = UnavailableRoutingProvider()
+    provider.get_diff_files = MagicMock(return_value=[])
+    provider.is_supported = MagicMock(return_value=True)
+    provider.get_pr_labels = MagicMock(return_value=[])
+    provider.publish_comment = MagicMock()
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = True
+        settings.data = {"artifact": "STALE REVIEW"}
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+            artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.STANDARD
+    assert "files[0].kind" in reviewer.review_route_decision.missing_inputs
+    assert reviewer.review_route_request.changed_files_complete is False
+    assert artifact == ""
+    provider.get_diff_files.assert_called_once_with()
+    provider.get_pr_labels.assert_called_once_with()
+    provider.publish_comment.assert_not_called()
+    extract_tickets.assert_not_awaited()
+    run_main_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_incremental_disabled_routing_preserves_legacy_artifact_and_run_details():
+    provider = GitLabProvider.__new__(GitLabProvider)
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {}
+    provider.previous_review = SimpleNamespace(html_url="https://example/review/previous")
+    provider.publish_comment = MagicMock()
+    provider.get_files = MagicMock()
+    provider.get_diff_files = MagicMock()
+    provider.get_pr_labels = MagicMock()
+    provider.is_supported = MagicMock()
+    provider.git_files = ["docs/full-pr.md"]
+    provider._incremental_scope_complete = True
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
+
+    settings = get_settings()
+    snapshot = snapshot_settings(("config.publish_output", "data"))
+    try:
+        settings.config.publish_output = False
+        settings.data = {"artifact": "LEGACY ARTIFACT"}
+        await reviewer.run()
+        artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.routing_enabled is False
+    assert get_run_details().review_route is None
+    assert reviewer._review_shadow_only is False
+    assert artifact == "LEGACY ARTIFACT"
+    provider.publish_comment.assert_not_called()
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider.get_pr_labels.assert_not_called()
+    provider.is_supported.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_type", [AzureDevopsProvider, GitLabProvider])
+async def test_incomplete_incremental_scope_is_not_mistaken_for_known_empty(
+    provider_type,
+):
+    provider = provider_type.__new__(provider_type)
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {}
+    provider.previous_review = SimpleNamespace(html_url="https://example/review/previous")
+    provider.publish_comment = MagicMock()
+    provider.get_diff_files = MagicMock(return_value=[])
+    if provider_type is AzureDevopsProvider:
+        provider._get_files_full = MagicMock(return_value=["/docs/full-pr.md"])
+        provider._routing_incremental_files = (
+            FilePatchInfo(
+                base_file="",
+                head_file="",
+                patch="",
+                filename="",
+                edit_type=EDIT_TYPE.UNKNOWN,
+            ),
+        )
+    else:
+        provider.git_files = ["docs/full-pr.md"]
+        provider._incremental_scope_complete = False
+        provider._expand_submodule_changes = MagicMock(side_effect=lambda files: files)
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.vars = {}
+    reviewer._can_run_incremental_review = MagicMock(return_value=True)
+    reviewer._prepare_review_route = MagicMock()
+    reviewer._specialist_escalation_consumption_enabled = MagicMock(return_value=False)
+    reviewer._review_model_route = MagicMock(return_value=None)
+
+    settings = get_settings()
+    original_publish_output = settings.config.publish_output
+    settings.set("config.publish_output", False)
+    try:
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+    finally:
+        settings.set("config.publish_output", original_publish_output)
+
+    reviewer._prepare_review_route.assert_called_once_with()
+    reviewer._specialist_escalation_consumption_enabled.assert_called_once_with()
+    extract_tickets.assert_awaited_once()
+    run_main_model.assert_awaited_once()
+    provider.publish_comment.assert_not_called()
+
+
+def test_gitlab_incomplete_empty_incremental_inventory_fails_safe():
+    provider = _gitlab_routing_provider([], [], incremental=True)
+    provider.unreviewed_files_map = {}
+    provider._incremental_scope_complete = False
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+
+
+def test_gitlab_incomplete_filter_keeps_sensitive_compare_path_deep():
+    sensitive_change = _gitlab_change(
+        "services/auth/guard.py",
+        "services/auth/guard.py",
+        renamed=False,
+    )
+    provider = _gitlab_routing_provider([sensitive_change], [], incremental=True)
+    provider._incremental_scope_complete = False
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_type", [AzureDevopsProvider, GitLabProvider])
+async def test_nonincremental_empty_map_still_reviews_full_pr(provider_type):
+    provider = provider_type.__new__(provider_type)
+    provider.incremental = IncrementalPR(False)
+    provider.unreviewed_files_map = {}
+    provider.publish_comment = MagicMock()
+    if provider_type is AzureDevopsProvider:
+        provider._get_files_full = MagicMock(return_value=["/docs/full-pr.md"])
+    else:
+        provider.git_files = ["docs/full-pr.md"]
+
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.incremental = provider.incremental
+    reviewer.vars = {}
+    reviewer._prepare_review_route = MagicMock()
+    reviewer._specialist_escalation_consumption_enabled = MagicMock(return_value=False)
+    reviewer._review_model_route = MagicMock(return_value=None)
+
+    settings = get_settings()
+    original_publish_output = settings.config.publish_output
+    settings.set("config.publish_output", False)
+    try:
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                new_callable=AsyncMock,
+            ) as extract_tickets,
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                new_callable=AsyncMock,
+            ) as run_main_model,
+        ):
+            await reviewer.run()
+    finally:
+        settings.set("config.publish_output", original_publish_output)
+
+    reviewer._prepare_review_route.assert_called_once_with()
+    extract_tickets.assert_awaited_once()
+    run_main_model.assert_awaited_once()
+    if provider_type is AzureDevopsProvider:
+        provider._get_files_full.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -870,6 +4450,160 @@ async def test_clean_bugs_only_rerun_clears_only_bugs_only_persistent_review(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", ["local", "health", "mosaico"])
+async def test_shadow_only_run_retains_bounded_artifact_without_provider_mutations(
+        monkeypatch, consumer):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["docs/guide.md"]
+    git_provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    git_provider.is_supported.return_value = True
+    git_provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    async def fake_retry(prepare_fn, model_type=None, model_route=None):
+        reviewer.prediction = """\
+review:
+  estimated_effort_to_review_[1-5]: '2'
+  score: '85'
+  key_issues_to_review:
+    - issue_header: first bounded finding
+    - issue_header: second bounded finding
+    - issue_header: third over-budget finding
+  security_concerns: 'No'
+"""
+
+    def render_bounded_review(data, *_args, **_kwargs):
+        headers = [
+            issue["issue_header"]
+            for issue in data["review"]["key_issues_to_review"]
+        ]
+        return "## PR Reviewer Guide\n\n" + "\n".join(headers)
+
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", AsyncMock())
+    monkeypatch.setattr(pr_reviewer_module, "convert_to_markdown_v2", render_bounded_review)
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.publish_output",
+        "config.is_auto_command",
+        "config.output_run_details",
+        "config.output_relevant_configurations",
+        "data",
+        "pr_reviewer.persistent_comment",
+        "pr_reviewer.inline_key_issues",
+        "pr_reviewer.enable_help_text",
+    ))
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.config.output_run_details = False
+        settings.config.output_relevant_configurations = False
+        settings.pr_reviewer.persistent_comment = True
+        settings.pr_reviewer.inline_key_issues = True
+        settings.pr_reviewer.enable_help_text = False
+        settings.data = {"artifact": "STALE REVIEW"}
+
+        await reviewer.run()
+
+        if consumer == "local":
+            artifact = settings.data["artifact"]
+        elif consumer == "health":
+            artifact = dict(settings.data)["artifact"]
+        else:
+            from pr_agent.mosaico.dispatch import _capture_artifact
+            artifact = _capture_artifact()
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.QUICK
+    assert reviewer._review_shadow_only is True
+    assert artifact.startswith("## PR Reviewer Guide")
+    assert "first bounded finding" in artifact
+    assert "second bounded finding" in artifact
+    assert "third over-budget finding" not in artifact
+    for method_name in (
+        "publish_comment",
+        "remove_comment",
+        "remove_initial_comment",
+        "clear_persistent_review",
+        "publish_persistent_comment",
+        "publish_structured_review",
+        "publish_code_suggestions",
+        "publish_inline_comments",
+        "publish_labels",
+        "set_pr_labels",
+    ):
+        getattr(git_provider, method_name).assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", ["unavailable", "failed"])
+async def test_shadow_only_unavailable_or_failed_result_clears_stale_artifact_without_mutations(
+        monkeypatch, result):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["docs/guide.md"]
+    git_provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    git_provider.is_supported.return_value = True
+    git_provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    async def unavailable_retry(prepare_fn, model_type=None, model_route=None):
+        return None
+
+    retry = unavailable_retry
+    if result == "failed":
+        retry = AsyncMock(side_effect=RuntimeError("shadow model failed"))
+    render = MagicMock(return_value="must not render")
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", AsyncMock())
+    monkeypatch.setattr(pr_reviewer_module, "convert_to_markdown_v2", render)
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.publish_output",
+        "config.is_auto_command",
+        "config.propagate_tool_errors",
+        "data",
+    ))
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.config.propagate_tool_errors = False
+        settings.data = {"artifact": "STALE REVIEW"}
+
+        await reviewer.run()
+        artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert artifact == ""
+    render.assert_not_called()
+    for method_name in (
+        "publish_comment",
+        "remove_comment",
+        "remove_initial_comment",
+        "clear_persistent_review",
+        "publish_persistent_comment",
+        "publish_structured_review",
+        "publish_code_suggestions",
+        "publish_inline_comments",
+        "publish_labels",
+    ):
+        getattr(git_provider, method_name).assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("propagate_tool_errors", [False, True])
 async def test_run_removes_its_progress_comment_when_review_generation_fails(
         monkeypatch, propagate_tool_errors):
@@ -1188,6 +4922,36 @@ def test_prepare_review_publishes_provider_neutral_structured_data(monkeypatch):
     # (assert_called_once_with cannot catch this: dict equality ignores key order.)
     published = git_provider.publish_structured_review.call_args[0][0]
     assert list(published["review"].keys()) == ["key_issues_to_review", "security_concerns"]
+
+
+def test_structured_review_includes_applied_route_without_aliasing_decision(monkeypatch):
+    git_provider = MagicMock()
+    git_provider.is_supported.return_value = True
+    git_provider.get_pr_labels.return_value = []
+    git_provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.set_review_labels = MagicMock()
+    init_run_details()
+    decision = reviewer._prepare_review_route()
+    reviewer.prediction = """review:
+  key_issues_to_review: []
+  security_concerns: no
+"""
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+        lambda *args, **kwargs: "## Review",
+    )
+
+    reviewer._prepare_pr_review()
+
+    metadata = git_provider.publish_structured_review.call_args[0][0]["metadata"]
+    assert metadata["review_route"] == review_route_decision_to_dict(decision)
+    metadata["review_route"]["reasons"].append({"code": "mutated"})
+    assert "mutated" not in str(review_route_decision_to_dict(decision))
 
 
 def test_bugs_only_publishes_structured_empty_list_but_no_markdown():

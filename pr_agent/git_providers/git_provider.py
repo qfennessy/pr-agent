@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import time
 from abc import ABC, abstractmethod
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Mapping, Optional, Tuple
 
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.algo.utils import (Range, add_pr_review_identity,
@@ -392,6 +392,38 @@ class GitProvider(ABC):
     @abstractmethod
     def get_files(self) -> list:
         pass
+
+    def get_files_for_routing(self) -> list:
+        """Return the complete current changed-file inventory used by review routing.
+
+        ``get_files()`` is the compatibility default. Providers whose ordinary file
+        list is filtered, incremental, or historical may override this method with a
+        current, unfiltered pull-request inventory. The returned paths may still use
+        provider-native spelling; ``normalize_file_path_for_routing()`` is the narrow
+        provider-owned adapter for that representation.
+        """
+        return self.get_files()
+
+    def is_incremental_scope_empty(self) -> Optional[bool]:
+        """Return whether the provider has a complete, known-empty incremental scope.
+
+        ``None`` means the provider cannot prove completeness, so callers must not
+        turn the run into a no-op. Providers with richer incremental evidence can
+        override this to distinguish a legitimate empty scope from a partial fetch.
+        """
+        inventory = getattr(self, "unreviewed_files_map", None)
+        if not isinstance(inventory, Mapping):
+            return None
+        return not inventory
+
+    def normalize_file_path_for_routing(self, path: str | None) -> str | None:
+        """Adapt a provider-native changed path to a repository-relative path.
+
+        The identity default deliberately leaves absolute paths untouched so the
+        router continues to reject arbitrary absolute input. A provider should only
+        override this when its API has a documented repository-root path format.
+        """
+        return path
 
     @abstractmethod
     def get_diff_files(self) -> list[FilePatchInfo]:
