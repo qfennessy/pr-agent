@@ -17,6 +17,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
+from pr_agent.algo.git_patch_processing import RE_HUNK_HEADER
 from pr_agent.algo.review_snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
     CoverageIssue,
@@ -812,6 +813,50 @@ class LocalPairReview:
         )
 
 
+def _findings_match_snapshot(
+    snapshot: ReviewSnapshot,
+    structured_review: Mapping[str, Any],
+) -> bool:
+    review = structured_review.get("review")
+    findings = review.get("key_issues_to_review") if isinstance(review, Mapping) else None
+    if not isinstance(findings, list):
+        return False
+
+    reviewable_lines: dict[str, set[int]] = {}
+    for item in parse_plain_diff(snapshot.diff):
+        filename = getattr(item, "filename", None)
+        if not filename or filename not in snapshot.changed_paths:
+            continue
+        lines = reviewable_lines.setdefault(filename, set())
+        new_line = None
+        for patch_line in item.patch.splitlines():
+            hunk_match = RE_HUNK_HEADER.match(patch_line)
+            if hunk_match:
+                new_line = int(hunk_match.group(3))
+                continue
+            if new_line is None or patch_line.startswith("\\"):
+                continue
+            if patch_line.startswith("-"):
+                continue
+            if patch_line.startswith(("+", " ")):
+                lines.add(new_line)
+                new_line += 1
+
+    for finding in findings:
+        if not isinstance(finding, Mapping):
+            return False
+        filename = finding.get("relevant_file")
+        try:
+            start_line = int(str(finding.get("start_line", "")).strip())
+            end_line = int(str(finding.get("end_line", "")).strip())
+        except ValueError:
+            return False
+        allowed_lines = reviewable_lines.get(filename, set())
+        if not allowed_lines or not set(range(start_line, end_line + 1)).issubset(allowed_lines):
+            return False
+    return True
+
+
 class SnapshotCache:
     """Small repository-local cache keyed by snapshot and policy identity."""
 
@@ -858,10 +903,16 @@ class SnapshotCache:
             try:
                 os.close(current_fd)
             except OSError:
+                # The traversal failure may already have closed the descriptor.
                 pass
             raise
 
-    def read(self, snapshot_id: str) -> Optional[ReviewSnapshotResult]:
+    def read(
+        self,
+        snapshot_id: str,
+        *,
+        snapshot: Optional[ReviewSnapshot] = None,
+    ) -> Optional[ReviewSnapshotResult]:
         cache_fd = None
         try:
             cache_fd = self._open_cache_dir(create=False)
@@ -905,6 +956,10 @@ class SnapshotCache:
                 or data.get("shadow_capable") is not True
                 or (state is ReviewResultState.FINDINGS and findings == 0)
                 or (state is ReviewResultState.NO_FINDINGS and (findings != 0 or coverage_issues))
+                or (
+                    snapshot is not None
+                    and not _findings_match_snapshot(snapshot, {"review": review})
+                )
             ):
                 return None
             return ReviewSnapshotResult(
@@ -995,6 +1050,7 @@ class SnapshotCache:
                 try:
                     os.unlink(temporary_name, dir_fd=cache_fd)
                 except OSError:
+                    # Best-effort cleanup must not mask the original cache failure.
                     pass
             os.close(cache_fd)
 
@@ -1024,7 +1080,13 @@ def build_snapshot_result(
             if isinstance(path, str) and path
         )
     findings = finding_count(structured_review)
-    if structured_review is not None and findings is None:
+    if (
+        structured_review is not None
+        and (
+            findings is None
+            or not _findings_match_snapshot(snapshot, structured_review)
+        )
+    ):
         error = error or "InvalidStructuredReview"
     if current_snapshot is None:
         coverage.append(CoverageIssue(reason="current_snapshot_unavailable"))

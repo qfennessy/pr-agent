@@ -846,7 +846,7 @@ def test_result_states_distinguish_findings_clean_and_unavailable():
         snapshot,
         current_snapshot=snapshot,
         structured_review={"review": {"key_issues_to_review": [{
-            "relevant_file": "app.py",
+            "relevant_file": "x",
             "issue_header": "Bug",
             "issue_content": "The wrong value is returned.",
             "start_line": 1,
@@ -925,6 +925,33 @@ def test_deleted_files_have_distinct_unsupported_coverage():
     assert result.review is None
     assert CoverageIssue(path="removed.py", reason="deleted_file_unsupported") in result.coverage_issues
     assert CoverageIssue(path="removed.py", reason="token_budget_omitted") not in result.coverage_issues
+
+
+@pytest.mark.parametrize(
+    ("relevant_file", "start_line", "end_line"),
+    [("other.py", 1, 1), ("x", 2, 2), ("x", 1, 2)],
+)
+def test_findings_must_match_captured_files_and_hunk_lines(
+    relevant_file, start_line, end_line
+):
+    snapshot = _snapshot("/repo/one")
+
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={"review": {"key_issues_to_review": [{
+            "relevant_file": relevant_file,
+            "issue_header": "Bug",
+            "issue_content": "This finding is outside the captured hunk.",
+            "start_line": start_line,
+            "end_line": end_line,
+        }]}},
+        started_at=monotonic(),
+    )
+
+    assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert result.review is None
+    assert CoverageIssue(reason="review_failed:InvalidStructuredReview") in result.coverage_issues
 
 
 @pytest.mark.parametrize(
@@ -1061,12 +1088,23 @@ def test_cache_treats_semantically_inconsistent_results_as_misses(tmp_path):
         {**valid, "advisory": False},
         {**valid, "review": {}},
         {**valid, "review": {"key_issues_to_review": "none"}},
+        {
+            **valid,
+            "state": "findings",
+            "review": {"key_issues_to_review": [{
+                "relevant_file": "other.py",
+                "issue_header": "Bug",
+                "issue_content": "This file was not captured.",
+                "start_line": 1,
+                "end_line": 1,
+            }]},
+        },
     ]
     cache.cache_dir.mkdir(parents=True, exist_ok=True)
 
     for payload in invalid_payloads:
         cache._path(snapshot.snapshot_id).write_text(json.dumps(payload), encoding="utf-8")
-        assert cache.read(snapshot.snapshot_id) is None
+        assert cache.read(snapshot.snapshot_id, snapshot=snapshot) is None
 
 
 def test_cache_write_failure_does_not_abort_completed_review(tmp_path):

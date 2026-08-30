@@ -805,7 +805,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         and current is not None
         and current.snapshot_id == snapshot.snapshot_id
     ):
-        cached_result = cache.read(snapshot.snapshot_id)
+        cached_result = cache.read(snapshot.snapshot_id, snapshot=snapshot)
         if cached_result is not None:
             _emit_snapshot_result(
                 cached_result, json_output, output_parent_identities.get(json_output)
