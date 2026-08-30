@@ -487,6 +487,20 @@ def test_review_snapshot_rejects_output_parent_swapped_during_review(
     capsys.readouterr()
 
 
+def test_atomic_snapshot_publication_uses_portable_fallback(monkeypatch, tmp_path):
+    from pr_agent.cli import _atomic_replace_bytes, _prepare_output_parent
+
+    output = tmp_path / "result.json"
+    output.write_text("old", encoding="utf-8")
+    identity = _prepare_output_parent(str(output))
+    monkeypatch.setattr("pr_agent.cli._supports_descriptor_relative_publication", lambda: False)
+
+    _atomic_replace_bytes(output, b"new", identity)
+
+    assert output.read_bytes() == b"new"
+    assert list(tmp_path.glob(".pr-agent-*.tmp")) == []
+
+
 def test_review_snapshot_restores_provider_settings_for_later_hosted_run(
     cfg, monkeypatch, tmp_path, capsys
 ):

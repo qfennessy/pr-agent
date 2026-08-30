@@ -15,8 +15,10 @@ from time import monotonic
 
 from pr_agent.agent.pr_agent import PRAgent, commands
 from pr_agent.algo.ai_handlers.litellm_helpers import (
-    DEFAULT_CALLBACK_TIMEOUT_SECONDS, drain_litellm_callbacks,
-    litellm_callbacks_registered)
+    DEFAULT_CALLBACK_TIMEOUT_SECONDS,
+    drain_litellm_callbacks,
+    litellm_callbacks_registered,
+)
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState
 from pr_agent.algo.run_details import get_run_details
 from pr_agent.algo.skills_loader import get_skills_context, pin_skills_context
@@ -24,10 +26,13 @@ from pr_agent.algo.utils import get_version
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.utils import apply_local_repo_settings
 from pr_agent.log import get_logger, setup_logger
-from pr_agent.tools.local_pair_review import (LocalPairReview, SnapshotCache,
-                                              SnapshotCaptureError,
-                                              build_snapshot_result,
-                                              find_repository_root)
+from pr_agent.tools.local_pair_review import (
+    LocalPairReview,
+    SnapshotCache,
+    SnapshotCaptureError,
+    build_snapshot_result,
+    find_repository_root,
+)
 
 log_level = os.environ.get("LOG_LEVEL", "INFO")
 setup_logger(log_level)
@@ -172,11 +177,59 @@ def _prepare_output_parent(output_path: str) -> tuple[int, int]:
     return parent_stat.st_dev, parent_stat.st_ino
 
 
+def _supports_descriptor_relative_publication() -> bool:
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    return (
+        hasattr(os, "O_DIRECTORY")
+        and os.open in supports_dir_fd
+        and os.rename in supports_dir_fd
+        and os.unlink in supports_dir_fd
+    )
+
+
+def _validate_output_parent(
+    destination: Path,
+    parent_identity: tuple[int, int],
+    action: str,
+) -> None:
+    parent_stat = destination.parent.stat()
+    if (parent_stat.st_dev, parent_stat.st_ino) != parent_identity:
+        raise SnapshotCaptureError(f"output parent changed before {action}: {destination}")
+
+
+def _portable_atomic_replace_bytes(
+    destination: Path,
+    content: bytes,
+    parent_identity: tuple[int, int],
+) -> None:
+    """Publish atomically on platforms without descriptor-relative filesystem calls."""
+    _validate_output_parent(destination, parent_identity, "publication")
+    temporary_fd, temporary_path = tempfile.mkstemp(
+        prefix=".pr-agent-",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    try:
+        with os.fdopen(temporary_fd, "wb") as handle:
+            handle.write(content)
+        _validate_output_parent(destination, parent_identity, "publication")
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            with suppress(OSError):
+                # Best-effort cleanup after a failed portable publication.
+                os.unlink(temporary_path)
+
+
 def _atomic_replace_bytes(
     destination: Path,
     content: bytes,
     parent_identity: tuple[int, int],
 ) -> None:
+    if not _supports_descriptor_relative_publication():
+        _portable_atomic_replace_bytes(destination, content, parent_identity)
+        return
     parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
     temporary_name = None
     try:
@@ -207,6 +260,14 @@ def _atomic_replace_bytes(
 
 
 def _unlink_output(destination: Path, parent_identity: tuple[int, int]) -> None:
+    if not _supports_descriptor_relative_publication():
+        _validate_output_parent(destination, parent_identity, "preparation")
+        try:
+            destination.unlink()
+        except FileNotFoundError:
+            # A stale Markdown artifact is optional; there is nothing to remove.
+            pass
+        return
     parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         parent_stat = os.fstat(parent_fd)

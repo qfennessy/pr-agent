@@ -15,9 +15,14 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-from pr_agent.algo.review_snapshot import (CoverageIssue, ReviewEvent,
-                                           ReviewResultState, ReviewSnapshot,
-                                           ReviewSnapshotResult, finding_count)
+from pr_agent.algo.review_snapshot import (
+    CoverageIssue,
+    ReviewEvent,
+    ReviewResultState,
+    ReviewSnapshot,
+    ReviewSnapshotResult,
+    finding_count,
+)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.diff_parsing import to_hunk_only_patch
 from pr_agent.git_providers.plain_diff_provider import parse_plain_diff
@@ -51,7 +56,7 @@ def find_repository_root(start: Optional[str] = None) -> Path:
     )
     if process.returncode != 0:
         raise SnapshotCaptureError("review-snapshot must run inside a Git worktree")
-    return Path(process.stdout.decode("utf-8").strip()).resolve()
+    return Path(process.stdout.decode("utf-8", errors="surrogateescape").rstrip("\r\n")).resolve()
 
 
 def _decode_z_paths(output: bytes) -> list[str]:
@@ -463,7 +468,9 @@ class SnapshotCache:
     """Small repository-local cache keyed by snapshot and policy identity."""
 
     def __init__(self, repository_root: Path, max_entries: int = 50) -> None:
-        common_dir = _run_git(repository_root, "rev-parse", "--git-common-dir").decode("utf-8").strip()
+        common_dir = _run_git(repository_root, "rev-parse", "--git-common-dir").decode(
+            "utf-8", errors="surrogateescape"
+        ).rstrip("\r\n")
         git_dir = Path(common_dir)
         if not git_dir.is_absolute():
             git_dir = repository_root / git_dir

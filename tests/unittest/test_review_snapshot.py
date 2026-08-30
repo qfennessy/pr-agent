@@ -1,4 +1,5 @@
 import json
+import os
 import shlex
 import stat
 import subprocess
@@ -8,12 +9,15 @@ from time import monotonic
 
 import pytest
 
-from pr_agent.algo.review_snapshot import (CoverageIssue, ReviewEvent,
-                                           ReviewResultState, ReviewSnapshot)
+from pr_agent.algo.review_snapshot import CoverageIssue, ReviewEvent, ReviewResultState, ReviewSnapshot
 from pr_agent.git_providers.plain_diff_provider import parse_plain_diff
-from pr_agent.tools.local_pair_review import (LocalPairReview, SnapshotCache,
-                                              SnapshotCaptureError,
-                                              build_snapshot_result)
+from pr_agent.tools.local_pair_review import (
+    LocalPairReview,
+    SnapshotCache,
+    SnapshotCaptureError,
+    build_snapshot_result,
+    find_repository_root,
+)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -38,6 +42,32 @@ def _repo(tmp_path: Path, name: str = "repo") -> Path:
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "initial")
     return repo
+
+
+def test_repository_locations_decode_non_utf8_bytes_with_surrogateescape(monkeypatch, tmp_path):
+    encoded_root = os.fsencode(str(tmp_path)) + b"/repo-\xff\n"
+
+    class CompletedProcess:
+        returncode = 0
+        stdout = encoded_root
+        stderr = b""
+
+    monkeypatch.setattr("pr_agent.tools.local_pair_review.subprocess.run", lambda *args, **kwargs: CompletedProcess())
+
+    root = find_repository_root(str(tmp_path))
+
+    assert os.fsencode(str(root)).endswith(b"repo-\xff")
+
+
+def test_snapshot_cache_decodes_non_utf8_git_common_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "pr_agent.tools.local_pair_review._run_git",
+        lambda *args, **kwargs: b".git-\xff\n",
+    )
+
+    cache = SnapshotCache(tmp_path)
+
+    assert os.fsencode(str(cache.cache_dir)).endswith(b".git-\xff/pr-agent/snapshot-cache")
 
 
 def _snapshot(root: str, *, diff: str = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n", policy="v1", config="c1"):
