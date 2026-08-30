@@ -432,6 +432,59 @@ def test_profile_model_route_uses_request_local_controls_and_retry_semantics():
     assert route.attribution is None
 
 
+def test_quick_claude_weak_route_disables_thinking_when_cap_equals_budget():
+    from pr_agent.algo import CLAUDE_EXTENDED_THINKING_MODELS
+    from pr_agent.algo.ai_handlers.litellm_ai_handler import (
+        LiteLLMAIHandler,
+        get_effective_litellm_output_token_cap,
+    )
+
+    provider = MagicMock()
+    provider.get_files.return_value = ["docs/guide.md"]
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+    reviewer._prepare_review_route()
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.enable_claude_extended_thinking",
+        "config.extended_thinking_budget_tokens",
+        "config.extended_thinking_max_output_tokens",
+    ))
+
+    try:
+        settings.set("config.enable_claude_extended_thinking", True)
+        settings.set("config.extended_thinking_budget_tokens", 2_048)
+        settings.set("config.extended_thinking_max_output_tokens", 4_096)
+        model = "claude-3-7-sonnet-20250219"
+        with patch("pr_agent.tools.pr_reviewer.get_model", return_value=model):
+            route = reviewer._review_model_route()
+        effective_cap = get_effective_litellm_output_token_cap(
+            model,
+            route.max_output_tokens,
+            claude_extended_thinking_models=CLAUDE_EXTENDED_THINKING_MODELS,
+        )
+        handler = LiteLLMAIHandler.__new__(LiteLLMAIHandler)
+        handler.claude_extended_thinking_models = CLAUDE_EXTENDED_THINKING_MODELS
+        kwargs = handler._configure_claude_extended_thinking(
+            model,
+            {},
+            effective_max_output_tokens=effective_cap,
+        )
+    finally:
+        restore_settings(snapshot)
+
+    assert route.models[0] == model
+    assert route.max_output_tokens == 2_048
+    assert effective_cap == 2_048
+    assert "thinking" not in kwargs
+
+
 def test_publication_budget_clamps_findings_and_shadow_profile_never_publishes_markdown():
     reviewer = _make_prediction_reviewer()
     reviewer._review_max_published_findings = 1
@@ -681,6 +734,7 @@ async def test_disabled_routing_adds_no_provider_inventory_or_model_calls(monkey
 
     assert artifact == "legacy review"
     assert get_run_details().review_route is None
+    assert reviewer._review_model_route() is None
     retry.assert_awaited_once()
     assert provider.get_files.call_count == 1
     assert provider.get_diff_files.call_count == 1

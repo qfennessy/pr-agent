@@ -38,6 +38,52 @@ def _positive_token_cap(value) -> int | None:
     return cap if cap > 0 else None
 
 
+def _resolve_claude_extended_thinking(
+    model: str,
+    max_output_tokens: int | None,
+    claude_extended_thinking_models: list[str],
+) -> tuple[int | None, int | None]:
+    """Resolve one output cap and an optional safe Claude thinking budget.
+
+    Anthropic requires ``max_tokens`` to be strictly greater than
+    ``budget_tokens``. Returning ``None`` for the thinking budget keeps the
+    effective output cap while disabling thinking whenever it would consume the
+    entire completion allowance.
+    """
+
+    settings = get_settings()
+    if (
+        model not in claude_extended_thinking_models
+        or not settings.config.get("enable_claude_extended_thinking", False)
+    ):
+        return max_output_tokens, None
+
+    thinking_budget = settings.config.get("extended_thinking_budget_tokens", 2048)
+    thinking_cap = settings.config.get("extended_thinking_max_output_tokens", 4096)
+    if not isinstance(thinking_budget, int) or thinking_budget <= 0:
+        raise ValueError(
+            f"extended_thinking_budget_tokens must be a positive integer, got {thinking_budget}"
+        )
+    if not isinstance(thinking_cap, int) or thinking_cap <= 0:
+        raise ValueError(
+            f"extended_thinking_max_output_tokens must be a positive integer, got {thinking_cap}"
+        )
+    if thinking_cap < thinking_budget:
+        raise ValueError(
+            f"extended_thinking_max_output_tokens ({thinking_cap}) must be greater than or equal to "
+            f"extended_thinking_budget_tokens ({thinking_budget})"
+        )
+
+    effective_cap = (
+        min(max_output_tokens, thinking_cap)
+        if max_output_tokens is not None
+        else thinking_cap
+    )
+    if effective_cap <= thinking_budget:
+        return effective_cap, None
+    return effective_cap, thinking_budget
+
+
 def get_effective_litellm_output_token_cap(
     model: str,
     request_max_output_tokens: int | None = None,
@@ -68,29 +114,11 @@ def get_effective_litellm_output_token_cap(
             and all(isinstance(value, str) and value.strip() for value in override)
             else CLAUDE_EXTENDED_THINKING_MODELS
         )
-    if (
-        request_max_output_tokens is None
-        and model in claude_extended_thinking_models
-        and settings.config.get("enable_claude_extended_thinking", False)
-    ):
-        thinking_budget = settings.config.get("extended_thinking_budget_tokens", 2048)
-        thinking_cap = settings.config.get("extended_thinking_max_output_tokens", 4096)
-        if not isinstance(thinking_budget, int) or thinking_budget <= 0:
-            raise ValueError(
-                f"extended_thinking_budget_tokens must be a positive integer, got {thinking_budget}"
-            )
-        if not isinstance(thinking_cap, int) or thinking_cap <= 0:
-            raise ValueError(
-                f"extended_thinking_max_output_tokens must be a positive integer, got {thinking_cap}"
-            )
-        if thinking_cap < thinking_budget:
-            raise ValueError(
-                f"extended_thinking_max_output_tokens ({thinking_cap}) must be greater than or equal to "
-                f"extended_thinking_budget_tokens ({thinking_budget})"
-            )
-        # Extended thinking sets max_tokens before the generic global cap uses
-        # setdefault, so this is the actual inherited cap for that model.
-        cap = thinking_cap
+    cap, _ = _resolve_claude_extended_thinking(
+        model,
+        cap,
+        claude_extended_thinking_models,
+    )
 
     if model.startswith("openrouter/"):
         openrouter_settings = settings.get("openrouter", {}) or {}
@@ -564,7 +592,7 @@ class LiteLLMAIHandler(BaseAiHandler):
         self,
         model: str,
         kwargs: dict,
-        request_max_output_tokens: int | None = None,
+        effective_max_output_tokens: int | None = None,
     ) -> dict:
         """
         Configure Claude extended thinking parameters if applicable.
@@ -576,35 +604,25 @@ class LiteLLMAIHandler(BaseAiHandler):
         Returns:
             dict: Updated kwargs with extended thinking configuration
         """
-        extended_thinking_budget_tokens = get_settings().config.get("extended_thinking_budget_tokens", 2048)
-        extended_thinking_max_output_tokens = get_settings().config.get("extended_thinking_max_output_tokens", 4096)
-
-        # Validate extended thinking parameters
-        if not isinstance(extended_thinking_budget_tokens, int) or extended_thinking_budget_tokens <= 0:
-            raise ValueError(f"extended_thinking_budget_tokens must be a positive integer, got {extended_thinking_budget_tokens}")
-        if not isinstance(extended_thinking_max_output_tokens, int) or extended_thinking_max_output_tokens <= 0:
-            raise ValueError(f"extended_thinking_max_output_tokens must be a positive integer, got {extended_thinking_max_output_tokens}")
-        if extended_thinking_max_output_tokens < extended_thinking_budget_tokens:
-            raise ValueError(f"extended_thinking_max_output_tokens ({extended_thinking_max_output_tokens}) must be greater than or equal to extended_thinking_budget_tokens ({extended_thinking_budget_tokens})")
-        if request_max_output_tokens is not None:
-            extended_thinking_max_output_tokens = min(
-                extended_thinking_max_output_tokens,
-                request_max_output_tokens,
+        effective_max_output_tokens, thinking_budget = _resolve_claude_extended_thinking(
+            model,
+            effective_max_output_tokens,
+            self.claude_extended_thinking_models,
+        )
+        if thinking_budget is None:
+            get_logger().info(
+                "Skipping Claude extended thinking because the effective output cap "
+                "does not leave response headroom beyond the thinking budget"
             )
-            if extended_thinking_max_output_tokens < extended_thinking_budget_tokens:
-                get_logger().info(
-                    "Skipping Claude extended thinking because the request-local output cap "
-                    "is smaller than the thinking budget"
-                )
-                return kwargs
+            return kwargs
 
         kwargs["thinking"] = {
             "type": "enabled",
-            "budget_tokens": extended_thinking_budget_tokens
+            "budget_tokens": thinking_budget
         }
         if get_settings().config.verbosity_level >= 2:
-            get_logger().info(f"Adding max output tokens {extended_thinking_max_output_tokens} to model {model}, extended thinking budget tokens: {extended_thinking_budget_tokens}")
-        kwargs["max_tokens"] = extended_thinking_max_output_tokens
+            get_logger().info(f"Adding max output tokens {effective_max_output_tokens} to model {model}, extended thinking budget tokens: {thinking_budget}")
+        kwargs["max_tokens"] = effective_max_output_tokens
 
         # temperature may only be set to 1 when thinking is enabled
         if get_settings().config.verbosity_level >= 2:
@@ -959,7 +977,7 @@ class LiteLLMAIHandler(BaseAiHandler):
                     kwargs = self._configure_claude_extended_thinking(
                         model,
                         kwargs,
-                        request_max_output_tokens=request_max_output_tokens,
+                        effective_max_output_tokens=max_output_tokens,
                     )
 
                 if max_output_tokens is not None:
