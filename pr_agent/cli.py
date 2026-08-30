@@ -741,16 +741,21 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     )
 
     def current_configuration_hash(base_revision: str) -> str:
-        # Rebuild all file-backed layers so edits and removed keys in either the
-        # shared source or .pr_agent.toml cannot inherit the materialized values
-        # from the start of the review. The invocation baseline retains CLI/env
-        # precedence, including the original extra-config source.
-        _restore_all_settings(configuration_baseline)
-        apply_local_repo_settings(repository_root)
-        return _snapshot_review_configuration_hash(
-            get_skills_context(),
-            _load_snapshot_repo_context(repository_root, base_revision),
-        )
+        try:
+            # Rebuild all file-backed layers so edits and removed keys in either the
+            # shared source or .pr_agent.toml cannot inherit the materialized values
+            # from the start of the review. The invocation baseline retains CLI/env
+            # precedence, including the original extra-config source.
+            _restore_all_settings(configuration_baseline)
+            apply_local_repo_settings(repository_root)
+            return _snapshot_review_configuration_hash(
+                get_skills_context(),
+                _load_snapshot_repo_context(repository_root, base_revision),
+            )
+        except Exception as exc:
+            raise SnapshotCaptureError(
+                "could not reload snapshot configuration"
+            ) from exc
 
     try:
         current = reviewer.recapture(

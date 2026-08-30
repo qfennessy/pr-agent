@@ -5,14 +5,16 @@ from typing import List, Optional
 
 from unidiff.errors import UnidiffParseError
 
-from pr_agent.algo.types import FilePatchInfo
+from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.config_loader import _find_repository_root, get_settings
 from pr_agent.git_providers.diff_parsing import parse_unified_diff, reconstruct_base_file, to_hunk_only_patch
 from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.log import get_logger
 
 
-def _decode_git_c_quoted_path(path: str) -> str:
+def _decode_git_c_quoted_path(path: str, *, c_quoted_header: bool) -> str:
+    if not c_quoted_header:
+        return path
     if len(path) < 2 or not (path.startswith('"') and path.endswith('"')):
         return path
     raw = path[1:-1]
@@ -52,6 +54,13 @@ def _decode_git_c_quoted_path(path: str) -> str:
     return value[2:]
 
 
+def _header_is_c_quoted(patch: str, prefix: str) -> bool:
+    for line in patch.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):].startswith('"')
+    return False
+
+
 def parse_plain_diff(diff_text: str) -> List[FilePatchInfo]:
     """Parse plain-diff input through the provider's single shared seam."""
     try:
@@ -59,9 +68,16 @@ def parse_plain_diff(diff_text: str) -> List[FilePatchInfo]:
     except UnidiffParseError as e:
         raise ValueError(f"Failed to parse the provided diff: {e}") from e
     for item in files:
-        item.filename = _decode_git_c_quoted_path(item.filename)
+        filename_header = "--- " if item.edit_type is EDIT_TYPE.DELETED else "+++ "
+        item.filename = _decode_git_c_quoted_path(
+            item.filename,
+            c_quoted_header=_header_is_c_quoted(item.patch, filename_header),
+        )
         if item.old_filename:
-            item.old_filename = _decode_git_c_quoted_path(item.old_filename)
+            item.old_filename = _decode_git_c_quoted_path(
+                item.old_filename,
+                c_quoted_header=_header_is_c_quoted(item.patch, "--- "),
+            )
     return files
 
 

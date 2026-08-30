@@ -1084,8 +1084,9 @@ def test_review_snapshot_returns_stale_when_skills_change_during_review(
 
 
 @pytest.mark.parametrize("config_source", ["repository", "external"])
+@pytest.mark.parametrize("replacement", ["valid", "malformed"])
 def test_review_snapshot_returns_stale_when_file_backed_settings_change(
-    cfg, monkeypatch, tmp_path, capsys, config_source
+    cfg, monkeypatch, tmp_path, capsys, config_source, replacement
 ):
     import json
     import subprocess
@@ -1115,7 +1116,11 @@ def test_review_snapshot_returns_stale_when_file_backed_settings_change(
     class FakeAgent:
         async def _handle_request(self, target, request, notify=None):
             config_path.write_text(
-                '[pr_reviewer]\nextra_instructions = "after"\n',
+                (
+                    '[pr_reviewer]\nextra_instructions = "after"\n'
+                    if replacement == "valid"
+                    else "[pr_reviewer\n"
+                ),
                 encoding="utf-8",
             )
             Path(get_settings().plain_diff.json_output_path).write_text(

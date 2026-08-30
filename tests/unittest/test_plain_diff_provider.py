@@ -79,6 +79,20 @@ def test_literal_quotes_in_a_unified_diff_filename_are_preserved():
     assert files[0].filename == '"foo"'
 
 
+def test_literal_quoted_filename_starting_with_git_prefix_is_preserved():
+    diff = '''diff --git a/"a/foo" b/"a/foo"
+--- a/"a/foo"
++++ b/"a/foo"
+@@ -1 +1 @@
+-old
++new
+'''
+
+    files = parse_plain_diff(diff)
+
+    assert files[0].filename == '"a/foo"'
+
+
 def test_git_c_quoted_prefixed_filename_is_decoded():
     diff = '''diff --git "a/foo\\tbar.py" "b/foo\\tbar.py"
 --- "a/foo\\tbar.py"
