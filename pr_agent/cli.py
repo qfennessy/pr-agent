@@ -32,6 +32,7 @@ from pr_agent.tools.local_pair_review import (
     SnapshotCaptureError,
     build_snapshot_result,
     find_repository_root,
+    validate_local_pair_review_limits,
 )
 
 log_level = os.environ.get("LOG_LEVEL", "INFO")
@@ -681,6 +682,10 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     except Exception as exc:
         outer_parser.error(f"could not apply repository settings: {type(exc).__name__}")
     settings = get_settings().get("local_pair_review", {}) or {}
+    try:
+        validate_local_pair_review_limits(settings)
+    except SnapshotCaptureError as exc:
+        outer_parser.error(str(exc))
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
     raw_exclusions = settings.get("excluded_paths", []) or []
     if isinstance(raw_exclusions, str):

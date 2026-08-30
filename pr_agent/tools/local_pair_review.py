@@ -118,6 +118,26 @@ def _normalize_patterns(value: Optional[Sequence[str] | str]) -> tuple[str, ...]
     return tuple(pattern for pattern in value if isinstance(pattern, str) and pattern)
 
 
+_LOCAL_PAIR_REVIEW_LIMIT_DEFAULTS = {
+    "max_file_bytes": 1_000_000,
+    "max_snapshot_bytes": 5_000_000,
+    "max_path_discovery_bytes": 1_000_000,
+}
+
+
+def validate_local_pair_review_limits(settings: Mapping[str, Any]) -> dict[str, int]:
+    limits = {}
+    for key, default in _LOCAL_PAIR_REVIEW_LIMIT_DEFAULTS.items():
+        value = settings.get(key, default) if hasattr(settings, "get") else default
+        try:
+            limits[key] = max(0, int(value))
+        except (TypeError, ValueError) as exc:
+            raise SnapshotCaptureError(
+                f"local_pair_review.{key} must be an integer"
+            ) from exc
+    return limits
+
+
 class LocalPairReview:
     """Build exact local diffs without requiring a clean worktree or hosted PR."""
 
@@ -138,36 +158,19 @@ class LocalPairReview:
             excluded_paths if excluded_paths is not None else configured_exclusions
         )
         self.ignored_paths = _normalize_patterns(ignored_paths)
-        configured_limit = settings.get("max_file_bytes", 1_000_000) if hasattr(settings, "get") else 1_000_000
-        self.max_file_bytes = max(
-            0, int(max_file_bytes if max_file_bytes is not None else configured_limit)
-        )
-        configured_snapshot_limit = (
-            settings.get("max_snapshot_bytes", 5_000_000)
-            if hasattr(settings, "get")
-            else 5_000_000
-        )
-        self.max_snapshot_bytes = max(
-            0,
-            int(
-                max_snapshot_bytes
-                if max_snapshot_bytes is not None
-                else configured_snapshot_limit
-            ),
-        )
-        configured_path_limit = (
-            settings.get("max_path_discovery_bytes", 1_000_000)
-            if hasattr(settings, "get")
-            else 1_000_000
-        )
-        self.max_path_discovery_bytes = max(
-            0,
-            int(
-                max_path_discovery_bytes
-                if max_path_discovery_bytes is not None
-                else configured_path_limit
-            ),
-        )
+        configured_limits = validate_local_pair_review_limits(settings)
+        explicit_limits = {
+            "max_file_bytes": max_file_bytes,
+            "max_snapshot_bytes": max_snapshot_bytes,
+            "max_path_discovery_bytes": max_path_discovery_bytes,
+        }
+        effective_limits = validate_local_pair_review_limits({
+            key: configured_limits[key] if value is None else value
+            for key, value in explicit_limits.items()
+        })
+        self.max_file_bytes = effective_limits["max_file_bytes"]
+        self.max_snapshot_bytes = effective_limits["max_snapshot_bytes"]
+        self.max_path_discovery_bytes = effective_limits["max_path_discovery_bytes"]
 
     def _relative_path(self, supplied_path: str) -> str:
         path = Path(supplied_path)

@@ -415,6 +415,34 @@ def test_review_snapshot_reports_looped_git_artifact_root(monkeypatch, tmp_path,
     assert "Traceback" not in error
 
 
+def test_review_snapshot_validates_byte_limits_before_removing_output(
+    monkeypatch, tmp_path, capsys
+):
+    import subprocess
+
+    repo = tmp_path / "repo-invalid-byte-limit"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    (repo / ".pr_agent.toml").write_text(
+        '[local_pair_review]\nmax_file_bytes = "1 MB"\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "previous-review.md"
+    previous = "<!-- pr-agent-review-snapshot -->\nPrevious review\n"
+    output.write_text(previous, encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "worktree-idle", "--output", str(output),
+        ])
+
+    error = capsys.readouterr().err
+    assert "local_pair_review.max_file_bytes must be an integer" in error
+    assert "Traceback" not in error
+    assert output.read_text(encoding="utf-8") == previous
+
+
 def test_git_artifact_root_uses_linked_worktree_git_directory(tmp_path):
     import os
     import subprocess
