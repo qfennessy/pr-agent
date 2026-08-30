@@ -14,6 +14,7 @@ from pr_agent.algo.ai_handlers.litellm_helpers import (
     litellm_callbacks_registered)
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState
 from pr_agent.algo.run_details import get_run_details
+from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.utils import get_version
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.utils import apply_local_repo_settings
@@ -203,6 +204,7 @@ def _snapshot_review_configuration_hash() -> str:
     all_settings.pop("PLAIN_DIFF", None)
     effective = {
         "runtime_version": get_version(),
+        "skills_context_sha256": hashlib.sha256(get_skills_context().encode("utf-8")).hexdigest(),
         "settings": {
             str(section): sanitized(contents, section=str(section).lower())
             for section, contents in all_settings.items()

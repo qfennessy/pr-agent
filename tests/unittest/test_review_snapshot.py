@@ -1,4 +1,5 @@
 import subprocess
+import shlex
 from pathlib import Path
 from time import monotonic
 
@@ -149,7 +150,53 @@ def test_snapshot_diff_disables_textconv_filters(tmp_path, monkeypatch):
     reviewer._capture_diff(ReviewEvent.WORKTREE_IDLE, "HEAD", ["tracked.py"])
     reviewer._capture_untracked_addition("untracked.py")
 
-    assert all("--no-textconv" in args for args in calls)
+    diff_calls = [args for args in calls if "diff" in args]
+    assert len(diff_calls) == 2
+    assert all("--no-textconv" in args for args in diff_calls)
+
+
+def test_snapshot_diff_neutralizes_configured_clean_and_process_filters(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, "neutral-filters")
+    reviewer = LocalPairReview(str(repo))
+    calls = []
+
+    def fake_run_git(repository_root, *args, **kwargs):
+        calls.append(args)
+        if "--get-regexp" in args:
+            return b"filter.danger.clean\nfilter.danger.process\nfilter.danger.required\n"
+        return b""
+
+    monkeypatch.setattr("pr_agent.tools.local_pair_review._run_git", fake_run_git)
+
+    reviewer._capture_diff(ReviewEvent.WORKTREE_IDLE, "HEAD", ["tracked.py"])
+
+    diff_args = next(args for args in calls if "diff" in args)
+    assert "filter.danger.clean=cat" in diff_args
+    assert "filter.danger.process=" in diff_args
+    assert "filter.danger.required=false" in diff_args
+
+
+def test_snapshot_capture_does_not_execute_repository_clean_filter(tmp_path):
+    repo = _repo(tmp_path, "raw-filter-content")
+    tracked = repo / "tracked.py"
+    tracked.write_text("raw = 1\n", encoding="utf-8")
+    _git(repo, "add", "tracked.py")
+    _git(repo, "commit", "-m", "initial")
+    (repo / ".gitattributes").write_text("tracked.py filter=danger\n", encoding="utf-8")
+    _git(repo, "add", ".gitattributes")
+    _git(repo, "commit", "-m", "attributes")
+    marker = repo / ".git" / "filter-ran"
+    filter_command = f"touch {shlex.quote(str(marker))}; sed s/raw/FILTERED/g"
+    _git(repo, "config", "filter.danger.clean", filter_command)
+    _git(repo, "config", "filter.danger.process", filter_command)
+    _git(repo, "config", "filter.danger.required", "true")
+    tracked.write_text("raw = 2\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert not marker.exists()
+    assert "+raw = 2" in snapshot.diff
+    assert "FILTERED" not in snapshot.diff
 
 
 def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):

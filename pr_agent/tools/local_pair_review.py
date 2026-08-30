@@ -6,6 +6,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -94,6 +95,30 @@ class LocalPairReview:
 
     def _is_ignored(self, path: str) -> bool:
         return path in self.ignored_paths
+
+    def _diff_filter_overrides(self) -> list[str]:
+        """Replace repository-configured content filters with raw pass-throughs."""
+        output = _run_git(
+            self.repository_root,
+            "config",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|process|required)$",
+            allowed_returncodes=(0, 1),
+        )
+        drivers = set()
+        for raw_key in output.decode("utf-8", errors="replace").splitlines():
+            match = re.match(r"^filter\.(.+)\.(?:clean|process|required)$", raw_key, re.IGNORECASE)
+            if match:
+                drivers.add(match.group(1))
+        overrides = []
+        for driver in sorted(drivers):
+            overrides.extend([
+                "-c", f"filter.{driver}.clean=cat",
+                "-c", f"filter.{driver}.process=",
+                "-c", f"filter.{driver}.required=false",
+            ])
+        return overrides
 
     def _git_object_identity(self, revision: str, path: str) -> tuple[Optional[str], Optional[str]]:
         if revision == ":":
@@ -196,7 +221,7 @@ class LocalPairReview:
         return resolved.decode("ascii").strip()
 
     def _tracked_path_groups(self, event: ReviewEvent, base_revision: str) -> list[tuple[str, ...]]:
-        args = ["diff"]
+        args = [*self._diff_filter_overrides(), "diff", "--no-ext-diff", "--no-textconv"]
         if event is ReviewEvent.PRE_COMMIT:
             args.append("--cached")
         args.extend(["--name-status", "-z", "--find-renames", base_revision, "--"])
@@ -219,7 +244,10 @@ class LocalPairReview:
     def _capture_diff(self, event: ReviewEvent, base_revision: str, paths: Sequence[str]) -> str:
         if not paths:
             return ""
-        args = ["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--find-renames"]
+        args = [
+            *self._diff_filter_overrides(),
+            "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--find-renames",
+        ]
         if event is ReviewEvent.PRE_COMMIT:
             args.append("--cached")
         args.extend([base_revision, "--", *paths])
@@ -228,6 +256,7 @@ class LocalPairReview:
     def _capture_untracked_addition(self, path: str) -> str:
         output = _run_git(
             self.repository_root,
+            *self._diff_filter_overrides(),
             "diff",
             "--no-index",
             "--no-ext-diff",

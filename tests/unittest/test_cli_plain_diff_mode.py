@@ -254,6 +254,27 @@ def test_snapshot_configuration_hash_covers_review_settings(cfg):
     assert _snapshot_review_configuration_hash() != second
 
 
+def test_snapshot_configuration_hash_covers_resolved_skill_content(cfg, tmp_path):
+    from pr_agent.cli import _snapshot_review_configuration_hash
+
+    skill_dir = tmp_path / "review-skill"
+    skill_dir.mkdir()
+    skill = skill_dir / "SKILL.md"
+    skill.write_text(
+        "---\nname: local-review\ndescription: Review local changes.\n---\n\nCheck the first rule.\n",
+        encoding="utf-8",
+    )
+    cfg("skills.enabled", True)
+    cfg("skills.paths", [str(tmp_path)])
+    first = _snapshot_review_configuration_hash()
+    skill.write_text(
+        "---\nname: local-review\ndescription: Review local changes.\n---\n\nCheck the second rule.\n",
+        encoding="utf-8",
+    )
+
+    assert _snapshot_review_configuration_hash() != first
+
+
 def test_review_snapshot_applies_external_policy_before_capture(cfg, monkeypatch, tmp_path, capsys):
     import json
     import subprocess
