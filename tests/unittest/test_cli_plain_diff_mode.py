@@ -13,7 +13,8 @@ _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path", "plain_diff.js
                   "local_pair_review.policy_version", "local_pair_review.excluded_paths",
                   "local_pair_review.max_file_bytes", "local_pair_review.cache_enabled",
                   "local_pair_review.cache_max_entries", "config.use_repo_settings_file",
-                  "config.reasoning_effort", "config.max_model_tokens"]
+                  "config.reasoning_effort", "config.max_model_tokens", "skills.enabled",
+                  "skills.paths", "skills.max_skills_tokens"]
 
 
 @pytest.fixture(autouse=True)
