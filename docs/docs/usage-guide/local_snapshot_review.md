@@ -50,7 +50,9 @@ Skipped binary, unreadable, oversized, excluded, or unsafe paths appear in
 envelope do not contain the full diff; the immutable input envelope retains the exact diff
 in memory only for the review path. `local_pair_review.max_snapshot_bytes` bounds the
 cumulative captured diff; paths beyond that budget are reported with
-`snapshot_byte_budget` coverage.
+`snapshot_byte_budget` coverage. `local_pair_review.max_path_discovery_bytes` separately
+bounds Git's changed and untracked path listings; if either listing exceeds that limit,
+the snapshot reports stage-level path-discovery coverage instead of buffering the list.
 
 Successful identical snapshots can use a bounded cache under the repository's Git common
 directory. The key includes repository identity, exact diff content, event, base revision,

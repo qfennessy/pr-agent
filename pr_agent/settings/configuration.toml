@@ -381,6 +381,7 @@ events = ["file_save", "worktree_idle", "pre_commit"]
 excluded_paths = [] # glob patterns relative to the repository root
 max_file_bytes = 1000000 # larger files are reported as unavailable coverage
 max_snapshot_bytes = 5000000 # cumulative diff bytes retained by one immutable snapshot
+max_path_discovery_bytes = 1000000 # bound NUL-delimited changed and untracked path discovery
 cache_enabled = true
 cache_max_entries = 50 # repository-local result cache under the Git common directory
 # Reserved for the optional watcher. Explicit review-snapshot invocation does not

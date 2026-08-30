@@ -606,6 +606,22 @@ def test_snapshot_diff_read_is_bounded_by_remaining_budget(tmp_path):
     assert CoverageIssue(path="tracked.py", reason="snapshot_byte_budget") in snapshot.coverage_issues
 
 
+def test_changed_path_discovery_is_bounded_and_reports_stage_coverage(tmp_path):
+    repo = _repo(tmp_path, "bounded-path-discovery")
+    (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+    (repo / "untracked.py").write_text("value = 1\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(
+        str(repo),
+        max_path_discovery_bytes=1,
+    ).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(reason="tracked_path_discovery_budget") in snapshot.coverage_issues
+    assert CoverageIssue(reason="untracked_path_discovery_budget") in snapshot.coverage_issues
+
+
 def test_superseded_snapshot_is_stale_and_suppresses_review(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "tracked.py"

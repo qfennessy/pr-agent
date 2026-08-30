@@ -124,6 +124,7 @@ class LocalPairReview:
         ignored_paths: Optional[Sequence[str]] = None,
         max_file_bytes: Optional[int] = None,
         max_snapshot_bytes: Optional[int] = None,
+        max_path_discovery_bytes: Optional[int] = None,
     ) -> None:
         self.repository_root = find_repository_root(repository_root)
         settings = get_settings().get("local_pair_review", {}) or {}
@@ -147,6 +148,19 @@ class LocalPairReview:
                 max_snapshot_bytes
                 if max_snapshot_bytes is not None
                 else configured_snapshot_limit
+            ),
+        )
+        configured_path_limit = (
+            settings.get("max_path_discovery_bytes", 1_000_000)
+            if hasattr(settings, "get")
+            else 1_000_000
+        )
+        self.max_path_discovery_bytes = max(
+            0,
+            int(
+                max_path_discovery_bytes
+                if max_path_discovery_bytes is not None
+                else configured_path_limit
             ),
         )
 
@@ -332,12 +346,26 @@ class LocalPairReview:
         resolved = _run_git(self.repository_root, "rev-parse", "--verify", f"{base}^{{commit}}")
         return resolved.decode("ascii").strip()
 
-    def _tracked_path_groups(self, event: ReviewEvent, base_revision: str) -> list[tuple[str, ...]]:
+    def _tracked_path_groups(
+        self,
+        event: ReviewEvent,
+        base_revision: str,
+        focus_path: Optional[str] = None,
+    ) -> Optional[list[tuple[str, ...]]]:
         args = [*self._diff_filter_overrides(), "diff", "--no-ext-diff", "--no-textconv"]
         if event is ReviewEvent.PRE_COMMIT:
             args.append("--cached")
         args.extend(["--name-status", "-z", "--find-renames", base_revision, "--"])
-        fields = _decode_z_paths(_run_git(self.repository_root, *args))
+        if focus_path:
+            args.append(focus_path)
+        output = _run_git_bounded(
+            self.repository_root,
+            *args,
+            max_output_bytes=self.max_path_discovery_bytes,
+        )
+        if output is None:
+            return None
+        fields = _decode_z_paths(output)
         path_groups = []
         index = 0
         while index < len(fields):
@@ -348,10 +376,16 @@ class LocalPairReview:
             index += path_count
         return path_groups
 
-    def _untracked_paths(self) -> list[str]:
-        return _decode_z_paths(
-            _run_git(self.repository_root, "ls-files", "--others", "--exclude-standard", "-z", "--")
+    def _untracked_paths(self, focus_path: Optional[str] = None) -> Optional[list[str]]:
+        args = ["ls-files", "--others", "--exclude-standard", "-z", "--"]
+        if focus_path:
+            args.append(focus_path)
+        output = _run_git_bounded(
+            self.repository_root,
+            *args,
+            max_output_bytes=self.max_path_discovery_bytes,
         )
+        return None if output is None else _decode_z_paths(output)
 
     def _capture_diff(
         self,
@@ -430,12 +464,6 @@ class LocalPairReview:
         if review_configuration_hash_factory is not None:
             review_configuration_hash = review_configuration_hash_factory(base_revision)
         normalized_focus = self._relative_path(focus_path) if focus_path else None
-        tracked_groups = self._tracked_path_groups(event, base_revision)
-        untracked = [] if event is ReviewEvent.PRE_COMMIT else self._untracked_paths()
-
-        if normalized_focus:
-            tracked_groups = [group for group in tracked_groups if normalized_focus in group]
-            untracked = [path for path in untracked if path == normalized_focus]
         selected_tracked: list[str] = []
         selected_tracked_groups: list[tuple[str, ...]] = []
         selected_untracked: list[str] = []
@@ -444,6 +472,21 @@ class LocalPairReview:
         def add_coverage(path: Optional[str], reason: str) -> None:
             fingerprint = self._path_fingerprint(event, path, base_revision) if path else None
             coverage.append(CoverageIssue(path=path, reason=reason, fingerprint=fingerprint))
+
+        tracked_groups = self._tracked_path_groups(
+            event, base_revision, normalized_focus
+        )
+        if tracked_groups is None:
+            add_coverage(None, "tracked_path_discovery_budget")
+            tracked_groups = []
+        untracked = (
+            []
+            if event is ReviewEvent.PRE_COMMIT
+            else self._untracked_paths(normalized_focus)
+        )
+        if untracked is None:
+            add_coverage(None, "untracked_path_discovery_budget")
+            untracked = []
 
         def validate_path(path: str) -> Optional[str]:
             try:
