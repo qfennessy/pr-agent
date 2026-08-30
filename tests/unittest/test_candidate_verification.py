@@ -18,6 +18,7 @@ from pr_agent.algo.candidate_verification import (
     apply_verification_decisions,
     bounded_verification_evidence,
     prepare_candidates,
+    prompt_evidence_coverage,
     render_verification_payload,
     retrieve_evidence,
     safe_repo_path,
@@ -2659,6 +2660,90 @@ async def test_prompt_clipping_cannot_publish_after_omitting_the_changed_anchor(
     assert decisions[0]["reason"] == "changed_code_evidence_unavailable"
 
 
+@pytest.mark.parametrize("missing_kind", ["changed_anchor", "required_context"])
+def test_prompt_evidence_coverage_reports_clipped_required_proof(missing_kind):
+    candidate = _candidate(candidate_id="candidate-1")
+    changed = {
+        **_changed_evidence(content="changed service", line=12),
+        "evidence_id": "changed-evidence",
+    }
+    required = {
+        "candidate_id": "candidate-1",
+        "source": "repository_file",
+        "path": "src/caller.py",
+        "content": "def call_service(): return service().value",
+        "start_line": 1,
+        "end_line": 1,
+        "evidence_id": "required-evidence",
+        "required_evidence": True,
+    }
+    request = {
+        "candidate_id": "candidate-1",
+        "path": "src/caller.py",
+        "required": True,
+        "status": "retrieved",
+        "evidence_id": "required-evidence",
+    }
+    visible = [changed, required]
+    if missing_kind == "changed_anchor":
+        visible = [required]
+    else:
+        visible = [changed]
+
+    coverage = prompt_evidence_coverage([candidate], visible, [request])
+
+    assert coverage["status"] == "incomplete"
+    assert coverage["candidate_count"] == 1
+    assert coverage["complete_candidate_count"] == 0
+    assert coverage["missing_changed_candidate_count"] == int(
+        missing_kind == "changed_anchor"
+    )
+    assert coverage["missing_required_request_count"] == int(
+        missing_kind == "required_context"
+    )
+
+
+def test_prompt_evidence_coverage_allows_truncation_that_preserves_atomic_proof():
+    candidate = _candidate(candidate_id="candidate-1")
+    changed = {
+        **_changed_evidence(content="before\nchanged service\nafter", line=11, end_line=13),
+        "anchor_start_line": 12,
+        "anchor_end_line": 12,
+        "evidence_id": "changed-evidence",
+    }
+    required = {
+        "candidate_id": "candidate-1",
+        "source": "repository_file",
+        "path": "src/caller.py",
+        "content": "before\ndef call_service(): return service().value\nafter",
+        "start_line": 1,
+        "end_line": 3,
+        "anchor_start_line": 2,
+        "anchor_end_line": 2,
+        "evidence_id": "required-evidence",
+        "required_evidence": True,
+    }
+    request = {
+        "candidate_id": "candidate-1",
+        "path": "src/caller.py",
+        "required": True,
+        "status": "retrieved",
+        "evidence_id": "required-evidence",
+    }
+
+    visible = bounded_verification_evidence([changed, required], 0.8)
+    coverage = prompt_evidence_coverage([candidate], visible, [request])
+
+    assert any(item.get("content_truncated") for item in visible)
+    assert coverage == {
+        "status": "complete",
+        "candidate_count": 1,
+        "complete_candidate_count": 1,
+        "missing_changed_candidate_count": 0,
+        "missing_required_request_count": 0,
+    }
+
+
 def test_paths_and_prompt_injection_text_are_handled_as_untrusted_data():
     assert safe_repo_path("../secret") is None
     payload = render_verification_payload(
@@ -3863,6 +3948,89 @@ async def test_orchestration_clips_complete_prompt_to_selected_model_budget():
     assert len(call["system"]) + len(call["user"]) <= 4_000
     assert reviewer.candidate_verification_artifact["prompt_budget"]["truncated"] is True
     assert reviewer.candidate_verification_artifact["prompt_budget"]["prompt_tokens"] <= 4_000
+
+
+@pytest.mark.parametrize("missing_kind", ["changed_anchor", "required_context"])
+@pytest.mark.asyncio
+async def test_orchestration_clipped_required_proof_suppresses_false_clean_publication(
+    missing_kind,
+):
+    private_proof = f"private_{missing_kind}_proof_" + ("x" * 8_000)
+    head_lines = [f"line {line}" for line in range(1, 31)]
+    if missing_kind == "changed_anchor":
+        head_lines[11] = private_proof
+    diff_file = _diff_file(head_file="\n".join(head_lines))
+    if missing_kind == "changed_anchor":
+        diff_file.patch = f"@@ -10,1 +12,1 @@\n+{private_proof}"
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [diff_file]
+    provider.get_repo_file_content.return_value = private_proof
+    provider.publish_structured_review = MagicMock()
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer.patches_diff = "+small changed diff"
+    reviewer._parse_review_prediction = MagicMock(return_value=_review_data(
+        _candidate(context_files=[] if missing_kind == "changed_anchor" else ["src/caller.py"])
+    ))
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        _rejected_verification_response("candidate-1"),
+        "stop",
+    ))
+    settings = _verification_settings()
+    settings.pr_reviewer["candidate_verification_max_lines_per_file"] = 60
+    settings.pr_reviewer["candidate_verification_max_total_lines"] = 120
+    settings.pr_reviewer["candidate_verification_max_context_tokens"] = 50_000
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch(
+            "pr_agent.tools.pr_reviewer.TokenEncoder.get_token_encoder",
+            return_value=_CharacterEncoder(),
+        ),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=5_500),
+    ):
+        await reviewer._run_candidate_verification()
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.github_action_output") as action_output,
+        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2") as markdown,
+    ):
+        assert reviewer._prepare_pr_review() == ""
+
+    artifact = reviewer.candidate_verification_artifact
+    coverage = artifact["prompt_evidence_coverage"]
+    assert artifact["prompt_budget"]["evidence_content_fraction"] < 1.0, (
+        artifact["prompt_budget"],
+        coverage,
+        [
+            (request.get("path"), request.get("required"), request.get("status"))
+            for request in artifact["retrieval"]["requests"]
+        ],
+        [
+            (
+                item.get("source"),
+                item.get("path"),
+                len(str(item.get("content") or "")),
+                item.get("required_evidence"),
+            )
+            for item in artifact["retrieval"]["retrieved_evidence"]
+        ],
+    )
+    assert artifact["status"] == "partial"
+    assert artifact["publication_safe"] is False
+    assert coverage["status"] == "incomplete"
+    assert coverage["missing_changed_candidate_count"] == int(
+        missing_kind == "changed_anchor"
+    )
+    assert coverage["missing_required_request_count"] == int(
+        missing_kind == "required_context"
+    )
+    assert reviewer.verified_review_data["review"]["key_issues_to_review"] == []
+    structured = provider.publish_structured_review.call_args.args[0]
+    assert structured["candidate_verification"]["prompt_evidence_coverage"] == coverage
+    assert private_proof not in json.dumps(structured)
+    action_output.assert_not_called()
+    markdown.assert_not_called()
 
 
 @pytest.mark.asyncio

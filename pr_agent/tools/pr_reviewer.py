@@ -20,6 +20,7 @@ from pr_agent.algo.candidate_verification import (
     apply_verification_decisions,
     bounded_verification_evidence,
     prepare_candidates,
+    prompt_evidence_coverage,
     render_verification_payload,
     retrieve_evidence,
     safe_repo_path,
@@ -1184,8 +1185,14 @@ class PRReviewer:
                 "prompt_tokens": prompt_tokens,
                 "route_count": len(verifier_route.models),
                 "truncated": evidence_fraction < 1.0 or changed_diff_fraction < 1.0,
-                "evidence_content_fraction": round(evidence_fraction, 4),
-                "changed_diff_fraction": round(changed_diff_fraction, 4),
+                "evidence_content_fraction": (
+                    1.0 if evidence_fraction >= 1.0
+                    else min(round(evidence_fraction, 4), 0.9999)
+                ),
+                "changed_diff_fraction": (
+                    1.0 if changed_diff_fraction >= 1.0
+                    else min(round(changed_diff_fraction, 4), 0.9999)
+                ),
             }
             artifact["model_calls"] = 1
             verifier_started = time.monotonic()
@@ -1233,6 +1240,12 @@ class PRReviewer:
                 })
                 return
             prompt_evidence = bounded_verification_evidence(evidence, evidence_fraction)
+            visible_coverage = prompt_evidence_coverage(
+                candidates,
+                prompt_evidence,
+                retrieval_artifact["requests"],
+            )
+            prompt_evidence_incomplete = visible_coverage["status"] != "complete"
             verified_findings, decisions = apply_verification_decisions(
                 candidates,
                 prompt_evidence,
@@ -1258,6 +1271,7 @@ class PRReviewer:
             verification_status = "partial" if (
                 model_candidate_coverage_incomplete
                 or sensitive_coverage_incomplete
+                or prompt_evidence_incomplete
                 or rejected_verified_claim
                 or retrieval_artifact["budget_exhausted"]
                 or any(
@@ -1276,6 +1290,7 @@ class PRReviewer:
                     and (verification_status == "complete" or bool(published_findings))
                 ),
                 "decisions": decisions,
+                "prompt_evidence_coverage": visible_coverage,
                 "verified_count": len(published_findings),
                 "verifier_verified_count": len(verified_findings),
                 "finding_limit_dropped": len(verified_findings) - len(published_findings),

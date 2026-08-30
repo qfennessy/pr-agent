@@ -137,6 +137,7 @@ def telemetry_safe_artifact(artifact: dict) -> dict:
     mapping_keys = {
         "specialist_prioritization", "sensitive_audit_coverage", "prompt_budget",
         "verifier_usage", "verifier_cost", "model_candidate_coverage",
+        "prompt_evidence_coverage",
     }
     for key in scalar_keys:
         if key in artifact and isinstance(artifact[key], (str, int, float, bool, type(None))):
@@ -1600,6 +1601,89 @@ def bounded_verification_evidence(evidence: list[dict], content_fraction: float)
     return bounded
 
 
+def _candidate_prompt_evidence_gaps(
+    candidate: dict,
+    available_evidence: list[dict],
+    retrieval_requests: list[dict],
+) -> tuple[bool, int]:
+    """Report changed-anchor and required-context gaps in prompt-visible evidence."""
+    visible_evidence_ids = {
+        item.get("evidence_id") for item in available_evidence
+        if str(item.get("content") or "").strip() and item.get("evidence_id")
+    }
+    missing_required_request_count = sum(
+        1 for request in retrieval_requests
+        if request.get("required") and (
+            request.get("status") not in {"retrieved", "satisfied_by_changed_head"}
+            or not request.get("evidence_id")
+            or request.get("evidence_id") not in visible_evidence_ids
+        )
+    )
+    candidate_side = candidate.get("side", "new")
+    candidate_start = candidate.get("start_line")
+    candidate_end = candidate.get("end_line")
+    missing_changed_anchor = not any(
+        item.get("source") in {"changed_head", "changed_patch"}
+        and str(item.get("content") or "").strip()
+        and item.get("path") == candidate.get("relevant_file")
+        and item.get("side", "new") == candidate_side
+        and isinstance(candidate_start, int)
+        and isinstance(candidate_end, int)
+        and isinstance(item.get("start_line"), int)
+        and isinstance(item.get("end_line"), int)
+        and item["start_line"] <= candidate_start
+        and candidate_end <= item["end_line"]
+        for item in available_evidence
+    )
+    return missing_changed_anchor, missing_required_request_count
+
+
+def prompt_evidence_coverage(
+    candidates: list[dict],
+    evidence: list[dict],
+    retrieval_requests: Optional[list[dict]] = None,
+) -> dict:
+    """Summarize whether every candidate retained its required prompt evidence."""
+    evidence_by_candidate = {}
+    for item in evidence:
+        candidate_ids = item.get("candidate_ids")
+        if not isinstance(candidate_ids, list):
+            candidate_ids = [item.get("candidate_id")]
+        for candidate_id in candidate_ids:
+            evidence_by_candidate.setdefault(candidate_id, []).append(item)
+    requests_by_candidate = {}
+    for request in retrieval_requests if isinstance(retrieval_requests, list) else []:
+        if isinstance(request, dict):
+            requests_by_candidate.setdefault(request.get("candidate_id"), []).append(request)
+
+    missing_changed_candidate_count = 0
+    missing_required_request_count = 0
+    complete_candidate_count = 0
+    for candidate in candidates:
+        candidate_id = candidate.get("candidate_id")
+        missing_changed, missing_required = _candidate_prompt_evidence_gaps(
+            candidate,
+            evidence_by_candidate.get(candidate_id, []),
+            requests_by_candidate.get(candidate_id, []),
+        )
+        missing_changed_candidate_count += int(missing_changed)
+        missing_required_request_count += missing_required
+        complete_candidate_count += int(not missing_changed and not missing_required)
+
+    status = (
+        "complete"
+        if complete_candidate_count == len(candidates)
+        else "incomplete"
+    )
+    return {
+        "status": status,
+        "candidate_count": len(candidates),
+        "complete_candidate_count": complete_candidate_count,
+        "missing_changed_candidate_count": missing_changed_candidate_count,
+        "missing_required_request_count": missing_required_request_count,
+    }
+
+
 def _verified_finding_identity(candidate: dict) -> Optional[tuple[str, str]]:
     """Derive identities internally from a verified assertion and its cited proof.
 
@@ -1692,20 +1776,12 @@ def apply_verification_decisions(
         if isinstance(cited_paths, str):
             cited_paths = [cited_paths]
         available_evidence = evidence_by_candidate.get(candidate_id, [])
-        prompt_visible_evidence_ids = {
-            item.get("evidence_id") for item in available_evidence
-            if str(item.get("content") or "").strip()
-            and item.get("evidence_id")
-        }
-        failed_required_requests = [
-            request for request in requests_by_candidate.get(candidate_id, [])
-            if request.get("required") and (
-                request.get("status") not in {"retrieved", "satisfied_by_changed_head"}
-                or not request.get("evidence_id")
-                or request.get("evidence_id") not in prompt_visible_evidence_ids
-            )
-        ]
-        if failed_required_requests:
+        _, missing_required_request_count = _candidate_prompt_evidence_gaps(
+            candidate,
+            available_evidence,
+            requests_by_candidate.get(candidate_id, []),
+        )
+        if missing_required_request_count:
             record["verdict"] = "rejected"
             record["reason"] = "required_context_unavailable"
             result_records.append(record)
