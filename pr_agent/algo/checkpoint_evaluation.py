@@ -22,6 +22,7 @@ from pr_agent.algo.run_details import RunDetails
 
 EVALUATION_SCHEMA_VERSION = "checkpoint-evaluation-v1"
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+_FAILURE_REASON_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ANSWER_ONLY_KEYS = frozenset({
     "adjudication",
     "adjudication_hash",
@@ -134,7 +135,7 @@ _EVALUATION_SCHEMA_DESCRIPTOR = {
             "schema_version", "manifest_id", "case_id", "arm_id", "snapshot_id", "attempt", "state",
             "terminal", "findings", "snapshot_result_state", "latency_seconds", "tokens", "cost_usd",
             "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id", "provider_id",
-            "model_revision", "record_id",
+            "model_revision", "failure_reason_code", "record_id",
         ),
         "gate_rule": ("metric", "comparator", "threshold", "minimum_support"),
         "score_metric": ("status", "value", "support"),
@@ -948,6 +949,7 @@ class EvaluationRunRecord:
     model_id: Optional[str] = None
     provider_id: Optional[str] = None
     model_revision: Optional[str] = None
+    failure_reason_code: Optional[str] = None
     schema_version: str = EVALUATION_SCHEMA_VERSION
     record_id: str = field(init=False)
 
@@ -1010,11 +1012,18 @@ class EvaluationRunRecord:
             _validate_identifier("run provider_id", self.provider_id)
         if self.model_revision is not None:
             _validate_identifier("run model_revision", self.model_revision)
+        if self.failure_reason_code is not None and (
+            not isinstance(self.failure_reason_code, str)
+            or not _FAILURE_REASON_CODE_PATTERN.fullmatch(self.failure_reason_code)
+        ):
+            raise EvaluationValidationError("run failure_reason_code must be a bounded machine-readable code")
+        if self.state is EvaluationRunState.COMPLETED and self.failure_reason_code is not None:
+            raise EvaluationValidationError("a completed run cannot have a failure_reason_code")
         payload = self._identity_payload()
         object.__setattr__(self, "record_id", content_hash(payload))
 
     def _identity_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "manifest_id": self.manifest_id,
             "case_id": self.case_id,
@@ -1039,6 +1048,9 @@ class EvaluationRunRecord:
             "provider_id": self.provider_id,
             "model_revision": self.model_revision,
         }
+        if self.failure_reason_code is not None:
+            payload["failure_reason_code"] = self.failure_reason_code
+        return payload
 
     def to_dict(self) -> dict[str, Any]:
         return {**self._identity_payload(), "record_id": self.record_id}
@@ -1052,7 +1064,7 @@ class EvaluationRunRecord:
                 "schema_version", "manifest_id", "case_id", "arm_id", "snapshot_id", "attempt", "state",
                 "terminal", "findings", "snapshot_result_state", "latency_seconds", "tokens", "cost_usd",
                 "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id", "provider_id",
-                "model_revision", "record_id",
+                "model_revision", "failure_reason_code", "record_id",
             },
         )
         snapshot_result_state = value.get("snapshot_result_state")
@@ -1079,6 +1091,7 @@ class EvaluationRunRecord:
             model_id=value.get("model_id"),
             provider_id=value.get("provider_id"),
             model_revision=value.get("model_revision"),
+            failure_reason_code=value.get("failure_reason_code"),
             schema_version=value.get("schema_version", EVALUATION_SCHEMA_VERSION),
         )
         supplied_id = value.get("record_id")
@@ -1101,6 +1114,7 @@ class EvaluationRunRecord:
         retry_count: int = 0,
         escalated: Optional[bool] = None,
         stage_latencies_seconds: Optional[Mapping[str, NumericMeasurement]] = None,
+        failure_reason_code: Optional[str] = None,
     ) -> "EvaluationRunRecord":
         """Bind shipped snapshot/run telemetry to one evaluation attempt."""
         if case not in manifest.cases:
@@ -1153,6 +1167,7 @@ class EvaluationRunRecord:
             model_id=selected_model_id,
             provider_id=selected_provider_id,
             model_revision=selected_model_revision,
+            failure_reason_code=failure_reason_code,
         )
 
 
