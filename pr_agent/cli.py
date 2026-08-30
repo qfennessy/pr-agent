@@ -238,12 +238,21 @@ def _reject_existing_repository_outputs(
         if not supplied_path:
             continue
         lexical = Path(os.path.abspath(supplied_path))
-        if not lexical.exists() and not lexical.is_symlink():
-            continue
         resolved = lexical.resolve(strict=False)
-        if lexical.is_relative_to(git_metadata_root):
-            continue
-        if lexical.is_relative_to(repository_root) or resolved.is_relative_to(repository_root):
+        exists = lexical.exists() or lexical.is_symlink()
+        lexical_worktree = (
+            lexical.is_relative_to(repository_root)
+            and not lexical.is_relative_to(git_metadata_root)
+        )
+        resolved_worktree = (
+            resolved.is_relative_to(repository_root)
+            and not resolved.is_relative_to(git_metadata_root)
+        )
+        if resolved_worktree and not lexical_worktree:
+            raise SnapshotCaptureError(
+                f"output destination aliases an existing repository path: {supplied_path}"
+            )
+        if exists and lexical_worktree:
             raise SnapshotCaptureError(
                 f"output destination aliases an existing repository path: {supplied_path}"
             )
@@ -271,6 +280,8 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
         apply_local_repo_settings(repository_root)
     except SnapshotCaptureError as exc:
         outer_parser.error(str(exc))
+    except Exception as exc:
+        outer_parser.error(f"could not apply repository settings: {type(exc).__name__}")
     settings = get_settings().get("local_pair_review", {}) or {}
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
     configured_exclusions = list(settings.get("excluded_paths", []) or [])

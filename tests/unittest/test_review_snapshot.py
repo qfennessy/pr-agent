@@ -256,6 +256,11 @@ def test_excluding_either_side_rejects_an_entire_rename(tmp_path):
     assert snapshot.diff == ""
     assert snapshot.changed_paths == ()
     assert CoverageIssue(path="ignored.py", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="allowed.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+    (repo / "allowed.py").write_text("secret = False\n", encoding="utf-8")
+    current = LocalPairReview(str(repo), excluded_paths=["ignored.py"]).capture(event="worktree-idle")
+    assert current.snapshot_id != snapshot.snapshot_id
 
 
 def test_captured_filenames_are_literal_git_pathspecs(tmp_path):

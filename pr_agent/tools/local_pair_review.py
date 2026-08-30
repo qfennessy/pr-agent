@@ -341,6 +341,16 @@ class LocalPairReview:
             normalized_group = [validate_path(path) for path in group]
             if all(normalized_group):
                 selected_tracked.extend(path for path in normalized_group if path is not None)
+            else:
+                covered_paths = {issue.path for issue in coverage}
+                for raw_path in group:
+                    try:
+                        normalized = self._relative_path(raw_path)
+                    except SnapshotCaptureError:
+                        continue
+                    if normalized not in covered_paths:
+                        add_coverage(normalized, "rename_group_omitted")
+                        covered_paths.add(normalized)
         for path in untracked:
             normalized = validate_path(path)
             if normalized is not None:

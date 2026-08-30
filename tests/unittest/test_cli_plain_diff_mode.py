@@ -122,6 +122,68 @@ def test_review_snapshot_rejects_worktree_symlink_into_git_metadata(monkeypatch,
     assert (repo / ".git" / "config").read_text(encoding="utf-8") == original_config
 
 
+def test_review_snapshot_rejects_metadata_symlink_into_worktree(monkeypatch, tmp_path, capsys):
+    import subprocess
+
+    repo = tmp_path / "repo-reverse-metadata-alias"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    source = repo / "changed.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    artifact_dir = repo / ".git" / "pr-agent"
+    artifact_dir.mkdir()
+    (artifact_dir / "result.json").symlink_to(source)
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--json-output", ".git/pr-agent/result.json", "--no-cache",
+        ])
+
+    assert "aliases an existing repository path" in capsys.readouterr().err
+    assert source.read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_review_snapshot_rejects_nonexistent_output_through_repo_symlink(monkeypatch, tmp_path, capsys):
+    import subprocess
+
+    repo = tmp_path / "repo-parent-alias"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    source = repo / "changed.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    alias = tmp_path / "repo-link"
+    alias.symlink_to(repo, target_is_directory=True)
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--json-output", str(alias / "new.json"), "--no-cache",
+        ])
+
+    assert "aliases an existing repository path" in capsys.readouterr().err
+    assert not (repo / "new.json").exists()
+
+
+def test_review_snapshot_reports_invalid_repository_settings(monkeypatch, tmp_path, capsys):
+    import subprocess
+
+    repo = tmp_path / "repo-invalid-settings"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    (repo / ".pr_agent.toml").write_text("[broken\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=["review-snapshot", "--event", "worktree-idle"])
+
+    err = capsys.readouterr().err
+    assert "could not apply repository settings: TOMLDecodeError" in err
+    assert "Traceback" not in err
+
+
 _DIFF = (
     "diff --git a/foo.py b/foo.py\n"
     "index 1111111..2222222 100644\n"
