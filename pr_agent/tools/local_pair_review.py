@@ -623,6 +623,7 @@ class LocalPairReview:
         ):
             raise SnapshotCaptureError("file-save --path must identify a file, not a directory")
         selected_tracked: list[str] = []
+        validation_tracked: list[str] = []
         selected_tracked_groups: list[tuple[str, ...]] = []
         selected_untracked: list[str] = []
         coverage: list[CoverageIssue] = []
@@ -707,7 +708,7 @@ class LocalPairReview:
 
         # A rename/copy is one security unit. If either side is unavailable or
         # excluded, selecting the other side alone can expose the full source.
-        for _, group in tracked_groups:
+        for status, group in tracked_groups:
             if any(path in filtered_paths for path in group):
                 covered_paths = {issue.path for issue in coverage}
                 for raw_path in group:
@@ -721,8 +722,14 @@ class LocalPairReview:
                 selected_group = tuple(
                     path for path in normalized_group if path is not None
                 )
-                selected_tracked_groups.append(selected_group)
-                selected_tracked.extend(selected_group)
+                validation_tracked.extend(selected_group)
+                captured_group = (
+                    selected_group[-1:]
+                    if status.startswith("C")
+                    else selected_group
+                )
+                selected_tracked_groups.append(captured_group)
+                selected_tracked.extend(captured_group)
             else:
                 covered_paths = {issue.path for issue in coverage}
                 for raw_path in group:
@@ -781,7 +788,7 @@ class LocalPairReview:
             captured_diff, captured_omissions = capture_selected()
             revalidated = all(
                 validate_path(selected_path) is not None
-                for selected_path in (*selected_tracked, *selected_untracked)
+                for selected_path in (*validation_tracked, *selected_untracked)
             )
             if revalidated:
                 verified_diff, verified_omissions = capture_selected()
@@ -801,6 +808,7 @@ class LocalPairReview:
                 add_coverage(None, "content_changed_during_capture")
             captured_diff = ""
             selected_tracked.clear()
+            validation_tracked.clear()
             selected_tracked_groups.clear()
             selected_untracked.clear()
             budget_omitted_paths: set[str] = set()

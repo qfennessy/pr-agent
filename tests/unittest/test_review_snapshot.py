@@ -515,6 +515,7 @@ def test_file_save_does_not_select_a_copy_by_its_unchanged_source(tmp_path):
     assert source_snapshot.diff == ""
     assert destination_snapshot.changed_paths == ("other.txt",)
     assert "+shared content" in destination_snapshot.diff
+    assert destination_snapshot.coverage_issues == ()
 
 
 def test_pre_commit_rejects_a_copy_from_an_unchanged_excluded_source(tmp_path):
