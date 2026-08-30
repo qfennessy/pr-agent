@@ -27,7 +27,10 @@ from starlette_context import context
 
 from pr_agent.algo import MAX_TOKENS
 from pr_agent.algo.git_patch_processing import (extract_hunk_headers,
-                                                extract_hunk_lines_from_patch)
+                                                extract_hunk_lines_from_patch,
+                                                iter_git_patch_lines,
+                                                split_git_file_lines,
+                                                strip_git_line_ending)
 from pr_agent.algo.run_details import get_run_details
 from pr_agent.algo.token_handler import TokenEncoder
 from pr_agent.algo.types import FilePatchInfo
@@ -507,12 +510,13 @@ def extract_relevant_lines_str(end_line, files, relevant_file, start_line, deden
                             return ""
                         # filter out '-' lines
                         relevant_lines_str = ""
-                        for line in selected_lines.splitlines():
+                        for line in (strip_git_line_ending(record)
+                                     for record in iter_git_patch_lines(selected_lines)):
                             if line.startswith('-'):
                                 continue
                             relevant_lines_str += line[1:] + '\n'
                     else:
-                        relevant_file_lines = file.head_file.splitlines()
+                        relevant_file_lines = split_git_file_lines(file.head_file)
                         relevant_lines_str = "\n".join(relevant_file_lines[start_line - 1:end_line])
 
                     if dedent and relevant_lines_str:
@@ -856,10 +860,10 @@ def load_large_diff(filename, new_file_content_str: str, original_file_content_s
         return ""
 
     try:
-        original_file_content_str = (original_file_content_str or "").rstrip() + "\n"
-        new_file_content_str = (new_file_content_str or "").rstrip() + "\n"
-        diff = difflib.unified_diff(original_file_content_str.splitlines(keepends=True),
-                                    new_file_content_str.splitlines(keepends=True))
+        original_file_content_str = (original_file_content_str or "").rstrip(" \t\n") + "\n"
+        new_file_content_str = (new_file_content_str or "").rstrip(" \t\n") + "\n"
+        diff = difflib.unified_diff(list(iter_git_patch_lines(original_file_content_str)),
+                                    list(iter_git_patch_lines(new_file_content_str)))
         if get_settings().config.verbosity_level >= 2 and show_warning:
             get_logger().info(f"File was modified, but no patch was found. Manually creating patch: {filename}.")
         patch = ''.join(diff)
@@ -1418,7 +1422,10 @@ def find_line_number_of_relevant_line_in_file(diff_files: List[FilePatchInfo],
     for file in diff_files:
         if file.filename and (file.filename.strip() == relevant_file):
             patch = file.patch
-            patch_lines = patch.splitlines()
+            patch_lines = [
+                strip_git_line_ending(line)
+                for line in iter_git_patch_lines(patch)
+            ]
             delta = 0
             start1, size1, start2, size2 = 0, 0, 0, 0
             if absolute_position != -1: # matching absolute to relative
