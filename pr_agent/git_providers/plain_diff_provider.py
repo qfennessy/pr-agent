@@ -14,12 +14,55 @@ from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.log import get_logger
 
 
+def _decode_git_c_quoted_path(path: str) -> str:
+    if len(path) < 2 or not (path.startswith('"') and path.endswith('"')):
+        return path
+    raw = path[1:-1]
+    decoded = bytearray()
+    index = 0
+    escapes = {
+        "a": b"\a", "b": b"\b", "f": b"\f", "n": b"\n",
+        "r": b"\r", "t": b"\t", "v": b"\v", "\\": b"\\", '"': b'"',
+    }
+    while index < len(raw):
+        character = raw[index]
+        if character != "\\":
+            decoded.extend(character.encode("utf-8", errors="surrogateescape"))
+            index += 1
+            continue
+        index += 1
+        if index >= len(raw):
+            decoded.extend(b"\\")
+            break
+        escaped = raw[index]
+        if escaped in escapes:
+            decoded.extend(escapes[escaped])
+            index += 1
+            continue
+        if escaped in "01234567":
+            end = index
+            while end < min(index + 3, len(raw)) and raw[end] in "01234567":
+                end += 1
+            decoded.append(int(raw[index:end], 8))
+            index = end
+            continue
+        decoded.extend(escaped.encode("utf-8", errors="surrogateescape"))
+        index += 1
+    value = decoded.decode("utf-8", errors="surrogateescape")
+    return value[2:] if value.startswith(("a/", "b/")) else value
+
+
 def parse_plain_diff(diff_text: str) -> List[FilePatchInfo]:
     """Parse plain-diff input through the provider's single shared seam."""
     try:
-        return parse_unified_diff(diff_text)
+        files = parse_unified_diff(diff_text)
     except UnidiffParseError as e:
         raise ValueError(f"Failed to parse the provided diff: {e}") from e
+    for item in files:
+        item.filename = _decode_git_c_quoted_path(item.filename)
+        if item.old_filename:
+            item.old_filename = _decode_git_c_quoted_path(item.old_filename)
+    return files
 
 
 class PullRequestMimic:
@@ -96,6 +139,10 @@ class PlainDiffGitProvider(GitProvider):
             f.patch = to_hunk_only_patch(f.patch)
         self.diff_files = files
         return files
+
+    def get_repo_file_content(self, file_path: str, from_default_branch: bool = False):
+        files = get_settings().get("plain_diff.repo_context_files", {}) or {}
+        return files.get(file_path) if hasattr(files, "get") else None
 
     def get_files(self) -> List[str]:
         return [f.filename for f in self.get_diff_files()]

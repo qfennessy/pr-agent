@@ -110,6 +110,21 @@ def test_worktree_snapshot_round_trips_non_ascii_git_path(tmp_path):
     assert "café.py" in snapshot.diff
 
 
+def test_worktree_snapshot_decodes_c_quoted_control_path(tmp_path):
+    repo = _repo(tmp_path, "control-path")
+    filename = "line\nbreak.py"
+    path = repo / filename
+    path.write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", filename)
+    _git(repo, "commit", "-m", "add control path")
+    path.write_text("value = 2\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.changed_paths == (filename,)
+    assert snapshot.coverage_issues == ()
+
+
 def test_mixed_review_reports_metadata_only_path_as_unavailable(tmp_path):
     repo = _repo(tmp_path, "mixed-metadata")
     (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")

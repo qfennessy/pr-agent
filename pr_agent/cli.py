@@ -5,10 +5,11 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 from contextlib import suppress
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from time import monotonic
 
 from pr_agent.agent.pr_agent import PRAgent, commands
@@ -40,6 +41,7 @@ _SNAPSHOT_PROVIDER_SETTINGS = (
     "plain_diff.json_output_path",
     "plain_diff.suppress_stdout",
     "plain_diff.disable_working_tree_enrichment",
+    "plain_diff.repo_context_files",
     "pr_reviewer.extra_instructions",
 )
 
@@ -188,7 +190,10 @@ def _snapshot_review_instructions(snapshot) -> str:
     return f"{existing}\n\n{snapshot_context}" if existing else snapshot_context
 
 
-def _snapshot_review_configuration_hash(skills_context: str | None = None) -> str:
+def _snapshot_review_configuration_hash(
+    skills_context: str | None = None,
+    repo_context_files: dict[str, str] | None = None,
+) -> str:
     settings = get_settings()
 
     credential_names = {"key", "token", "secret", "password", "credential", "credentials", "private"}
@@ -223,6 +228,7 @@ def _snapshot_review_configuration_hash(skills_context: str | None = None) -> st
         "skills_context_sha256": hashlib.sha256(
             (get_skills_context() if skills_context is None else skills_context).encode("utf-8")
         ).hexdigest(),
+        "repo_context_files": repo_context_files or {},
         "settings": {
             str(section): sanitized(contents, section=str(section).lower())
             for section, contents in all_settings.items()
@@ -230,6 +236,43 @@ def _snapshot_review_configuration_hash(skills_context: str | None = None) -> st
     }
     payload = json.dumps(effective, ensure_ascii=True, sort_keys=True, default=str, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_snapshot_repo_context(repository_root: Path, base_revision: str) -> dict[str, str]:
+    configured = get_settings().get("config.repo_context_files", []) or []
+    if isinstance(configured, str):
+        configured = [configured]
+    if not isinstance(configured, list):
+        return {}
+    try:
+        max_lines = max(0, int(get_settings().get("config.repo_context_max_lines", 500)))
+    except (TypeError, ValueError):
+        max_lines = 500
+    if max_lines == 0:
+        return {}
+
+    files = {}
+    for supplied_path in configured:
+        if not isinstance(supplied_path, str) or not supplied_path.strip():
+            continue
+        normalized = PurePosixPath(supplied_path.strip())
+        if normalized.is_absolute() or ".." in normalized.parts or normalized == PurePosixPath("."):
+            continue
+        path = normalized.as_posix()
+        process = subprocess.run(
+            [
+                "git", "-C", str(repository_root), "--literal-pathspecs",
+                "show", f"{base_revision}:{path}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if process.returncode != 0 or not process.stdout:
+            continue
+        content = process.stdout.decode("utf-8", errors="replace").rstrip()
+        files[path] = "\n".join(content.splitlines()[:max_lines])
+    return files
 
 
 def _output_artifact_exclusions(repository_root: Path, *paths: str | None) -> list[str]:
@@ -403,13 +446,17 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             excluded_paths=configured_exclusions,
             ignored_paths=artifact_exclusions,
         )
+        base_revision = reviewer._resolve_base(snapshot_args.base)
+        repo_context_files = _load_snapshot_repo_context(repository_root, base_revision)
         snapshot = reviewer.capture(
             event=event,
-            base=snapshot_args.base,
+            base=base_revision,
             focus_path=snapshot_args.focus_path,
             task_intent=snapshot_args.task_intent,
             deterministic_results=checks,
-            review_configuration_hash=_snapshot_review_configuration_hash(skills_context),
+            review_configuration_hash=_snapshot_review_configuration_hash(
+                skills_context, repo_context_files
+            ),
             policy_version=policy_version,
             parent_snapshot_id=snapshot_args.parent_snapshot_id,
         )
@@ -453,6 +500,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             get_settings().set("plain_diff.json_output_path", str(structured_path))
             get_settings().set("plain_diff.suppress_stdout", True)
             get_settings().set("plain_diff.disable_working_tree_enrichment", True)
+            get_settings().set("plain_diff.repo_context_files", repo_context_files)
             get_settings().set("config.publish_output", True)
             get_settings().set("config.propagate_tool_errors", True)
             get_settings().set("pr_reviewer.extra_instructions", _snapshot_review_instructions(snapshot))
