@@ -1633,6 +1633,37 @@ def test_deletion_only_modified_file_is_unsupported_coverage(event, tmp_path):
     ) in snapshot.coverage_issues
 
 
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+def test_deletion_only_unicode_separator_line_is_unsupported_coverage(
+    event, unicode_separator, tmp_path
+):
+    repo = _repo(
+        tmp_path, f"deletion-only-unicode-separator-{event}-{ord(unicode_separator)}"
+    )
+    path = repo / "tracked.py"
+    path.write_text(
+        f"safe{unicode_separator}+looks_added\nkeep_me = True\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "tracked.py")
+    _git(repo, "commit", "-m", "add unicode deletion fixture")
+    path.write_text("keep_me = True\n", encoding="utf-8")
+    if event == "pre-commit":
+        _git(repo, "add", "tracked.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="tracked.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(
+        path="tracked.py", reason="deleted_file_unsupported"
+    ) in snapshot.coverage_issues
+
+
 def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "large.py"
@@ -2521,6 +2552,37 @@ def test_findings_must_match_captured_files_and_hunk_lines(
     assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
     assert result.review is None
     assert CoverageIssue(reason="review_failed:InvalidStructuredReview") in result.coverage_issues
+
+
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+def test_finding_cannot_target_a_unicode_separator_fragment(unicode_separator):
+    diff = (
+        "--- a/x\n"
+        "+++ b/x\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        f"+new{unicode_separator}+looks_like_a_second_line\n"
+    )
+    snapshot = _snapshot("/repo/one", diff=diff)
+
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={"review": {"key_issues_to_review": [{
+            "relevant_file": "x",
+            "issue_header": "Bug",
+            "issue_content": "This finding targets a nonexistent patch line.",
+            "start_line": 2,
+            "end_line": 2,
+        }]}},
+        started_at=monotonic(),
+    )
+
+    assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert result.review is None
+    assert CoverageIssue(
+        reason="review_failed:InvalidStructuredReview"
+    ) in result.coverage_issues
 
 
 def test_finding_range_may_include_adjacent_unchanged_context():
