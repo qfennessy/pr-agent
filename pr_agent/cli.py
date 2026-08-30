@@ -777,10 +777,10 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         )
     except SnapshotCaptureError:
         current = None
-    if current is None:
+    if current is None or current.snapshot_id != snapshot.snapshot_id:
         stale_result = build_snapshot_result(
             snapshot,
-            current_snapshot=None,
+            current_snapshot=current,
             structured_review=None,
             started_at=monotonic(),
         )

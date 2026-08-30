@@ -308,6 +308,25 @@ def test_snapshot_capture_does_not_execute_repository_clean_filter(tmp_path):
     assert "FILTERED" not in snapshot.diff
 
 
+def test_filtered_path_is_reported_when_clean_driver_alone_makes_it_dirty(tmp_path):
+    repo = _repo(tmp_path, "filter-only-dirty")
+    tracked = repo / "tracked.py"
+    tracked.write_text("raw\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text("tracked.py filter=changing\n", encoding="utf-8")
+    _git(repo, "add", "tracked.py", ".gitattributes")
+    _git(repo, "commit", "-m", "filtered fixture")
+    _git(repo, "config", "filter.changing.clean", "sed s/raw/OTHER/g")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(
+        path="tracked.py",
+        reason="content_filter_unsupported",
+    ) in snapshot.coverage_issues
+
+
 def test_pre_commit_uses_index_content_filter_attributes(tmp_path):
     repo = _repo(tmp_path, "index-filter-attributes")
     tracked = repo / "tracked.py"

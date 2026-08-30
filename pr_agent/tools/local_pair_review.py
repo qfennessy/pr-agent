@@ -53,11 +53,16 @@ def _run_git_bounded(
     *args: str,
     max_output_bytes: int,
     allowed_returncodes: tuple[int, ...] = (0,),
+    stdin_bytes: Optional[bytes] = None,
 ) -> Optional[bytes]:
     """Read at most one byte beyond a caller's Git-output budget."""
-    with tempfile.TemporaryFile() as stderr:
+    with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as stderr:
+        if stdin_bytes:
+            stdin.write(stdin_bytes)
+            stdin.seek(0)
         process = subprocess.Popen(
             ["git", "-C", str(repository_root), *args],
+            stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=stderr,
         )
@@ -382,6 +387,44 @@ class LocalPairReview:
             index += path_count
         return path_groups
 
+    def _tracked_filtered_paths(
+        self,
+        event: ReviewEvent,
+        focus_path: Optional[str] = None,
+    ) -> Optional[set[str]]:
+        tracked_args = ["--literal-pathspecs", "ls-files", "-z", "--"]
+        if focus_path:
+            tracked_args.append(focus_path)
+        tracked = _run_git_bounded(
+            self.repository_root,
+            *tracked_args,
+            max_output_bytes=self.max_path_discovery_bytes,
+        )
+        if tracked is None:
+            return None
+        if not tracked:
+            return set()
+        attribute_args = ["--literal-pathspecs", "check-attr"]
+        if event is ReviewEvent.PRE_COMMIT:
+            attribute_args.append("--cached")
+        attribute_args.extend(["-z", "--stdin", "filter"])
+        attributes = _run_git_bounded(
+            self.repository_root,
+            *attribute_args,
+            max_output_bytes=self.max_path_discovery_bytes,
+            stdin_bytes=tracked,
+        )
+        if attributes is None:
+            return None
+        fields = _decode_z_paths(attributes)
+        if len(fields) % 3:
+            raise SnapshotCaptureError("git check-attr returned malformed path data")
+        return {
+            fields[index]
+            for index in range(0, len(fields), 3)
+            if fields[index + 2].lower() not in {"unspecified", "unset"}
+        }
+
     def _untracked_paths(self, focus_path: Optional[str] = None) -> Optional[list[str]]:
         args = [
             "--literal-pathspecs",
@@ -486,10 +529,19 @@ class LocalPairReview:
             fingerprint = self._path_fingerprint(event, path, base_revision) if path else None
             coverage.append(CoverageIssue(path=path, reason=reason, fingerprint=fingerprint))
 
+        filtered_paths = self._tracked_filtered_paths(event, normalized_focus)
+        discovery_overflow = filtered_paths is None
+        if filtered_paths is None:
+            add_coverage(None, "filtered_path_discovery_budget")
+            filtered_paths = set()
+        else:
+            for filtered_path in sorted(filtered_paths):
+                add_coverage(filtered_path, "content_filter_unsupported")
+
         tracked_groups = self._tracked_path_groups(
             event, base_revision, normalized_focus
         )
-        discovery_overflow = tracked_groups is None
+        discovery_overflow = discovery_overflow or tracked_groups is None
         if tracked_groups is None:
             add_coverage(None, "tracked_path_discovery_budget")
             tracked_groups = []
@@ -550,6 +602,14 @@ class LocalPairReview:
         # A rename/copy is one security unit. If either side is unavailable or
         # excluded, selecting the other side alone can expose the full source.
         for group in tracked_groups:
+            if any(path in filtered_paths for path in group):
+                covered_paths = {issue.path for issue in coverage}
+                for raw_path in group:
+                    normalized = self._relative_path(raw_path)
+                    if normalized not in covered_paths:
+                        add_coverage(normalized, "rename_group_omitted")
+                        covered_paths.add(normalized)
+                continue
             normalized_group = [validate_path(path) for path in group]
             if all(normalized_group):
                 selected_group = tuple(

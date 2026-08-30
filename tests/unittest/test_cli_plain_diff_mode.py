@@ -1100,6 +1100,50 @@ def test_review_snapshot_returns_stale_when_base_ref_disappears(
     ]
 
 
+def test_review_snapshot_stops_before_model_when_initial_recapture_is_stale(
+    cfg, monkeypatch, tmp_path, capsys
+):
+    import subprocess
+
+    from pr_agent.tools.local_pair_review import LocalPairReview
+
+    repo = tmp_path / "repo-stale-before-review"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "initial"],
+        check=True,
+        capture_output=True,
+    )
+    changed.write_text("value = 2\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+    original_recapture = LocalPairReview.recapture
+
+    def stale_recapture(self, snapshot, **kwargs):
+        changed.write_text("value = 3\n", encoding="utf-8")
+        return original_recapture(self, snapshot, **kwargs)
+
+    class UnexpectedAgent:
+        def __init__(self):
+            raise AssertionError("known-stale snapshots must not reach the model")
+
+    monkeypatch.setattr(LocalPairReview, "recapture", stale_recapture)
+    monkeypatch.setattr("pr_agent.cli.PRAgent", UnexpectedAgent)
+
+    result = run(inargs=[
+        "review-snapshot", "--event", "file-save", "--path", "changed.py", "--no-cache",
+    ])
+
+    assert result.state.value == "stale"
+    assert result.current_snapshot_id != result.snapshot_id
+    assert __import__("json").loads(capsys.readouterr().out)["state"] == "stale"
+
+
 def test_review_snapshot_returns_stale_when_skills_change_during_review(
     cfg, monkeypatch, tmp_path, capsys
 ):
