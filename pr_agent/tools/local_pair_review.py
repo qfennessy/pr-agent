@@ -310,6 +310,8 @@ class SnapshotCache:
             try:
                 old_path.unlink()
             except OSError:
+                # Eviction is best effort; an in-use or concurrently removed cache
+                # entry must not turn a completed review into unavailable coverage.
                 pass
 
 
