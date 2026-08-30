@@ -2,6 +2,7 @@ import pytest
 
 from pr_agent.cli import run, set_parser
 from pr_agent.config_loader import get_settings
+from pr_agent.tools.local_pair_review import SnapshotCaptureError
 
 # Keys run() mutates on the process-wide settings singleton, directly or via the
 # diff-mode CLI path. Snapshotted and restored around every test (autouse) so
@@ -439,6 +440,50 @@ def test_review_snapshot_atomically_replaces_json_symlink_swapped_during_review(
     assert protected.read_bytes() == original
     assert not output.is_symlink()
     assert json.loads(output.read_text(encoding="utf-8"))["snapshot_id"] == result.snapshot_id
+    capsys.readouterr()
+
+
+def test_review_snapshot_rejects_output_parent_swapped_during_review(
+    cfg, monkeypatch, tmp_path, capsys
+):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo-json-parent-race"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    output = repo / ".git" / "pr-agent" / "reviews" / "result.json"
+    external_parent = tmp_path / "external-reviews"
+    external_parent.mkdir()
+    protected = external_parent / "result.json"
+    protected.write_text("keep external\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            output.parent.rmdir()
+            output.parent.symlink_to(external_parent, target_is_directory=True)
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    with pytest.raises(SnapshotCaptureError, match="output parent changed before publication"):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--no-cache", "--json-output", str(output),
+        ])
+
+    assert protected.read_text(encoding="utf-8") == "keep external\n"
     capsys.readouterr()
 
 

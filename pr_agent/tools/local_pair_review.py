@@ -21,6 +21,7 @@ from pr_agent.algo.review_snapshot import (CoverageIssue, ReviewEvent,
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.diff_parsing import to_hunk_only_patch
 from pr_agent.git_providers.plain_diff_provider import parse_plain_diff
+from pr_agent.log import get_logger
 
 
 class SnapshotCaptureError(ValueError):
@@ -74,7 +75,9 @@ class LocalPairReview:
         self.excluded_paths = tuple(excluded_paths if excluded_paths is not None else configured_exclusions)
         self.ignored_paths = tuple(ignored_paths or ())
         configured_limit = settings.get("max_file_bytes", 1_000_000) if hasattr(settings, "get") else 1_000_000
-        self.max_file_bytes = int(max_file_bytes if max_file_bytes is not None else configured_limit)
+        self.max_file_bytes = max(
+            0, int(max_file_bytes if max_file_bytes is not None else configured_limit)
+        )
 
     def _relative_path(self, supplied_path: str) -> str:
         path = Path(supplied_path)
@@ -501,6 +504,15 @@ class SnapshotCache:
         }
         if result.state in unavailable_states:
             return
+        try:
+            self._write(result)
+        except OSError as exc:
+            get_logger().warning(
+                "Could not persist local snapshot cache; continuing without cache",
+                artifact={"error": type(exc).__name__},
+            )
+
+    def _write(self, result: ReviewSnapshotResult) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(result.to_dict(), ensure_ascii=True, sort_keys=True, indent=2) + "\n"
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.cache_dir, delete=False) as handle:

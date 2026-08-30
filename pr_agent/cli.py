@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import secrets
 import stat
 import subprocess
 import sys
@@ -164,23 +165,74 @@ def _parse_deterministic_checks(values: list[str], parser: argparse.ArgumentPars
     return checks
 
 
-def _emit_snapshot_result(result, output_path: str | None) -> None:
+def _prepare_output_parent(output_path: str) -> tuple[int, int]:
+    parent = Path(output_path).parent
+    parent.mkdir(parents=True, exist_ok=True)
+    parent_stat = parent.stat()
+    return parent_stat.st_dev, parent_stat.st_ino
+
+
+def _atomic_replace_bytes(
+    destination: Path,
+    content: bytes,
+    parent_identity: tuple[int, int],
+) -> None:
+    parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    temporary_name = None
+    try:
+        parent_stat = os.fstat(parent_fd)
+        if (parent_stat.st_dev, parent_stat.st_ino) != parent_identity:
+            raise SnapshotCaptureError(f"output parent changed before publication: {destination}")
+        temporary_name = f".pr-agent-{secrets.token_hex(16)}.tmp"
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        with os.fdopen(temporary_fd, "wb") as handle:
+            handle.write(content)
+        os.replace(
+            temporary_name,
+            destination.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            with suppress(OSError):
+                os.unlink(temporary_name, dir_fd=parent_fd)
+        os.close(parent_fd)
+
+
+def _unlink_output(destination: Path, parent_identity: tuple[int, int]) -> None:
+    parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        parent_stat = os.fstat(parent_fd)
+        if (parent_stat.st_dev, parent_stat.st_ino) != parent_identity:
+            raise SnapshotCaptureError(f"output parent changed before preparation: {destination}")
+        try:
+            os.unlink(destination.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+    finally:
+        os.close(parent_fd)
+
+
+def _emit_snapshot_result(
+    result,
+    output_path: str | None,
+    parent_identity: tuple[int, int] | None = None,
+) -> None:
     payload = json.dumps(result.to_dict(), ensure_ascii=True, sort_keys=True, indent=2) + "\n"
     print(payload, end="")
     if output_path:
-        temporary_path = None
         try:
             destination = Path(output_path)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                "w", encoding="utf-8", dir=destination.parent, delete=False
-            ) as handle:
-                handle.write(payload)
-                temporary_path = Path(handle.name)
-            os.replace(temporary_path, destination)
-        except OSError as exc:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+            identity = parent_identity or _prepare_output_parent(output_path)
+            _atomic_replace_bytes(destination, payload.encode("utf-8"), identity)
+        except (OSError, SnapshotCaptureError) as exc:
             raise SnapshotCaptureError(f"could not write --json-output '{output_path}': {exc}") from exc
 
 
@@ -439,11 +491,24 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
     configured_exclusions = list(settings.get("excluded_paths", []) or [])
     git_metadata_root = SnapshotCache(repository_root).cache_dir.parents[1]
+    output_parent_identities = {}
     try:
         _reject_existing_repository_outputs(
             repository_root, git_metadata_root, markdown_output, json_output
         )
-    except SnapshotCaptureError as exc:
+        for output_path in (markdown_output, json_output):
+            if output_path:
+                output_parent_identities[output_path] = _prepare_output_parent(output_path)
+        # Parent creation is intentionally followed by a second alias check so
+        # newly materialized components cannot redirect into protected paths.
+        _reject_existing_repository_outputs(
+            repository_root, git_metadata_root, markdown_output, json_output
+        )
+        if markdown_output:
+            _unlink_output(
+                Path(markdown_output), output_parent_identities[markdown_output]
+            )
+    except (OSError, SnapshotCaptureError) as exc:
         outer_parser.error(str(exc))
     artifact_exclusions = _output_artifact_exclusions(repository_root, markdown_output, json_output)
     skills_context = get_skills_context()
@@ -482,7 +547,9 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     if cache_enabled and not markdown_output and current.snapshot_id == snapshot.snapshot_id:
         cached_result = cache.read(snapshot.snapshot_id)
         if cached_result is not None:
-            _emit_snapshot_result(cached_result, json_output)
+            _emit_snapshot_result(
+                cached_result, json_output, output_parent_identities.get(json_output)
+            )
             return cached_result
 
     started_at = monotonic()
@@ -490,13 +557,6 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     review_error = None
     details = None
     pending_markdown = None
-    if markdown_output:
-        try:
-            Path(markdown_output).unlink(missing_ok=True)
-        except OSError as exc:
-            raise SnapshotCaptureError(
-                f"could not prepare --output '{markdown_output}': {exc}"
-            ) from exc
     if snapshot.diff.strip():
         with tempfile.TemporaryDirectory(prefix="pr-agent-snapshot-") as temp_dir:
             structured_path = Path(temp_dir) / "review.json"
@@ -584,18 +644,15 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
     ):
         output_path = Path(markdown_output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = None
         try:
-            with tempfile.NamedTemporaryFile("wb", dir=output_path.parent, delete=False) as handle:
-                handle.write(pending_markdown)
-                temporary_path = Path(handle.name)
-            os.replace(temporary_path, output_path)
-        except OSError as exc:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+            _atomic_replace_bytes(
+                output_path,
+                pending_markdown,
+                output_parent_identities[markdown_output],
+            )
+        except (OSError, SnapshotCaptureError) as exc:
             raise SnapshotCaptureError(f"could not publish --output '{markdown_output}': {exc}") from exc
-    _emit_snapshot_result(result, json_output)
+    _emit_snapshot_result(result, json_output, output_parent_identities.get(json_output))
     return result
 
 

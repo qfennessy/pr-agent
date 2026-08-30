@@ -478,6 +478,17 @@ def test_binary_and_excluded_files_are_visible_partial_coverage(tmp_path):
     }
 
 
+def test_negative_file_size_limit_is_clamped_before_reads(tmp_path):
+    repo = _repo(tmp_path, "negative-limit")
+    (repo / "large.py").write_text("content\n", encoding="utf-8")
+    reviewer = LocalPairReview(str(repo), max_file_bytes=-2)
+
+    snapshot = reviewer.capture(event="worktree-idle")
+
+    assert reviewer.max_file_bytes == 0
+    assert CoverageIssue(path="large.py", reason="file_too_large") in snapshot.coverage_issues
+
+
 def test_superseded_snapshot_is_stale_and_suppresses_review(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "tracked.py"
@@ -641,3 +652,20 @@ def test_cache_treats_structurally_invalid_json_as_a_miss(tmp_path):
     for payload in invalid_payloads:
         cache._path(snapshot.snapshot_id).write_text(json.dumps(payload), encoding="utf-8")
         assert cache.read(snapshot.snapshot_id) is None
+
+
+def test_cache_write_failure_does_not_abort_completed_review(tmp_path):
+    repo = _repo(tmp_path, "cache-write-failure")
+    cache = SnapshotCache(repo)
+    snapshot = _snapshot(str(repo))
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={"review": {"key_issues_to_review": []}},
+        started_at=monotonic(),
+    )
+    cache.cache_dir.parent.write_text("not a directory", encoding="utf-8")
+
+    cache.write(result)
+
+    assert result.state is ReviewResultState.NO_FINDINGS
