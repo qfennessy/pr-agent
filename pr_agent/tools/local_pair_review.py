@@ -287,9 +287,9 @@ def _patch_model_visible_regions(patch: str) -> tuple[bytes, ...]:
 
 def _status_has_content_patch(status: str) -> bool:
     """Return whether a status has a hunk distinct from a full copy addition."""
-    if status.startswith("M"):
+    if status.startswith(("M", "R")):
         return True
-    if not status.startswith(("R", "C")):
+    if not status.startswith("C"):
         return False
     similarity = status[1:]
     return not similarity.isdigit() or int(similarity) < 100

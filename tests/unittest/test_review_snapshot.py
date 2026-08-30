@@ -943,6 +943,47 @@ def test_rename_copy_edits_scope_provenance_to_captured_group_patch(
     )
 
 
+def test_metadata_only_staged_rename_does_not_suppress_safe_worktree_edit(tmp_path):
+    repo = _repo(tmp_path, "metadata-rename-safe-worktree-edit")
+    secret_line = "API_TOKEN=distant-metadata-rename-secret"
+    (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
+    source = repo / "feature.py"
+    filler = "".join(f"FILLER_{index}=unchanged\n" for index in range(12))
+    source.write_text(
+        f"{secret_line}\n{filler}FEATURE_FLAG=disabled\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add metadata rename fixture")
+    destination = repo / "renamed.py"
+    _git(repo, "mv", "feature.py", "renamed.py")
+    destination.write_text(
+        destination.read_text(encoding="utf-8").replace(
+            "FEATURE_FLAG=disabled", "FEATURE_FLAG=enabled"
+        ),
+        encoding="utf-8",
+    )
+    reviewer = LocalPairReview(str(repo))
+    groups = reviewer._tracked_path_groups(
+        ReviewEvent.WORKTREE_IDLE,
+        _git(repo, "rev-parse", "HEAD"),
+    )
+
+    assert groups is not None
+    assert ("index", "R100", ("feature.py", "renamed.py")) in groups
+    assert ("worktree", "M", ("renamed.py",)) in groups
+
+    snapshot = reviewer.capture(event="worktree-idle")
+
+    assert "renamed.py" in snapshot.changed_paths
+    assert "+FEATURE_FLAG=enabled" in snapshot.diff
+    assert secret_line not in snapshot.diff
+    assert not any(
+        issue.path == "renamed.py" and issue.reason == "rename_group_omitted"
+        for issue in snapshot.coverage_issues
+    )
+
+
 @pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
 def test_modified_file_exposing_large_unsafe_source_context_is_omitted(event, tmp_path):
     repo = _repo(tmp_path, f"exposed-large-excluded-context-{event}")
