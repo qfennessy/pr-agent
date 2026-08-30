@@ -13,7 +13,7 @@ _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path", "plain_diff.js
                   "local_pair_review.policy_version", "local_pair_review.excluded_paths",
                   "local_pair_review.max_file_bytes", "local_pair_review.cache_enabled",
                   "local_pair_review.cache_max_entries", "config.use_repo_settings_file",
-                  "config.reasoning_effort", "config.max_model_tokens", "skills.enabled",
+                  "config.model", "config.reasoning_effort", "config.max_model_tokens", "skills.enabled",
                   "skills.paths", "skills.max_skills_tokens"]
 
 
@@ -351,9 +351,13 @@ def test_review_snapshot_restores_provider_settings_for_later_hosted_run(
     subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
     changed.write_text("value = 2\n", encoding="utf-8")
+    (repo / ".pr_agent.toml").write_text(
+        '[config]\nmodel = "repo-only-model"\n', encoding="utf-8"
+    )
     monkeypatch.chdir(repo)
 
     baselines = {
+        "config.model": "hosted-model",
         "config.git_provider": "github",
         "config.publish_output": False,
         "config.propagate_tool_errors": False,
@@ -369,6 +373,7 @@ def test_review_snapshot_restores_provider_settings_for_later_hosted_run(
 
     class FakeAgent:
         async def _handle_request(self, target, request, notify=None):
+            assert get_settings().config.model == "repo-only-model"
             Path(get_settings().plain_diff.json_output_path).write_text(
                 json.dumps({"review": {"key_issues_to_review": []}}),
                 encoding="utf-8",

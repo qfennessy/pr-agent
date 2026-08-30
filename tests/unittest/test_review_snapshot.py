@@ -244,6 +244,20 @@ def test_symlink_paths_are_preserved_and_reported_as_unsupported(tmp_path):
     assert CoverageIssue(path="link.py", reason="symlink") in snapshot.coverage_issues
 
 
+def test_symlink_loop_is_reported_as_unsupported_coverage(tmp_path):
+    repo = _repo(tmp_path, "symlink-loop")
+    link = repo / "loop.py"
+    link.symlink_to("loop.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    issue = snapshot.coverage_issues[0]
+    assert issue.path == "loop.py"
+    assert issue.reason == "symlink"
+    assert issue.fingerprint is not None
+
+
 def test_excluding_either_side_rejects_an_entire_rename(tmp_path):
     repo = _repo(tmp_path)
     source = repo / "ignored.py"

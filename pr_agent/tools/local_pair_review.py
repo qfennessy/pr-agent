@@ -81,7 +81,19 @@ class LocalPairReview:
         # Resolve existing symlinks as well as lexical ``..``. A symlink that points
         # outside the worktree is not safe input even when its link lives inside it.
         lexical = Path(os.path.abspath(candidate))
-        resolved = candidate.resolve(strict=False)
+        try:
+            resolved = candidate.resolve(strict=False)
+        except RuntimeError:
+            # A looped symlink is still a repository entry that must appear in
+            # coverage. Keep its lexical path so inspection can classify and
+            # fingerprint the link itself without following it.
+            try:
+                relative = lexical.relative_to(self.repository_root)
+            except ValueError as exc:
+                raise SnapshotCaptureError(f"path is outside repository root: {supplied_path}") from exc
+            if relative == Path("."):
+                raise SnapshotCaptureError("a repository root is not a reviewable file path")
+            return relative.as_posix()
         try:
             resolved.relative_to(self.repository_root)
             relative = lexical.relative_to(self.repository_root)

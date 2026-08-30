@@ -7,6 +7,7 @@ import os
 import stat
 import sys
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 from time import monotonic
 
@@ -269,6 +270,19 @@ def _restore_settings(snapshot: dict[str, object]) -> None:
                 break
 
 
+def _snapshot_all_settings() -> dict[str, object]:
+    return copy.deepcopy(get_settings().as_dict())
+
+
+def _restore_all_settings(snapshot: dict[str, object]) -> None:
+    settings = get_settings()
+    for section in list(settings.as_dict().keys()):
+        with suppress(KeyError):
+            settings.unset(section)
+    for section, value in snapshot.items():
+        settings.set(section, copy.deepcopy(value), merge=False)
+
+
 def _reject_existing_repository_outputs(
     repository_root: Path,
     git_metadata_root: Path,
@@ -339,6 +353,14 @@ def _is_hard_linked_to_repository(candidate: Path, *roots: Path) -> bool:
 
 
 def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
+    original_settings = _snapshot_all_settings()
+    try:
+        return _run_review_snapshot_impl(args, outer_parser)
+    finally:
+        _restore_all_settings(original_settings)
+
+
+def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     parser = _snapshot_parser()
     snapshot_args = parser.parse_args(args.rest)
     if args.output and snapshot_args.output:
