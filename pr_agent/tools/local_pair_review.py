@@ -774,6 +774,15 @@ class LocalPairReview:
             dict.fromkeys(path for _, _, group in tracked_groups for path in group)
         )
         attribute_candidate_paths = list(changed_group_paths)
+        untracked = (
+            []
+            if event is ReviewEvent.PRE_COMMIT
+            else self._untracked_paths(normalized_focus)
+        )
+        if untracked is None:
+            add_coverage(None, "untracked_path_discovery_budget")
+            untracked = []
+            discovery_overflow = True
         if event is not ReviewEvent.PRE_COMMIT:
             active_attribute_paths = self._tracked_attribute_candidate_paths(
                 normalized_focus
@@ -783,7 +792,9 @@ class LocalPairReview:
                 add_coverage(None, "filtered_path_discovery_budget")
             else:
                 attribute_candidate_paths = list(
-                    dict.fromkeys((*active_attribute_paths, *changed_group_paths))
+                    dict.fromkeys(
+                        (*active_attribute_paths, *changed_group_paths, *untracked)
+                    )
                 )
         filtered_paths = self._tracked_filtered_paths(
             event, base_revision, attribute_candidate_paths
@@ -798,15 +809,6 @@ class LocalPairReview:
             filtered_paths = set()
         for filtered_path in sorted(filtered_paths):
             add_coverage(filtered_path, "content_filter_unsupported")
-        untracked = (
-            []
-            if event is ReviewEvent.PRE_COMMIT
-            else self._untracked_paths(normalized_focus)
-        )
-        if untracked is None:
-            add_coverage(None, "untracked_path_discovery_budget")
-            untracked = []
-            discovery_overflow = True
         if discovery_overflow:
             # An incomplete path set cannot safely produce feedback. Discard the
             # other discovery stage as well so omitted repository state can never
@@ -846,6 +848,13 @@ class LocalPairReview:
                 )
             )
             current_attribute_paths = list(current_group_paths)
+            current_untracked = (
+                []
+                if event is ReviewEvent.PRE_COMMIT
+                else self._untracked_paths(normalized_focus)
+            )
+            if current_untracked is None:
+                return None
             if event is not ReviewEvent.PRE_COMMIT:
                 active_paths = self._tracked_attribute_candidate_paths(
                     normalized_focus
@@ -853,17 +862,14 @@ class LocalPairReview:
                 if active_paths is None:
                     return None
                 current_attribute_paths = list(
-                    dict.fromkeys((*active_paths, *current_group_paths))
+                    dict.fromkeys(
+                        (*active_paths, *current_group_paths, *current_untracked)
+                    )
                 )
             current_filtered = self._tracked_filtered_paths(
                 event, base_revision, current_attribute_paths
             )
-            current_untracked = (
-                []
-                if event is ReviewEvent.PRE_COMMIT
-                else self._untracked_paths(normalized_focus)
-            )
-            if current_filtered is None or current_untracked is None:
+            if current_filtered is None:
                 return None
             return (
                 tuple(current_groups),
@@ -881,6 +887,8 @@ class LocalPairReview:
                 return None
             if self._is_excluded(normalized):
                 add_coverage(normalized, "excluded")
+                return None
+            if normalized in filtered_paths:
                 return None
             if self._has_content_filter(event, normalized):
                 add_coverage(normalized, "content_filter_unsupported")

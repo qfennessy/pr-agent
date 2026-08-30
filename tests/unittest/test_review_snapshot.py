@@ -411,6 +411,35 @@ def test_removed_filter_assignment_remains_excluded_from_base(event, tmp_path):
     ) in snapshot.coverage_issues
 
 
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle"])
+def test_untracked_path_uses_index_and_base_filter_attributes(event, tmp_path):
+    repo = _repo(tmp_path, f"untracked-filter-attributes-{event}")
+    (repo / ".gitattributes").write_text(
+        "*.secret filter=crypt\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".gitattributes")
+    _git(repo, "commit", "-m", "filtered fixture")
+    (repo / ".gitattributes").write_text("", encoding="utf-8")
+    (repo / "new.secret").write_text("plaintext secret\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="new.secret" if event == "file-save" else None,
+    )
+
+    assert "new.secret" not in snapshot.changed_paths
+    assert "plaintext secret" not in snapshot.diff
+    if event == "file-save":
+        assert snapshot.diff == ""
+    else:
+        assert snapshot.changed_paths == (".gitattributes",)
+    assert CoverageIssue(
+        path="new.secret",
+        reason="content_filter_unsupported",
+    ) in snapshot.coverage_issues
+
+
 def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "large.py"
