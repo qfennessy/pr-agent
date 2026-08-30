@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -16,6 +17,7 @@ from time import monotonic
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from pr_agent.algo.review_snapshot import (
+    SNAPSHOT_SCHEMA_VERSION,
     CoverageIssue,
     ReviewEvent,
     ReviewResultState,
@@ -490,15 +492,40 @@ class SnapshotCache:
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict) or data.get("snapshot_id") != snapshot_id:
                 return None
+            state = ReviewResultState(data["state"])
+            current_snapshot_id = data.get("current_snapshot_id")
+            review = data.get("review")
+            coverage_issues = tuple(
+                CoverageIssue(**issue) for issue in data.get("coverage_issues", [])
+            )
+            latency_seconds = float(data.get("latency_seconds", 0))
+            usage = data.get("usage", {})
+            cost = data.get("cost", {})
+            findings = finding_count({"review": review})
+            if (
+                data.get("schema_version") != SNAPSHOT_SCHEMA_VERSION
+                or current_snapshot_id != snapshot_id
+                or state not in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
+                or not isinstance(review, Mapping)
+                or not isinstance(usage, Mapping)
+                or not isinstance(cost, Mapping)
+                or not math.isfinite(latency_seconds)
+                or latency_seconds < 0
+                or data.get("advisory") is not True
+                or data.get("shadow_capable") is not True
+                or (state is ReviewResultState.FINDINGS and findings == 0)
+                or (state is ReviewResultState.NO_FINDINGS and (findings != 0 or coverage_issues))
+            ):
+                return None
             return ReviewSnapshotResult(
                 snapshot_id=data["snapshot_id"],
-                state=ReviewResultState(data["state"]),
-                current_snapshot_id=data.get("current_snapshot_id"),
-                review=data.get("review"),
-                coverage_issues=tuple(CoverageIssue(**issue) for issue in data.get("coverage_issues", [])),
-                latency_seconds=float(data.get("latency_seconds", 0)),
-                usage=data.get("usage", {}),
-                cost=data.get("cost", {}),
+                state=state,
+                current_snapshot_id=current_snapshot_id,
+                review=review,
+                coverage_issues=coverage_issues,
+                latency_seconds=latency_seconds,
+                usage=usage,
+                cost=cost,
                 cached=True,
                 advisory=True,
                 shadow_capable=True,

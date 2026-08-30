@@ -265,11 +265,9 @@ def _atomic_replace_bytes(
 def _unlink_output(destination: Path, parent_identity: tuple[int, int]) -> None:
     if not _supports_descriptor_relative_publication():
         _validate_output_parent(destination, parent_identity, "preparation")
-        try:
-            destination.unlink()
-        except FileNotFoundError:
-            # A stale Markdown artifact is optional; there is nothing to remove.
-            pass
+        # Without handle-relative deletion, validation and unlink cannot be bound
+        # to the same directory object. Leave the previous artifact untouched;
+        # a successful review will replace it atomically during final publication.
         return
     parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:

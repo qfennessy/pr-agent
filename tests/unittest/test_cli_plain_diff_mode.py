@@ -605,6 +605,21 @@ def test_atomic_snapshot_publication_uses_portable_fallback(monkeypatch, tmp_pat
     assert list(tmp_path.glob(".pr-agent-*.tmp")) == []
 
 
+def test_portable_snapshot_preparation_does_not_delete_existing_markdown(
+    monkeypatch, tmp_path
+):
+    from pr_agent.cli import _prepare_output_parent, _unlink_output
+
+    output = tmp_path / "review.md"
+    output.write_text("previous review\n", encoding="utf-8")
+    identity = _prepare_output_parent(str(output))
+    monkeypatch.setattr("pr_agent.cli._supports_descriptor_relative_publication", lambda: False)
+
+    _unlink_output(output, identity)
+
+    assert output.read_text(encoding="utf-8") == "previous review\n"
+
+
 def test_review_snapshot_restores_provider_settings_for_later_hosted_run(
     cfg, monkeypatch, tmp_path, capsys
 ):

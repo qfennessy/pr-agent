@@ -701,6 +701,35 @@ def test_cache_treats_structurally_invalid_json_as_a_miss(tmp_path):
         assert cache.read(snapshot.snapshot_id) is None
 
 
+def test_cache_treats_semantically_inconsistent_results_as_misses(tmp_path):
+    repo = _repo(tmp_path, "inconsistent-cache")
+    cache = SnapshotCache(repo)
+    snapshot = _snapshot(str(repo))
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={"review": {"key_issues_to_review": []}},
+        started_at=monotonic(),
+    )
+    valid = result.to_dict()
+    invalid_payloads = [
+        {**valid, "coverage_issues": [{"reason": "unreadable", "path": "lost.py"}]},
+        {**valid, "current_snapshot_id": "sha256:" + "0" * 64},
+        {**valid, "state": "findings"},
+        {
+            **valid,
+            "review": {"key_issues_to_review": [{"issue": "contradicts state"}]},
+        },
+        {**valid, "state": "stale"},
+        {**valid, "advisory": False},
+    ]
+    cache.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    for payload in invalid_payloads:
+        cache._path(snapshot.snapshot_id).write_text(json.dumps(payload), encoding="utf-8")
+        assert cache.read(snapshot.snapshot_id) is None
+
+
 def test_cache_write_failure_does_not_abort_completed_review(tmp_path):
     repo = _repo(tmp_path, "cache-write-failure")
     cache = SnapshotCache(repo)
