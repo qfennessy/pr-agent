@@ -219,7 +219,7 @@ class LocalPairReview:
     def _capture_diff(self, event: ReviewEvent, base_revision: str, paths: Sequence[str]) -> str:
         if not paths:
             return ""
-        args = ["--literal-pathspecs", "diff", "--no-ext-diff", "--find-renames"]
+        args = ["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--find-renames"]
         if event is ReviewEvent.PRE_COMMIT:
             args.append("--cached")
         args.extend([base_revision, "--", *paths])
@@ -231,6 +231,7 @@ class LocalPairReview:
             "diff",
             "--no-index",
             "--no-ext-diff",
+            "--no-textconv",
             "--",
             "/dev/null",
             path,

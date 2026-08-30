@@ -25,6 +25,39 @@ class FakeProvider:
         return {"Python": 100}
 
 
+def test_get_pr_diff_reports_pruned_deletions_as_omitted(monkeypatch):
+    provider = FakeProvider([])
+    token_handler = FakeTokenHandler(prompt_tokens=100)
+    monkeypatch.setattr(
+        pr_processing,
+        "pr_generate_extended_diff",
+        lambda *args, **kwargs: (["full diff"], 2_000, [2_000]),
+    )
+    monkeypatch.setattr(
+        pr_processing,
+        "pr_generate_compressed_diff",
+        lambda *args, **kwargs: (
+            [["included patch"]],
+            [120],
+            ["deleted.py"],
+            ["remaining.py"],
+            {},
+            [["included.py"]],
+        ),
+    )
+    monkeypatch.setattr(pr_processing, "get_max_tokens", lambda model: 2_500)
+
+    diff, omitted = pr_processing.get_pr_diff(
+        provider,
+        token_handler,
+        "model",
+        return_remaining_files=True,
+    )
+
+    assert "deleted.py" not in diff
+    assert omitted == ["remaining.py", "deleted.py"]
+
+
 def test_generate_full_patch_keeps_remaining_files_when_patch_exceeds_soft_budget():
     settings = get_settings()
     original_verbosity_level = settings.config.verbosity_level

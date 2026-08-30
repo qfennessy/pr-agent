@@ -150,7 +150,8 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
     if not return_remaining_files:
         return final_diff
     else:
-        return final_diff, remaining_files_list
+        omitted_files = list(dict.fromkeys([*remaining_files_list, *deleted_files_list]))
+        return final_diff, omitted_files
 
 
 def get_pr_diff_multiple_patchs(git_provider: GitProvider, token_handler: TokenHandler, model: str,

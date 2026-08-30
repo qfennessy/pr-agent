@@ -135,6 +135,23 @@ def test_git_blob_size_is_checked_before_content_is_read(tmp_path, monkeypatch):
     assert calls == [("cat-file", "-s", "blob-id")]
 
 
+def test_snapshot_diff_disables_textconv_filters(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, "no-textconv")
+    reviewer = LocalPairReview(str(repo))
+    calls = []
+
+    def fake_run_git(repository_root, *args, **kwargs):
+        calls.append(args)
+        return b""
+
+    monkeypatch.setattr("pr_agent.tools.local_pair_review._run_git", fake_run_git)
+
+    reviewer._capture_diff(ReviewEvent.WORKTREE_IDLE, "HEAD", ["tracked.py"])
+    reviewer._capture_untracked_addition("untracked.py")
+
+    assert all("--no-textconv" in args for args in calls)
+
+
 def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "large.py"
