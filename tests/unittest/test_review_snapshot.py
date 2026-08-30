@@ -400,9 +400,14 @@ def test_capture_revalidates_before_accepting_diff_bytes(tmp_path):
     path.write_text("small\n", encoding="utf-8")
 
     class RacingReview(LocalPairReview):
-        def _capture_diff(self, event, base_revision, paths):
+        def _capture_diff(self, event, base_revision, paths, *, max_output_bytes=None):
             path.write_text("x" * 100, encoding="utf-8")
-            return super()._capture_diff(event, base_revision, paths)
+            return super()._capture_diff(
+                event,
+                base_revision,
+                paths,
+                max_output_bytes=max_output_bytes,
+            )
 
     snapshot = RacingReview(str(repo), max_file_bytes=20).capture(event="worktree-idle")
 
@@ -546,6 +551,21 @@ def test_snapshot_diff_budget_reports_all_uncaptured_paths(tmp_path):
         issue.path for issue in snapshot.coverage_issues
         if issue.reason == "snapshot_byte_budget"
     } == {"first.py", "second.py"}
+
+
+def test_snapshot_diff_read_is_bounded_by_remaining_budget(tmp_path):
+    repo = _repo(tmp_path, "bounded-snapshot-read")
+    path = repo / "tracked.py"
+    path.write_text("value = '" + ("x" * 20_000) + "'\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(
+        str(repo),
+        max_file_bytes=100_000,
+        max_snapshot_bytes=128,
+    ).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert CoverageIssue(path="tracked.py", reason="snapshot_byte_budget") in snapshot.coverage_issues
 
 
 def test_superseded_snapshot_is_stale_and_suppresses_review(tmp_path):

@@ -48,6 +48,46 @@ def _run_git(repository_root: Path, *args: str, allowed_returncodes: tuple[int, 
     return process.stdout
 
 
+def _run_git_bounded(
+    repository_root: Path,
+    *args: str,
+    max_output_bytes: int,
+    allowed_returncodes: tuple[int, ...] = (0,),
+) -> Optional[bytes]:
+    """Read at most one byte beyond a caller's Git-output budget."""
+    with tempfile.TemporaryFile() as stderr:
+        process = subprocess.Popen(
+            ["git", "-C", str(repository_root), *args],
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+        )
+        if process.stdout is None:
+            process.kill()
+            process.wait()
+            raise SnapshotCaptureError("failed to capture git output")
+        output = process.stdout.read(max(0, max_output_bytes) + 1)
+        exceeded = len(output) > max_output_bytes
+        if exceeded:
+            process.terminate()
+            process.stdout.close()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        else:
+            process.stdout.close()
+            process.wait()
+        stderr.seek(0)
+        error_output = stderr.read()
+    if exceeded:
+        return None
+    if process.returncode not in allowed_returncodes:
+        message = error_output.decode("utf-8", errors="replace").strip()
+        raise SnapshotCaptureError(message or f"git {' '.join(args)} failed with exit code {process.returncode}")
+    return output
+
+
 def find_repository_root(start: Optional[str] = None) -> Path:
     start_path = Path(start or os.getcwd()).resolve()
     process = subprocess.run(
@@ -300,7 +340,14 @@ class LocalPairReview:
             _run_git(self.repository_root, "ls-files", "--others", "--exclude-standard", "-z", "--")
         )
 
-    def _capture_diff(self, event: ReviewEvent, base_revision: str, paths: Sequence[str]) -> str:
+    def _capture_diff(
+        self,
+        event: ReviewEvent,
+        base_revision: str,
+        paths: Sequence[str],
+        *,
+        max_output_bytes: Optional[int] = None,
+    ) -> Optional[str]:
         if not paths:
             return ""
         args = [
@@ -311,25 +358,40 @@ class LocalPairReview:
         if event is ReviewEvent.PRE_COMMIT:
             args.append("--cached")
         args.extend([base_revision, "--", *paths])
-        return _run_git(self.repository_root, *args).decode("utf-8", errors="surrogateescape")
-
-    def _capture_untracked_addition(self, path: str) -> str:
-        output = _run_git(
-            self.repository_root,
-            *self._diff_filter_overrides(),
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--no-color",
-            "--no-index",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--",
-            "/dev/null",
-            path,
-            allowed_returncodes=(0, 1),
+        output = (
+            _run_git(self.repository_root, *args)
+            if max_output_bytes is None
+            else _run_git_bounded(
+                self.repository_root,
+                *args,
+                max_output_bytes=max_output_bytes,
+            )
         )
-        return output.decode("utf-8", errors="surrogateescape")
+        return None if output is None else output.decode("utf-8", errors="surrogateescape")
+
+    def _capture_untracked_addition(
+        self,
+        path: str,
+        *,
+        max_output_bytes: Optional[int] = None,
+    ) -> Optional[str]:
+        args = (
+            *self._diff_filter_overrides(),
+            "-c", "core.quotePath=false",
+            "diff", "--no-color", "--no-index", "--no-ext-diff", "--no-textconv",
+            "--", "/dev/null", path,
+        )
+        output = (
+            _run_git(self.repository_root, *args, allowed_returncodes=(0, 1))
+            if max_output_bytes is None
+            else _run_git_bounded(
+                self.repository_root,
+                *args,
+                max_output_bytes=max_output_bytes,
+                allowed_returncodes=(0, 1),
+            )
+        )
+        return None if output is None else output.decode("utf-8", errors="surrogateescape")
 
     def capture(
         self,
@@ -422,7 +484,15 @@ class LocalPairReview:
                 if remaining_bytes <= 0:
                     omitted_paths.update(selected_group)
                     continue
-                part = self._capture_diff(event, base_revision, selected_group)
+                part = self._capture_diff(
+                    event,
+                    base_revision,
+                    selected_group,
+                    max_output_bytes=remaining_bytes,
+                )
+                if part is None:
+                    omitted_paths.update(selected_group)
+                    continue
                 part_size = len(part.encode("utf-8", errors="surrogateescape"))
                 if part_size > remaining_bytes:
                     omitted_paths.update(selected_group)
@@ -433,7 +503,13 @@ class LocalPairReview:
                 if remaining_bytes <= 0:
                     omitted_paths.add(selected_path)
                     continue
-                part = self._capture_untracked_addition(selected_path)
+                part = self._capture_untracked_addition(
+                    selected_path,
+                    max_output_bytes=remaining_bytes,
+                )
+                if part is None:
+                    omitted_paths.add(selected_path)
+                    continue
                 part_size = len(part.encode("utf-8", errors="surrogateescape"))
                 if part_size > remaining_bytes:
                     omitted_paths.add(selected_path)
