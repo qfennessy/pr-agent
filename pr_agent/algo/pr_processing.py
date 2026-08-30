@@ -264,7 +264,7 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, mo
         patch = handle_patch_deletions(patch, original_file_content_str,
                                        new_file_content_str, file.filename, file.edit_type)
         if patch is None:
-            if file.filename not in file_dict and file.filename not in deleted_files_list:
+            if file.filename not in deleted_files_list:
                 deleted_files_list.append(file.filename)
             continue
 
@@ -289,9 +289,6 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, mo
                 'tokens': new_patch_tokens,
                 'edit_type': file.edit_type,
             }
-        if file.filename in deleted_files_list:
-            deleted_files_list.remove(file.filename)
-
     max_tokens_model = get_max_tokens(model)
 
     # first iteration

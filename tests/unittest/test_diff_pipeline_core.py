@@ -405,6 +405,43 @@ class TestPrGenerateCompressedDiff:
         assert deleted_files_list == []
         assert patches_list[0][0].count("## File: 'tracked.py'") == 1
 
+    def test_duplicate_filename_preserves_delete_only_stage_coverage(self, monkeypatch):
+        monkeypatch.setattr(pr_processing, "get_max_tokens", lambda model: 10_000)
+        staged = _make_file(
+            filename="tracked.py",
+            patch="@@ -1,1 +1,1 @@\n-old\n+staged-value\n",
+            base="old\n",
+            head="staged-value\n",
+        )
+        unstaged_delete = _make_file(
+            filename="tracked.py",
+            patch="@@ -1,1 +0,0 @@\n-staged-value\n",
+            edit_type=EDIT_TYPE.DELETED,
+            base="staged-value\n",
+            head="",
+        )
+
+        (
+            patches_list,
+            _,
+            deleted_files_list,
+            remaining_files_list,
+            file_dict,
+            files_in_patches_list,
+        ) = pr_processing.pr_generate_compressed_diff(
+            top_langs=[{"files": [staged, unstaged_delete]}],
+            token_handler=FakeTokenHandler(prompt_tokens=10),
+            model="some-model",
+            convert_hunks_to_line_numbers=False,
+            large_pr_handling=False,
+        )
+
+        assert "staged-value" in file_dict["tracked.py"]["patch"]
+        assert deleted_files_list == ["tracked.py"]
+        assert files_in_patches_list == [["tracked.py"]]
+        assert remaining_files_list == []
+        assert patches_list[0][0].count("## File: 'tracked.py'") == 1
+
     def test_large_pr_handling_paginates_across_iterations(self, monkeypatch):
         # Build patches large enough that exactly one fits per iteration. The
         # per-iteration budget in generate_full_patch is

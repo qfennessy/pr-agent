@@ -59,6 +59,8 @@ _DEFAULT_SECRET_EXCLUSIONS = (
     "**/.aws/credentials",
     ".kube/config",
     "**/.kube/config",
+    ".docker/config.json",
+    "**/.docker/config.json",
     "id_rsa",
     "**/id_rsa",
     "id_ed25519",
