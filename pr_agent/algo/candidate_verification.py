@@ -125,7 +125,7 @@ def telemetry_safe_artifact(artifact: dict) -> dict:
     scalar_keys = {
         "enabled", "status", "model_calls", "candidate_count", "verified_count", "model",
         "verifier_verified_count", "finding_limit_dropped", "rejected_count", "failure",
-        "verifier_latency_seconds",
+        "verifier_latency_seconds", "publication_safe",
     }
     mapping_keys = {"specialist_prioritization", "prompt_budget", "verifier_usage", "verifier_cost"}
     for key in scalar_keys:
@@ -452,7 +452,13 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
     sensitive_count = 0
     for diff_file in diff_files or []:
         relevant_file = safe_repo_path(getattr(diff_file, "filename", ""))
-        if not relevant_file or not any(fnmatch.fnmatch(relevant_file, pattern) for pattern in normalized_globs):
+        old_file = safe_repo_path(getattr(diff_file, "old_filename", ""))
+        sensitive_paths = {path for path in (relevant_file, old_file) if path}
+        if not relevant_file or not any(
+            fnmatch.fnmatch(path, pattern)
+            for path in sensitive_paths
+            for pattern in normalized_globs
+        ):
             continue
         patch = getattr(diff_file, "patch", "")
         for anchor_index, (side, start_line, end_line, changed_line_ranges) in enumerate(

@@ -199,6 +199,66 @@ def test_sensitive_deletion_uses_a_trusted_old_side_anchor():
     assert decisions[0]["verdict"] == "verified"
 
 
+@pytest.mark.asyncio
+async def test_sensitive_rename_to_safe_path_audits_both_sides_with_old_lineage():
+    diff_file = _diff_file(
+        "src/policy.py",
+        edit_type=EDIT_TYPE.RENAMED,
+        old_filename="auth/policy.py",
+    )
+    diff_file.patch = (
+        "@@ -10,1 +10,1 @@\n"
+        "-auth_check(request)\n"
+        "+log_request(request)"
+    )
+    candidates, rejected = prepare_candidates(
+        _review_data(), [diff_file], ["auth/**"], 1
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = diff_file.base_file
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(max_lines_per_file=60, max_total_lines=120),
+        [],
+        diff_files=[diff_file],
+    )
+    old_candidate = next(candidate for candidate in candidates if candidate["side"] == "old")
+    verification = {"verification": {"decisions": [{
+        "candidate_id": old_candidate["candidate_id"],
+        "verdict": "verified",
+        "relevant_file": "src/policy.py",
+        "start_line": 10,
+        "end_line": 10,
+        "evidence_paths": ["src/policy.py"],
+    }]}}
+
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    assert rejected == []
+    assert [(candidate["side"], candidate["relevant_file"]) for candidate in candidates] == [
+        ("new", "src/policy.py"),
+        ("old", "src/policy.py"),
+    ]
+    assert all(candidate["_trusted_lineage_key"] == "file:auth/policy.py" for candidate in candidates)
+    assert any(
+        item["candidate_id"] == old_candidate["candidate_id"]
+        and item["source"] == "changed_patch"
+        and item["side"] == "old"
+        and item["content"] == "auth_check(request)"
+        for item in evidence
+    )
+    provider.get_repo_file_content.assert_called_once_with("auth/policy.py", False)
+    assert findings[0]["side"] == "old"
+    assert decisions[0]["verdict"] == "verified"
+
+
 def test_sensitive_path_creates_a_candidate_for_each_changed_hunk():
     diff_file = _diff_file(
         "auth/policy.py",
@@ -2014,6 +2074,9 @@ def _reviewer_for_orchestration(provider):
     reviewer.git_provider = provider
     reviewer.prediction = "review: {}"
     reviewer.patches_diff = "+changed"
+    reviewer.remaining_files_list = []
+    reviewer.deleted_files_list = []
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
     reviewer.ai_handler = SimpleNamespace(chat_completion=AsyncMock(side_effect=RuntimeError("provider failed")))
     reviewer.candidate_verification_artifact = None
     reviewer.verified_review_data = None
@@ -2055,6 +2118,7 @@ async def test_orchestration_exposes_unsupported_provider_without_calling_verifi
         await reviewer._run_candidate_verification()
 
     assert reviewer.candidate_verification_artifact["status"] == "unsupported_provider"
+    assert reviewer.candidate_verification_artifact["publication_safe"] is False
     reviewer.ai_handler.chat_completion.assert_not_awaited()
 
 
@@ -2074,7 +2138,137 @@ async def test_orchestration_exposes_verifier_failure_and_does_not_publish_candi
 
     assert reviewer.candidate_verification_artifact["status"] == "verifier_failed"
     assert reviewer.candidate_verification_artifact["model_calls"] == 1
+    assert reviewer.candidate_verification_artifact["publication_safe"] is False
     assert reviewer.verified_review_data["review"]["key_issues_to_review"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_status", "expected_failure"),
+    [
+        ("unsupported", "unsupported_provider", None),
+        ("exception", "verifier_failed", "RuntimeError"),
+        ("malformed", "verifier_response_invalid", None),
+        ("timeout", "verifier_failed", "TimeoutError"),
+        ("wrong_shape", "verifier_response_invalid", "invalid_decisions"),
+        ("missing_decision", "verifier_response_invalid", "missing_decision"),
+        ("duplicate_decision", "verifier_response_invalid", "duplicate_decision"),
+        ("incomplete_verified", "verifier_response_invalid", "invalid_verified_decision"),
+        ("wrong_verified_types", "verifier_response_invalid", "invalid_verified_decision"),
+    ],
+)
+async def test_verification_failure_suppresses_false_clean_publication(
+    failure_mode, expected_status, expected_failure
+):
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = failure_mode != "unsupported"
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    provider.publish_structured_review = MagicMock()
+    reviewer = _reviewer_for_orchestration(provider)
+    if failure_mode == "malformed":
+        reviewer.ai_handler.chat_completion = AsyncMock(return_value=("verification: [", None))
+    elif failure_mode == "timeout":
+        reviewer.ai_handler.chat_completion = AsyncMock(side_effect=asyncio.TimeoutError())
+    elif failure_mode == "wrong_shape":
+        reviewer.ai_handler.chat_completion = AsyncMock(
+            return_value=("verification:\n  decisions: wrong-shape", None)
+        )
+    elif failure_mode == "missing_decision":
+        reviewer.ai_handler.chat_completion = AsyncMock(
+            return_value=("verification:\n  decisions: []", None)
+        )
+    elif failure_mode == "duplicate_decision":
+        reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+            "verification:\n"
+            "  decisions:\n"
+            "    - candidate_id: candidate-1\n"
+            "      verdict: rejected\n"
+            "    - candidate_id: candidate-1\n"
+            "      verdict: rejected",
+            None,
+        ))
+    elif failure_mode == "incomplete_verified":
+        reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+            "verification:\n"
+            "  decisions:\n"
+            "    - candidate_id: candidate-1\n"
+            "      verdict: verified",
+            None,
+        ))
+    elif failure_mode == "wrong_verified_types":
+        reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+            "verification:\n"
+            "  decisions:\n"
+            "    - candidate_id: candidate-1\n"
+            "      verdict: verified\n"
+            "      relevant_file: src/service.py\n"
+            "      start_line: wrong\n"
+            "      end_line: 12\n"
+            "      issue_header: Bug\n"
+            "      issue_content: Incorrect behavior.\n"
+            "      trigger: Concrete trigger.\n"
+            "      impact: Concrete impact.\n"
+            "      evidence_paths: src/service.py",
+            None,
+        ))
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.github_action_output") as action_output,
+        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2") as markdown,
+    ):
+        review = reviewer._prepare_pr_review()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == expected_status
+    assert artifact["publication_safe"] is False
+    if expected_failure is not None:
+        assert artifact["failure"] == expected_failure
+    assert review == ""
+    assert reviewer._should_publish_review_no_suggestions("No major issues detected") is False
+    reviewer._clear_stale_persistent_bugs_only_review()
+    provider.clear_persistent_review.assert_not_called()
+    action_output.assert_not_called()
+    markdown.assert_not_called()
+    structured = provider.publish_structured_review.call_args.args[0]
+    assert structured["review"]["key_issues_to_review"] == []
+    assert structured["candidate_verification"]["status"] == expected_status
+    assert structured["candidate_verification"]["publication_safe"] is False
+    assert "unchecked lookup result" not in json.dumps(structured)
+
+
+@pytest.mark.asyncio
+async def test_explicit_rejection_for_every_candidate_is_a_valid_clean_verification():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        "verification:\n"
+        "  decisions:\n"
+        "    - candidate_id: candidate-1\n"
+        "      verdict: rejected\n"
+        "      reason: disproved by repository evidence",
+        None,
+    ))
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    assert reviewer.candidate_verification_artifact["status"] == "complete"
+    assert reviewer.candidate_verification_artifact["publication_safe"] is True
+    assert reviewer.candidate_verification_artifact["verified_count"] == 0
+    assert reviewer._candidate_verification_blocks_publication() is False
 
 
 @pytest.mark.asyncio
@@ -2247,6 +2441,10 @@ async def test_orchestration_retains_deleted_candidate_patch_when_global_diff_is
         "verification:\n  decisions:\n    - candidate_id: sensitive-1\n"
         "      verdict: verified\n      relevant_file: auth/policy.py\n"
         "      start_line: 10\n      end_line: 10\n"
+        "      issue_header: Sensitive regression\n"
+        "      issue_content: The deleted guard permits unauthorized access.\n"
+        "      trigger: A request reaches the policy without the deleted guard.\n"
+        "      impact: Unauthorized access is allowed.\n"
         "      evidence_paths: [auth/policy.py]\n",
         "stop",
     ))
@@ -2291,10 +2489,16 @@ async def test_orchestration_applies_global_finding_limit_after_verification():
         "verification:\n  decisions:\n"
         "    - candidate_id: candidate-1\n      verdict: verified\n"
         "      relevant_file: src/service.py\n      start_line: 12\n      end_line: 12\n"
-        "      issue_content: First verified defect.\n      evidence_paths: [src/service.py]\n"
+        "      issue_header: First bug\n      issue_content: First verified defect.\n"
+        "      trigger: The first changed branch runs.\n"
+        "      impact: The first request fails.\n"
+        "      evidence_paths: [src/service.py]\n"
         "    - candidate_id: candidate-2\n      verdict: verified\n"
         "      relevant_file: src/service.py\n      start_line: 13\n      end_line: 13\n"
-        "      issue_content: Second verified defect.\n      evidence_paths: [src/service.py]\n",
+        "      issue_header: Second bug\n      issue_content: Second verified defect.\n"
+        "      trigger: The second changed branch runs.\n"
+        "      impact: The second request fails.\n"
+        "      evidence_paths: [src/service.py]\n",
         "stop",
     ))
     settings = _verification_settings()

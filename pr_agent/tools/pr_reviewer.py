@@ -18,6 +18,7 @@ from pr_agent.algo.candidate_verification import (
     prepare_candidates,
     render_verification_payload,
     retrieve_evidence,
+    safe_repo_path,
     telemetry_safe_artifact,
     validated_specialist_prioritization,
 )
@@ -278,7 +279,9 @@ class PRReviewer:
             if not should_publish:
                 self._clear_stale_persistent_bugs_only_review()
                 reason = "Review output is not published"
-                if get_settings().config.publish_output:
+                if self._candidate_verification_blocks_publication():
+                    reason += ": candidate verification did not complete successfully."
+                elif get_settings().config.publish_output:
                     reason += ": no major issues detected."
                 get_logger().info(reason)
                 get_settings().data = {"artifact": pr_review}
@@ -345,6 +348,8 @@ class PRReviewer:
                     get_logger().exception(f"Failed to publish review failure result, error: {e}")
 
     def _should_publish_review_no_suggestions(self, pr_review: str) -> bool:
+        if self._candidate_verification_blocks_publication():
+            return False
         if self._review_profile() == "bugs_only":
             return bool(pr_review.strip())
         return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
@@ -355,7 +360,8 @@ class PRReviewer:
 
     def _clear_stale_persistent_bugs_only_review(self) -> None:
         """Remove a prior persistent defect summary after a clean bugs-only rerun."""
-        if (self._review_profile() != "bugs_only" or not get_settings().config.publish_output or
+        if (self._candidate_verification_blocks_publication() or
+                self._review_profile() != "bugs_only" or not get_settings().config.publish_output or
                 not get_settings().pr_reviewer.persistent_comment or self.incremental.is_incremental):
             return
         self.git_provider.clear_persistent_review(
@@ -636,6 +642,79 @@ class PRReviewer:
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
 
+    def _candidate_verification_blocks_publication(self) -> bool:
+        """Fail closed when enabled candidate verification did not reach a publishable result."""
+        artifact = getattr(self, "candidate_verification_artifact", None)
+        if not isinstance(artifact, dict):
+            return False
+        if "publication_safe" in artifact:
+            return artifact.get("publication_safe") is not True
+        status = artifact.get("status")
+        if status in {"complete", "no_candidates"}:
+            return False
+        return not (status == "partial" and int(artifact.get("verified_count") or 0) > 0)
+
+    @staticmethod
+    def _verification_response_contract_error(
+        candidates: list[dict], verification_data: dict
+    ) -> Optional[str]:
+        """Return a source-free error when a verifier response is not complete and unambiguous."""
+        if not isinstance(verification_data, dict):
+            return "invalid_response"
+        verification = verification_data.get("verification")
+        if not isinstance(verification, dict):
+            return "invalid_verification"
+        decisions = verification.get("decisions")
+        if not isinstance(decisions, list):
+            return "invalid_decisions"
+        expected_ids = {candidate["candidate_id"] for candidate in candidates}
+        seen_ids = set()
+        for decision in decisions:
+            if not isinstance(decision, dict):
+                return "invalid_decision"
+            candidate_id = str(decision.get("candidate_id") or "").strip()
+            if candidate_id not in expected_ids:
+                return "unknown_candidate"
+            if candidate_id in seen_ids:
+                return "duplicate_decision"
+            if str(decision.get("verdict") or "").strip().lower() not in {"verified", "rejected"}:
+                return "invalid_verdict"
+            if str(decision.get("verdict") or "").strip().lower() == "verified":
+                required_text = (
+                    "issue_header", "issue_content", "trigger", "impact",
+                )
+                if (
+                    safe_repo_path(decision.get("relevant_file")) is None
+                    or any(
+                        not isinstance(decision.get(key), str)
+                        or not decision[key].strip()
+                        for key in required_text
+                    )
+                ):
+                    return "invalid_verified_decision"
+                start_line = decision.get("start_line")
+                end_line = decision.get("end_line")
+                if (
+                    not isinstance(start_line, int)
+                    or isinstance(start_line, bool)
+                    or not isinstance(end_line, int)
+                    or isinstance(end_line, bool)
+                    or start_line < 1
+                    or end_line < start_line
+                ):
+                    return "invalid_verified_decision"
+                evidence_paths = decision.get("evidence_paths")
+                if (
+                    not isinstance(evidence_paths, list)
+                    or not evidence_paths
+                    or any(safe_repo_path(path) is None for path in evidence_paths)
+                ):
+                    return "invalid_verified_decision"
+            seen_ids.add(candidate_id)
+        if seen_ids != expected_ids:
+            return "missing_decision"
+        return None
+
     @staticmethod
     def _candidate_specialist_prioritization_enabled() -> bool:
         value = get_settings().pr_reviewer.get(
@@ -663,6 +742,7 @@ class PRReviewer:
             "enabled": True,
             "status": "initializing",
             "model_calls": 0,
+            "publication_safe": False,
             "specialist_prioritization": {
                 "status": "pending" if consume_specialist_prioritization else "disabled"
             },
@@ -719,7 +799,7 @@ class PRReviewer:
                 "verified_count": 0,
             })
             if not candidates:
-                artifact["status"] = "no_candidates"
+                artifact.update({"status": "no_candidates", "publication_safe": True})
                 return
 
             model = str(
@@ -859,6 +939,16 @@ class PRReviewer:
                 first_key="verification",
                 last_key="decisions",
             )
+            response_error = self._verification_response_contract_error(
+                candidates, verification_data
+            )
+            if response_error is not None:
+                artifact.update({
+                    "status": "verifier_response_invalid",
+                    "failure": response_error,
+                    "verified_count": 0,
+                })
+                return
             prompt_evidence = bounded_verification_evidence(evidence, evidence_fraction)
             verified_findings, decisions = apply_verification_decisions(
                 candidates,
@@ -869,11 +959,27 @@ class PRReviewer:
             max_findings = max(0, int(config.get("num_max_findings", 3)))
             published_findings = verified_findings[:max_findings]
             self.verified_review_data["review"]["key_issues_to_review"] = published_findings
-            artifact.update({
-                "status": "partial" if retrieval_artifact["budget_exhausted"] or any(
+            verifier_claimed_ids = {
+                str(decision.get("candidate_id") or "").strip()
+                for decision in verification_data["verification"]["decisions"]
+                if str(decision.get("verdict") or "").strip().lower() == "verified"
+            }
+            rejected_verified_claim = any(
+                decision.get("candidate_id") in verifier_claimed_ids
+                and decision.get("verdict") != "verified"
+                for decision in decisions
+            )
+            verification_status = "partial" if (
+                rejected_verified_claim
+                or retrieval_artifact["budget_exhausted"]
+                or any(
                     request["status"] not in {"retrieved", "satisfied_by_changed_head"}
                     for request in retrieval_artifact["requests"]
-                ) else "complete",
+                )
+            ) else "complete"
+            artifact.update({
+                "status": verification_status,
+                "publication_safe": verification_status == "complete" or bool(published_findings),
                 "decisions": decisions,
                 "verified_count": len(published_findings),
                 "verifier_verified_count": len(verified_findings),
@@ -914,7 +1020,6 @@ class PRReviewer:
             get_logger().exception("Failed to parse review data", artifact={"data": data})
             return ""
         data = self._normalize_bugs_only_review(data)
-        github_action_output(data, 'review')
 
         structured_publisher = getattr(self.git_provider, "publish_structured_review", None)
         if callable(structured_publisher):
@@ -945,6 +1050,11 @@ class PRReviewer:
             if specialist_shadow_result is not None:
                 structured_data["metadata"]["specialist_shadow"] = specialist_shadow_result.to_dict()
             structured_publisher(structured_data)
+
+        if self._candidate_verification_blocks_publication():
+            return ""
+
+        github_action_output(data, 'review')
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
         if 'key_issues_to_review' in data['review']:
