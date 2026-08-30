@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import heapq
 import json
 import math
 import os
@@ -13,6 +14,7 @@ import stat
 import subprocess
 import tempfile
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
@@ -77,6 +79,12 @@ _DEFAULT_SECRET_EXCLUSIONS = (
     "**/id_xmss",
 )
 
+_UNSAFE_COPY_SIMILARITY_THRESHOLD = 0.5
+_UNSAFE_COPY_PROBE_WINDOW = 16
+_UNSAFE_COPY_MAX_PROBES = 128
+_UNSAFE_COPY_MAX_TOTAL_PROBES = 65_536
+_UNSAFE_COPY_MAX_SMALL_COMPARISONS = 10_000
+
 
 class SnapshotCaptureError(ValueError):
     pass
@@ -138,6 +146,87 @@ def _run_git_bounded(
         message = error_output.decode("utf-8", errors="replace").strip()
         raise SnapshotCaptureError(message or f"git {' '.join(args)} failed with exit code {process.returncode}")
     return output
+
+
+def _read_stable_regular_file(path: Path, max_bytes: int) -> Optional[bytes]:
+    """Read a regular file without following links or accepting an in-flight rewrite."""
+    file_descriptor = None
+    try:
+        file_descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(file_descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+            return None
+        with os.fdopen(file_descriptor, "rb", closefd=False) as handle:
+            content = handle.read(max_bytes + 1)
+        after = os.fstat(file_descriptor)
+    except OSError:
+        return None
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if len(content) != before.st_size or before_identity != after_identity:
+        return None
+    return content
+
+
+def _rolling_copy_hashes(content: bytes) -> Iterable[int]:
+    """Yield fixed-window fingerprints that survive small insertions and edits."""
+    window = _UNSAFE_COPY_PROBE_WINDOW
+    if len(content) < window:
+        return
+    mask = (1 << 64) - 1
+    base = 257
+    outgoing_factor = pow(base, window - 1, 1 << 64)
+    fingerprint = 0
+    for value in content[:window]:
+        fingerprint = ((fingerprint * base) + value + 1) & mask
+    yield fingerprint
+    for outgoing, incoming in zip(content, content[window:], strict=False):
+        fingerprint = (fingerprint - ((outgoing + 1) * outgoing_factor)) & mask
+        fingerprint = ((fingerprint * base) + incoming + 1) & mask
+        yield fingerprint
+
+
+def _copy_similarity_probes(content: bytes) -> frozenset[int]:
+    """Select a bounded, deterministic min-hash signature for copy containment."""
+    selected: set[int] = set()
+    largest_first: list[int] = []
+    for fingerprint in _rolling_copy_hashes(content):
+        if fingerprint in selected:
+            continue
+        if len(largest_first) < _UNSAFE_COPY_MAX_PROBES:
+            heapq.heappush(largest_first, -fingerprint)
+            selected.add(fingerprint)
+            continue
+        largest = -largest_first[0]
+        if fingerprint >= largest:
+            continue
+        removed = -heapq.heapreplace(largest_first, -fingerprint)
+        selected.remove(removed)
+        selected.add(fingerprint)
+    return frozenset(selected)
 
 
 def find_repository_root(start: Optional[str] = None) -> Path:
@@ -678,7 +767,7 @@ class LocalPairReview:
         base_revision: str,
         untracked_paths: Sequence[str],
     ) -> Optional[dict[str, tuple[tuple[str, str], ...]]]:
-        """Find exact untracked copies of excluded or filtered tracked files."""
+        """Find exact or substantially similar untracked copies of unsafe tracked files."""
         if not untracked_paths:
             return {}
         base_entries = _run_git_bounded(
@@ -739,8 +828,9 @@ class LocalPairReview:
         if not unsafe_reasons:
             return {}
 
+        candidate_contents: dict[str, bytes] = {}
         candidate_oids: dict[str, str] = {}
-        candidate_sizes: set[int] = set()
+        remaining_similarity_bytes = self.max_snapshot_bytes
         for path in untracked_paths:
             if self._is_excluded(path) or self._is_ignored(path):
                 continue
@@ -755,19 +845,78 @@ class LocalPairReview:
                 or candidate_stat.st_size > self.max_file_bytes
             ):
                 continue
+            if candidate_stat.st_size > remaining_similarity_bytes:
+                return None
+            content = _read_stable_regular_file(candidate, self.max_file_bytes)
+            if content is None:
+                return None
+            remaining_similarity_bytes -= len(content)
             try:
-                candidate_oids[path] = _run_git(
+                object_id = _run_git_bounded(
                     self.repository_root,
                     "hash-object",
-                    "--no-filters",
-                    "--",
-                    path,
-                ).decode("ascii").strip()
+                    "--stdin",
+                    max_output_bytes=128,
+                    stdin_bytes=content,
+                )
+                if object_id is None:
+                    return None
+                candidate_oids[path] = object_id.decode("ascii").strip()
             except (SnapshotCaptureError, UnicodeDecodeError):
                 return None
-            candidate_sizes.add(candidate_stat.st_size)
+            candidate_contents[path] = content
 
-        remaining_source_bytes = self.max_snapshot_bytes
+        if not candidate_contents:
+            return {}
+
+        candidate_sizes = {len(content) for content in candidate_contents.values()}
+
+        def is_similar_size(source_size: int, destination_size: int) -> bool:
+            largest = max(source_size, destination_size)
+            if largest == 0:
+                return True
+            return (
+                min(source_size, destination_size) / largest
+                >= _UNSAFE_COPY_SIMILARITY_THRESHOLD
+            )
+
+        def has_similar_candidate_size(source_size: int) -> bool:
+            return any(is_similar_size(source_size, size) for size in candidate_sizes)
+
+        object_contents: dict[str, bytes] = {}
+        source_contents: dict[str, dict[str, bytes]] = {
+            path: {} for path in unsafe_reasons
+        }
+        for path in unsafe_reasons:
+            for object_id in source_oids[path]:
+                try:
+                    object_size = int(
+                        _run_git(
+                            self.repository_root, "cat-file", "-s", object_id
+                        ).strip()
+                    )
+                except (SnapshotCaptureError, ValueError):
+                    return None
+                if not has_similar_candidate_size(object_size):
+                    continue
+                if object_size > self.max_file_bytes:
+                    return None
+                if object_id not in object_contents:
+                    if object_size > remaining_similarity_bytes:
+                        return None
+                    content = _run_git_bounded(
+                        self.repository_root,
+                        "cat-file",
+                        "blob",
+                        object_id,
+                        max_output_bytes=object_size,
+                    )
+                    if content is None or len(content) != object_size:
+                        return None
+                    remaining_similarity_bytes -= len(content)
+                    object_contents[object_id] = content
+                source_contents[path][object_id] = object_contents[object_id]
+
         for path in unsafe_reasons:
             candidate = self.repository_root / path
             try:
@@ -779,35 +928,87 @@ class LocalPairReview:
             if (
                 stat.S_ISLNK(source_stat.st_mode)
                 or not stat.S_ISREG(source_stat.st_mode)
-                or source_stat.st_size not in candidate_sizes
+                or not has_similar_candidate_size(source_stat.st_size)
             ):
                 continue
-            if source_stat.st_size > remaining_source_bytes:
+            if (
+                source_stat.st_size > self.max_file_bytes
+                or source_stat.st_size > remaining_similarity_bytes
+            ):
                 return None
-            remaining_source_bytes -= source_stat.st_size
+            content = _read_stable_regular_file(candidate, self.max_file_bytes)
+            if content is None:
+                return None
+            remaining_similarity_bytes -= len(content)
             try:
-                current_oid = _run_git(
+                current_oid_output = _run_git_bounded(
                     self.repository_root,
                     "hash-object",
-                    "--no-filters",
-                    "--",
-                    path,
-                ).decode("ascii").strip()
+                    "--stdin",
+                    max_output_bytes=128,
+                    stdin_bytes=content,
+                )
+                if current_oid_output is None:
+                    return None
+                current_oid = current_oid_output.decode("ascii").strip()
             except (SnapshotCaptureError, UnicodeDecodeError):
                 return None
             source_oids[path].add(current_oid)
+            source_contents[path][current_oid] = content
+
+        large_signatures: list[tuple[str, str, int, frozenset[int]]] = []
+        small_sources: list[tuple[str, str, bytes]] = []
+        for source, variants in source_contents.items():
+            reason = unsafe_reasons[source]
+            for content in variants.values():
+                if len(content) < 4 * _UNSAFE_COPY_PROBE_WINDOW:
+                    small_sources.append((source, reason, content))
+                    continue
+                probes = _copy_similarity_probes(content)
+                if probes:
+                    large_signatures.append((source, reason, len(content), probes))
+
+        probe_index: dict[int, set[int]] = {}
+        total_probes = 0
+        for signature_index, (_, _, _, probes) in enumerate(large_signatures):
+            total_probes += len(probes)
+            if total_probes > _UNSAFE_COPY_MAX_TOTAL_PROBES:
+                return None
+            for probe in probes:
+                probe_index.setdefault(probe, set()).add(signature_index)
 
         matches: dict[str, tuple[tuple[str, str], ...]] = {}
-        for destination, object_id in candidate_oids.items():
-            sources = tuple(
-                sorted(
-                    (source, unsafe_reasons[source])
-                    for source, object_ids in source_oids.items()
-                    if source in unsafe_reasons and object_id in object_ids
-                )
-            )
+        small_comparisons = 0
+        for destination, content in candidate_contents.items():
+            object_id = candidate_oids[destination]
+            sources = {
+                (source, unsafe_reasons[source])
+                for source, object_ids in source_oids.items()
+                if source in unsafe_reasons and object_id in object_ids
+            }
+            matched_probes: dict[int, set[int]] = {}
+            for probe in _rolling_copy_hashes(content):
+                for signature_index in probe_index.get(probe, ()):
+                    matched_probes.setdefault(signature_index, set()).add(probe)
+            for signature_index, probes in matched_probes.items():
+                source, reason, source_size, expected = large_signatures[signature_index]
+                if (
+                    is_similar_size(source_size, len(content))
+                    and len(probes) / len(expected) >= _UNSAFE_COPY_SIMILARITY_THRESHOLD
+                ):
+                    sources.add((source, reason))
+            for source, reason, source_content in small_sources:
+                if not is_similar_size(len(source_content), len(content)):
+                    continue
+                small_comparisons += 1
+                if small_comparisons > _UNSAFE_COPY_MAX_SMALL_COMPARISONS:
+                    return None
+                if SequenceMatcher(
+                    None, source_content, content, autojunk=False
+                ).ratio() >= _UNSAFE_COPY_SIMILARITY_THRESHOLD:
+                    sources.add((source, reason))
             if sources:
-                matches[destination] = sources
+                matches[destination] = tuple(sorted(sources))
         return matches
 
     def _capture_diff(

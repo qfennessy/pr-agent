@@ -620,6 +620,22 @@ def _repository_settings_exclusions(repository_root: Path) -> list[str]:
     )
 
 
+def _snapshot_context_exclusions(
+    repository_root: Path,
+    configured_exclusions: list[str],
+    markdown_output: str | None,
+    json_output: str | None,
+    extra_config_source,
+) -> list[str]:
+    exclusions = list(configured_exclusions)
+    exclusions.extend(
+        _output_artifact_exclusions(repository_root, markdown_output, json_output)
+    )
+    exclusions.extend(_repository_settings_exclusions(repository_root))
+    exclusions.extend(_extra_config_exclusions(repository_root, extra_config_source))
+    return list(dict.fromkeys(exclusions))
+
+
 def _snapshot_settings(keys: tuple[str, ...]) -> dict[str, object]:
     settings = get_settings()
     snapshot = {}
@@ -880,15 +896,13 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         configured_exclusions = _configured_snapshot_exclusions(settings)
     except SnapshotCaptureError as exc:
         outer_parser.error(str(exc))
-    artifact_exclusions = _output_artifact_exclusions(
-        repository_root, markdown_output, json_output
-    )
     try:
-        artifact_exclusions.extend(
-            _repository_settings_exclusions(repository_root)
-        )
-        artifact_exclusions.extend(
-            _extra_config_exclusions(repository_root, invocation_extra_config)
+        artifact_exclusions = _snapshot_context_exclusions(
+            repository_root,
+            [],
+            markdown_output,
+            json_output,
+            invocation_extra_config,
         )
     except SnapshotCaptureError as exc:
         outer_parser.error(str(exc))
@@ -898,7 +912,9 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     def initial_configuration_hash(base_revision: str) -> str:
         repo_context_files.update(
             _load_snapshot_repo_context(
-                repository_root, base_revision, configured_exclusions
+                repository_root,
+                base_revision,
+                list(dict.fromkeys((*configured_exclusions, *artifact_exclusions))),
             )
         )
         return _snapshot_review_configuration_hash(skills_context, repo_context_files)
@@ -973,13 +989,20 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             # precedence, including the original extra-config source.
             _restore_all_settings(configuration_baseline)
             apply_local_repo_settings(repository_root)
+            current_exclusions = _configured_snapshot_exclusions(
+                get_settings().get("local_pair_review", {}) or {}
+            )
             return _snapshot_review_configuration_hash(
                 get_skills_context(),
                 _load_snapshot_repo_context(
                     repository_root,
                     base_revision,
-                    _configured_snapshot_exclusions(
-                        get_settings().get("local_pair_review", {}) or {}
+                    _snapshot_context_exclusions(
+                        repository_root,
+                        current_exclusions,
+                        markdown_output,
+                        json_output,
+                        invocation_extra_config,
                     ),
                 ),
             )

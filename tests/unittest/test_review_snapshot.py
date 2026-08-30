@@ -468,6 +468,61 @@ def test_untracked_copy_from_excluded_tracked_source_is_omitted(event, tmp_path)
     ) in snapshot.coverage_issues
 
 
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle"])
+def test_edited_untracked_copy_from_excluded_tracked_source_is_omitted(event, tmp_path):
+    repo = _repo(tmp_path, f"untracked-edited-excluded-copy-{event}")
+    source = repo / "secrets.json"
+    source.write_text(
+        '{"token":"production-secret-abcdef","mode":"production","region":"east"}\n',
+        encoding="utf-8",
+    )
+    _git(repo, "add", "secrets.json")
+    _git(repo, "commit", "-m", "add excluded source")
+    destination = repo / "public.json"
+    destination.write_text(
+        '{"token":"production-secret-abcdef","mode":"production","region":"west"}\n',
+        encoding="utf-8",
+    )
+
+    snapshot = LocalPairReview(str(repo), excluded_paths=["secrets.json"]).capture(
+        event=event,
+        focus_path="public.json" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "production-secret-abcdef" not in snapshot.diff
+    assert CoverageIssue(path="secrets.json", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="public.json", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle"])
+def test_unrelated_untracked_file_remains_reviewable_with_excluded_tracked_source(event, tmp_path):
+    repo = _repo(tmp_path, f"untracked-unrelated-to-excluded-{event}")
+    source = repo / "secrets.json"
+    source.write_text(
+        '{"token":"production-secret-abcdef","mode":"production","region":"east"}\n',
+        encoding="utf-8",
+    )
+    _git(repo, "add", "secrets.json")
+    _git(repo, "commit", "-m", "add excluded source")
+    destination = repo / "feature.py"
+    destination.write_text(
+        "def greet(name):\n    return f'hello {name}'\n",
+        encoding="utf-8",
+    )
+
+    snapshot = LocalPairReview(str(repo), excluded_paths=["secrets.json"]).capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.changed_paths == ("feature.py",)
+    assert "+def greet(name):" in snapshot.diff
+    assert "production-secret-abcdef" not in snapshot.diff
+    assert not any(issue.path == "feature.py" for issue in snapshot.coverage_issues)
+
+
 def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "large.py"

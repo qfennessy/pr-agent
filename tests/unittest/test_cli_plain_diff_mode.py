@@ -1370,12 +1370,17 @@ def test_review_snapshot_ignores_repository_settings_input(
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
     changed = repo / "changed.py"
     changed.write_text("value = 1\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    (repo / ".pr_agent.toml").write_text(
+        '[config]\nrepo_context_files = [".pr_agent.toml"]\n'
+        '[openai]\nkey = "repo-secret-must-not-reach-model"\n',
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "changed.py", ".pr_agent.toml"],
+        check=True,
+    )
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
     changed.write_text("value = 2\n", encoding="utf-8")
-    (repo / ".pr_agent.toml").write_text(
-        '[openai]\nkey = "repo-secret-must-not-reach-model"\n', encoding="utf-8"
-    )
     monkeypatch.chdir(repo)
 
     class FakeAgent:
@@ -1383,6 +1388,7 @@ def test_review_snapshot_ignores_repository_settings_input(
             review_input = get_settings().plain_diff.content
             assert "repo-secret-must-not-reach-model" not in review_input
             assert ".pr_agent.toml" not in review_input
+            assert get_settings().plain_diff.repo_context_files == {}
             Path(get_settings().plain_diff.json_output_path).write_text(
                 json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
             )
