@@ -14,7 +14,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from pr_agent.algo.review_snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
@@ -340,6 +340,7 @@ class LocalPairReview:
         task_intent: Optional[str] = None,
         deterministic_results: Iterable[Mapping[str, Any]] = (),
         review_configuration_hash: Optional[str] = None,
+        review_configuration_hash_factory: Optional[Callable[[str], Optional[str]]] = None,
         policy_version: str = "local-pair-review-v1",
         parent_snapshot_id: Optional[str] = None,
     ) -> ReviewSnapshot:
@@ -348,6 +349,8 @@ class LocalPairReview:
             raise SnapshotCaptureError("file-save snapshots require --path")
 
         base_revision = self._resolve_base(base)
+        if review_configuration_hash_factory is not None:
+            review_configuration_hash = review_configuration_hash_factory(base_revision)
         normalized_focus = self._relative_path(focus_path) if focus_path else None
         tracked_groups = self._tracked_path_groups(event, base_revision)
         untracked = [] if event is ReviewEvent.PRE_COMMIT else self._untracked_paths()
@@ -519,7 +522,14 @@ class LocalPairReview:
             coverage_issues=tuple(coverage),
         )
 
-    def recapture(self, snapshot: ReviewSnapshot) -> ReviewSnapshot:
+    def recapture(
+        self,
+        snapshot: ReviewSnapshot,
+        *,
+        review_configuration_hash_factory: Optional[
+            Callable[[str], Optional[str]]
+        ] = None,
+    ) -> ReviewSnapshot:
         return self.capture(
             event=snapshot.event,
             base=snapshot.base_selector or snapshot.base_revision,
@@ -528,6 +538,7 @@ class LocalPairReview:
             task_intent=snapshot.task_intent,
             deterministic_results=snapshot.deterministic_results,
             review_configuration_hash=snapshot.review_configuration_hash,
+            review_configuration_hash_factory=review_configuration_hash_factory,
             policy_version=snapshot.policy_version,
             parent_snapshot_id=snapshot.parent_snapshot_id,
         )

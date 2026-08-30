@@ -573,6 +573,24 @@ def test_recapture_re_resolves_a_moving_base_selector(tmp_path):
     assert current.snapshot_id != snapshot.snapshot_id
 
 
+def test_recapture_can_recompute_configuration_identity(tmp_path):
+    repo = _repo(tmp_path, "moving-configuration")
+    (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+    reviewer = LocalPairReview(str(repo))
+    snapshot = reviewer.capture(
+        event="worktree-idle",
+        review_configuration_hash="sha256:old",
+    )
+
+    current = reviewer.recapture(
+        snapshot,
+        review_configuration_hash_factory=lambda base_revision: "sha256:new",
+    )
+
+    assert current.review_configuration_hash == "sha256:new"
+    assert current.snapshot_id != snapshot.snapshot_id
+
+
 def test_result_states_distinguish_findings_clean_and_unavailable():
     snapshot = _snapshot("/repo/one")
     findings = build_snapshot_result(

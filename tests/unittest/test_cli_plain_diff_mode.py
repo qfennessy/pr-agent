@@ -215,6 +215,28 @@ def test_review_snapshot_rejects_looped_output_symlink(monkeypatch, tmp_path, ca
     assert "aliases an existing repository path" in capsys.readouterr().err
 
 
+def test_review_snapshot_rejects_looped_symlink_before_output_collision_check(
+    monkeypatch, tmp_path, capsys
+):
+    import subprocess
+
+    repo = tmp_path / "repo-output-loop-collision"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    (repo / "loop").symlink_to("loop", target_is_directory=True)
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "worktree-idle",
+            "--output", "loop/review.md", "--json-output", "result.json",
+        ])
+
+    error = capsys.readouterr().err
+    assert "aliases an existing repository path" in error
+    assert "Traceback" not in error
+
+
 def test_review_snapshot_rejects_external_symlink_into_git_metadata(monkeypatch, tmp_path, capsys):
     import subprocess
 
@@ -1020,6 +1042,45 @@ def test_review_snapshot_returns_stale_when_base_ref_disappears(
     assert payload["coverage_issues"] == [
         {"fingerprint": None, "path": None, "reason": "current_snapshot_unavailable"}
     ]
+
+
+def test_review_snapshot_returns_stale_when_skills_change_during_review(
+    cfg, monkeypatch, tmp_path, capsys
+):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo-changing-skills"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+    skills = {"content": "before"}
+    monkeypatch.setattr("pr_agent.cli.get_skills_context", lambda: skills["content"])
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            skills["content"] = "after"
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    result = run(inargs=[
+        "review-snapshot", "--event", "worktree-idle", "--no-cache",
+    ])
+
+    assert result.state.value == "stale"
+    assert result.review is None
+    assert json.loads(capsys.readouterr().out)["state"] == "stale"
 
 
 def test_review_snapshot_restores_snapshot_only_instructions(cfg, monkeypatch, tmp_path, capsys):

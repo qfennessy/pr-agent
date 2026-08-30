@@ -647,12 +647,16 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         parser.error("--json-output may be provided before or after review-snapshot, not both")
     markdown_output = snapshot_args.output or args.output
     json_output = snapshot_args.json_output or args.json_output
-    if (
-        markdown_output
-        and json_output
-        and Path(markdown_output).resolve(strict=False) == Path(json_output).resolve(strict=False)
-    ):
-        parser.error("--output and --json-output must reference different paths")
+    if markdown_output and json_output:
+        try:
+            outputs_collide = (
+                Path(markdown_output).resolve(strict=False)
+                == Path(json_output).resolve(strict=False)
+            )
+        except RuntimeError:
+            parser.error("output destination aliases an existing repository path")
+        if outputs_collide:
+            parser.error("--output and --json-output must reference different paths")
     checks = _parse_deterministic_checks(snapshot_args.deterministic_check, parser)
     event = ReviewEvent.parse(snapshot_args.event)
     try:
@@ -734,8 +738,18 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         reviewer.repository_root,
         max_entries=int(settings.get("cache_max_entries", 50)),
     )
+
+    def current_configuration_hash(base_revision: str) -> str:
+        return _snapshot_review_configuration_hash(
+            get_skills_context(),
+            _load_snapshot_repo_context(repository_root, base_revision),
+        )
+
     try:
-        current = reviewer.recapture(snapshot)
+        current = reviewer.recapture(
+            snapshot,
+            review_configuration_hash_factory=current_configuration_hash,
+        )
     except SnapshotCaptureError:
         current = None
     if current is None:
@@ -814,7 +828,10 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
                     review_error = review_error or "InvalidStructuredReview"
 
             try:
-                current = reviewer.recapture(snapshot)
+                current = reviewer.recapture(
+                    snapshot,
+                    review_configuration_hash_factory=current_configuration_hash,
+                )
             except SnapshotCaptureError:
                 current = None
             if (
