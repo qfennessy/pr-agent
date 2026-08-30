@@ -6,8 +6,10 @@ from requests.exceptions import HTTPError
 
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity
+from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import BitbucketServerProvider
 from pr_agent.git_providers.bitbucket_provider import BitbucketProvider
+from tests.unittest._settings_helpers import restore_settings, snapshot_settings
 
 
 class TestBitbucketProvider:
@@ -132,6 +134,31 @@ class TestBitbucketProvider:
         assert result is True
         provider.pr.delete.assert_called_once_with("comments/42")
 
+    def test_clear_persistent_review_respects_configured_reviewer_id(self):
+        saved = snapshot_settings(("config.persistent_comment_id",))
+        try:
+            get_settings().set("config.persistent_comment_id", "current-reviewer")
+            current_review = MagicMock()
+            current_review.raw = (
+                "## Review\n\n<!-- pr-agent:review:bugs-only -->\n\ndefect\n\n"
+                "<!-- pr-agent-persistent-id: current-reviewer -->"
+            )
+            current_review.data = {"id": 42}
+            other_review = MagicMock()
+            other_review.raw = (
+                "## Review\n\n<!-- pr-agent:review:bugs-only -->\n\ndefect\n\n"
+                "<!-- pr-agent-persistent-id: other-reviewer -->"
+            )
+            other_review.data = {"id": 43}
+            provider = self._make_persistent_provider([current_review, other_review])
+
+            result = provider.clear_persistent_review(PRReviewIdentity.BUGS_ONLY.value, "bugs-only review")
+
+            assert result is True
+            provider.pr.delete.assert_called_once_with("comments/42")
+        finally:
+            restore_settings(saved)
+
     def test_persistent_review_update_falls_back_when_edit_fails(self):
         provider = BitbucketProvider.__new__(BitbucketProvider)
         provider.pr = MagicMock()
@@ -228,6 +255,33 @@ class TestBitbucketProvider:
         unrelated.put.assert_not_called()
         provider.publish_comment.assert_called_once()
         assert PRReviewIdentity.REGULAR.value in provider.publish_comment.call_args.args[0]
+
+    def test_persistent_review_preserves_reviewer_id_and_skips_other_reviewer(self):
+        saved = snapshot_settings(("config.persistent_comment_id",))
+        try:
+            get_settings().set("config.persistent_comment_id", "current-reviewer")
+            other_review = MagicMock()
+            other_review.raw = (
+                "## Review\n\n<!-- pr-agent:review:bugs-only -->\n\ndefect\n\n"
+                "<!-- pr-agent-persistent-id: other-reviewer -->"
+            )
+            provider = self._make_persistent_provider([other_review])
+
+            provider.publish_persistent_comment(
+                "## Review\n\nnew defect",
+                initial_header="## Review",
+                update_header=True,
+                final_update_message=False,
+                identity_marker=PRReviewIdentity.BUGS_ONLY.value,
+            )
+
+            other_review.put.assert_not_called()
+            provider.publish_comment.assert_called_once()
+            published = provider.publish_comment.call_args.args[0]
+            assert PRReviewIdentity.BUGS_ONLY.value in published
+            assert published.rstrip().endswith("<!-- pr-agent-persistent-id: current-reviewer -->")
+        finally:
+            restore_settings(saved)
 
     def test_nonreview_persistent_comment_keeps_existing_bitbucket_matching(self):
         existing = MagicMock()

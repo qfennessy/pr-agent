@@ -12,11 +12,11 @@ from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 from ..algo.file_filter import filter_ignored
 from ..algo.language_handler import is_valid_file
-from ..algo.utils import (add_pr_review_identity, comment_matches_identity,
-                          find_line_number_of_relevant_line_in_file)
+from ..algo.utils import add_pr_review_identity, find_line_number_of_relevant_line_in_file
 from ..config_loader import get_settings
 from ..log import get_logger
-from .git_provider import MAX_FILES_ALLOWED_FULL, GitProvider, get_cached_global_settings
+from .git_provider import (MAX_FILES_ALLOWED_FULL, GitProvider, attach_persistent_comment_id,
+                           get_cached_global_settings, is_own_persistent_comment_for_identities)
 
 
 def _gef_filename(diff):
@@ -400,6 +400,7 @@ class BitbucketProvider(GitProvider):
                                    identity_marker: str | None = None,
                                    legacy_initial_header: str | None = None):
         try:
+            pr_comment = attach_persistent_comment_id(pr_comment)
             pr_comment = add_pr_review_identity(pr_comment, identity_marker)
             comments = list(self.pr.comments())
             if identity_marker:
@@ -407,7 +408,7 @@ class BitbucketProvider(GitProvider):
                     (
                         comment
                         for comment in comments
-                        if comment_matches_identity(comment.raw, identity_marker)
+                        if is_own_persistent_comment_for_identities(comment.raw, (identity_marker,))
                     ),
                     None,
                 )
@@ -416,7 +417,7 @@ class BitbucketProvider(GitProvider):
                         (
                             comment
                             for comment in comments
-                            if comment_matches_identity(comment.raw, legacy_initial_header)
+                            if is_own_persistent_comment_for_identities(comment.raw, (legacy_initial_header,))
                         ),
                         None,
                     )
@@ -460,7 +461,7 @@ class BitbucketProvider(GitProvider):
         try:
             comments = list(self.pr.comments())
             for comment in reversed(comments):
-                if not comment_matches_identity(comment.raw, identity_marker):
+                if not is_own_persistent_comment_for_identities(comment.raw, (identity_marker,)):
                     continue
                 comment_data = getattr(comment, "data", {}) or {}
                 comment_id = comment_data.get("id") if isinstance(comment_data, dict) else None
