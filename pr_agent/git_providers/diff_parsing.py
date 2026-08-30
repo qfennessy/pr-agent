@@ -1,6 +1,7 @@
 from unidiff import PatchSet
 from unidiff.errors import UnidiffParseError
 
+from pr_agent.algo.git_patch_processing import iter_git_patch_lines
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.log import get_logger
 
@@ -21,7 +22,7 @@ def to_hunk_only_patch(patch_str: str) -> str:
     shared hunk/line-number converter treats any '+'/'-' line as content. Left
     in, the '---'/'+++' headers would be emitted as a bogus leading hunk with
     invalid line numbers. Returns "" when there is no hunk (e.g. rename-only)."""
-    lines = patch_str.splitlines(keepends=True)
+    lines = list(iter_git_patch_lines(patch_str))
     for i, line in enumerate(lines):
         if line.startswith("@@"):
             return "".join(lines[i:])
@@ -79,7 +80,10 @@ def reconstruct_base_file(head_file_str: str, patch_str: str) -> str:
     if len(patch_set) != 1:
         return ""
 
-    head_lines = head_file_str.splitlines()
+    head_lines = head_file_str.split("\n")
+    if head_lines and head_lines[-1] == "":
+        head_lines.pop()
+    head_lines = [line.removesuffix("\r") for line in head_lines]
     base_lines: list[str] = []
     head_idx = 0  # 0-based cursor into head_lines
 
@@ -91,7 +95,7 @@ def reconstruct_base_file(head_file_str: str, patch_str: str) -> str:
         head_idx = hunk_head_start
 
         for line in hunk:
-            value = line.value.rstrip("\r\n")
+            value = line.value.removesuffix("\n").removesuffix("\r")
             if line.is_context:
                 if head_idx >= len(head_lines) or head_lines[head_idx] != value:
                     return ""

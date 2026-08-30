@@ -7,6 +7,7 @@ from jinja2 import Environment, StrictUndefined
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.git_patch_processing import split_git_file_lines
 from pr_agent.algo.pr_processing import get_pr_diff, retry_with_fallback_models
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import load_yaml
@@ -142,7 +143,7 @@ class PRAddDocs:
             file_lines = []
             for file in self.diff_files:
                 if file.filename.strip() == relevant_file:
-                    file_lines = file.head_file.splitlines() if file.head_file else []
+                    file_lines = split_git_file_lines(file.head_file) if file.head_file else []
                     if not 1 <= relevant_lines_start <= len(file_lines):
                         get_logger().warning(
                             "Could not dedent code snippet, relevant_lines_start is out of range",
@@ -157,7 +158,7 @@ class PRAddDocs:
                     line = file_lines[relevant_lines_start]
                 else:
                     line = original_initial_line
-                suggested_initial_line = new_code_snippet.splitlines()[0]
+                suggested_initial_line = split_git_file_lines(new_code_snippet)[0]
                 original_initial_spaces = len(line) - len(line.lstrip())
                 suggested_initial_spaces = len(suggested_initial_line) - len(suggested_initial_line.lstrip())
                 delta_spaces = original_initial_spaces - suggested_initial_spaces

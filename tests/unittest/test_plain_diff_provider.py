@@ -3,7 +3,11 @@ import pytest
 from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import _GIT_PROVIDERS
-from pr_agent.git_providers.plain_diff_provider import PlainDiffGitProvider, parse_plain_diff
+from pr_agent.git_providers.plain_diff_provider import (
+    PlainDiffGitProvider,
+    _header_is_c_quoted,
+    parse_plain_diff,
+)
 
 # Diff-mode settings keys these tests mutate on the process-wide singleton.
 _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path",
@@ -105,6 +109,22 @@ def test_git_c_quoted_prefixed_filename_is_decoded():
     files = parse_plain_diff(diff)
 
     assert files[0].filename == "foo\tbar.py"
+
+
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+def test_c_quoted_header_detection_ignores_unicode_separator_fragments(
+    unicode_separator,
+):
+    patch = (
+        f'diff metadata{unicode_separator}+++ "b/fake.py"\n'
+        "--- a/real.py\n"
+        "+++ b/real.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+
+    assert not _header_is_c_quoted(patch, "+++ ")
 
 
 _MULTI_LANG_DIFF = """diff --git a/foo.py b/foo.py

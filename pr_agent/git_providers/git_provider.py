@@ -277,6 +277,13 @@ def is_own_persistent_comment_for_identities(comment_body: str, identities: Iter
     return not owned_by_an_identified_run
 
 
+def _comment_body(comment) -> str:
+    """Read comment text from provider objects and dictionary-shaped payloads."""
+    if isinstance(comment, dict):
+        return str(comment.get("body") or comment.get("comment") or "")
+    return str(getattr(comment, "body", "") or "")
+
+
 class GitProvider(ABC):
     @abstractmethod
     def is_supported(self, capability: str) -> bool:
@@ -557,6 +564,22 @@ class GitProvider(ABC):
     def supports_review_comment_identity(self) -> bool:
         return False
 
+    def get_ci_failure_context(self) -> dict:
+        """Return bounded failed-check metadata when the provider can supply it."""
+        return {"status": "unavailable", "failures": []}
+
+    def clear_persistent_review(self, identity_marker: str, name: str = "review") -> bool:
+        """Remove the newest persistent review matching an exact tool identity."""
+        try:
+            comments = list(self.get_issue_comments())
+            for comment in reversed(comments):
+                if is_own_persistent_comment_for_identities(_comment_body(comment), (identity_marker,)):
+                    self.remove_comment(comment)
+                    return True
+        except Exception as e:
+            get_logger().exception(f"Failed to clear persistent {name}, error: {e}")
+        return False
+
     def unresolve_comment_thread(self, comment):  # noqa: B027 - intentional no-op
         pass
 
@@ -603,7 +626,7 @@ class GitProvider(ABC):
                     for identifier in identifiers
                     if identifier
                     for comment in prev_comments
-                    if is_own_persistent_comment_for_identities(comment.body, (identifier,))
+                    if is_own_persistent_comment_for_identities(_comment_body(comment), (identifier,))
                 ),
                 None,
             )
@@ -708,6 +731,11 @@ class GitProvider(ABC):
     def get_latest_commit_url(self) -> str:
         return ""
 
+    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
+        """Return a stable current head identity when the provider supports it."""
+
+        return None
+
     def auto_approve(self) -> bool:
         return False
 
@@ -794,8 +822,9 @@ def get_main_pr_language(languages, files) -> str:
 
 
 class IncrementalPR:
-    def __init__(self, is_incremental: bool = False):
+    def __init__(self, is_incremental: bool = False, review_profile: str = "full"):
         self.is_incremental = is_incremental
+        self.review_profile = review_profile
         self.commits_range = None
         self.first_new_commit = None
         self.last_seen_commit = None

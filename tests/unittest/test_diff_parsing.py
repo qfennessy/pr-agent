@@ -1,5 +1,11 @@
+import pytest
+
 from pr_agent.algo.types import EDIT_TYPE
-from pr_agent.git_providers.diff_parsing import parse_unified_diff, reconstruct_base_file
+from pr_agent.git_providers.diff_parsing import (
+    parse_unified_diff,
+    reconstruct_base_file,
+    to_hunk_only_patch,
+)
 
 MODIFY_DIFF = """diff --git a/foo.py b/foo.py
 index 1111111..2222222 100644
@@ -67,6 +73,21 @@ def test_parse_rename():
     assert f.old_filename == "old.py"
 
 
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+def test_hunk_only_patch_ignores_fake_hunk_after_unicode_separator(
+    unicode_separator,
+):
+    patch = (
+        "diff --git a/source.py b/destination"
+        f"{unicode_separator}@@ -1 +1 @@ fake.py\n"
+        "similarity index 100%\n"
+        "rename from source.py\n"
+        f"rename to destination{unicode_separator}@@ -1 +1 @@ fake.py\n"
+    )
+
+    assert to_hunk_only_patch(patch) == ""
+
+
 _PATCH = """--- a/foo.py
 +++ b/foo.py
 @@ -1,3 +1,3 @@
@@ -87,6 +108,39 @@ def test_reconstruct_base_success():
 def test_reconstruct_base_drift_returns_empty():
     drifted_head = "completely\ndifferent\ncontent\n"
     assert reconstruct_base_file(drifted_head, _PATCH) == ""
+
+
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+def test_reconstruct_base_treats_unicode_separator_as_file_content(
+    unicode_separator,
+):
+    patch = (
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        f" prefix{unicode_separator}suffix\n"
+        "-old\n"
+        "+new\n"
+    )
+    head = f"prefix{unicode_separator}suffix\nnew\n"
+
+    assert reconstruct_base_file(head, patch) == (
+        f"prefix{unicode_separator}suffix\nold\n"
+    )
+
+
+def test_reconstruct_base_removes_at_most_one_carriage_return_per_record():
+    patch = (
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " keep\r\r\n"
+        "-old\n"
+        "+new\n"
+    )
+    head = "keep\r\r\nnew\n"
+
+    assert reconstruct_base_file(head, patch) == "keep\r\nold\n"
 
 
 # --- new tests for reconstruct_base_file ---

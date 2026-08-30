@@ -19,7 +19,10 @@ import pytest
 import pr_agent.algo.pr_processing as pr_processing
 from pr_agent.algo.git_patch_processing import (
     decouple_and_convert_to_hunks_with_lines_numbers,
-    extract_hunk_lines_from_patch)
+    extract_hunk_lines_from_patch,
+    handle_patch_deletions,
+    process_patch_lines,
+)
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 # ---------------------------------------------------------------------------
@@ -141,11 +144,87 @@ class TestDecoupleAndConvertToHunks:
         assert "1 +brand new line 1" in out
         assert "2 +brand new line 2" in out
 
+    @pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+    def test_unicode_separator_does_not_create_a_second_numbered_line(
+        self, unicode_separator
+    ):
+        patch = (
+            f"@@ -1 +1,2 @@\n-old\n+new{unicode_separator}+fake\n"
+            "+real_second\n"
+        )
+        file = _make_file(patch=patch)
+
+        out = decouple_and_convert_to_hunks_with_lines_numbers(patch, file)
+
+        assert f"1 +new{unicode_separator}+fake" in out
+        assert "2 +real_second" in out
+        assert "3 +fake" not in out
+
     def test_no_file_arg_omits_file_header(self):
         out = decouple_and_convert_to_hunks_with_lines_numbers(MULTI_HUNK_PATCH, file=None)
         assert "## File:" not in out
         assert "@@ -1,3 +1,4 @@" in out
         assert "__new hunk__" in out
+
+
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+def test_patch_extension_preserves_unicode_separator_inside_content_line(
+    unicode_separator,
+):
+    fake_header = "@@ -99 +99 @@ fake"
+    patch = (
+        f"@@ -1 +1,2 @@\n-old\n+new{unicode_separator}{fake_header}\n"
+        "+real_second\n"
+    )
+
+    extended = process_patch_lines(
+        patch,
+        "old",
+        0,
+        0,
+        f"new{unicode_separator}{fake_header}\nreal_second",
+    )
+
+    assert f"+new{unicode_separator}{fake_header}" in extended
+    assert extended.count("\n@@") == 1
+
+
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+def test_patch_extension_treats_unicode_separator_as_original_file_content(
+    unicode_separator,
+):
+    context = f"before{unicode_separator}inside"
+    patch = "@@ -2 +2 @@\n-old\n+new\n"
+
+    extended = process_patch_lines(
+        patch,
+        f"{context}\nold\n",
+        1,
+        0,
+        f"{context}\nnew\n",
+    )
+
+    assert f" {context}" in extended
+
+
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+def test_patch_deletion_filter_ignores_fake_addition_after_unicode_separator(
+    unicode_separator,
+):
+    patch = (
+        f"@@ -1,2 +0,0 @@\n-safe{unicode_separator}+fake\n"
+        "-real_second\n"
+    )
+
+    filtered = handle_patch_deletions(
+        patch,
+        "safe",
+        "still-present",
+        "sample.py",
+        EDIT_TYPE.MODIFIED,
+    )
+
+    assert filtered == ""
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +233,26 @@ class TestDecoupleAndConvertToHunks:
 
 
 class TestExtractHunkLinesFromPatch:
+    @pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+    def test_unicode_separator_fragment_stays_on_selected_line(
+        self, unicode_separator
+    ):
+        fake_header = "@@ -99 +99 @@ fake"
+        patch = (
+            f"@@ -1 +1,2 @@\n-old\n+new{unicode_separator}{fake_header}\n"
+            "+real_second\n"
+        )
+
+        full, selected = extract_hunk_lines_from_patch(
+            patch, "src/sample.py", 1, 2, "right"
+        )
+
+        assert f"+new{unicode_separator}{fake_header}" in full
+        assert selected == (
+            f"-old\n+new{unicode_separator}{fake_header}\n+real_second"
+        )
+        assert "\n@@ -99" not in full
+
     def test_right_side_single_line_selection_in_first_hunk(self):
         # In MULTI_HUNK_PATCH new-file numbering:
         #   1 " line1"

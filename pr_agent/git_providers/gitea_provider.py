@@ -6,7 +6,7 @@ import giteapy
 from giteapy.rest import ApiException
 
 from pr_agent.algo.file_filter import filter_ignored
-from pr_agent.algo.git_patch_processing import decode_if_bytes
+from pr_agent.algo.git_patch_processing import decode_if_bytes, iter_git_patch_lines, strip_git_line_ending
 from pr_agent.algo.language_handler import is_valid_file
 from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.algo.utils import (clip_tokens,
@@ -199,23 +199,23 @@ class GiteaProvider(GitProvider):
                     pr_number=self.pr_number
             )
 
-            lines = diff_contents.splitlines()
             current_file = None
             current_patch = []
             file_patches = {}
-            for line in lines:
-                if line.startswith('diff --git'):
+            for record in iter_git_patch_lines(diff_contents):
+                line = strip_git_line_ending(record)
+                if line.startswith('diff --git '):
                     if current_file and current_patch:
-                        file_patches[current_file] = '\n'.join(current_patch)
+                        file_patches[current_file] = ''.join(current_patch)
                         current_patch = []
                     current_file = line.split(' b/')[-1]
                 elif line.startswith('@@') and not current_patch:
-                    current_patch = [line]
+                    current_patch = [record]
                 elif current_patch:
-                    current_patch.append(line)
+                    current_patch.append(record)
 
             if current_file and current_patch:
-                file_patches[current_file] = '\n'.join(current_patch)
+                file_patches[current_file] = ''.join(current_patch)
 
             self.file_diffs = file_patches
         except Exception as e:
@@ -305,6 +305,8 @@ class GiteaProvider(GitProvider):
         return self.last_commit.html_url if self.last_commit else ""
 
     def get_comment_url(self, comment) -> str:
+        if isinstance(comment, dict):
+            return str(comment.get("html_url") or "")
         return comment.html_url
 
     def publish_persistent_comment(self, pr_comment: str,
@@ -314,13 +316,14 @@ class GiteaProvider(GitProvider):
                                    final_update_message=True,
                                    identity_marker: str | None = None,
                                    legacy_initial_header: str | None = None):
-        # Keep the legacy updater path until Gitea normalizes its dictionary-shaped comment payloads.
         self.publish_persistent_comment_full(
             pr_comment,
             initial_header,
             update_header,
             name,
             final_update_message,
+            identity_marker=identity_marker,
+            legacy_initial_header=legacy_initial_header,
         )
 
     def publish_comment(self, comment: str,is_temporary: bool = False) -> None:
