@@ -11,18 +11,36 @@ from starlette_context import context
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 from ..algo.file_filter import filter_ignored
+from ..algo.git_patch_processing import iter_git_patch_lines, strip_git_line_ending
 from ..algo.language_handler import is_valid_file
-from ..algo.utils import (add_pr_review_identity, comment_matches_identity,
-                          find_line_number_of_relevant_line_in_file)
+from ..algo.utils import add_pr_review_identity, find_line_number_of_relevant_line_in_file
 from ..config_loader import get_settings
 from ..log import get_logger
-from .git_provider import MAX_FILES_ALLOWED_FULL, GitProvider, get_cached_global_settings
+from .git_provider import (MAX_FILES_ALLOWED_FULL, GitProvider, attach_persistent_comment_id,
+                           get_cached_global_settings, is_own_persistent_comment_for_identities)
 
 
 def _gef_filename(diff):
     if diff.new.path:
         return diff.new.path
     return diff.old.path
+
+
+def _split_git_diff_sections(patch: str) -> list[str]:
+    """Split a raw Git diff only at LF-delimited file headers."""
+    sections = []
+    current = []
+    for record in iter_git_patch_lines(patch):
+        line = strip_git_line_ending(record)
+        if line.startswith("diff --git "):
+            if current:
+                sections.append("".join(current))
+            current = [record]
+        elif current:
+            current.append(record)
+    if current:
+        sections.append("".join(current))
+    return sections
 
 
 class BitbucketProvider(GitProvider):
@@ -176,7 +194,10 @@ class BitbucketProvider(GitProvider):
                     diff = difflib.unified_diff(existing_code.split('\n'),
                                                 improved_code.split('\n'), n=999)
                     patch_orig = "\n".join(diff)
-                    patch = "\n".join(patch_orig.splitlines()[5:]).strip('\n')
+                    patch = "\n".join(
+                        strip_git_line_ending(line)
+                        for line in list(iter_git_patch_lines(patch_orig))[5:]
+                    ).strip('\n')
                     diff_code = f"\n\n```diff\n{patch.rstrip()}\n```"
                     # replace ```suggestion ... ``` with diff_code, using regex:
                     body = re.sub(r'```suggestion.*?```', diff_code, body, flags=re.DOTALL)
@@ -293,7 +314,7 @@ class BitbucketProvider(GitProvider):
             if pr_patches is None:
                 raise ValueError(f"Failed to decode PR patch with encodings {encodings_to_try}")
 
-        diff_split = ["diff --git" + x for x in pr_patches.split("diff --git") if x.strip()]
+        diff_split = _split_git_diff_sections(pr_patches)
         # filter all elements of 'diff_split' that are of indices in 'diffs_original' that are not in 'diffs'
         if len(diff_split) > len(diffs) and len(diffs_original) == len(diff_split):
             diff_split = [diff_split[i] for i in range(len(diff_split)) if diffs_original[i] in diffs]
@@ -308,7 +329,12 @@ class BitbucketProvider(GitProvider):
         #  +++ b/pr_agent/cli_pip.py
         #   @@ -... @@"
         for i, _ in enumerate(diff_split):
-            diff_split_lines = diff_split[i].splitlines()
+            diff_split_records = list(iter_git_patch_lines(diff_split[i]))
+            diff_split_lines = [
+                strip_git_line_ending(record)
+                for record in diff_split_records
+            ]
+            hunk_index = None
             if (len(diff_split_lines) >= 6) and \
                     ((diff_split_lines[2].startswith("---") and
                       diff_split_lines[3].startswith("+++") and
@@ -316,7 +342,9 @@ class BitbucketProvider(GitProvider):
                      (diff_split_lines[3].startswith("---") and  # new or deleted file
                       diff_split_lines[4].startswith("+++") and
                       diff_split_lines[5].startswith("@@"))):
-                diff_split[i] = "\n".join(diff_split_lines[4:])
+                hunk_index = 4 if diff_split_lines[4].startswith("@@") else 5
+            if hunk_index is not None:
+                diff_split[i] = "".join(diff_split_records[hunk_index:])
             else:
                 if diffs[i].data.get('lines_added', 0) == 0 and diffs[i].data.get('lines_removed', 0) == 0:
                     diff_split[i] = ""
@@ -400,6 +428,7 @@ class BitbucketProvider(GitProvider):
                                    identity_marker: str | None = None,
                                    legacy_initial_header: str | None = None):
         try:
+            pr_comment = attach_persistent_comment_id(pr_comment)
             pr_comment = add_pr_review_identity(pr_comment, identity_marker)
             comments = list(self.pr.comments())
             if identity_marker:
@@ -407,7 +436,7 @@ class BitbucketProvider(GitProvider):
                     (
                         comment
                         for comment in comments
-                        if comment_matches_identity(comment.raw, identity_marker)
+                        if is_own_persistent_comment_for_identities(comment.raw, (identity_marker,))
                     ),
                     None,
                 )
@@ -416,7 +445,7 @@ class BitbucketProvider(GitProvider):
                         (
                             comment
                             for comment in comments
-                            if comment_matches_identity(comment.raw, legacy_initial_header)
+                            if is_own_persistent_comment_for_identities(comment.raw, (legacy_initial_header,))
                         ),
                         None,
                     )
@@ -454,6 +483,24 @@ class BitbucketProvider(GitProvider):
             get_logger().exception(f"Failed to update persistent review, error: {e}")
             pass
         self.publish_comment(pr_comment)
+
+    def clear_persistent_review(self, identity_marker: str, name: str = "review") -> bool:
+        """Remove the newest matching persistent review through Bitbucket's PR comment API."""
+        try:
+            comments = list(self.pr.comments())
+            for comment in reversed(comments):
+                if not is_own_persistent_comment_for_identities(comment.raw, (identity_marker,)):
+                    continue
+                comment_data = getattr(comment, "data", {}) or {}
+                comment_id = comment_data.get("id") if isinstance(comment_data, dict) else None
+                if comment_id is None:
+                    get_logger().warning(f"Cannot clear persistent {name}: Bitbucket comment ID is missing")
+                    return False
+                self.remove_comment(comment_id)
+                return True
+        except Exception as e:
+            get_logger().exception(f"Failed to clear persistent {name}, error: {e}")
+        return False
 
     def publish_comment(self, pr_comment: str, is_temporary: bool = False):
         if is_temporary and not get_settings().config.publish_output_progress:

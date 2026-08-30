@@ -111,6 +111,11 @@ class ProductionArmResult:
             raise EvaluationValidationError("production arm result must use ReviewSnapshotResult")
         if self.run_details is not None and not isinstance(self.run_details, RunDetails):
             raise EvaluationValidationError("production arm telemetry must use RunDetails")
+        if self.run_details is not None and self.run_details.specialist_runs:
+            raise EvaluationValidationError(
+                "production arm result contains per-stage or per-role model telemetry "
+                "that EvaluationRunRecord cannot preserve"
+            )
         if not isinstance(self.snapshot_result.state, ReviewResultState):
             raise EvaluationValidationError("production snapshot result state is invalid")
         latency = self.snapshot_result.latency_seconds
@@ -440,6 +445,14 @@ def _record_from_production_result(
     *,
     attempt: int,
 ) -> EvaluationRunRecord:
+    if outcome.run_details is not None and outcome.run_details.specialist_runs:
+        # RunDetails is mutable even though ProductionArmResult is frozen. Recheck at
+        # the persistence boundary so an adapter cannot add role telemetry after the
+        # result was constructed and silently collapse it into one selected model.
+        raise EvaluationValidationError(
+            "production arm result contains per-stage or per-role model telemetry "
+            "that EvaluationRunRecord cannot preserve"
+        )
     result = outcome.snapshot_result
     if result.snapshot_id != snapshot.snapshot_id:
         raise EvaluationValidationError("production result names a different immutable snapshot")

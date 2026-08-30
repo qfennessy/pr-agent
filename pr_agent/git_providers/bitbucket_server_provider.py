@@ -11,7 +11,7 @@ import shlex
 import subprocess
 
 from ..algo.file_filter import filter_ignored
-from ..algo.git_patch_processing import decode_if_bytes
+from ..algo.git_patch_processing import decode_if_bytes, iter_git_patch_lines, strip_git_line_ending
 from ..algo.language_handler import is_valid_file
 from ..algo.types import EDIT_TYPE, FilePatchInfo
 from ..algo.utils import (find_line_number_of_relevant_line_in_file,
@@ -147,7 +147,10 @@ class BitbucketServerProvider(GitProvider):
                     diff = difflib.unified_diff(existing_code.split('\n'),
                                                 improved_code.split('\n'), n=999)
                     patch_orig = "\n".join(diff)
-                    patch = "\n".join(patch_orig.splitlines()[5:]).strip('\n')
+                    patch = "\n".join(
+                        strip_git_line_ending(line)
+                        for line in list(iter_git_patch_lines(patch_orig))[5:]
+                    ).strip('\n')
                     diff_code = f"\n\n```diff\n{patch.rstrip()}\n```"
                     # replace ```suggestion ... ``` with diff_code, using regex:
                     body = re.sub(r'```suggestion.*?```', diff_code, body, flags=re.DOTALL)

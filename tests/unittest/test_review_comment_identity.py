@@ -5,12 +5,14 @@ import pytest
 
 from pr_agent.algo.utils import (PRReviewIdentity, add_pr_review_identity,
                                  comment_matches_identity,
+                                 comment_matches_pr_review_identity,
                                  convert_to_markdown_v2,
                                  format_pr_review_header,
                                  get_pr_review_comment_identifiers)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
 from pr_agent.git_providers.gitea_provider import GiteaProvider
+from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.git_providers.github_provider import GithubProvider
 from tests.unittest._settings_helpers import (restore_settings,
                                               snapshot_settings)
@@ -79,43 +81,97 @@ def test_hidden_identity_only_matches_as_a_bounded_standalone_line():
 def test_full_and_incremental_review_identities_remain_distinct():
     full_identifiers = get_pr_review_comment_identifiers(full=True, incremental=False)
     incremental_identifiers = get_pr_review_comment_identifiers(full=False, incremental=True)
+    bugs_only_incremental_identifiers = get_pr_review_comment_identifiers(
+        full=True,
+        incremental=True,
+        review_profile="bugs_only",
+    )
     incremental = add_pr_review_identity(
         "## Incremental Team Review 🔍\n\nbody",
-        PRReviewIdentity.INCREMENTAL.value,
+        PRReviewIdentity.FULL_INCREMENTAL.value,
     )
 
     assert PRReviewIdentity.REGULAR.value in full_identifiers
     assert PRReviewIdentity.INCREMENTAL.value not in full_identifiers
-    assert PRReviewIdentity.INCREMENTAL.value in incremental_identifiers
+    assert PRReviewIdentity.BUGS_ONLY.value not in full_identifiers
+    assert PRReviewIdentity.FULL_INCREMENTAL.value in incremental_identifiers
+    assert PRReviewIdentity.INCREMENTAL.value not in incremental_identifiers
+    assert PRReviewIdentity.BUGS_ONLY.value not in incremental_identifiers
+    assert PRReviewIdentity.BUGS_ONLY.value in bugs_only_incremental_identifiers
+    assert PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value in bugs_only_incremental_identifiers
+    assert PRReviewIdentity.FULL_INCREMENTAL.value in bugs_only_incremental_identifiers
+    assert PRReviewIdentity.INCREMENTAL.value in bugs_only_incremental_identifiers
+    assert PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value not in incremental_identifiers
     assert not any(comment_matches_identity(incremental, item) for item in full_identifiers)
 
 
 @pytest.mark.parametrize(
-    ("body", "full", "incremental"),
+    ("body", "full", "incremental", "review_profile"),
     [
-        ("## PR Reviewer Guide 🔍\n\nlegacy", True, False),
-        ("## Incremental PR Reviewer Guide 🔍\n\nlegacy", False, True),
+        ("## PR Reviewer Guide 🔍\n\nlegacy", True, False, "full"),
+        ("## Incremental PR Reviewer Guide 🔍\n\nlegacy", False, True, "bugs_only"),
         (
             "## Team Review 🔍\n\n<!-- pr-agent:review:full -->\n\nmarked",
             True,
             False,
+            "full",
         ),
         (
-            "## Incremental Team Review 🔍\n\n<!-- pr-agent:review:incremental -->\n\nmarked",
+            "## Incremental Team Review 🔍\n\n<!-- pr-agent:review:full:incremental -->\n\nmarked",
             False,
             True,
+            "full",
+        ),
+        (
+            "## Incremental Team Review 🔍\n\n<!-- pr-agent:review:bugs-only:incremental -->\n\nmarked",
+            True,
+            True,
+            "bugs_only",
         ),
     ],
 )
-def test_github_previous_review_accepts_markers_and_legacy_headers(body, full, incremental):
+def test_github_previous_review_accepts_markers_and_legacy_headers(
+        body, full, incremental, review_profile):
     provider = GithubProvider.__new__(GithubProvider)
     provider.pr = MagicMock()
     expected = SimpleNamespace(body=body)
     provider.pr.get_issue_comments.return_value = [expected]
 
-    result = provider.get_previous_review(full=full, incremental=incremental)
+    result = provider.get_previous_review(
+        full=full,
+        incremental=incremental,
+        review_profile=review_profile,
+    )
 
     assert result is expected
+
+
+def test_github_full_incremental_lookup_does_not_adopt_bugs_only_marker():
+    provider = GithubProvider.__new__(GithubProvider)
+    provider.pr = MagicMock()
+    provider.pr.get_issue_comments.return_value = [SimpleNamespace(
+        body="## PR Reviewer Guide 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\nmarked",
+    )]
+
+    assert provider.get_previous_review(full=True, incremental=True, review_profile="full") is None
+
+
+def test_explicit_bugs_only_identity_overrides_legacy_full_heading():
+    body = "## PR Reviewer Guide 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\nmarked"
+    identifiers = get_pr_review_comment_identifiers(full=True, incremental=True, review_profile="full")
+
+    assert comment_matches_identity(body, "## PR Reviewer Guide") is True
+    assert comment_matches_pr_review_identity(body, identifiers, "full") is False
+
+
+def test_github_full_incremental_lookup_does_not_adopt_ambiguous_legacy_marker():
+    provider = GithubProvider.__new__(GithubProvider)
+    provider.pr = MagicMock()
+    provider.pr.get_issue_comments.return_value = [SimpleNamespace(
+        body="## Incremental Team Review 🔍\n\n<!-- pr-agent:review:incremental -->\n\nmarked",
+    )]
+
+    assert provider.get_previous_review(full=True, incremental=True, review_profile="full") is None
 
 
 def test_github_full_lookup_does_not_adopt_incremental_marker():
@@ -130,6 +186,50 @@ def test_github_full_lookup_does_not_adopt_incremental_marker():
     provider.pr.get_issue_comments.return_value = [incremental]
 
     assert provider.get_previous_review(full=True, incremental=False) is None
+
+
+def test_clear_persistent_bugs_only_review_preserves_full_review():
+    provider = MagicMock()
+    full_review = SimpleNamespace(
+        body="## Team Review 🔍\n\n<!-- pr-agent:review:full -->\n\nfull findings"
+    )
+    bugs_only_review = SimpleNamespace(
+        body="## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\ndefect"
+    )
+    provider.get_issue_comments.return_value = [full_review, bugs_only_review]
+
+    result = GitProvider.clear_persistent_review(
+        provider,
+        PRReviewIdentity.BUGS_ONLY.value,
+        "bugs-only review",
+    )
+
+    assert result is True
+    provider.remove_comment.assert_called_once_with(bugs_only_review)
+
+
+def test_persistent_review_updates_dictionary_shaped_comment_by_identity():
+    provider = MagicMock()
+    existing = {
+        "comment_id": 42,
+        "comment": "## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\nold defect",
+    }
+    provider.get_issue_comments.return_value = [existing]
+    provider.get_latest_commit_url.return_value = "https://example.test/commit/deadbeef"
+    provider.get_comment_url.return_value = ""
+
+    GitProvider.publish_persistent_comment_full(
+        provider,
+        "## Team Review 🔍\n\nnew defect",
+        initial_header="## Team Review 🔍",
+        final_update_message=False,
+        identity_marker=PRReviewIdentity.BUGS_ONLY.value,
+    )
+
+    provider.edit_comment.assert_called_once()
+    assert provider.edit_comment.call_args.args[0] is existing
+    assert PRReviewIdentity.BUGS_ONLY.value in provider.edit_comment.call_args.args[1]
+    provider.publish_comment.assert_not_called()
 
 
 def test_github_check_run_receives_presentation_without_comment_identity():
@@ -196,7 +296,7 @@ def test_azure_comment_path_forwards_review_identity():
     }
 
 
-def test_gitea_keeps_identity_inactive_until_comment_payloads_are_normalized():
+def test_gitea_comment_path_forwards_review_identity():
     provider = GiteaProvider.__new__(GiteaProvider)
     provider.publish_persistent_comment_full = MagicMock()
     review = "## Team Review 🔍\n\nbody"
@@ -208,4 +308,7 @@ def test_gitea_keeps_identity_inactive_until_comment_payloads_are_normalized():
         legacy_initial_header="## PR Reviewer Guide 🔍",
     )
 
-    assert provider.publish_persistent_comment_full.call_args.kwargs == {}
+    assert provider.publish_persistent_comment_full.call_args.kwargs == {
+        "identity_marker": PRReviewIdentity.REGULAR.value,
+        "legacy_initial_header": "## PR Reviewer Guide 🔍",
+    }

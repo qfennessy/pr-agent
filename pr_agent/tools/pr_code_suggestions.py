@@ -13,8 +13,12 @@ from jinja2 import Environment, StrictUndefined
 from pr_agent.algo import MAX_TOKENS
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
-from pr_agent.algo.git_patch_processing import \
-    decouple_and_convert_to_hunks_with_lines_numbers
+from pr_agent.algo.git_patch_processing import (
+    decouple_and_convert_to_hunks_with_lines_numbers,
+    iter_git_patch_lines,
+    split_git_file_lines,
+    strip_git_line_ending,
+)
 from pr_agent.algo.pr_processing import (_get_all_models,
                                          add_ai_metadata_to_diff_files,
                                          get_pr_diff, get_pr_multi_diffs,
@@ -851,7 +855,8 @@ class PRCodeSuggestions:
         target_lines = {}
         target_line = None
         target_remaining = 0
-        for line in (patch or "").splitlines():
+        for record in iter_git_patch_lines(patch or ""):
+            line = strip_git_line_ending(record)
             hunk_match = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
             if hunk_match:
                 target_line = int(hunk_match.group(1))
@@ -880,7 +885,7 @@ class PRCodeSuggestions:
         if diff_file is None:
             return False, "the file content is unavailable", False
         if diff_file.head_file and getattr(diff_file, "head_file_is_complete", True):
-            file_lines = diff_file.head_file.splitlines()
+            file_lines = split_git_file_lines(diff_file.head_file)
             if relevant_lines_end > len(file_lines):
                 return False, "the anchored range is outside the file", False
             anchored_lines = file_lines[relevant_lines_start - 1:relevant_lines_end]
@@ -892,8 +897,14 @@ class PRCodeSuggestions:
 
         if not existing_code:
             return False, "the existing code is unavailable", True
-        anchored_lines = [line.rstrip() for line in textwrap.dedent("\n".join(anchored_lines)).split("\n")]
-        existing_lines = [line.rstrip() for line in textwrap.dedent(existing_code).splitlines()]
+        anchored_lines = [
+            line.rstrip(" \t")
+            for line in split_git_file_lines(textwrap.dedent("\n".join(anchored_lines)))
+        ]
+        existing_lines = [
+            line.rstrip(" \t")
+            for line in split_git_file_lines(textwrap.dedent(existing_code))
+        ]
         if existing_lines != anchored_lines:
             return False, "the existing code does not match the anchored range", True
         return True, "", True
@@ -912,7 +923,7 @@ class PRCodeSuggestions:
     @staticmethod
     def _shift_code_indentation(code_snippet: str, delta_spaces: int) -> str:
         shifted_lines = []
-        for line in code_snippet.splitlines():
+        for line in split_git_file_lines(code_snippet):
             if not line.strip():
                 shifted_lines.append("")
                 continue
@@ -977,7 +988,7 @@ class PRCodeSuggestions:
 
     @staticmethod
     def _align_code_with_tabs(code_snippet: str, anchor_prefix: str) -> str:
-        lines = code_snippet.splitlines()
+        lines = split_git_file_lines(code_snippet)
         if not lines:
             return code_snippet
         leading_whitespace = [line[:len(line) - len(line.lstrip())] for line in lines]
@@ -1054,7 +1065,7 @@ class PRCodeSuggestions:
             for file in self.diff_files:
                 if file.filename.strip() == relevant_file:
                     if file.head_file and getattr(file, "head_file_is_complete", True):
-                        file_lines = file.head_file.splitlines()
+                        file_lines = split_git_file_lines(file.head_file)
                         if relevant_lines_start > len(file_lines):
                             get_logger().warning(
                                 "Could not dedent code snippet, because relevant_lines_start is out of range",
@@ -1079,7 +1090,7 @@ class PRCodeSuggestions:
                     break
             if original_initial_line:
                 suggested_initial_line = next(
-                    (line for line in new_code_snippet.splitlines() if line.strip()),
+                    (line for line in split_git_file_lines(new_code_snippet) if line.strip()),
                     "",
                 )
                 original_initial_spaces = len(original_initial_line) - len(original_initial_line.lstrip())
@@ -1127,7 +1138,10 @@ class PRCodeSuggestions:
         try:
             self.patches_diff_list_no_line_numbers = []
             for patches_diff in self.patches_diff_list:
-                patches_diff_lines = patches_diff.splitlines()
+                patches_diff_lines = [
+                    strip_git_line_ending(line)
+                    for line in iter_git_patch_lines(patches_diff)
+                ]
                 for i, line in enumerate(patches_diff_lines):
                     if line.strip():
                         if line.isnumeric():
@@ -1354,7 +1368,10 @@ class PRCodeSuggestions:
                     diff = difflib.unified_diff(existing_code.split('\n'),
                                                 improved_code.split('\n'), n=999)
                     patch_orig = "\n".join(diff)
-                    patch = "\n".join(patch_orig.splitlines()[5:]).strip('\n')
+                    patch = "\n".join(
+                        strip_git_line_ending(line)
+                        for line in list(iter_git_patch_lines(patch_orig))[5:]
+                    ).strip('\n')
 
                     example_code = ""
                     example_code += f"```diff\n{patch.rstrip()}\n```\n"

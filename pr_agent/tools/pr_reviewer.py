@@ -1,5 +1,6 @@
 import copy
 import datetime
+import json
 import re
 from functools import partial
 from typing import List, Optional, Tuple
@@ -8,6 +9,7 @@ from jinja2 import Environment, StrictUndefined
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.git_patch_processing import iter_git_patch_lines, split_git_file_lines
 from pr_agent.algo.inline_comment_dedup import (
     InlineCommentStore, can_verify_inline_comment_publication,
     get_inline_comment_store, key_issue_body_with_markers,
@@ -17,6 +19,14 @@ from pr_agent.algo.pr_processing import (PRDiffCoverage,
                                          get_pr_diff,
                                          retry_with_fallback_models)
 from pr_agent.algo.repo_context import build_repo_context
+from pr_agent.algo.review_specialists import (
+    build_specialist_input,
+    get_specialist_snapshot_context,
+    load_specialist_pipeline_config,
+    run_shadow_specialists,
+    specialists_enabled,
+    unavailable_specialist_batch,
+)
 from pr_agent.algo.run_details import (get_run_details, init_run_details,
                                        record_review_profile)
 from pr_agent.algo.skills_loader import get_skills_context
@@ -44,6 +54,10 @@ _BUG_FINDING_HEADERS = {
     "security": "Security vulnerability",
     "performance": "Performance regression",
 }
+_GENERIC_CI_EVIDENCE_TERMS = {
+    "assert", "assertion", "build", "check", "error", "errors", "fail", "failed", "failure", "failures",
+    "job", "test", "tests", "unit",
+}
 
 
 class PRReviewer:
@@ -65,7 +79,15 @@ class PRReviewer:
         """
         self.git_provider = get_git_provider_with_context(pr_url)
         self.args = args
+        configured_profile = str(get_settings().pr_reviewer.get("review_profile", "full")).strip().lower()
+        if configured_profile not in _VALID_REVIEW_PROFILES:
+            get_logger().warning(
+                f"Unknown pr_reviewer.review_profile '{configured_profile}'; falling back to 'full'"
+            )
+            configured_profile = "full"
+        self.review_profile = configured_profile
         self.incremental = self.parse_incremental(args)  # -i command
+        self.incremental.review_profile = self.review_profile
         if self.incremental and self.incremental.is_incremental:
             self.git_provider.get_incremental_commits(self.incremental)
 
@@ -75,13 +97,6 @@ class PRReviewer:
         self.pr_url = pr_url
         self.is_answer = is_answer
         self.is_auto = is_auto
-        configured_profile = str(get_settings().pr_reviewer.get("review_profile", "full")).strip().lower()
-        if configured_profile not in _VALID_REVIEW_PROFILES:
-            get_logger().warning(
-                f"Unknown pr_reviewer.review_profile '{configured_profile}'; falling back to 'full'"
-            )
-            configured_profile = "full"
-        self.review_profile = configured_profile
 
         if self.is_answer and not self.git_provider.is_supported("get_issue_comments"):
             raise Exception(f"Answer mode is not supported for {get_settings().config.git_provider} for now")
@@ -91,6 +106,8 @@ class PRReviewer:
         self.remaining_files_list = []
         self.deleted_files_list = []
         self.prediction = None
+        self.specialist_shadow_result = None
+        self._specialists_started = False
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
             self.git_provider.get_pr_description(split_changes_walkthrough=True))
@@ -103,6 +120,26 @@ class PRReviewer:
             get_logger().debug(f"AI metadata is disabled for this command")
 
         bugs_only = self.review_profile == "bugs_only"
+        self.ci_failure_context = (
+            self.git_provider.get_ci_failure_context()
+            if bugs_only
+            else {"status": "not_requested", "failures": []}
+        )
+        if not isinstance(self.ci_failure_context, dict):
+            self.ci_failure_context = {"status": "unavailable", "failures": []}
+        ci_failures = self.ci_failure_context.get("failures")
+        if not isinstance(ci_failures, list):
+            ci_failures = []
+            self.ci_failure_context["failures"] = ci_failures
+        self.ci_failure_evidence_by_name = {}
+        for failure in ci_failures:
+            if not isinstance(failure, dict):
+                continue
+            name = str(failure.get("name") or "").strip().casefold()
+            if not name:
+                continue
+            evidence = " ".join((str(failure.get("title") or ""), str(failure.get("summary") or ""))).strip()
+            self.ci_failure_evidence_by_name.setdefault(name, []).append(evidence)
         self.vars = {
             "title": self.git_provider.pr.title,
             "branch": self.git_provider.get_pr_branch(),
@@ -135,6 +172,7 @@ class PRReviewer:
             "related_tickets": [] if bugs_only else get_settings().get('related_tickets', []),
             'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False),
             "date": datetime.datetime.now().strftime('%Y-%m-%d'),
+            "ci_failure_context": json.dumps(self.ci_failure_context, ensure_ascii=False),
         }
 
         self.token_handler = TokenHandler(
@@ -209,6 +247,7 @@ class PRReviewer:
 
             should_publish = get_settings().config.publish_output and self._should_publish_review_no_suggestions(pr_review)
             if not should_publish:
+                self._clear_stale_persistent_bugs_only_review()
                 reason = "Review output is not published"
                 if get_settings().config.publish_output:
                     reason += ": no major issues detected."
@@ -222,21 +261,39 @@ class PRReviewer:
             review_thread_kwargs = {"as_thread": True} if self.git_provider.should_publish_review_as_thread() else {}
             if get_settings().pr_reviewer.persistent_comment and not self.incremental.is_incremental:
                 final_update_message = get_settings().pr_reviewer.final_update_message
+                identity_marker = (
+                    PRReviewIdentity.BUGS_ONLY.value
+                    if self._review_profile() == "bugs_only"
+                    else PRReviewIdentity.REGULAR.value
+                )
                 self.git_provider.publish_persistent_comment(
                     pr_review,
                     initial_header=pr_review.split("\n", 1)[0],
                     update_header=True,
                     final_update_message=final_update_message,
-                    identity_marker=PRReviewIdentity.REGULAR.value,
-                    legacy_initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
+                    name="bugs-only review" if self._review_profile() == "bugs_only" else "review",
+                    identity_marker=identity_marker,
+                    legacy_initial_header=(
+                        None
+                        if self._review_profile() == "bugs_only"
+                        else f"{PRReviewHeader.REGULAR.value} 🔍"
+                    ),
                     **review_thread_kwargs,
                 )
             else:
                 if self.git_provider.supports_review_comment_identity() is True:
                     identity_marker = (
-                        PRReviewIdentity.INCREMENTAL.value
+                        (
+                            PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value
+                            if self._review_profile() == "bugs_only"
+                            else PRReviewIdentity.FULL_INCREMENTAL.value
+                        )
                         if self.incremental.is_incremental
-                        else PRReviewIdentity.REGULAR.value
+                        else (
+                            PRReviewIdentity.BUGS_ONLY.value
+                            if self._review_profile() == "bugs_only"
+                            else PRReviewIdentity.REGULAR.value
+                        )
                     )
                     pr_review = add_pr_review_identity(pr_review, identity_marker)
                 self.git_provider.publish_comment(pr_review, **review_thread_kwargs)
@@ -267,6 +324,16 @@ class PRReviewer:
         """Return the selected profile, defaulting legacy/test instances to full review."""
         return getattr(self, "review_profile", "full")
 
+    def _clear_stale_persistent_bugs_only_review(self) -> None:
+        """Remove a prior persistent defect summary after a clean bugs-only rerun."""
+        if (self._review_profile() != "bugs_only" or not get_settings().config.publish_output or
+                not get_settings().pr_reviewer.persistent_comment or self.incremental.is_incremental):
+            return
+        self.git_provider.clear_persistent_review(
+            identity_marker=PRReviewIdentity.BUGS_ONLY.value,
+            name="bugs-only review",
+        )
+
     async def _prepare_prediction(self, model: str) -> None:
         output = get_pr_diff(self.git_provider,
                              self.token_handler,
@@ -286,11 +353,75 @@ class PRReviewer:
 
         if self.patches_diff:
             get_logger().debug(f"PR diff", diff=self.patches_diff)
+            if specialists_enabled() and not getattr(self, "_specialists_started", False):
+                await self._run_shadow_specialists_once()
             self.prediction = await self._get_prediction(model)
             self._reject_unparsable_prediction(model)
         else:
             get_logger().warning(f"Empty diff for PR: {self.pr_url}")
             self.prediction = None
+
+    async def _run_shadow_specialists_once(self) -> None:
+        """Run the configured shadow batch once without changing review inputs or output."""
+
+        self._specialists_started = True
+        try:
+            pipeline = load_specialist_pipeline_config()
+            snapshot_context = get_specialist_snapshot_context()
+            if snapshot_context is not None:
+                snapshot = snapshot_context.snapshot
+                head_sha = snapshot.snapshot_id
+                current_identity = snapshot_context.current_snapshot_id
+            else:
+                snapshot = None
+                try:
+                    head_sha = self.git_provider.get_pr_head_sha(refresh=False)
+                except Exception as exc:
+                    head_sha = None
+                    get_logger().warning(
+                        "Could not read a stable provider head identity for specialist shadow mode",
+                        artifact={"error_class": type(exc).__name__},
+                    )
+                if not head_sha:
+                    self.specialist_shadow_result = unavailable_specialist_batch(
+                        pipeline,
+                        failure_reason="stable_head_identity_unavailable",
+                    )
+                    get_logger().info(
+                        "Specialist shadow telemetry",
+                        artifact=self.specialist_shadow_result.to_dict(),
+                    )
+                    get_logger().warning(
+                        "Specialist shadow batch is unavailable because the provider has no stable head identity"
+                    )
+                    return
+                def current_identity():
+                    return self.git_provider.get_pr_head_sha(refresh=True)
+            specialist_input = build_specialist_input(
+                title=self.vars["title"],
+                description=self.pr_description,
+                diff_files=self.git_provider.get_diff_files() or [],
+                head_sha=head_sha,
+                snapshot=snapshot,
+                allowed_change_labels=pipeline.allowed_change_labels,
+            )
+            self.specialist_shadow_result = await run_shadow_specialists(
+                specialist_input,
+                pipeline,
+                self.ai_handler,
+                current_identity=current_identity,
+            )
+            get_logger().info(
+                "Specialist shadow telemetry",
+                artifact=self.specialist_shadow_result.to_dict(),
+            )
+        except Exception as exc:
+            # Shadow infrastructure is observational. Configuration/provider failures
+            # remain telemetry and can never block or alter the ordinary review.
+            get_logger().warning(
+                "Specialist shadow batch failed; continuing the ordinary review",
+                artifact={"error_class": type(exc).__name__},
+            )
 
     def _reject_unparsable_prediction(self, model: str) -> None:
         """Treat a prediction that will not parse as a failure of this model.
@@ -358,7 +489,7 @@ class PRReviewer:
                 continue
             file_lines = set()
             new_line = None
-            for patch_line in patch.splitlines():
+            for patch_line in iter_git_patch_lines(patch):
                 header = _HUNK_HEADER_RE.match(patch_line)
                 if header:
                     new_line = int(header.group(1))
@@ -388,6 +519,28 @@ class PRReviewer:
                 return False
         return None
 
+    @staticmethod
+    def _specific_ci_terms(value: str) -> set[str]:
+        return {
+            term
+            for term in re.findall(r"[a-z0-9]+", value.casefold())
+            if len(term) >= 4 and term not in _GENERIC_CI_EVIDENCE_TERMS
+        }
+
+    def _ci_failure_evidences_same_defect(self, issue: dict, matching_ci_failure: str) -> bool:
+        issue_text = " ".join(
+            str(issue.get(field) or "")
+            for field in ("issue_content", "trigger", "impact", "root_cause")
+        )
+        issue_terms = self._specific_ci_terms(issue_text)
+        if len(issue_terms) < 2:
+            return False
+        evidence_by_name = getattr(self, "ci_failure_evidence_by_name", {})
+        for evidence in evidence_by_name.get(matching_ci_failure, []):
+            if len(issue_terms & self._specific_ci_terms(evidence)) >= 2:
+                return True
+        return False
+
     def _normalize_bugs_only_review(self, data: dict) -> dict:
         """Keep only complete, changed-line defect reports and collapse shared root causes."""
         if self._review_profile() != "bugs_only":
@@ -405,7 +558,9 @@ class PRReviewer:
             finding_type = str(issue.get("finding_type") or "").strip().lower()
             if finding_type not in _BUG_FINDING_HEADERS:
                 continue
-            if self._strict_bool(issue.get("duplicates_ci_failure")) is not False:
+            matching_ci_failure = str(issue.get("matching_ci_failure") or "").strip().casefold()
+            if (self._strict_bool(issue.get("duplicates_ci_failure")) is True and
+                    self._ci_failure_evidences_same_defect(issue, matching_ci_failure)):
                 continue
 
             relevant_file = str(issue.get("relevant_file") or "").strip()
@@ -478,6 +633,9 @@ class PRReviewer:
                 "omitted_files": sorted(set(self.remaining_files_list)),
                 "deleted_files": sorted(set(getattr(self, "deleted_files_list", []))),
             }
+            specialist_shadow_result = getattr(self, "specialist_shadow_result", None)
+            if specialist_shadow_result is not None:
+                structured_data["metadata"]["specialist_shadow"] = specialist_shadow_result.to_dict()
             structured_publisher(structured_data)
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
@@ -569,7 +727,7 @@ class PRReviewer:
             get_logger().warning("Review finding points at a file that is not in the diff, "
                                  "keeping it in the summary", artifact={"relevant_file": relevant_file})
             return None
-        if not file.head_file or end_line > len(file.head_file.splitlines()):
+        if not file.head_file or end_line > len(split_git_file_lines(file.head_file)):
             get_logger().warning("Review finding points past the end of the file, keeping it in the summary",
                                  artifact={"relevant_file": relevant_file, "start_line": start_line,
                                            "end_line": end_line})

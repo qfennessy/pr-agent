@@ -15,7 +15,9 @@ from gitlab import (GitlabAuthenticationError, GitlabCreateError,
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 from ..algo.file_filter import filter_ignored
-from ..algo.git_patch_processing import decode_if_bytes
+from ..algo.git_patch_processing import (decode_if_bytes, iter_git_patch_lines,
+                                         split_git_file_lines,
+                                         strip_git_line_ending)
 from ..algo.inline_comment_dedup import (body_fingerprint, body_with_markers,
                                          code_fingerprint,
                                          get_inline_comment_store,
@@ -25,6 +27,7 @@ from ..algo.language_handler import is_valid_file
 from ..algo.utils import (PRCodeSuggestionsHeader,
                           PRCodeSuggestionsIdentity, clip_tokens,
                           comment_matches_any_identity,
+                          comment_matches_pr_review_identity,
                           find_line_number_of_relevant_line_in_file,
                           get_pr_review_comment_identifiers, load_large_diff)
 from ..config_loader import get_settings
@@ -414,7 +417,7 @@ class GitLabProvider(GitProvider):
         return True
 
     def supports_incremental_kind(self, kind: str) -> bool:
-        return kind in self._INCREMENTAL_ANCHOR_PREFIXES
+        return kind == "review" or kind in self._INCREMENTAL_ANCHOR_PREFIXES
 
     def _get_project_path_from_pr_or_issue_url(self, pr_or_issue_url: str) -> str:
         repo_project_path = None
@@ -482,7 +485,6 @@ class GitLabProvider(GitProvider):
     )
     _SUGGESTIONS_LEGACY_ANCHORS = (PRCodeSuggestionsHeader.SUMMARY.value,)
     _INCREMENTAL_ANCHOR_PREFIXES = {
-        "review": get_pr_review_comment_identifiers(full=True, incremental=True),
         "suggestions": _SUGGESTIONS_STABLE_ANCHORS + _SUGGESTIONS_LEGACY_ANCHORS,
     }
 
@@ -513,9 +515,21 @@ class GitLabProvider(GitProvider):
             self.mr_commits = list(self.mr.commits())[::-1]
 
         kind = getattr(self, '_incremental_kind', 'review')
-        prefixes = self._INCREMENTAL_ANCHOR_PREFIXES.get(kind, ())
+        prefixes = (
+            get_pr_review_comment_identifiers(
+                full=True,
+                incremental=True,
+                review_profile=self.incremental.review_profile,
+            )
+            if kind == "review"
+            else self._INCREMENTAL_ANCHOR_PREFIXES.get(kind, ())
+        )
         self.previous_review = (
-            self._find_anchor_note(prefixes, prefer_latest_activity=kind == "suggestions")
+            self._find_anchor_note(
+                prefixes,
+                prefer_latest_activity=kind == "suggestions",
+                review_profile=self.incremental.review_profile if kind == "review" else None,
+            )
             if prefixes
             else None
         )
@@ -642,13 +656,18 @@ class GitLabProvider(GitProvider):
                 break
         return self.mr_commits[first_new_commit_index:] if first_new_commit_index is not None else []
 
-    def get_previous_review(self, *, full: bool, incremental: bool):
+    def get_previous_review(self, *, full: bool, incremental: bool, review_profile: str = "full"):
         if not (full or incremental):
             raise ValueError("At least one of full or incremental must be True")
-        identifiers = get_pr_review_comment_identifiers(full=full, incremental=incremental)
-        return self._find_anchor_note(identifiers)
+        identifiers = get_pr_review_comment_identifiers(
+            full=full,
+            incremental=incremental,
+            review_profile=review_profile,
+        )
+        return self._find_anchor_note(identifiers, review_profile=review_profile)
 
-    def _find_anchor_note(self, identities, *, prefer_latest_activity: bool = False):
+    def _find_anchor_note(
+            self, identities, *, prefer_latest_activity: bool = False, review_profile: str | None = None):
         """Return the most recent MR note whose body matches any supplied identity.
 
         Used by incremental flows (`/review -i`, `/improve -i`) to find the timestamp
@@ -685,7 +704,12 @@ class GitLabProvider(GitProvider):
             body = getattr(note, 'body', None)
             if not isinstance(body, str):
                 continue
-            if not comment_matches_any_identity(body, identities):
+            matches_identity = (
+                comment_matches_pr_review_identity(body, identities, review_profile)
+                if review_profile
+                else comment_matches_any_identity(body, identities)
+            )
+            if not matches_identity:
                 continue
             if own_user_id is not None:
                 author = getattr(note, 'author', None)
@@ -853,7 +877,7 @@ class GitLabProvider(GitProvider):
 
 
             # count number of lines added and removed
-            patch_lines = patch.splitlines(keepends=True)
+            patch_lines = list(iter_git_patch_lines(patch))
             num_plus_lines = len([line for line in patch_lines if line.startswith('+')])
             num_minus_lines = len([line for line in patch_lines if line.startswith('-')])
             diff_files.append(
@@ -1148,7 +1172,10 @@ class GitLabProvider(GitProvider):
                 diff_patch = difflib.unified_diff(old_code_snippet.split('\n'),
                                             new_code_snippet.split('\n'), n=999)
                 patch_orig = "\n".join(diff_patch)
-                patch = "\n".join(patch_orig.splitlines()[5:]).strip('\n')
+                patch = "\n".join(
+                    strip_git_line_ending(line)
+                    for line in list(iter_git_patch_lines(patch_orig))[5:]
+                ).strip('\n')
                 diff_code = f"\n\n```diff\n{patch.rstrip()}\n```"
                 body_fallback += diff_code
 
@@ -1224,7 +1251,7 @@ class GitLabProvider(GitProvider):
                     continue
                 range = relevant_lines_end - relevant_lines_start # no need to add 1
                 body = body.replace('```suggestion', f'```suggestion:-0+{range}')
-                lines = target_file.head_file.splitlines()
+                lines = split_git_file_lines(target_file.head_file)
                 relevant_line_in_file = lines[relevant_lines_start - 1]
 
                 # edit_type, found, source_line_no, target_file, target_line_no = self.find_in_file(target_file,
@@ -1293,7 +1320,10 @@ class GitLabProvider(GitProvider):
         found = False
         target_file = file
         patch = file.patch
-        patch_lines = patch.splitlines()
+        patch_lines = [
+            strip_git_line_ending(line)
+            for line in iter_git_patch_lines(patch)
+        ]
         for line in patch_lines:
             if line.startswith('@@'):
                 match = self.RE_HUNK_HEADER.match(line)
@@ -1352,6 +1382,10 @@ class GitLabProvider(GitProvider):
 
     def get_pr_branch(self):
         return self.mr.source_branch
+
+    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
+        merge_request = self._get_merge_request() if refresh else self.mr
+        return (getattr(merge_request, "diff_refs", None) or {}).get("head_sha")
 
     def get_pr_owner_id(self) -> str | None:
         if not self.gitlab_url or 'gitlab.com' in self.gitlab_url:

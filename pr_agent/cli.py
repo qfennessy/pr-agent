@@ -21,6 +21,7 @@ from pr_agent.algo.ai_handlers.litellm_helpers import (
 )
 from pr_agent.algo.checkpoint_evaluation_cli import run_evaluation_plan
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState
+from pr_agent.algo.review_specialists import use_specialist_snapshot_context
 from pr_agent.algo.run_details import get_run_details
 from pr_agent.algo.skills_loader import get_skills_context, pin_skills_context
 from pr_agent.algo.utils import get_version
@@ -1090,7 +1091,16 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
 
             try:
                 try:
-                    with pin_skills_context(skills_context):
+                    def current_specialist_snapshot_id():
+                        try:
+                            return reviewer.recapture(snapshot).snapshot_id
+                        except SnapshotCaptureError:
+                            return None
+
+                    with (
+                        pin_skills_context(skills_context),
+                        use_specialist_snapshot_context(snapshot, current_specialist_snapshot_id),
+                    ):
                         details = asyncio.run(inner())
                 except Exception as exc:
                     # The result exposes the error class, not provider text that may

@@ -31,7 +31,7 @@ from pr_agent.algo.checkpoint_evaluation_runner import (
     failed_production_arm_result,
 )
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshot, ReviewSnapshotResult
-from pr_agent.algo.run_details import RunDetails
+from pr_agent.algo.run_details import RunDetails, SpecialistRunDetails
 
 
 def _hash(value: str) -> str:
@@ -302,6 +302,31 @@ def test_binding_rejects_wrong_model_identity_and_per_role_telemetry(tmp_path):
     with pytest.raises(ProductionDependencyUnavailable, match="per-stage or per-role model identities"):
         _runner(manifest, path, bindings, store, request, decision).preflight()
     assert store.calls == []
+
+
+def test_result_rejects_merged_specialist_role_telemetry(tmp_path):
+    snapshot, _path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    arm = next(arm for arm in manifest.arms if arm.kind is EvaluationArmKind.GENERAL_REVIEW)
+    details = RunDetails(model_used=arm.model_id)
+    details.specialist_runs["change_classification"] = SpecialistRunDetails(
+        role="change_classification",
+        model_used="specialist-model",
+        deployment_id="specialist-deployment",
+    )
+
+    with pytest.raises(EvaluationValidationError, match="per-stage or per-role model telemetry"):
+        ProductionArmResult(
+            snapshot_result=ReviewSnapshotResult(
+                snapshot_id=snapshot.snapshot_id,
+                state=ReviewResultState.NO_FINDINGS,
+                current_snapshot_id=snapshot.snapshot_id,
+                review={"review": {"key_issues_to_review": []}},
+                coverage_issues=(),
+                latency_seconds=0.25,
+            ),
+            run_details=details,
+        )
 
 
 def test_preflight_requires_all_five_kinds_and_the_exact_paid_decision(tmp_path):
