@@ -167,6 +167,29 @@ def test_review_snapshot_rejects_nonexistent_output_through_repo_symlink(monkeyp
     assert not (repo / "new.json").exists()
 
 
+def test_review_snapshot_rejects_external_symlink_into_git_metadata(monkeypatch, tmp_path, capsys):
+    import subprocess
+
+    repo = tmp_path / "repo-external-metadata-alias"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    source = repo / "changed.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    alias = tmp_path / "git-metadata-link"
+    alias.symlink_to(repo / ".git", target_is_directory=True)
+    original_config = (repo / ".git" / "config").read_text(encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--json-output", str(alias / "config"), "--no-cache",
+        ])
+
+    assert "aliases an existing repository path" in capsys.readouterr().err
+    assert (repo / ".git" / "config").read_text(encoding="utf-8") == original_config
+
+
 def test_review_snapshot_reports_invalid_repository_settings(monkeypatch, tmp_path, capsys):
     import subprocess
 
@@ -281,6 +304,61 @@ def test_review_snapshot_cli_emits_snapshot_bound_json(cfg, monkeypatch, tmp_pat
     expected_output = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     assert result_path.read_text(encoding="utf-8") == expected_output
     assert result.state.value == "no_findings"
+
+
+def test_review_snapshot_restores_provider_settings_for_later_hosted_run(
+    cfg, monkeypatch, tmp_path, capsys
+):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo-settings-restore"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    baselines = {
+        "config.git_provider": "github",
+        "config.publish_output": False,
+        "config.propagate_tool_errors": False,
+        "plain_diff.content": "",
+        "plain_diff.output_path": "hosted-output",
+        "plain_diff.json_output_path": "hosted-json-output",
+        "plain_diff.suppress_stdout": False,
+        "plain_diff.disable_working_tree_enrichment": False,
+        "pr_reviewer.extra_instructions": "hosted instructions",
+    }
+    for key, value in baselines.items():
+        cfg(key, value)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}),
+                encoding="utf-8",
+            )
+            return True
+
+        async def handle_request(self, target, request, notify=None):
+            assert target == "https://example.test/pr/1"
+            for key, value in baselines.items():
+                assert get_settings().get(key) == value
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    run(inargs=[
+        "review-snapshot", "--event", "file-save", "--path", "changed.py", "--no-cache",
+    ])
+    capsys.readouterr()
+    run(inargs=["--pr_url", "https://example.test/pr/1", "review"])
 
 
 def test_review_snapshot_loads_repo_policy_before_capture(cfg, monkeypatch, tmp_path, capsys):

@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -26,6 +27,19 @@ from pr_agent.tools.local_pair_review import (LocalPairReview, SnapshotCache,
 
 log_level = os.environ.get("LOG_LEVEL", "INFO")
 setup_logger(log_level)
+
+_MISSING_SETTING = object()
+_SNAPSHOT_PROVIDER_SETTINGS = (
+    "config.git_provider",
+    "config.publish_output",
+    "config.propagate_tool_errors",
+    "plain_diff.content",
+    "plain_diff.output_path",
+    "plain_diff.json_output_path",
+    "plain_diff.suppress_stdout",
+    "plain_diff.disable_working_tree_enrichment",
+    "pr_reviewer.extra_instructions",
+)
 
 
 def set_parser():
@@ -229,6 +243,31 @@ def _output_artifact_exclusions(repository_root: Path, *paths: str | None) -> li
     return exclusions
 
 
+def _snapshot_settings(keys: tuple[str, ...]) -> dict[str, object]:
+    settings = get_settings()
+    snapshot = {}
+    for key in keys:
+        value = settings.get(key, _MISSING_SETTING)
+        snapshot[key] = _MISSING_SETTING if value is _MISSING_SETTING else copy.deepcopy(value)
+    return snapshot
+
+
+def _restore_settings(snapshot: dict[str, object]) -> None:
+    settings = get_settings()
+    for key, value in snapshot.items():
+        if value is not _MISSING_SETTING:
+            settings.set(key, value)
+            continue
+        section_name, leaf = key.split(".", 1)
+        section = getattr(settings, section_name, None)
+        if section is None:
+            continue
+        for stored_key in list(section.keys()):
+            if stored_key.lower() == leaf.lower():
+                section.pop(stored_key, None)
+                break
+
+
 def _reject_existing_repository_outputs(
     repository_root: Path,
     git_metadata_root: Path,
@@ -248,7 +287,12 @@ def _reject_existing_repository_outputs(
             resolved.is_relative_to(repository_root)
             and not resolved.is_relative_to(git_metadata_root)
         )
-        if resolved_worktree and not lexical_worktree:
+        lexical_metadata = lexical.is_relative_to(git_metadata_root)
+        resolved_metadata = resolved.is_relative_to(git_metadata_root)
+        if (
+            (resolved_worktree and not lexical_worktree)
+            or (resolved_metadata and not lexical_metadata)
+        ):
             raise SnapshotCaptureError(
                 f"output destination aliases an existing repository path: {supplied_path}"
             )
@@ -344,7 +388,7 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
         with tempfile.TemporaryDirectory(prefix="pr-agent-snapshot-") as temp_dir:
             structured_path = Path(temp_dir) / "review.json"
             markdown_path = Path(temp_dir) / "review.md" if markdown_output else None
-            original_extra_instructions = get_settings().get("pr_reviewer.extra_instructions", "")
+            original_provider_settings = _snapshot_settings(_SNAPSHOT_PROVIDER_SETTINGS)
             get_settings().set("config.git_provider", "plain-diff")
             get_settings().set("plain_diff.content", snapshot.diff)
             get_settings().set("plain_diff.output_path", str(markdown_path) if markdown_path else None)
@@ -376,7 +420,7 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
                     # contain credential-shaped values or source excerpts.
                     review_error = type(exc).__name__
             finally:
-                get_settings().set("pr_reviewer.extra_instructions", original_extra_instructions)
+                _restore_settings(original_provider_settings)
             if structured_path.exists():
                 try:
                     structured_review = json.loads(structured_path.read_text(encoding="utf-8"))
