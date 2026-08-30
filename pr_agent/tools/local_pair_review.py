@@ -53,6 +53,8 @@ _DEFAULT_SECRET_EXCLUSIONS = (
     "**/.netrc",
     ".git-credentials",
     "**/.git-credentials",
+    ".aws/credentials",
+    "**/.aws/credentials",
     "id_rsa",
     "**/id_rsa",
     "id_ed25519",
@@ -350,8 +352,14 @@ class LocalPairReview:
             return f"git:{mode}:{object_id}" if object_id else None
 
         candidate = self.repository_root / path
+        digest = hashlib.sha256()
+        index_identity = (None, None)
+        if event is ReviewEvent.WORKTREE_IDLE:
+            index_identity = self._git_object_identity(":", path)
+            digest.update(
+                f"index:{index_identity[0]}:{index_identity[1]}\0".encode("ascii")
+            )
         try:
-            digest = hashlib.sha256()
             if candidate.is_symlink():
                 digest.update(b"mode:120000\0")
                 digest.update(os.readlink(candidate).encode("utf-8", errors="surrogateescape"))
@@ -379,6 +387,11 @@ class LocalPairReview:
             # submodule HEAD or dirty worktree. Returning no fingerprint makes
             # result publication fail closed until submodules are supported.
             return None
+        if event is ReviewEvent.WORKTREE_IDLE:
+            if object_id is None and index_identity[1] is None:
+                return None
+            digest.update(f"base:{mode}:{object_id}\0".encode("ascii"))
+            return "sha256:" + digest.hexdigest()
         return f"git:{mode}:{object_id}" if object_id else None
 
     def _inspect_content(self, content: bytes) -> Optional[str]:
@@ -477,52 +490,77 @@ class LocalPairReview:
         event: ReviewEvent,
         base_revision: str,
         focus_path: Optional[str] = None,
-    ) -> Optional[list[tuple[str, tuple[str, ...]]]]:
-        args = [
-            *self._diff_filter_overrides(),
-            "--literal-pathspecs",
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-        ]
-        if event is ReviewEvent.PRE_COMMIT:
-            args.append("--cached")
-        args.extend(
-            [
-                "--name-status",
-                "-z",
-                "--find-copies",
-                "--find-copies-harder",
-                "-l0",
-                base_revision,
-                "--",
+    ) -> Optional[list[tuple[str, str, tuple[str, ...]]]]:
+        def discover_stage(
+            stage: str, *, cached: bool, compare_base: bool
+        ) -> Optional[list[tuple[str, str, tuple[str, ...]]]]:
+            args = [
+                *self._diff_filter_overrides(),
+                "--literal-pathspecs",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
             ]
-        )
-        output = _run_git_bounded(
-            self.repository_root,
-            *args,
-            max_output_bytes=self.max_path_discovery_bytes,
-        )
-        if output is None:
-            return None
-        fields = _decode_z_paths(output)
+            if cached:
+                args.append("--cached")
+            args.extend(
+                [
+                    "--name-status",
+                    "-z",
+                    "--find-copies",
+                    "--find-copies-harder",
+                    "-l0",
+                ]
+            )
+            if compare_base:
+                args.append(base_revision)
+            args.append("--")
+            output = _run_git_bounded(
+                self.repository_root,
+                *args,
+                max_output_bytes=self.max_path_discovery_bytes,
+            )
+            if output is None:
+                return None
+            return parse_stage(stage, _decode_z_paths(output))
+
+        def parse_stage(
+            stage: str, fields: list[str]
+        ) -> list[tuple[str, str, tuple[str, ...]]]:
+            path_groups = []
+            index = 0
+            while index < len(fields):
+                status = fields[index]
+                index += 1
+                path_count = 2 if status.startswith(("R", "C")) else 1
+                paths = tuple(fields[index:index + path_count])
+                path_groups.append((stage, status, paths))
+                index += path_count
+            return path_groups
+
         path_groups = []
-        index = 0
-        while index < len(fields):
-            status = fields[index]
-            index += 1
-            path_count = 2 if status.startswith(("R", "C")) else 1
-            paths = tuple(fields[index:index + path_count])
-            path_groups.append((status, paths))
-            index += path_count
+        stages = (
+            (("index", True, True), ("worktree", False, False))
+            if event is ReviewEvent.WORKTREE_IDLE
+            else (("index", True, True),)
+            if event is ReviewEvent.PRE_COMMIT
+            else (("combined", False, True),)
+        )
+        for stage, cached, compare_base in stages:
+            discovered = discover_stage(
+                stage, cached=cached, compare_base=compare_base
+            )
+            if discovered is None:
+                return None
+            path_groups.extend(discovered)
         if focus_path:
             return [
                 group
                 for group in path_groups
                 if (
-                    focus_path == group[1][-1]
-                    if group[0].startswith("C")
-                    else focus_path in group[1]
+                    focus_path == group[2][-1]
+                    if group[1].startswith("C")
+                    else focus_path in group[2]
                 )
             ]
         return path_groups
@@ -549,6 +587,21 @@ class LocalPairReview:
             max_output_bytes=self.max_path_discovery_bytes,
             stdin_bytes=tracked,
         )
+        index_attributes = (
+            _run_git_bounded(
+                self.repository_root,
+                "--literal-pathspecs",
+                "check-attr",
+                "--cached",
+                "-z",
+                "--stdin",
+                "filter",
+                max_output_bytes=self.max_path_discovery_bytes,
+                stdin_bytes=tracked,
+            )
+            if event is ReviewEvent.WORKTREE_IDLE
+            else b""
+        )
         base_attributes = _run_git_bounded(
             self.repository_root,
             "--literal-pathspecs",
@@ -560,10 +613,14 @@ class LocalPairReview:
             max_output_bytes=self.max_path_discovery_bytes,
             stdin_bytes=tracked,
         )
-        if current_attributes is None or base_attributes is None:
+        if (
+            current_attributes is None
+            or index_attributes is None
+            or base_attributes is None
+        ):
             return None
         filtered_paths = set()
-        for attributes in (current_attributes, base_attributes):
+        for attributes in (current_attributes, index_attributes, base_attributes):
             fields = _decode_z_paths(attributes)
             if len(fields) % 3:
                 raise SnapshotCaptureError("git check-attr returned malformed path data")
@@ -612,6 +669,7 @@ class LocalPairReview:
         paths: Sequence[str],
         *,
         max_output_bytes: Optional[int] = None,
+        diff_stage: str = "combined",
     ) -> Optional[str]:
         if not paths:
             return ""
@@ -621,9 +679,12 @@ class LocalPairReview:
             "--literal-pathspecs", "diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/",
             "--no-ext-diff", "--no-textconv", "--find-renames",
         ]
-        if event is ReviewEvent.PRE_COMMIT:
+        if event is ReviewEvent.PRE_COMMIT or diff_stage == "index":
             args.append("--cached")
-        args.extend([base_revision, "--", *paths])
+        if event is ReviewEvent.WORKTREE_IDLE and diff_stage == "worktree":
+            args.extend(["--", *paths])
+        else:
+            args.extend([base_revision, "--", *paths])
         output = (
             _run_git(self.repository_root, *args)
             if max_output_bytes is None
@@ -690,7 +751,7 @@ class LocalPairReview:
             raise SnapshotCaptureError("file-save --path must identify a file, not a directory")
         selected_tracked: list[str] = []
         validation_tracked: list[str] = []
-        selected_tracked_groups: list[tuple[str, ...]] = []
+        selected_tracked_groups: list[tuple[str, tuple[str, ...]]] = []
         selected_untracked: list[str] = []
         coverage: list[CoverageIssue] = []
 
@@ -706,7 +767,7 @@ class LocalPairReview:
             add_coverage(None, "tracked_path_discovery_budget")
             tracked_groups = []
         changed_group_paths = tuple(
-            dict.fromkeys(path for _, group in tracked_groups for path in group)
+            dict.fromkeys(path for _, _, group in tracked_groups for path in group)
         )
         attribute_candidate_paths = list(changed_group_paths)
         if event is not ReviewEvent.PRE_COMMIT:
@@ -763,6 +824,49 @@ class LocalPairReview:
                 coverage_issues=tuple(coverage),
             )
 
+        initial_discovery_state = (
+            tuple(tracked_groups),
+            tuple(sorted(filtered_paths)),
+            tuple(untracked),
+        )
+
+        def current_discovery_state():
+            current_groups = self._tracked_path_groups(
+                event, base_revision, normalized_focus
+            )
+            if current_groups is None:
+                return None
+            current_group_paths = tuple(
+                dict.fromkeys(
+                    path for _, _, group in current_groups for path in group
+                )
+            )
+            current_attribute_paths = list(current_group_paths)
+            if event is not ReviewEvent.PRE_COMMIT:
+                active_paths = self._tracked_attribute_candidate_paths(
+                    normalized_focus
+                )
+                if active_paths is None:
+                    return None
+                current_attribute_paths = list(
+                    dict.fromkeys((*active_paths, *current_group_paths))
+                )
+            current_filtered = self._tracked_filtered_paths(
+                event, base_revision, current_attribute_paths
+            )
+            current_untracked = (
+                []
+                if event is ReviewEvent.PRE_COMMIT
+                else self._untracked_paths(normalized_focus)
+            )
+            if current_filtered is None or current_untracked is None:
+                return None
+            return (
+                tuple(current_groups),
+                tuple(sorted(current_filtered)),
+                tuple(current_untracked),
+            )
+
         def validate_path(path: str) -> Optional[str]:
             try:
                 normalized = self._relative_path(path)
@@ -780,6 +884,18 @@ class LocalPairReview:
             file_issue = (
                 self._inspect_index_file(normalized, base_revision)
                 if event is ReviewEvent.PRE_COMMIT
+                else next(
+                    (
+                        issue
+                        for issue in (
+                            self._inspect_index_file(normalized, base_revision),
+                            self._inspect_current_file(normalized, base_revision),
+                        )
+                        if issue
+                    ),
+                    None,
+                )
+                if event is ReviewEvent.WORKTREE_IDLE
                 else self._inspect_current_file(normalized, base_revision)
             )
             if file_issue:
@@ -789,7 +905,7 @@ class LocalPairReview:
 
         # A rename/copy is one security unit. If either side is unavailable or
         # excluded, selecting the other side alone can expose the full source.
-        for status, group in tracked_groups:
+        for stage, status, group in tracked_groups:
             if any(path in filtered_paths for path in group):
                 covered_paths = {issue.path for issue in coverage}
                 for raw_path in group:
@@ -809,7 +925,7 @@ class LocalPairReview:
                     if status.startswith("C")
                     else selected_group
                 )
-                selected_tracked_groups.append(captured_group)
+                selected_tracked_groups.append((stage, captured_group))
                 selected_tracked.extend(captured_group)
             else:
                 covered_paths = {issue.path for issue in coverage}
@@ -830,22 +946,31 @@ class LocalPairReview:
             diff_parts = []
             omitted_paths: set[str] = set()
             remaining_bytes = self.max_snapshot_bytes
-            for tracked_batch in _batch_path_groups(selected_tracked_groups):
-                part = None if remaining_bytes <= 0 else self._capture_diff(
-                    event,
-                    base_revision,
-                    tracked_batch,
-                    max_output_bytes=remaining_bytes,
-                )
-                if part is None:
-                    omitted_paths.update(tracked_batch)
-                else:
-                    part_size = len(part.encode("utf-8", errors="surrogateescape"))
-                    if part_size > remaining_bytes:
+            for stage in dict.fromkeys(
+                stage_name for stage_name, _ in selected_tracked_groups
+            ):
+                stage_groups = [
+                    group
+                    for stage_name, group in selected_tracked_groups
+                    if stage_name == stage
+                ]
+                for tracked_batch in _batch_path_groups(stage_groups):
+                    part = None if remaining_bytes <= 0 else self._capture_diff(
+                        event,
+                        base_revision,
+                        tracked_batch,
+                        max_output_bytes=remaining_bytes,
+                        diff_stage=stage,
+                    )
+                    if part is None:
                         omitted_paths.update(tracked_batch)
                     else:
-                        diff_parts.append(part)
-                        remaining_bytes -= part_size
+                        part_size = len(part.encode("utf-8", errors="surrogateescape"))
+                        if part_size > remaining_bytes:
+                            omitted_paths.update(tracked_batch)
+                        else:
+                            diff_parts.append(part)
+                            remaining_bytes -= part_size
             for selected_path in selected_untracked:
                 if remaining_bytes <= 0:
                     omitted_paths.add(selected_path)
@@ -873,6 +998,10 @@ class LocalPairReview:
             )
             if revalidated:
                 verified_diff, verified_omissions = capture_selected()
+                verified_discovery_state = current_discovery_state()
+                if verified_discovery_state != initial_discovery_state:
+                    add_coverage(None, "content_changed_during_capture")
+                    revalidated = False
             else:
                 verified_diff, verified_omissions = "", set()
         except UnicodeDecodeError:

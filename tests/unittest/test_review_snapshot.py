@@ -495,6 +495,10 @@ def test_default_secret_paths_never_enter_snapshot_input(tmp_path):
     (repo / ".git-credentials").write_text(
         "https://user:password@example.test\n", encoding="utf-8"
     )
+    (repo / ".aws").mkdir()
+    (repo / ".aws" / "credentials").write_text(
+        "aws_secret_access_key = must-not-reach-model\n", encoding="utf-8"
+    )
     (repo / "visible.py").write_text("value = 1\n", encoding="utf-8")
 
     snapshot = LocalPairReview(str(repo), excluded_paths=[]).capture(event="worktree-idle")
@@ -504,10 +508,12 @@ def test_default_secret_paths_never_enter_snapshot_input(tmp_path):
     assert "PRIVATE KEY" not in snapshot.diff
     assert "OPENSSH PRIVATE KEY" not in snapshot.diff
     assert "password" not in snapshot.diff
+    assert "aws_secret_access_key" not in snapshot.diff
     assert CoverageIssue(path="credentials.json", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="signing.pem", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="id_ecdsa_sk", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path=".git-credentials", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path=".aws/credentials", reason="excluded") in snapshot.coverage_issues
 
 
 def test_file_save_rejects_a_focused_rename_with_an_excluded_source(tmp_path):
@@ -684,19 +690,56 @@ def test_capture_revalidates_before_accepting_diff_bytes(tmp_path):
     path.write_text("small\n", encoding="utf-8")
 
     class RacingReview(LocalPairReview):
-        def _capture_diff(self, event, base_revision, paths, *, max_output_bytes=None):
+        def _capture_diff(self, event, base_revision, paths, **kwargs):
             path.write_text("x" * 100, encoding="utf-8")
             return super()._capture_diff(
                 event,
                 base_revision,
                 paths,
-                max_output_bytes=max_output_bytes,
+                **kwargs,
             )
 
     snapshot = RacingReview(str(repo), max_file_bytes=20).capture(event="worktree-idle")
 
     assert snapshot.diff == ""
     assert CoverageIssue(path="tracked.py", reason="file_too_large") in snapshot.coverage_issues
+
+
+def test_capture_rejects_new_paths_discovered_after_verified_diff(tmp_path):
+    repo = _repo(tmp_path, "late-path-discovery")
+    tracked = repo / "tracked.py"
+    tracked.write_text("value = 2\n", encoding="utf-8")
+    late = repo / "late.py"
+
+    class RacingReview(LocalPairReview):
+        captured_once = False
+
+        def _capture_diff(self, event, base_revision, paths, **kwargs):
+            result = super()._capture_diff(event, base_revision, paths, **kwargs)
+            if not self.captured_once:
+                self.captured_once = True
+                late.write_text("appeared = True\n", encoding="utf-8")
+            return result
+
+    snapshot = RacingReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(reason="content_changed_during_capture") in snapshot.coverage_issues
+
+
+def test_worktree_idle_includes_index_only_content(tmp_path):
+    repo = _repo(tmp_path, "index-only-idle")
+    tracked = repo / "tracked.py"
+    tracked.write_text("value = 2\n", encoding="utf-8")
+    _git(repo, "add", "tracked.py")
+    tracked.write_text("value = 1\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.changed_paths == ("tracked.py",)
+    assert "+value = 2" in snapshot.diff
+    assert "-value = 2" in snapshot.diff
 
 
 def test_skipped_content_fingerprint_invalidates_snapshot_identity(tmp_path):
@@ -709,6 +752,28 @@ def test_skipped_content_fingerprint_invalidates_snapshot_identity(tmp_path):
     second = reviewer.capture(event="worktree-idle")
 
     assert first.coverage_issues[0].fingerprint != second.coverage_issues[0].fingerprint
+    assert first.snapshot_id != second.snapshot_id
+
+
+def test_excluded_index_only_content_invalidates_snapshot_identity(tmp_path):
+    repo = _repo(tmp_path, "excluded-index-fingerprint")
+    path = repo / "excluded.txt"
+    path.write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "excluded.txt")
+    _git(repo, "commit", "-m", "add excluded file")
+    reviewer = LocalPairReview(str(repo), excluded_paths=["excluded.txt"])
+
+    path.write_text("first staged value\n", encoding="utf-8")
+    _git(repo, "add", "excluded.txt")
+    path.write_text("base\n", encoding="utf-8")
+    first = reviewer.capture(event="worktree-idle")
+
+    path.write_text("second staged value\n", encoding="utf-8")
+    _git(repo, "add", "excluded.txt")
+    path.write_text("base\n", encoding="utf-8")
+    second = reviewer.capture(event="worktree-idle")
+
+    assert first.diff == second.diff == ""
     assert first.snapshot_id != second.snapshot_id
 
 
