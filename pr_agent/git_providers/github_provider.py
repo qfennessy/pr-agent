@@ -34,6 +34,7 @@ from ..algo.review_thread_reconciler import (
     ReviewThreadActionState,
     ReviewThreadAnchor,
     ReviewThreadCommentSnapshot,
+    ReviewThreadFailureKind,
     ReviewThreadSnapshot,
 )
 from ..algo.types import EDIT_TYPE
@@ -67,6 +68,19 @@ def _next_page_url(headers: dict) -> str:
         if match:
             return match.group(1)
     return ""
+
+
+def _review_thread_failure_kind(error: Exception) -> ReviewThreadFailureKind:
+    """Classify GitHub failures without discarding the original error details."""
+    status = getattr(error, "status", None)
+    if status == 422:
+        return ReviewThreadFailureKind.INVALID_INLINE_LOCATION
+    if status in {401, 403}:
+        return ReviewThreadFailureKind.PERMISSION_DENIED
+    details = f"{error} {getattr(error, 'data', '')}".casefold()
+    if any(token in details for token in ("permission denied", "forbidden", "resource not accessible")):
+        return ReviewThreadFailureKind.PERMISSION_DENIED
+    return ReviewThreadFailureKind.PROVIDER_FAILURE
 
 
 class GithubProvider(GitProvider):
@@ -696,7 +710,7 @@ class GithubProvider(GitProvider):
                 pageInfo { hasNextPage endCursor }
                 nodes {
                   id databaseId body createdAt url
-                  author { login }
+                  author { id login __typename }
                   pullRequestReview { commit { oid } }
                 }
               }
@@ -727,7 +741,7 @@ class GithubProvider(GitProvider):
         owner, repo_name = self.repo.split("/", 1)
         query = """
         query($owner: String!, $name: String!, $number: Int!, $after: String) {
-          viewer { login }
+          viewer { id login __typename }
           repository(owner: $owner, name: $name) {
             pullRequest(number: $number) {
               reviewThreads(first: 100, after: $after) {
@@ -735,11 +749,12 @@ class GithubProvider(GitProvider):
                 nodes {
                   id isResolved isOutdated path line startLine diffSide startDiffSide
                   originalLine originalStartLine
+                  subjectType viewerCanResolve
                   comments(first: 100) {
                     pageInfo { hasNextPage endCursor }
                     nodes {
                       id databaseId body createdAt url
-                      author { login }
+                      author { id login __typename }
                       pullRequestReview { commit { oid } }
                     }
                   }
@@ -750,7 +765,7 @@ class GithubProvider(GitProvider):
         }
         """
         cursor = None
-        viewer_login = None
+        viewer_identity = None
         raw_threads = []
         while True:
             data = self._request_review_thread_graphql(
@@ -758,9 +773,17 @@ class GithubProvider(GitProvider):
                 {"owner": owner, "name": repo_name, "number": self.pr_num, "after": cursor},
             )
             viewer = data.get("viewer")
-            if not isinstance(viewer, dict) or not viewer.get("login"):
+            if (
+                not isinstance(viewer, dict)
+                or not viewer.get("id")
+                or not viewer.get("login")
+                or not viewer.get("__typename")
+            ):
                 raise RuntimeError("GitHub review-thread inventory has no authenticated viewer")
-            viewer_login = viewer["login"]
+            if viewer_identity is None:
+                viewer_identity = viewer
+            elif viewer_identity != viewer:
+                raise RuntimeError("GitHub review-thread inventory viewer changed during pagination")
             repository = data.get("repository")
             pull_request = repository.get("pullRequest") if isinstance(repository, dict) else None
             connection = pull_request.get("reviewThreads") if isinstance(pull_request, dict) else None
@@ -804,7 +827,9 @@ class GithubProvider(GitProvider):
                 comments.append(ReviewThreadCommentSnapshot(
                     node_id=comment["id"],
                     database_id=comment.get("databaseId"),
+                    author_id=author.get("id") if isinstance(author, dict) else None,
                     author_login=author.get("login") if isinstance(author, dict) else None,
+                    author_type=author.get("__typename") if isinstance(author, dict) else None,
                     body=comment.get("body") or "",
                     created_at=comment.get("createdAt"),
                     url=comment.get("url"),
@@ -814,31 +839,48 @@ class GithubProvider(GitProvider):
             marker_values = finding_identity_markers(root.body if root else "")
             marker_ids = {finding_id for _, finding_id in marker_values}
             finding_id = next(iter(marker_ids)) if len(marker_ids) == 1 else None
-            root_author_is_viewer = bool(root and root.author_login and root.author_login == viewer_login)
-            bot_owned = bool(root_author_is_viewer and is_agent_inline_comment(root.body))
-            line = thread.get("line") or thread.get("originalLine")
-            start_line = thread.get("startLine") or thread.get("originalStartLine")
+            root_author_is_viewer_bot = bool(
+                root
+                and viewer_identity
+                and viewer_identity.get("__typename") == "Bot"
+                and root.author_type == "Bot"
+                and root.author_id == viewer_identity.get("id")
+                and root.author_login == viewer_identity.get("login")
+            )
+            bot_owned = bool(
+                finding_id and root_author_is_viewer_bot and is_agent_inline_comment(root.body)
+            )
             anchor = None
-            if thread.get("path") and isinstance(line, int) and line > 0:
-                anchor = ReviewThreadAnchor(
-                    path=thread["path"],
-                    line=line,
-                    start_line=start_line if isinstance(start_line, int) else None,
-                    side=thread.get("diffSide") or "RIGHT",
-                    start_side=thread.get("startDiffSide"),
+            if not thread.get("isOutdated") and thread.get("subjectType") != "FILE":
+                anchor = ReviewThreadAnchor.from_github(
+                    thread.get("path"),
+                    thread.get("line"),
+                    thread.get("startLine"),
+                    thread.get("diffSide"),
+                    thread.get("startDiffSide"),
                 )
+            original_anchor = ReviewThreadAnchor.from_github(
+                thread.get("path"),
+                thread.get("originalLine"),
+                thread.get("originalStartLine"),
+                thread.get("diffSide"),
+                thread.get("startDiffSide"),
+            )
             review = raw_comments[0].get("pullRequestReview") if raw_comments else None
             commit = review.get("commit") if isinstance(review, dict) else None
             snapshots.append(ReviewThreadSnapshot(
                 thread_id=thread["id"],
                 finding_id=finding_id,
                 anchor=anchor,
+                original_anchor=original_anchor,
                 is_resolved=bool(thread.get("isResolved")),
                 is_outdated=bool(thread.get("isOutdated")),
                 bot_owned=bot_owned,
                 has_replies=len(comments) > 1,
                 reviewed_head_sha=commit.get("oid") if isinstance(commit, dict) else None,
                 comments=tuple(comments),
+                subject_type=thread.get("subjectType"),
+                viewer_can_resolve=bool(thread.get("viewerCanResolve")),
             ))
         return tuple(snapshots)
 
@@ -862,6 +904,7 @@ class GithubProvider(GitProvider):
                 state=ReviewThreadActionState.FAILED,
                 expected_head_sha=expected_head_sha,
                 current_head_sha=None,
+                failure_kind=_review_thread_failure_kind(e),
                 reason=f"head_check_failed: {e}",
             )
         if current_head_sha != expected_head_sha:
@@ -900,6 +943,7 @@ class GithubProvider(GitProvider):
                 state=ReviewThreadActionState.FAILED,
                 expected_head_sha=expected_head_sha,
                 current_head_sha=current_head_sha,
+                failure_kind=_review_thread_failure_kind(e),
                 reason=f"create_failed: {e}",
             )
 
@@ -929,6 +973,7 @@ class GithubProvider(GitProvider):
                 expected_head_sha=expected_head_sha,
                 current_head_sha=current_head_sha,
                 comment_id=comment_id,
+                failure_kind=_review_thread_failure_kind(e),
                 reason=f"update_failed: {e}",
             )
 
@@ -964,6 +1009,7 @@ class GithubProvider(GitProvider):
                 expected_head_sha=expected_head_sha,
                 current_head_sha=current_head_sha,
                 thread_id=thread_id,
+                failure_kind=_review_thread_failure_kind(e),
                 reason=f"resolve_failed: {e}",
             )
 

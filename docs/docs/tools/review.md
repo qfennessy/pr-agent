@@ -64,8 +64,14 @@ enabled = false
 obsolete_thread_policy = "keep"
 ```
 
-`obsolete_thread_policy = "resolve"` is reserved for the later gated integration. Even then, plans preserve resolved
-threads, human-owned threads, and every thread with replies.
+`obsolete_thread_policy = "mark_fixed"` is the visible close-out policy reserved for the later gated integration: it
+adds a fixed-or-obsolete notice before resolving the thread. Both `mark_fixed` and the lower-level `resolve` policy
+also require an explicit authoritative-absence signal from a coverage-complete run. Without that signal the planner
+keeps the thread, and it always preserves resolved threads, human-owned threads, and every thread with replies.
+
+The foundation also models invalid or rejected inline locations as de-duplicated summary fallbacks. It returns those
+fallback entries to its caller rather than publishing them itself. Runtime publication remains disconnected until
+verified findings from #9 and the evaluation/rollout gate from #27 provide their final contracts.
 
 If you want to edit [configurations](#configuration-options), add the relevant ones to the command:
 

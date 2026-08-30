@@ -142,7 +142,7 @@ enable_review_coverage_footer=true
 # Reserved foundation for stable GitHub review threads. The runtime does not execute
 # lifecycle plans until candidate identity (#9) and rollout evidence (#27) are complete.
 enabled=false
-obsolete_thread_policy="keep" # "keep" or "resolve"; only used after lifecycle execution is integrated.
+obsolete_thread_policy="keep" # "keep", "resolve", or visible "mark_fixed"; inert until gated integration.
 
 [pr_description] # /describe #
 publish_labels=false

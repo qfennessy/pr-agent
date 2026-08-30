@@ -41,6 +41,9 @@ KEY_ISSUE_LOCATION_MARKER_RE = re.compile(r"<!-- pr-agent-key-issue-location: ([
 FINDING_IDENTITY_MARKER_RE = re.compile(
     r"<!-- pr-agent-finding:(v[1-9][0-9]*) id=(sha256:[a-f0-9]{64}) -->"
 )
+SUMMARY_FALLBACK_MARKER_RE = re.compile(
+    r"<!-- pr-agent-thread-fallback:(v[1-9][0-9]*) id=(sha256:[a-f0-9]{64}) -->"
+)
 _MARKER_RES = (BODY_MARKER_RE, CODE_MARKER_RE, KEY_ISSUE_LOCATION_MARKER_RE)
 
 _LEAD_RE = re.compile(r"^\*\*Suggestion:\*\*\s*", re.IGNORECASE)
@@ -92,6 +95,19 @@ def build_finding_identity_marker(finding_id: str, marker_version: str = "v1") -
     return f"<!-- pr-agent-finding:{marker_version} id={finding_id} -->"
 
 
+def summary_fallback_markers(body: str) -> tuple[tuple[str, str], ...]:
+    """Return versioned summary-fallback markers for cross-run de-duplication."""
+    return tuple((match.group(1), match.group(2)) for match in SUMMARY_FALLBACK_MARKER_RE.finditer(body or ""))
+
+
+def build_summary_fallback_marker(finding_id: str, marker_version: str = "v1") -> str:
+    if not re.fullmatch(r"v[1-9][0-9]*", marker_version):
+        raise ValueError("marker_version must look like v1")
+    if not re.fullmatch(r"sha256:[a-f0-9]{64}", finding_id or ""):
+        raise ValueError("finding_id must be a sha256 identity")
+    return f"<!-- pr-agent-thread-fallback:{marker_version} id={finding_id} -->"
+
+
 def body_with_finding_identity_marker(body: str, finding_id: str, marker_version: str = "v1",
                                       max_chars: Optional[int] = None) -> str:
     return _append_markers(body, build_finding_identity_marker(finding_id, marker_version), max_chars)
@@ -99,7 +115,8 @@ def body_with_finding_identity_marker(body: str, finding_id: str, marker_version
 
 def strip_identity_markers(body: str) -> str:
     """Remove lifecycle markers while leaving the legacy dedup behavior intact."""
-    return FINDING_IDENTITY_MARKER_RE.sub("", body or "")
+    body = FINDING_IDENTITY_MARKER_RE.sub("", body or "")
+    return SUMMARY_FALLBACK_MARKER_RE.sub("", body)
 
 
 def _strip_markers(body: str) -> str:
@@ -108,6 +125,7 @@ def _strip_markers(body: str) -> str:
     body = BODY_MARKER_RE.sub("", body or "")
     body = CODE_MARKER_RE.sub("", body)
     body = FINDING_IDENTITY_MARKER_RE.sub("", body)
+    body = SUMMARY_FALLBACK_MARKER_RE.sub("", body)
     return body
 
 
