@@ -11,6 +11,7 @@ import pytest
 
 from pr_agent.algo.review_snapshot import CoverageIssue, ReviewEvent, ReviewResultState, ReviewSnapshot
 from pr_agent.git_providers.plain_diff_provider import parse_plain_diff
+from pr_agent.tools import local_pair_review as local_pair_review_module
 from pr_agent.tools.local_pair_review import (
     LocalPairReview,
     SnapshotCache,
@@ -721,6 +722,294 @@ def test_modified_tracked_file_embedding_excluded_source_is_omitted(event, tmp_p
     assert "production-secret" not in snapshot.diff
     assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="feature.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_modified_file_with_distant_existing_unsafe_content_remains_reviewable(event, tmp_path):
+    repo = _repo(tmp_path, f"distant-existing-excluded-content-{event}")
+    (repo / ".env").write_text("API_TOKEN=existing-secret\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    destination.write_text(
+        "API_TOKEN=existing-secret\n"
+        + "".join(f"FILLER_{index}=unchanged\n" for index in range(12))
+        + "FEATURE_FLAG=disabled\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add historical content")
+    destination.write_text(
+        "API_TOKEN=existing-secret\n"
+        + "".join(f"FILLER_{index}=unchanged\n" for index in range(12))
+        + "FEATURE_FLAG=enabled\n",
+        encoding="utf-8",
+    )
+    if event == "pre-commit":
+        _git(repo, "add", "feature.py")
+
+    reviewer = LocalPairReview(str(repo))
+    snapshot = reviewer.capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+    recaptured = reviewer.recapture(snapshot)
+
+    assert snapshot.changed_paths == ("feature.py",)
+    assert "+FEATURE_FLAG=enabled" in snapshot.diff
+    assert "existing-secret" not in snapshot.diff
+    assert recaptured.snapshot_id == snapshot.snapshot_id
+    assert not any(
+        issue.path == "feature.py" and issue.reason == "rename_group_omitted"
+        for issue in snapshot.coverage_issues
+    )
+
+
+def test_worktree_idle_scopes_staged_and_current_modified_variants(tmp_path):
+    repo = _repo(tmp_path, "distant-existing-excluded-content-both-stages")
+    (repo / ".env").write_text("API_TOKEN=existing-secret\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    filler = "".join(f"FILLER_{index}=unchanged\n" for index in range(12))
+    base_content = (
+        "API_TOKEN=existing-secret\n"
+        f"{filler}STAGED_FLAG=disabled\n"
+        f"{filler}WORKTREE_FLAG=disabled\n"
+    )
+    destination.write_text(base_content, encoding="utf-8")
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add historical staged fixture")
+    staged_content = base_content.replace("STAGED_FLAG=disabled", "STAGED_FLAG=enabled")
+    destination.write_text(staged_content, encoding="utf-8")
+    _git(repo, "add", "feature.py")
+    destination.write_text(
+        staged_content.replace("WORKTREE_FLAG=disabled", "WORKTREE_FLAG=enabled"),
+        encoding="utf-8",
+    )
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.changed_paths == ("feature.py",)
+    assert "+STAGED_FLAG=enabled" in snapshot.diff
+    assert "+WORKTREE_FLAG=enabled" in snapshot.diff
+    assert "existing-secret" not in snapshot.diff
+    assert not any(
+        issue.path == "feature.py" and issue.reason == "rename_group_omitted"
+        for issue in snapshot.coverage_issues
+    )
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_modified_file_exposing_large_unsafe_source_context_is_omitted(event, tmp_path):
+    repo = _repo(tmp_path, f"exposed-large-excluded-context-{event}")
+    secret_line = "API_TOKEN=large-exposed-context-secret-1234567890"
+    (repo / ".env").write_text(
+        "".join(f"SOURCE_FILLER_{index}=unchanged\n" for index in range(150))
+        + f"{secret_line}\n",
+        encoding="utf-8",
+    )
+    destination = repo / "feature.py"
+    destination.write_text(
+        f"{secret_line}\nFEATURE_FLAG=disabled\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add contextual content")
+    destination.write_text(
+        f"{secret_line}\nFEATURE_FLAG=enabled\n",
+        encoding="utf-8",
+    )
+    if event == "pre-commit":
+        _git(repo, "add", "feature.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="feature.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("unsafe_stage", ["index", "worktree"])
+def test_worktree_idle_rejects_unsafe_modified_variant_in_either_stage(unsafe_stage, tmp_path):
+    repo = _repo(tmp_path, f"unsafe-modified-{unsafe_stage}-variant")
+    secret_line = "API_TOKEN=stage-specific-secret"
+    (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    destination.write_text("FEATURE_FLAG=disabled\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add staged parity fixture")
+    if unsafe_stage == "index":
+        destination.write_text(f"{secret_line}\nSTAGED_FLAG=enabled\n", encoding="utf-8")
+        _git(repo, "add", "feature.py")
+        destination.write_text("WORKTREE_FLAG=enabled\n", encoding="utf-8")
+    else:
+        destination.write_text("STAGED_FLAG=enabled\n", encoding="utf-8")
+        _git(repo, "add", "feature.py")
+        destination.write_text(
+            f"STAGED_FLAG=enabled\n{secret_line}\n",
+            encoding="utf-8",
+        )
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="feature.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+@pytest.mark.parametrize("source_policy", ["excluded", "filtered"])
+def test_non_regular_unsafe_symlink_source_fails_closed_without_following(
+    event, source_policy, tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path, f"unsafe-symlink-{source_policy}-{event}")
+    target = tmp_path / f"private-target-{source_policy}-{event}"
+    secret_line = "API_TOKEN=symlink-target-secret"
+    target.write_text(f"{secret_line}\n", encoding="utf-8")
+    if source_policy == "filtered":
+        (repo / ".gitattributes").write_text(
+            "*.secret filter=crypt\n", encoding="utf-8"
+        )
+        _git(repo, "add", ".gitattributes")
+        _git(repo, "commit", "-m", "mark filtered sources")
+        source = repo / "vault.secret"
+    else:
+        source = repo / ".env"
+    source.symlink_to(target)
+    destination = repo / "public.txt"
+    destination.write_text(f"{secret_line}\n", encoding="utf-8")
+    if event == "pre-commit":
+        _git(repo, "add", "public.txt")
+    stable_reads = []
+    original_stable_read = local_pair_review_module._read_stable_regular_file
+
+    def track_stable_read(path, max_bytes):
+        stable_reads.append(path)
+        return original_stable_read(path, max_bytes)
+
+    monkeypatch.setattr(
+        local_pair_review_module, "_read_stable_regular_file", track_stable_read
+    )
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="public.txt" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert source not in stable_reads
+    assert source.is_symlink()
+    assert CoverageIssue(reason="copy_source_discovery_budget") in snapshot.coverage_issues
+
+
+def test_operational_symlink_alias_uses_independently_inventoried_target(tmp_path):
+    repo = _repo(tmp_path, "operational-symlink-with-inventoried-target")
+    secret_line = "API_TOKEN=operational-alias-secret"
+    target = repo / "provider-secrets.toml"
+    target.write_text(f"{secret_line}\n", encoding="utf-8")
+    (repo / ".pr_agent.toml").symlink_to(target.name)
+    (repo / "public.txt").write_text(f"{secret_line}\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(
+        str(repo), ignored_paths=[".pr_agent.toml", "provider-secrets.toml"]
+    ).capture(event="file-save", focus_path="public.txt")
+
+    assert snapshot.diff == ""
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(
+        path="provider-secrets.toml", reason="excluded"
+    ) in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="public.txt", reason="rename_group_omitted"
+    ) in snapshot.coverage_issues
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="platform has no FIFO support")
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_non_regular_unsafe_fifo_source_fails_closed(event, tmp_path):
+    repo = _repo(tmp_path, f"unsafe-fifo-{event}")
+    source = repo / ".env"
+    os.mkfifo(source)
+    secret_line = "API_TOKEN=unavailable-fifo-source"
+    destination = repo / "public.txt"
+    destination.write_text(f"{secret_line}\n", encoding="utf-8")
+    if event == "pre-commit":
+        _git(repo, "add", "public.txt")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="public.txt" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(reason="copy_source_discovery_budget") in snapshot.coverage_issues
+
+
+def test_modified_destination_copy_scan_budget_fails_closed(tmp_path):
+    repo = _repo(tmp_path, "modified-destination-copy-budget")
+    secret_line = "API_TOKEN=copy-budget-secret"
+    (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    destination.write_text("FEATURE_FLAG=disabled\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add copy budget fixture")
+    destination.write_text(
+        f"{secret_line}\nFEATURE_FLAG=enabled\n",
+        encoding="utf-8",
+    )
+
+    snapshot = LocalPairReview(str(repo), max_snapshot_bytes=32).capture(
+        event="file-save", focus_path="feature.py"
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(reason="copy_source_discovery_budget") in snapshot.coverage_issues
+
+
+def test_modified_destination_copy_scan_revalidates_unsafe_source_state(tmp_path):
+    repo = _repo(tmp_path, "modified-destination-copy-source-race")
+    source = repo / ".env"
+    source.write_text("API_TOKEN=initial-unrelated-value\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    destination.write_text("FEATURE_FLAG=disabled\n", encoding="utf-8")
+    _git(repo, "add", "feature.py")
+    _git(repo, "commit", "-m", "add source race fixture")
+    secret_line = "API_TOKEN=late-symlink-secret"
+    destination.write_text(
+        f"{secret_line}\nFEATURE_FLAG=enabled\n",
+        encoding="utf-8",
+    )
+    target = tmp_path / "late-private-target"
+    target.write_text(f"{secret_line}\n", encoding="utf-8")
+
+    class RacingReview(LocalPairReview):
+        source_replaced = False
+
+        def _unsafe_copy_sources(self, *args, **kwargs):
+            result = super()._unsafe_copy_sources(*args, **kwargs)
+            if not self.source_replaced:
+                self.source_replaced = True
+                source.unlink()
+                source.symlink_to(target)
+            return result
+
+    snapshot = RacingReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert source.is_symlink()
+    assert CoverageIssue(reason="content_changed_during_capture") in snapshot.coverage_issues
 
 
 @pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
