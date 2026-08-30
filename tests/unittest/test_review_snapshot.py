@@ -104,7 +104,7 @@ def test_snapshot_identity_is_stable_and_policy_and_repository_scoped():
     assert first.snapshot_id != with_coverage.snapshot_id
 
 
-def test_worktree_snapshot_captures_modified_untracked_deleted_and_renamed_files(tmp_path):
+def test_worktree_snapshot_captures_reviewable_files_and_reports_unsupported_changes(tmp_path):
     repo = _repo(tmp_path)
     (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
     (repo / "new.py").write_text("added = True\n", encoding="utf-8")
@@ -117,10 +117,14 @@ def test_worktree_snapshot_captures_modified_untracked_deleted_and_renamed_files
     snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
     parsed = {item.filename: item for item in parse_plain_diff(snapshot.diff)}
 
-    assert {"tracked.py", "new.py", "deleted.py"}.issubset(set(snapshot.changed_paths))
+    assert {"tracked.py", "new.py"}.issubset(set(snapshot.changed_paths))
+    assert "deleted.py" not in snapshot.changed_paths
     assert "renamed.py" not in snapshot.changed_paths
     assert parsed["new.py"].edit_type.name == "ADDED"
-    assert parsed["deleted.py"].edit_type.name == "DELETED"
+    assert "deleted.py" not in parsed
+    assert CoverageIssue(
+        path="deleted.py", reason="deleted_file_unsupported"
+    ) in snapshot.coverage_issues
     assert CoverageIssue(path="rename_me.py", reason="metadata_only_diff") in snapshot.coverage_issues
     assert CoverageIssue(path="renamed.py", reason="metadata_only_diff") in snapshot.coverage_issues
 
@@ -433,7 +437,10 @@ def test_untracked_path_uses_index_and_base_filter_attributes(event, tmp_path):
     if event == "file-save":
         assert snapshot.diff == ""
     else:
-        assert snapshot.changed_paths == (".gitattributes",)
+        assert snapshot.changed_paths == ()
+        assert CoverageIssue(
+            path=".gitattributes", reason="deleted_file_unsupported"
+        ) in snapshot.coverage_issues
     assert CoverageIssue(
         path="new.secret",
         reason="content_filter_unsupported",
@@ -572,6 +579,83 @@ def test_untracked_addition_embedding_excluded_source_is_omitted(event, tmp_path
     assert "production-secret" not in snapshot.diff
     assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
     assert CoverageIssue(path="feature.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_staged_addition_embedding_excluded_source_is_omitted(event, tmp_path):
+    repo = _repo(tmp_path, f"staged-embedded-excluded-copy-{event}")
+    source = repo / ".env"
+    source.write_text("API_TOKEN=production-secret\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".env")
+    _git(repo, "commit", "-m", "add excluded source")
+    destination = repo / "feature.py"
+    destination.write_text(
+        "def configure():\n"
+        "    settings = '''\n"
+        "    API_TOKEN=production-secret\n"
+        "    FEATURE_FLAG=enabled\n"
+        "    '''\n"
+        "    return settings\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "feature.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "production-secret" not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="feature.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+def test_worktree_idle_scans_index_variant_of_staged_addition(tmp_path):
+    repo = _repo(tmp_path, "staged-embedded-source-index-variant")
+    source = repo / ".env"
+    source.write_text("API_TOKEN=production-secret\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".env")
+    _git(repo, "commit", "-m", "add excluded source")
+    destination = repo / "feature.py"
+    destination.write_text(
+        "API_TOKEN=production-secret\nFEATURE_FLAG=enabled\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "feature.py")
+    destination.write_text("FEATURE_FLAG=enabled\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "production-secret" not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="feature.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_deletion_only_modified_file_is_unsupported_coverage(event, tmp_path):
+    repo = _repo(tmp_path, f"deletion-only-modified-{event}")
+    path = repo / "tracked.py"
+    path.write_text("remove_me = True\nkeep_me = True\n", encoding="utf-8")
+    _git(repo, "add", "tracked.py")
+    _git(repo, "commit", "-m", "add deletion fixture")
+    path.write_text("keep_me = True\n", encoding="utf-8")
+    if event == "pre-commit":
+        _git(repo, "add", "tracked.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="tracked.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(
+        path="tracked.py", reason="deleted_file_unsupported"
+    ) in snapshot.coverage_issues
 
 
 def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):

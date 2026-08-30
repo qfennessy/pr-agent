@@ -232,6 +232,23 @@ def _copy_similarity_probes(content: bytes) -> frozenset[int]:
     return frozenset(selected)
 
 
+def _patch_has_only_deletions(patch: str) -> bool:
+    inside_hunk = False
+    has_addition = False
+    has_deletion = False
+    for line in patch.splitlines():
+        if RE_HUNK_HEADER.match(line):
+            inside_hunk = True
+            continue
+        if not inside_hunk or line.startswith("\\"):
+            continue
+        if line.startswith("+"):
+            has_addition = True
+        elif line.startswith("-"):
+            has_deletion = True
+    return has_deletion and not has_addition
+
+
 def find_repository_root(start: Optional[str] = None) -> Path:
     start_path = Path(start or os.getcwd()).resolve()
     process = subprocess.run(
@@ -764,14 +781,16 @@ class LocalPairReview:
         )
         return None if output is None else _decode_z_paths(output)
 
-    def _untracked_unsafe_copy_sources(
+    def _unsafe_copy_sources(
         self,
         event: ReviewEvent,
         base_revision: str,
-        untracked_paths: Sequence[str],
+        *,
+        current_candidate_paths: Sequence[str] = (),
+        index_candidate_paths: Sequence[str] = (),
     ) -> Optional[dict[str, tuple[tuple[str, str], ...]]]:
-        """Find exact or substantially similar untracked copies of unsafe tracked files."""
-        if not untracked_paths:
+        """Find candidate additions copied from unsafe tracked files."""
+        if not current_candidate_paths and not index_candidate_paths:
             return {}
         base_entries = _run_git_bounded(
             self.repository_root,
@@ -831,10 +850,43 @@ class LocalPairReview:
         if not unsafe_reasons:
             return {}
 
-        candidate_contents: dict[str, bytes] = {}
-        candidate_oids: dict[str, str] = {}
+        candidate_variants: list[tuple[str, bytes, str]] = []
+        candidate_keys: set[tuple[str, str]] = set()
         remaining_similarity_bytes = self.max_snapshot_bytes
-        for path in untracked_paths:
+        for path in dict.fromkeys(index_candidate_paths):
+            if self._is_excluded(path) or self._is_ignored(path):
+                continue
+            mode, candidate_oid = self._git_object_identity(":", path)
+            if mode not in {"100644", "100755"} or candidate_oid is None:
+                continue
+            if (path, candidate_oid) in candidate_keys:
+                continue
+            try:
+                candidate_size = int(
+                    _run_git(
+                        self.repository_root, "cat-file", "-s", candidate_oid
+                    ).strip()
+                )
+            except (SnapshotCaptureError, ValueError):
+                return None
+            if candidate_size > self.max_file_bytes:
+                continue
+            if candidate_size > remaining_similarity_bytes:
+                return None
+            content = _run_git_bounded(
+                self.repository_root,
+                "cat-file",
+                "blob",
+                candidate_oid,
+                max_output_bytes=candidate_size,
+            )
+            if content is None or len(content) != candidate_size:
+                return None
+            remaining_similarity_bytes -= len(content)
+            candidate_keys.add((path, candidate_oid))
+            candidate_variants.append((path, content, candidate_oid))
+
+        for path in dict.fromkeys(current_candidate_paths):
             if self._is_excluded(path) or self._is_ignored(path):
                 continue
             candidate = self.repository_root / path
@@ -848,12 +900,9 @@ class LocalPairReview:
                 or candidate_stat.st_size > self.max_file_bytes
             ):
                 continue
-            if candidate_stat.st_size > remaining_similarity_bytes:
-                return None
             content = _read_stable_regular_file(candidate, self.max_file_bytes)
             if content is None:
                 return None
-            remaining_similarity_bytes -= len(content)
             try:
                 object_id = _run_git_bounded(
                     self.repository_root,
@@ -864,12 +913,18 @@ class LocalPairReview:
                 )
                 if object_id is None:
                     return None
-                candidate_oids[path] = object_id.decode("ascii").strip()
+                candidate_oid = object_id.decode("ascii").strip()
             except (SnapshotCaptureError, UnicodeDecodeError):
                 return None
-            candidate_contents[path] = content
+            if (path, candidate_oid) in candidate_keys:
+                continue
+            if len(content) > remaining_similarity_bytes:
+                return None
+            remaining_similarity_bytes -= len(content)
+            candidate_keys.add((path, candidate_oid))
+            candidate_variants.append((path, content, candidate_oid))
 
-        if not candidate_contents:
+        if not candidate_variants:
             return {}
 
         object_contents: dict[str, bytes] = {}
@@ -964,10 +1019,9 @@ class LocalPairReview:
             for probe in probes:
                 probe_index.setdefault(probe, set()).add(signature_index)
 
-        matches: dict[str, tuple[tuple[str, str], ...]] = {}
+        matched_sources: dict[str, set[tuple[str, str]]] = {}
         small_comparisons = 0
-        for destination, content in candidate_contents.items():
-            object_id = candidate_oids[destination]
+        for destination, content, object_id in candidate_variants:
             sources = {
                 (source, unsafe_reasons[source])
                 for source, object_ids in source_oids.items()
@@ -995,8 +1049,11 @@ class LocalPairReview:
                 ):
                     sources.add((source, reason))
             if sources:
-                matches[destination] = tuple(sorted(sources))
-        return matches
+                matched_sources.setdefault(destination, set()).update(sources)
+        return {
+            destination: tuple(sorted(sources))
+            for destination, sources in matched_sources.items()
+        }
 
     def _capture_diff(
         self,
@@ -1115,16 +1172,42 @@ class LocalPairReview:
             add_coverage(None, "untracked_path_discovery_budget")
             untracked = []
             discovery_overflow = True
-        unsafe_untracked_sources = self._untracked_unsafe_copy_sources(
-            event, base_revision, untracked
+        tracked_additions = tuple(
+            dict.fromkeys(
+                group[-1]
+                for _, status, group in tracked_groups
+                if status.startswith("A")
+            )
         )
-        if unsafe_untracked_sources is None:
+        current_copy_candidates = tuple(
+            dict.fromkeys(
+                (
+                    *untracked,
+                    *(
+                        tracked_additions
+                        if event is not ReviewEvent.PRE_COMMIT
+                        else ()
+                    ),
+                )
+            )
+        )
+        unsafe_copy_sources = self._unsafe_copy_sources(
+            event,
+            base_revision,
+            current_candidate_paths=current_copy_candidates,
+            index_candidate_paths=(
+                tracked_additions
+                if event in {ReviewEvent.PRE_COMMIT, ReviewEvent.WORKTREE_IDLE}
+                else ()
+            ),
+        )
+        if unsafe_copy_sources is None:
             add_coverage(None, "copy_source_discovery_budget")
-            unsafe_untracked_sources = {}
+            unsafe_copy_sources = {}
             discovery_overflow = True
         else:
             covered = {(issue.path, issue.reason) for issue in coverage}
-            for destination, sources in sorted(unsafe_untracked_sources.items()):
+            for destination, sources in sorted(unsafe_copy_sources.items()):
                 for source, reason in sources:
                     if (source, reason) not in covered:
                         add_coverage(source, reason)
@@ -1181,7 +1264,7 @@ class LocalPairReview:
             tuple(tracked_groups),
             tuple(sorted(filtered_paths)),
             tuple(untracked),
-            tuple(sorted(unsafe_untracked_sources.items())),
+            tuple(sorted(unsafe_copy_sources.items())),
         )
 
         def current_discovery_state():
@@ -1203,8 +1286,34 @@ class LocalPairReview:
             )
             if current_untracked is None:
                 return None
-            current_unsafe_sources = self._untracked_unsafe_copy_sources(
-                event, base_revision, current_untracked
+            current_additions = tuple(
+                dict.fromkeys(
+                    group[-1]
+                    for _, status, group in current_groups
+                    if status.startswith("A")
+                )
+            )
+            current_candidates = tuple(
+                dict.fromkeys(
+                    (
+                        *current_untracked,
+                        *(
+                            current_additions
+                            if event is not ReviewEvent.PRE_COMMIT
+                            else ()
+                        ),
+                    )
+                )
+            )
+            current_unsafe_sources = self._unsafe_copy_sources(
+                event,
+                base_revision,
+                current_candidate_paths=current_candidates,
+                index_candidate_paths=(
+                    current_additions
+                    if event in {ReviewEvent.PRE_COMMIT, ReviewEvent.WORKTREE_IDLE}
+                    else ()
+                ),
             )
             if current_unsafe_sources is None:
                 return None
@@ -1244,7 +1353,7 @@ class LocalPairReview:
                 return None
             if normalized in filtered_paths:
                 return None
-            if normalized in unsafe_untracked_sources:
+            if normalized in unsafe_copy_sources:
                 return None
             if self._has_content_filter(event, normalized):
                 add_coverage(normalized, "content_filter_unsupported")
@@ -1399,8 +1508,18 @@ class LocalPairReview:
         parsed_files = parse_plain_diff(captured_diff) if captured_diff.strip() else []
         reviewable_files = []
         metadata_only_paths = set()
+        deletion_only_paths = set()
         for item in parsed_files:
             if to_hunk_only_patch(item.patch).strip():
+                if _patch_has_only_deletions(item.patch):
+                    for path in (
+                        getattr(item, "filename", None),
+                        getattr(item, "old_filename", None),
+                    ):
+                        if path and path not in deletion_only_paths:
+                            deletion_only_paths.add(path)
+                            add_coverage(path, "deleted_file_unsupported")
+                    continue
                 reviewable_files.append(item)
                 continue
             for path in (getattr(item, "filename", None), getattr(item, "old_filename", None)):
@@ -1417,7 +1536,9 @@ class LocalPairReview:
         expected_paths = (
             set(selected_tracked) | set(selected_untracked)
         ) - budget_omitted_paths
-        for missing_path in sorted(expected_paths - parsed_paths - metadata_only_paths):
+        for missing_path in sorted(
+            expected_paths - parsed_paths - metadata_only_paths - deletion_only_paths
+        ):
             add_coverage(missing_path, "binary_or_unparseable_diff")
 
         # Serializing the already parsed objects is the narrow reuse seam: the
