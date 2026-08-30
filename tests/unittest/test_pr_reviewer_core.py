@@ -160,6 +160,33 @@ def _incremental_raw_file(filename, *, status="modified", previous_filename=None
     )
 
 
+def _azure_net_change(path, *, change_type="edit", original_path=None):
+    properties = {"item": {"path": path}, "changeType": change_type}
+    if original_path is not None:
+        properties["originalPath"] = original_path
+    return SimpleNamespace(additional_properties=properties)
+
+
+def _azure_routing_provider(net_changes, detailed_files):
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.repo_slug = "repo"
+    provider.workspace_slug = "project"
+    provider.pr_num = 1
+    provider.incremental = None
+    provider.unreviewed_files_map = {}
+    provider._latest_pr_iteration_changes = None
+    provider.azure_devops_client = MagicMock()
+    provider.azure_devops_client.get_pull_request_iterations.return_value = [
+        SimpleNamespace(id=3)
+    ]
+    provider.azure_devops_client.get_pull_request_iteration_changes.return_value = (
+        SimpleNamespace(change_entries=list(net_changes), next_skip=0)
+    )
+    provider.azure_devops_client.get_pull_request_labels.return_value = []
+    provider.get_diff_files = MagicMock(return_value=list(detailed_files))
+    return provider
+
+
 @pytest.mark.asyncio
 async def test_prepare_prediction_requests_remaining_files_and_preserves_tuple_result():
     reviewer = _make_prediction_reviewer()
@@ -862,6 +889,222 @@ def test_nonincremental_provider_inventory_remains_provider_neutral_and_deduplic
     ),)
     provider.get_files.assert_called_once_with()
     provider.get_diff_files.assert_called_once_with()
+
+
+def test_azure_provider_rooted_docs_only_inventory_routes_quick():
+    provider = _azure_routing_provider(
+        [_azure_net_change("/docs/guide.md")],
+        [_route_file("/docs/guide.md")],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert reviewer.review_route_request.files[0].new_path == "docs/guide.md"
+    assert "input_invalid" not in [reason.code for reason in decision.reasons]
+
+
+def test_azure_sensitive_net_path_still_forces_deep():
+    provider = _azure_routing_provider(
+        [_azure_net_change("/services/auth/guard.py")],
+        [_route_file("/services/auth/guard.py")],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+
+
+def test_azure_historical_union_does_not_inflate_net_pr_routing():
+    provider = _azure_routing_provider(
+        [_azure_net_change("/docs/guide.md")],
+        [_route_file("/docs/guide.md")],
+    )
+    provider.azure_devops_client.get_pull_request_commits.return_value = [
+        SimpleNamespace(commit_id=f"commit-{index}") for index in range(25)
+    ]
+    provider.azure_devops_client.get_changes.return_value = SimpleNamespace(changes=[
+        {"item": {"path": "/services/auth/reverted.py"}},
+    ])
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert [file.new_path for file in reviewer.review_route_request.files] == ["docs/guide.md"]
+    provider.azure_devops_client.get_pull_request_commits.assert_not_called()
+    provider.azure_devops_client.get_changes.assert_not_called()
+
+
+def test_azure_net_inventory_preserves_rename_delete_and_drops_reverted_history():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = _azure_routing_provider(
+        [
+            _azure_net_change(
+                "/docs/new-name.md",
+                change_type="edit, rename",
+                original_path="/services/auth/old-name.py",
+            ),
+            _azure_net_change("/docs/deleted.md", change_type="delete"),
+        ],
+        [
+            _route_file(
+                "/docs/new-name.md",
+                edit_type=EDIT_TYPE.RENAMED,
+                old_filename="/services/auth/old-name.py",
+            ),
+            _route_file("/docs/deleted.md", edit_type=EDIT_TYPE.DELETED),
+        ],
+    )
+    provider.azure_devops_client.get_pull_request_commits.return_value = [
+        SimpleNamespace(commit_id="historical")
+    ]
+    provider.azure_devops_client.get_changes.return_value = SimpleNamespace(changes=[
+        {"item": {"path": "/services/auth/reverted.py"}},
+    ])
+    reviewer = _make_prediction_reviewer(provider)
+
+    changed_files = reviewer._changed_files_for_routing()
+
+    assert changed_files == (
+        ChangedFile(
+            new_path="docs/new-name.md",
+            old_path="services/auth/old-name.py",
+            kind=ChangeKind.RENAMED,
+            additions=2,
+            deletions=1,
+        ),
+        ChangedFile(
+            new_path=None,
+            old_path="docs/deleted.md",
+            kind=ChangeKind.DELETED,
+            additions=2,
+            deletions=1,
+        ),
+    )
+    assert all("reverted.py" not in (file.old_path or "") for file in changed_files)
+    provider.azure_devops_client.get_pull_request_commits.assert_not_called()
+
+
+def test_azure_ignored_sensitive_net_path_remains_visible_to_router():
+    provider = _azure_routing_provider(
+        [
+            _azure_net_change("/docs/guide.md"),
+            _azure_net_change("/services/auth/ignored.py"),
+        ],
+        [_route_file("/docs/guide.md")],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert {file.new_path for file in reviewer.review_route_request.files} == {
+        "docs/guide.md",
+        "services/auth/ignored.py",
+    }
+
+
+def test_azure_malformed_non_tree_net_entry_prevents_quick():
+    provider = _azure_routing_provider(
+        [
+            _azure_net_change("/docs/guide.md"),
+            SimpleNamespace(additional_properties={
+                "item": {"gitObjectType": "blob"},
+                "changeType": "edit",
+            }),
+        ],
+        [_route_file("/docs/guide.md")],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+    assert "files[1].kind" in decision.missing_inputs
+    assert "files[1].path" in decision.missing_inputs
+
+
+def test_azure_tree_entry_is_intentionally_ignored_without_blocking_quick():
+    provider = _azure_routing_provider(
+        [
+            _azure_net_change("/docs/guide.md"),
+            SimpleNamespace(additional_properties={
+                "item": {"path": "/docs", "gitObjectType": "tree"},
+                "changeType": "edit",
+            }),
+        ],
+        [_route_file("/docs/guide.md")],
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert len(reviewer.review_route_request.files) == 1
+
+
+def test_untrusted_provider_absolute_paths_remain_invalid_and_force_deep():
+    provider = MagicMock()
+    provider.get_files.return_value = [
+        SimpleNamespace(filename="/docs/guide.md", status="modified", additions=2, deletions=1)
+    ]
+    provider.get_diff_files.return_value = [_route_file("/docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert "input_invalid" in [reason.code for reason in decision.reasons]
+    assert reviewer.review_route_request.files[0].new_path == "/docs/guide.md"
 
 
 def test_changed_file_metadata_failure_is_recorded_and_prevents_quick():

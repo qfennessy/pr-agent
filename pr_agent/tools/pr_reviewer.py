@@ -430,7 +430,8 @@ class PRReviewer:
         The ordinary review diff is intentionally filtered for context quality. Risk
         routing has a different contract: every changed path must remain available so
         an ignore rule cannot hide a forced-deep path. Reconcile the provider's raw
-        file inventory with the richer review diff without branching on provider type.
+        file inventory with the richer review diff through provider-owned routing
+        capabilities rather than branching on provider type.
         """
 
         evidence_incomplete = False
@@ -439,9 +440,13 @@ class PRReviewer:
         # containers while loading diffs; retaining an immutable tuple here keeps
         # authoritative paths stable without provider-specific branching.
         try:
-            raw_inventory = self.git_provider.get_files()
+            routing_getter = getattr(type(self.git_provider), "get_files_for_routing", None)
+            if callable(routing_getter):
+                raw_inventory = routing_getter(self.git_provider)
+            else:
+                raw_inventory = self.git_provider.get_files()
             raw_files = (
-                tuple(self._changed_file_for_routing(file) for file in raw_inventory)
+                tuple(self._provider_changed_file_for_routing(file) for file in raw_inventory)
                 if raw_inventory is not None
                 else ()
             )
@@ -455,7 +460,7 @@ class PRReviewer:
 
         try:
             detailed = tuple(
-                self._changed_file_for_routing(file)
+                self._provider_changed_file_for_routing(file)
                 for file in (self.git_provider.get_diff_files() or [])
             )
         except Exception as exc:
@@ -509,6 +514,19 @@ class PRReviewer:
         if evidence_incomplete:
             reconciled.append(ChangedFile(new_path=None, kind=ChangeKind.UNKNOWN))
         return tuple(reconciled)
+
+    def _provider_changed_file_for_routing(self, file: Any) -> ChangedFile:
+        """Convert routing evidence and apply only the provider's path adapter."""
+
+        changed_file = self._changed_file_for_routing(file)
+        path_adapter = getattr(type(self.git_provider), "normalize_file_path_for_routing", None)
+        if not callable(path_adapter):
+            return changed_file
+        return replace(
+            changed_file,
+            old_path=path_adapter(self.git_provider, changed_file.old_path),
+            new_path=path_adapter(self.git_provider, changed_file.new_path),
+        )
 
     @staticmethod
     def _changed_file_for_routing(file: Any) -> ChangedFile:

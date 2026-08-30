@@ -72,23 +72,80 @@ class _AzureCommitAdapter:
         self.parents = list(getattr(raw, "parents", None) or [])
 
 
-def _get_azure_change_path(change):
+def _get_azure_change_item(change):
     try:
         item = change["item"]
     except (KeyError, TypeError):
         item = getattr(change, "item", None)
         if item is None:
             additional = getattr(change, "additional_properties", None) or {}
-            item = additional.get("item") or {}
+            item = additional.get("item")
+    return item
+
+
+def _is_azure_tree_change(change) -> bool:
+    item = _get_azure_change_item(change)
+    if isinstance(item, dict):
+        return item.get("gitObjectType", item.get("git_object_type")) == "tree"
+    return getattr(item, "git_object_type", getattr(item, "gitObjectType", None)) == "tree"
+
+
+def _get_azure_change_path(change):
+    item = _get_azure_change_item(change)
 
     if isinstance(item, dict):
-        if item.get("gitObjectType", item.get("git_object_type")) == "tree":
+        if _is_azure_tree_change(change):
             return None
         return item.get("path")
 
-    if getattr(item, "git_object_type", getattr(item, "gitObjectType", None)) == "tree":
+    if _is_azure_tree_change(change):
         return None
     return getattr(item, "path", None)
+
+
+def _get_azure_change_property(change, *names):
+    """Read a pull-request change property from dict or Azure SDK shapes."""
+
+    if isinstance(change, dict):
+        for name in names:
+            value = change.get(name)
+            if value is not None:
+                return value
+        return None
+    for name in names:
+        value = getattr(change, name, None)
+        if value is not None:
+            return value
+    additional = getattr(change, "additional_properties", None) or {}
+    for name in names:
+        value = additional.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def _azure_change_edit_type(change) -> EDIT_TYPE:
+    change_type = _get_azure_change_property(change, "changeType", "change_type")
+    normalized = str(change_type or "").casefold()
+    if "rename" in normalized:
+        return EDIT_TYPE.RENAMED
+    if normalized == "add":
+        return EDIT_TYPE.ADDED
+    if normalized == "delete":
+        return EDIT_TYPE.DELETED
+    if normalized in {"edit", "encoding", "property", "undelete"}:
+        return EDIT_TYPE.MODIFIED
+    return EDIT_TYPE.UNKNOWN
+
+
+def _azure_change_old_path(change) -> str | None:
+    return _get_azure_change_property(
+        change,
+        "originalPath",
+        "original_path",
+        "sourceServerItem",
+        "source_server_item",
+    )
 
 
 class AzureDevopsProvider(GitProvider):
@@ -104,6 +161,7 @@ class AzureDevopsProvider(GitProvider):
         self.azure_devops_client, self.azure_devops_board_client = self._get_azure_devops_client()
         self.diff_files = None
         self._diff_path_map = None
+        self._latest_pr_iteration_changes = None
         self.workspace_slug = None
         self.repo_slug = None
         self.repo = None
@@ -349,6 +407,7 @@ class AzureDevopsProvider(GitProvider):
     def set_pr(self, pr_url: str):
         self.diff_files = None
         self._diff_path_map = None
+        self._latest_pr_iteration_changes = None
         self._published_inline_comment_bodies = []
         self._inline_comment_store = None
         self.pr_url = pr_url
@@ -365,6 +424,7 @@ class AzureDevopsProvider(GitProvider):
             # returning the full-PR diff.
             self.diff_files = None
             self._diff_path_map = None
+            self._latest_pr_iteration_changes = None
             self.unreviewed_files_map = {}
             self._get_incremental_commits()
 
@@ -552,6 +612,82 @@ class AzureDevopsProvider(GitProvider):
             return list(self.unreviewed_files_map.keys())
         return self._get_files_full()
 
+    def normalize_file_path_for_routing(self, path: str | None) -> str | None:
+        """Translate Azure's documented repository-root paths for routing only."""
+        if not isinstance(path, str):
+            return path
+        return path[1:] if path.startswith("/") else path
+
+    def _get_latest_pr_iteration_changes(self):
+        """Return the unfiltered net PR changes, cached for routing and diff loading."""
+        cached = getattr(self, "_latest_pr_iteration_changes", None)
+        if cached is not None:
+            return cached
+
+        iterations = self.azure_devops_client.get_pull_request_iterations(
+            repository_id=self.repo_slug,
+            pull_request_id=self.pr_num,
+            project=self.workspace_slug,
+        )
+        if not iterations:
+            self._latest_pr_iteration_changes = ()
+            return self._latest_pr_iteration_changes
+
+        iteration_id = iterations[-1].id
+        entries = []
+        skip = 0
+        while True:
+            changes = self.azure_devops_client.get_pull_request_iteration_changes(
+                repository_id=self.repo_slug,
+                pull_request_id=self.pr_num,
+                iteration_id=iteration_id,
+                project=self.workspace_slug,
+                top=2000,
+                skip=skip,
+                compare_to=0,
+            )
+            entries.extend(getattr(changes, "change_entries", None) or [])
+            next_skip = getattr(changes, "next_skip", None)
+            if not isinstance(next_skip, int) or isinstance(next_skip, bool) or next_skip <= skip:
+                break
+            skip = next_skip
+
+        self._latest_pr_iteration_changes = tuple(entries)
+        return self._latest_pr_iteration_changes
+
+    def get_files_for_routing(self):
+        """Return current, unfiltered net paths instead of per-commit history."""
+        if (isinstance(getattr(self, "incremental", None), IncrementalPR)
+                and self.incremental.is_incremental
+                and self.unreviewed_files_map):
+            return list(self.unreviewed_files_map.keys())
+
+        files = []
+        for change in self._get_latest_pr_iteration_changes():
+            path = _get_azure_change_path(change)
+            if not path:
+                if not _is_azure_tree_change(change):
+                    # A malformed blob/change entry means the net inventory is not
+                    # complete. Retain an unknown record so routing cannot mistake
+                    # the remaining docs-only paths for safe complete evidence.
+                    files.append(FilePatchInfo(
+                        base_file="",
+                        head_file="",
+                        patch="",
+                        filename="",
+                        edit_type=EDIT_TYPE.UNKNOWN,
+                    ))
+                continue
+            files.append(FilePatchInfo(
+                base_file="",
+                head_file="",
+                patch="",
+                filename=path,
+                edit_type=_azure_change_edit_type(change),
+                old_filename=_azure_change_old_path(change),
+            ))
+        return files
+
     def _get_files_full(self):
         files = []
         for i in self.azure_devops_client.get_pull_request_commits(
@@ -589,33 +725,23 @@ class AzureDevopsProvider(GitProvider):
             base_sha = self.pr.last_merge_target_commit
             head_sha = self.pr.last_merge_commit
 
-            # Get PR iterations
-            iterations = self.azure_devops_client.get_pull_request_iterations(
-                repository_id=self.repo_slug,
-                pull_request_id=self.pr_num,
-                project=self.workspace_slug
-            )
-            changes = None
-            if iterations:
-                iteration_id = iterations[-1].id  # Get the last iteration (most recent changes)
-
-                # Get changes for the iteration
-                changes = self.azure_devops_client.get_pull_request_iteration_changes(
-                    repository_id=self.repo_slug,
-                    pull_request_id=self.pr_num,
-                    iteration_id=iteration_id,
-                    project=self.workspace_slug
-                )
+            changes = self._get_latest_pr_iteration_changes()
             diff_files = []
             diffs = []
             diff_types = {}
-            if changes:
-                for change in changes.change_entries:
-                    item = change.additional_properties.get('item', {})
-                    path = item.get('path', None)
-                    if path:
-                        diffs.append(path)
-                        diff_types[path] = change.additional_properties.get('changeType', 'Unknown')
+            old_paths = {}
+            for change in changes:
+                path = _get_azure_change_path(change)
+                if path:
+                    diffs.append(path)
+                    edit_type = _azure_change_edit_type(change)
+                    # Preserve the review-diff adapter's historical fallback for an
+                    # unrecognized Azure change type. The routing inventory above
+                    # intentionally retains UNKNOWN so risk classification fails safe.
+                    diff_types[path] = (
+                        EDIT_TYPE.MODIFIED if edit_type is EDIT_TYPE.UNKNOWN else edit_type
+                    )
+                    old_paths[path] = _azure_change_old_path(change)
 
             # wrong implementation - gets all the files that were changed in any commit in the PR
             # commits = self.azure_devops_client.get_pull_request_commits(
@@ -691,13 +817,7 @@ class AzureDevopsProvider(GitProvider):
                     # )
                     new_file_content_str = ""
 
-                edit_type = EDIT_TYPE.MODIFIED
-                if diff_types[file] == "add":
-                    edit_type = EDIT_TYPE.ADDED
-                elif diff_types[file] == "delete":
-                    edit_type = EDIT_TYPE.DELETED
-                elif "rename" in diff_types[file]: # diff_type can be `rename` | `edit, rename`
-                    edit_type = EDIT_TYPE.RENAMED
+                edit_type = diff_types[file]
 
                 if edit_type == EDIT_TYPE.ADDED or edit_type == EDIT_TYPE.RENAMED:
                     original_file_content_str = ""
@@ -759,6 +879,7 @@ class AzureDevopsProvider(GitProvider):
                         patch=patch,
                         filename=file,
                         edit_type=edit_type,
+                        old_filename=old_paths.get(file),
                         num_plus_lines=num_plus_lines,
                         num_minus_lines=num_minus_lines,
                     )

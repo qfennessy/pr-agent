@@ -393,6 +393,26 @@ class GitProvider(ABC):
     def get_files(self) -> list:
         pass
 
+    def get_files_for_routing(self) -> list:
+        """Return the complete current changed-file inventory used by review routing.
+
+        ``get_files()`` is the compatibility default. Providers whose ordinary file
+        list is filtered, incremental, or historical may override this method with a
+        current, unfiltered pull-request inventory. The returned paths may still use
+        provider-native spelling; ``normalize_file_path_for_routing()`` is the narrow
+        provider-owned adapter for that representation.
+        """
+        return self.get_files()
+
+    def normalize_file_path_for_routing(self, path: str | None) -> str | None:
+        """Adapt a provider-native changed path to a repository-relative path.
+
+        The identity default deliberately leaves absolute paths untouched so the
+        router continues to reject arbitrary absolute input. A provider should only
+        override this when its API has a documented repository-root path format.
+        """
+        return path
+
     @abstractmethod
     def get_diff_files(self) -> list[FilePatchInfo]:
         pass

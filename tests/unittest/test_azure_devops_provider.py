@@ -1,9 +1,9 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from pr_agent.algo.types import FilePatchInfo
+from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
 
 
@@ -118,6 +118,117 @@ class TestAzureDevopsProviderFiles:
         ])
 
         assert provider._get_files_full() == ["/src/app.py"]
+
+    def test_routing_inventory_uses_net_iteration_and_preserves_change_shapes(self):
+        provider = self._provider()
+        provider.incremental = None
+        provider.unreviewed_files_map = {}
+        provider._latest_pr_iteration_changes = None
+        provider.azure_devops_client.get_pull_request_iterations.return_value = [
+            SimpleNamespace(id=4)
+        ]
+        provider.azure_devops_client.get_pull_request_iteration_changes.return_value = (
+            SimpleNamespace(
+                change_entries=[
+                    SimpleNamespace(additional_properties={
+                        "item": {"path": "/docs/new.md"},
+                        "changeType": "edit, rename",
+                        "originalPath": "/services/auth/old.py",
+                    }),
+                    SimpleNamespace(additional_properties={
+                        "item": {"path": "/docs/deleted.md"},
+                        "changeType": "delete",
+                    }),
+                ],
+                next_skip=0,
+            )
+        )
+
+        files = provider.get_files_for_routing()
+
+        assert [(file.filename, file.old_filename, file.edit_type) for file in files] == [
+            ("/docs/new.md", "/services/auth/old.py", EDIT_TYPE.RENAMED),
+            ("/docs/deleted.md", None, EDIT_TYPE.DELETED),
+        ]
+        assert provider.normalize_file_path_for_routing(files[0].filename) == "docs/new.md"
+        provider.azure_devops_client.get_pull_request_commits.assert_not_called()
+        provider.azure_devops_client.get_pull_request_iteration_changes.assert_called_once_with(
+            repository_id="my-repo",
+            pull_request_id=1,
+            iteration_id=4,
+            project="my-project",
+            top=2000,
+            skip=0,
+            compare_to=0,
+        )
+
+    def test_routing_normalization_only_strips_one_documented_provider_root(self):
+        provider = self._provider()
+
+        assert provider.normalize_file_path_for_routing("/docs/guide.md") == "docs/guide.md"
+        assert provider.normalize_file_path_for_routing("docs/guide.md") == "docs/guide.md"
+        assert provider.normalize_file_path_for_routing("//outside") == "/outside"
+
+    def test_routing_inventory_retains_malformed_blob_but_ignores_tree(self):
+        provider = self._provider()
+        provider.incremental = None
+        provider.unreviewed_files_map = {}
+        provider._latest_pr_iteration_changes = (
+            SimpleNamespace(additional_properties={
+                "item": {"path": "/docs/guide.md", "gitObjectType": "blob"},
+                "changeType": "edit",
+            }),
+            SimpleNamespace(additional_properties={
+                "item": {"gitObjectType": "blob"},
+                "changeType": "edit",
+            }),
+            SimpleNamespace(additional_properties={
+                "item": {"path": "/docs", "gitObjectType": "tree"},
+                "changeType": "edit",
+            }),
+        )
+
+        files = provider.get_files_for_routing()
+
+        assert [(file.filename, file.edit_type) for file in files] == [
+            ("/docs/guide.md", EDIT_TYPE.MODIFIED),
+            ("", EDIT_TYPE.UNKNOWN),
+        ]
+
+    def test_detailed_net_rename_keeps_original_path_for_routing_reconciliation(self):
+        provider = self._provider()
+        provider.diff_files = None
+        provider._diff_path_map = None
+        provider.incremental = None
+        provider.unreviewed_files_map = {}
+        provider.pr = SimpleNamespace(
+            last_merge_commit=SimpleNamespace(commit_id="head"),
+            last_merge_target_commit=SimpleNamespace(commit_id="base"),
+        )
+        provider._latest_pr_iteration_changes = (
+            SimpleNamespace(additional_properties={
+                "item": {"path": "/docs/new.md"},
+                "changeType": "rename",
+                "originalPath": "/services/auth/old.py",
+            }),
+        )
+        provider.azure_devops_client.get_item.return_value = SimpleNamespace(content="new")
+
+        with patch(
+            "pr_agent.git_providers.azuredevops_provider.filter_ignored",
+            side_effect=lambda files, _kind: files,
+        ), patch(
+            "pr_agent.git_providers.azuredevops_provider.is_valid_file",
+            return_value=True,
+        ), patch(
+            "pr_agent.git_providers.azuredevops_provider.load_large_diff",
+            return_value="@@ -0,0 +1 @@\n+new\n",
+        ):
+            diff_file = provider.get_diff_files()[0]
+
+        assert diff_file.edit_type is EDIT_TYPE.RENAMED
+        assert diff_file.filename == "/docs/new.md"
+        assert diff_file.old_filename == "/services/auth/old.py"
 
 
 def _provider_with_diff(*filenames):
