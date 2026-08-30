@@ -170,6 +170,12 @@ Hosted and specialist stages should converge on the same envelope so results can
 }
 ```
 
+Every stage treats only line feed (`LF`) as the end of a Git patch record. Unicode
+separator characters and additional carriage returns remain source content; they cannot
+create another file, hunk, or line anchor. Hosted providers, supplied diffs, dynamic
+context, and local snapshots share this boundary so a finding keeps the same location as
+it moves through the cascade.
+
 The context builder works from explicit specialist requests. Its default bundle is:
 
 1. changed hunk and enclosing function, class, or configuration block;

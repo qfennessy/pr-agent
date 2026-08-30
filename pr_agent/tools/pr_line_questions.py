@@ -9,7 +9,10 @@ from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.git_patch_processing import (
     decouple_and_convert_to_hunks_with_lines_numbers,
-    extract_hunk_lines_from_patch)
+    extract_hunk_lines_from_patch,
+    iter_git_patch_lines,
+    strip_git_line_ending,
+)
 from pr_agent.algo.pr_processing import (OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
                                          get_pr_diff,
                                          retry_with_fallback_models)
@@ -104,7 +107,10 @@ class PR_LineQuestions:
         # title. Gating on selected_lines instead would also silence the case where GitHub
         # truncates diff_hunk from the front but keeps the original header, which leaves the
         # requested line outside the shortened body with the hunk itself still present.
-        hunk_found = any(line.startswith('@@') for line in self.patch_with_lines.splitlines())
+        hunk_found = any(
+            strip_git_line_ending(line).startswith('@@')
+            for line in iter_git_patch_lines(self.patch_with_lines)
+        )
         if hunk_found:
             model_answer = await retry_with_fallback_models(self._get_prediction, model_type=ModelType.WEAK)
 

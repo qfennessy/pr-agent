@@ -9,6 +9,7 @@ from urllib.parse import quote, unquote, urlparse
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 from ..algo.file_filter import filter_ignored
+from ..algo.git_patch_processing import iter_git_patch_lines, split_git_file_lines
 from ..algo.language_handler import is_valid_file
 from ..algo.utils import (PRDescriptionHeader, comment_matches_pr_review_identity,
                           find_line_number_of_relevant_line_in_file, get_pr_review_comment_identifiers,
@@ -138,7 +139,7 @@ class AzureDevopsProvider(GitProvider):
         for file in self.diff_files or []:
             if file.filename != relevant_file or not isinstance(file.head_file, str):
                 continue
-            lines = file.head_file.splitlines()
+            lines = split_git_file_lines(file.head_file)
             if relevant_lines_end > len(lines):
                 return None
             line = lines[relevant_lines_end - 1]
@@ -728,12 +729,12 @@ class AzureDevopsProvider(GitProvider):
 
                 patch = load_large_diff(
                     file, new_file_content_str, original_file_content_str, show_warning=False
-                ).rstrip()
+                )
                 if incremental_active:
                     self.unreviewed_files_map[file] = patch
 
                 # count number of lines added and removed
-                patch_lines = patch.splitlines(keepends=True)
+                patch_lines = list(iter_git_patch_lines(patch))
                 num_plus_lines = len([line for line in patch_lines if line.startswith('+')])
                 num_minus_lines = len([line for line in patch_lines if line.startswith('-')])
 

@@ -10,6 +10,7 @@ are read from MOSAICO.INPUT on the (context) settings.
 import re
 from typing import List, Optional
 
+from pr_agent.algo.git_patch_processing import iter_git_patch_lines, strip_git_line_ending
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.git_provider import GitProvider
@@ -23,7 +24,7 @@ class _PullRequestMimic:
         self.diff_files = diff_files
 
 
-_DIFF_GIT_RE = re.compile(r'^diff --git a/(?P<a>.+?) b/(?P<b>.+?)\s*$')
+_DIFF_GIT_RE = re.compile(r'^diff --git a/(?P<a>.+?) b/(?P<b>.+)$')
 
 
 def parse_unified_diff(diff_text: str) -> List[FilePatchInfo]:
@@ -37,9 +38,12 @@ def parse_unified_diff(diff_text: str) -> List[FilePatchInfo]:
     if not diff_text or not isinstance(diff_text, str):
         return []
 
-    lines = diff_text.splitlines(keepends=True)
+    lines = list(iter_git_patch_lines(diff_text))
     # Find the start index of each "diff --git" section.
-    starts = [i for i, ln in enumerate(lines) if _DIFF_GIT_RE.match(ln.rstrip("\n"))]
+    starts = [
+        i for i, line in enumerate(lines)
+        if _DIFF_GIT_RE.match(strip_git_line_ending(line))
+    ]
     if not starts:
         return []
     starts.append(len(lines))
@@ -47,7 +51,7 @@ def parse_unified_diff(diff_text: str) -> List[FilePatchInfo]:
     files: List[FilePatchInfo] = []
     for idx in range(len(starts) - 1):
         section = lines[starts[idx]:starts[idx + 1]]
-        header = section[0].rstrip("\n")
+        header = strip_git_line_ending(section[0])
         m = _DIFF_GIT_RE.match(header)
         a_path = m.group("a") if m else ""
         b_path = m.group("b") if m else ""
@@ -57,7 +61,7 @@ def parse_unified_diff(diff_text: str) -> List[FilePatchInfo]:
         edit_type = EDIT_TYPE.MODIFIED
         old_filename = None
         for ln in section[1:]:
-            s = ln.rstrip("\n")
+            s = strip_git_line_ending(ln)
             if s.startswith("new file mode"):
                 edit_type = EDIT_TYPE.ADDED
             elif s.startswith("deleted file mode"):
