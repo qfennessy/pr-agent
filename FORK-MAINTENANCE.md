@@ -43,9 +43,11 @@ the new commits, a diffstat, and any high-scrutiny paths touched.
 
 - Fork CI holds no real provider secrets. E2E stays `workflow_dispatch` only;
   publishing runs only from a manual dispatch or a published release.
-- Unit tests, coverage, CodeQL, and upstream provenance gate PRs. The `main`
-  ruleset requires an up-to-date PR, resolved review conversations, and a merge
-  commit; direct and force pushes are blocked.
+- Unit tests and CodeQL validate non-documentation changes, focused MkDocs
+  validation covers documentation changes, and upstream provenance classifies
+  every PR. The active `main` ruleset currently has no required status checks;
+  it requires a PR, resolved review conversations, and a merge commit. Direct
+  and force pushes are blocked.
 - This single-maintainer fork currently requires zero approving reviews because
   GitHub does not let a PR author approve their own change. Increase the count
   when a second eligible reviewer is added; the `/review` gate above still

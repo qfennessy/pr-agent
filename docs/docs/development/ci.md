@@ -7,6 +7,10 @@ This page documents the configuration in the `qfennessy/pr-agent` fork. Reposito
 secret values are configured in GitHub rather than in the repository, so maintainers must verify those settings in
 GitHub when changing required checks or release permissions.
 
+As reviewed on August 30, 2026, the active `main` ruleset does not require named status checks. The event-level path
+filters below rely on that setting: if unit tests or CodeQL become required checks, replace the filters with fast
+no-op jobs or update the ruleset so documentation-only PRs do not wait forever for workflows that never started.
+
 ## Workflow inventory
 
 | Workflow | Trigger | Purpose | Credentials or write access |
