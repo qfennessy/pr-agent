@@ -69,6 +69,7 @@ class ReviewSnapshot:
     diff: str
     policy_version: str
     created_at: str
+    base_selector: Optional[str] = None
     focus_path: Optional[str] = None
     task_intent: Optional[str] = None
     deterministic_results: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
@@ -79,6 +80,7 @@ class ReviewSnapshot:
     snapshot_id: str = field(init=False)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "base_selector", self.base_selector or self.base_revision)
         object.__setattr__(self, "changed_paths", tuple(sorted(set(self.changed_paths))))
         object.__setattr__(self, "deterministic_results", tuple(self.deterministic_results))
         object.__setattr__(self, "coverage_issues", tuple(self.coverage_issues))
@@ -86,6 +88,7 @@ class ReviewSnapshot:
             "schema_version": self.schema_version,
             "repository": _repository_identity(self.repository_root),
             "event": self.event.value,
+            "base_selector": self.base_selector,
             "base_revision": self.base_revision,
             "changed_paths": self.changed_paths,
             "focus_path": self.focus_path,

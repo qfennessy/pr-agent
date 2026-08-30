@@ -309,6 +309,7 @@ class LocalPairReview:
         *,
         event: ReviewEvent | str,
         base: str = "HEAD",
+        base_selector: Optional[str] = None,
         focus_path: Optional[str] = None,
         task_intent: Optional[str] = None,
         deterministic_results: Iterable[Mapping[str, Any]] = (),
@@ -438,6 +439,7 @@ class LocalPairReview:
         return ReviewSnapshot(
             event=event,
             repository_root=str(self.repository_root),
+            base_selector=base_selector or base,
             base_revision=base_revision,
             changed_paths=changed_paths,
             focus_path=normalized_focus,
@@ -454,7 +456,8 @@ class LocalPairReview:
     def recapture(self, snapshot: ReviewSnapshot) -> ReviewSnapshot:
         return self.capture(
             event=snapshot.event,
-            base=snapshot.base_revision,
+            base=snapshot.base_selector or snapshot.base_revision,
+            base_selector=snapshot.base_selector,
             focus_path=snapshot.focus_path,
             task_intent=snapshot.task_intent,
             deterministic_results=snapshot.deterministic_results,

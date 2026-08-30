@@ -540,6 +540,23 @@ def test_superseded_snapshot_is_stale_and_suppresses_review(tmp_path):
     assert result.current_snapshot_id == current.snapshot_id
 
 
+def test_recapture_re_resolves_a_moving_base_selector(tmp_path):
+    repo = _repo(tmp_path, "moving-head")
+    path = repo / "tracked.py"
+    path.write_text("value = 2\n", encoding="utf-8")
+    _git(repo, "add", "tracked.py")
+    reviewer = LocalPairReview(str(repo))
+    snapshot = reviewer.capture(event="pre-commit", base="HEAD")
+
+    _git(repo, "commit", "-m", "advance head")
+    current = reviewer.recapture(snapshot)
+
+    assert snapshot.base_selector == "HEAD"
+    assert current.base_selector == "HEAD"
+    assert current.base_revision != snapshot.base_revision
+    assert current.snapshot_id != snapshot.snapshot_id
+
+
 def test_result_states_distinguish_findings_clean_and_unavailable():
     snapshot = _snapshot("/repo/one")
     findings = build_snapshot_result(

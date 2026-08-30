@@ -586,6 +586,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         snapshot = reviewer.capture(
             event=event,
             base=base_revision,
+            base_selector=snapshot_args.base,
             focus_path=snapshot_args.focus_path,
             task_intent=snapshot_args.task_intent,
             deterministic_results=checks,
