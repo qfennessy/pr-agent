@@ -305,6 +305,8 @@ class GiteaProvider(GitProvider):
         return self.last_commit.html_url if self.last_commit else ""
 
     def get_comment_url(self, comment) -> str:
+        if isinstance(comment, dict):
+            return str(comment.get("html_url") or "")
         return comment.html_url
 
     def publish_persistent_comment(self, pr_comment: str,
@@ -314,13 +316,14 @@ class GiteaProvider(GitProvider):
                                    final_update_message=True,
                                    identity_marker: str | None = None,
                                    legacy_initial_header: str | None = None):
-        # Keep the legacy updater path until Gitea normalizes its dictionary-shaped comment payloads.
         self.publish_persistent_comment_full(
             pr_comment,
             initial_header,
             update_header,
             name,
             final_update_message,
+            identity_marker=identity_marker,
+            legacy_initial_header=legacy_initial_header,
         )
 
     def publish_comment(self, comment: str,is_temporary: bool = False) -> None:

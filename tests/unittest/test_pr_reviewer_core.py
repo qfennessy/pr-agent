@@ -238,6 +238,7 @@ def _bugs_only_issue(**overrides):
         "impact": "The second tenant receives the first tenant's data.",
         "root_cause": "The cache key omits the tenant identifier.",
         "duplicates_ci_failure": False,
+        "matching_ci_failure": "",
     }
     issue.update(overrides)
     return issue
@@ -279,15 +280,51 @@ def test_bugs_only_keeps_a_complete_defect_and_exposes_only_the_public_finding_s
 
 @pytest.mark.parametrize("issue", [
     _bugs_only_issue(finding_type="style"),
-    _bugs_only_issue(duplicates_ci_failure=True),
     _bugs_only_issue(start_line=1, end_line=1),
     _bugs_only_issue(trigger=""),
     _bugs_only_issue(impact=""),
 ])
-def test_bugs_only_discards_non_defects_ci_duplicates_and_unverifiable_findings(issue):
+def test_bugs_only_discards_non_defects_and_unverifiable_findings(issue):
     reviewer, data = _bugs_only_reviewer(issue)
 
     assert reviewer._normalize_bugs_only_review(data) == {"review": {"key_issues_to_review": []}}
+
+
+def test_bugs_only_discards_ci_duplicate_only_when_failed_check_evidences_same_defect():
+    issue = _bugs_only_issue(duplicates_ci_failure=True, matching_ci_failure="Unit tests")
+    reviewer, data = _bugs_only_reviewer(issue)
+    reviewer.ci_failure_evidence_by_name = {
+        "unit tests": ["test_cache_key: cache key omits tenant identifier"],
+    }
+
+    assert reviewer._normalize_bugs_only_review(data) == {"review": {"key_issues_to_review": []}}
+
+
+@pytest.mark.parametrize("evidence", [
+    "Tests failed",
+    "test_user_login failed because the session cookie is missing",
+])
+def test_bugs_only_keeps_claimed_ci_duplicate_without_same_defect_evidence(evidence):
+    issue = _bugs_only_issue(duplicates_ci_failure=True, matching_ci_failure="Unit tests")
+    reviewer, data = _bugs_only_reviewer(issue)
+    reviewer.ci_failure_evidence_by_name = {"unit tests": [evidence]}
+
+    result = reviewer._normalize_bugs_only_review(data)
+
+    assert len(result["review"]["key_issues_to_review"]) == 1
+
+
+@pytest.mark.parametrize("matching_ci_failure", ["", "Different check"])
+def test_bugs_only_keeps_claimed_ci_duplicate_without_matching_evidence(matching_ci_failure):
+    issue = _bugs_only_issue(duplicates_ci_failure=True, matching_ci_failure=matching_ci_failure)
+    reviewer, data = _bugs_only_reviewer(issue)
+    reviewer.ci_failure_evidence_by_name = {
+        "unit tests": ["test_cache_key: cache key omits tenant identifier"],
+    }
+
+    result = reviewer._normalize_bugs_only_review(data)
+
+    assert len(result["review"]["key_issues_to_review"]) == 1
 
 
 def test_bugs_only_collapses_multiple_symptoms_with_the_same_root_cause():
@@ -679,6 +716,51 @@ async def test_run_removes_its_progress_comment_when_quiet_output_suppresses_rev
     git_provider.publish_comment.assert_called_once_with("Preparing review...", is_temporary=True)
     git_provider.remove_comment.assert_called_once_with(progress_comment)
     git_provider.remove_initial_comment.assert_not_called()
+    git_provider.publish_persistent_comment.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_clean_bugs_only_rerun_clears_only_bugs_only_persistent_review(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    progress_comment = MagicMock()
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["app.py"]
+    git_provider.publish_comment.return_value = progress_comment
+    reviewer = _make_reviewer(git_provider)
+    reviewer.review_profile = "bugs_only"
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.vars = {}
+    reviewer.prediction = None
+    reviewer._prepare_pr_review = lambda: ""
+
+    async def fake_retry(prepare_fn, model_type=None):
+        reviewer.prediction = "prediction"
+
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+
+    settings = get_settings()
+    original = {
+        "publish_output": settings.config.publish_output,
+        "persistent_comment": settings.pr_reviewer.persistent_comment,
+        "is_auto_command": settings.config.get("is_auto_command", False),
+    }
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.pr_reviewer.persistent_comment = True
+
+        await reviewer.run()
+    finally:
+        settings.config.publish_output = original["publish_output"]
+        settings.config.is_auto_command = original["is_auto_command"]
+        settings.pr_reviewer.persistent_comment = original["persistent_comment"]
+
+    git_provider.clear_persistent_review.assert_called_once_with(
+        identity_marker=PRReviewIdentity.BUGS_ONLY.value,
+        name="bugs-only review",
+    )
+    git_provider.remove_comment.assert_called_once_with(progress_comment)
     git_provider.publish_persistent_comment.assert_not_called()
 
 
@@ -1091,7 +1173,16 @@ def test_get_user_answers_collects_question_and_answer_from_issue_comments():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("persistent", [True, False])
 @pytest.mark.parametrize("thread_enabled", [True, False])
-async def test_run_threads_only_the_final_review_comment(monkeypatch, persistent, thread_enabled):
+@pytest.mark.parametrize(
+    ("review_profile", "expected_identity", "expected_name", "expected_legacy_header"),
+    [
+        ("full", PRReviewIdentity.REGULAR.value, "review", f"{PRReviewHeader.REGULAR.value} 🔍"),
+        ("bugs_only", PRReviewIdentity.BUGS_ONLY.value, "bugs-only review", None),
+    ],
+)
+async def test_run_threads_only_the_final_review_comment(
+        monkeypatch, persistent, thread_enabled, review_profile, expected_identity, expected_name,
+        expected_legacy_header):
     """`as_thread` is forwarded to the review's final publish call only when the provider opts in
     (should_publish_review_as_thread), and is omitted entirely otherwise - other providers'
     publish methods don't accept it. Status/progress comments are never threaded.
@@ -1104,6 +1195,7 @@ async def test_run_threads_only_the_final_review_comment(monkeypatch, persistent
     git_provider.supports_review_comment_identity.return_value = False
     git_provider.publish_comment.return_value = progress_comment
     reviewer = _make_reviewer(git_provider)
+    reviewer.review_profile = review_profile
     reviewer.incremental = SimpleNamespace(is_incremental=False)
     reviewer.vars = {}
     reviewer.prediction = None
@@ -1139,8 +1231,9 @@ async def test_run_threads_only_the_final_review_comment(monkeypatch, persistent
     if persistent:
         publish = git_provider.publish_persistent_comment
         publish.assert_called_once()
-        assert publish.call_args.kwargs["identity_marker"] == PRReviewIdentity.REGULAR.value
-        assert publish.call_args.kwargs["legacy_initial_header"] == f"{PRReviewHeader.REGULAR.value} 🔍"
+        assert publish.call_args.kwargs["name"] == expected_name
+        assert publish.call_args.kwargs["identity_marker"] == expected_identity
+        assert publish.call_args.kwargs["legacy_initial_header"] == expected_legacy_header
     else:
         publish = git_provider.publish_comment
     assert publish.call_args.args[0] == review_text
@@ -1156,15 +1249,17 @@ async def test_run_threads_only_the_final_review_comment(monkeypatch, persistent
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("is_incremental", "expected_identity"),
+    ("is_incremental", "review_profile", "expected_identity"),
     [
-        (False, PRReviewIdentity.REGULAR.value),
-        (True, PRReviewIdentity.INCREMENTAL.value),
+        (False, "full", PRReviewIdentity.REGULAR.value),
+        (True, "full", PRReviewIdentity.FULL_INCREMENTAL.value),
+        (True, "bugs_only", PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value),
     ],
 )
 async def test_nonpersistent_review_adds_identity_for_incremental_capable_provider(
     monkeypatch,
     is_incremental,
+    review_profile,
     expected_identity,
 ):
     from pr_agent.tools import pr_reviewer as pr_reviewer_module
@@ -1175,6 +1270,7 @@ async def test_nonpersistent_review_adds_identity_for_incremental_capable_provid
     git_provider.supports_review_comment_identity.return_value = True
     git_provider.publish_comment.return_value = progress_comment
     reviewer = _make_reviewer(git_provider)
+    reviewer.review_profile = review_profile
     reviewer.incremental = SimpleNamespace(is_incremental=is_incremental)
     if is_incremental:
         reviewer._can_run_incremental_review = lambda: True

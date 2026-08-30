@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.github_provider import GithubProvider
 
 
@@ -239,3 +240,170 @@ def test_find_existing_check_run_returns_none_on_api_error():
     result = provider._find_existing_check_run("PR Agent - Review", "deadbeef")
 
     assert result is None
+
+
+def test_get_ci_failure_context_returns_only_bounded_failed_checks():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    requester.set_response(
+        "GET",
+        f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs",
+        (
+            {},
+            {
+                "check_runs": [
+                    {"name": "Passing", "conclusion": "success", "output": {}},
+                    {
+                        "name": "Unit tests",
+                        "conclusion": "failure",
+                        "output": {"title": "Tests failed", "summary": "first\nsecond"},
+                    },
+                ]
+            },
+        ),
+    )
+
+    assert provider.get_ci_failure_context() == {
+        "status": "available",
+        "failures": [{
+            "name": "Unit tests",
+            "conclusion": "failure",
+            "title": "Tests failed",
+            "summary": "first second",
+        }],
+    }
+
+
+def test_get_ci_failure_context_bounds_total_examined_check_runs():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    first_url = f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs"
+    second_url = f"{first_url}?page=2"
+    requester.set_response(
+        "GET",
+        first_url,
+        (
+            {"Link": f'<{second_url}>; rel="next"'},
+            {"check_runs": [{"name": f"Passing {index}", "conclusion": "success"} for index in range(100)]},
+        ),
+    )
+    requester.set_response("GET", second_url, ({}, {"check_runs": []}))
+
+    assert provider.get_ci_failure_context() == {"status": "available", "failures": []}
+    assert [call[1] for call in requester.calls] == [first_url]
+
+
+def test_get_ci_failure_context_is_explicitly_unavailable_on_api_error():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    requester.set_exception(
+        "GET",
+        f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs",
+        RuntimeError("API error"),
+    )
+
+    assert provider.get_ci_failure_context() == {"status": "unavailable", "failures": []}
+
+
+def test_clear_persistent_bugs_only_review_updates_its_existing_check_run():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    requester.set_response(
+        "GET",
+        f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs",
+        ({}, {"check_runs": [{"id": 42, "name": "PR Agent - Bugs-only review"}]}),
+    )
+    requester.set_response(
+        "PATCH",
+        f"{provider.base_url}/repos/{provider.repo}/check-runs/42",
+        ({}, {}),
+    )
+    original = get_settings().github.publish_as_check_run
+    try:
+        get_settings().github.publish_as_check_run = True
+
+        result = provider.clear_persistent_review("<!-- pr-agent:review:bugs-only -->", "bugs-only review")
+    finally:
+        get_settings().github.publish_as_check_run = original
+
+    assert result is True
+    patch_call = next(call for call in requester.calls if call[0] == "PATCH")
+    assert patch_call[2]["input"]["output"]["text"] == (
+        "No qualifying defects found in the latest bugs-only review."
+    )
+
+
+def test_clear_persistent_bugs_only_review_does_not_replace_full_review_check():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    requester.set_response(
+        "GET",
+        f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs",
+        ({}, {"check_runs": [{"id": 42, "name": "PR Agent - Review"}]}),
+    )
+    original = get_settings().github.publish_as_check_run
+    try:
+        get_settings().github.publish_as_check_run = True
+
+        result = provider.clear_persistent_review("<!-- pr-agent:review:bugs-only -->", "bugs-only review")
+    finally:
+        get_settings().github.publish_as_check_run = original
+
+    assert result is False
+    assert all(call[0] == "GET" for call in requester.calls)
+
+
+def test_clear_persistent_bugs_only_review_falls_back_to_matching_comment():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    requester.set_response(
+        "GET",
+        f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs",
+        ({}, {"check_runs": []}),
+    )
+    comment = SimpleNamespace(
+        body="## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\ndefect"
+    )
+    provider.pr.get_issue_comments = lambda: [comment]
+    provider.remove_comment = lambda value: setattr(provider, "removed_comment", value)
+    original = get_settings().github.publish_as_check_run
+    try:
+        get_settings().github.publish_as_check_run = True
+
+        result = provider.clear_persistent_review("<!-- pr-agent:review:bugs-only -->", "bugs-only review")
+    finally:
+        get_settings().github.publish_as_check_run = original
+
+    assert result is True
+    assert provider.removed_comment is comment
+
+
+def test_clear_persistent_bugs_only_review_updates_check_and_removes_fallback_comment():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    requester.set_response(
+        "GET",
+        f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs",
+        ({}, {"check_runs": [{"id": 42, "name": "PR Agent - Bugs-only review"}]}),
+    )
+    requester.set_response(
+        "PATCH",
+        f"{provider.base_url}/repos/{provider.repo}/check-runs/42",
+        ({}, {}),
+    )
+    comment = SimpleNamespace(
+        body="## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\ndefect"
+    )
+    provider.pr.get_issue_comments = lambda: [comment]
+    provider.remove_comment = lambda value: setattr(provider, "removed_comment", value)
+    original = get_settings().github.publish_as_check_run
+    try:
+        get_settings().github.publish_as_check_run = True
+
+        result = provider.clear_persistent_review("<!-- pr-agent:review:bugs-only -->", "bugs-only review")
+    finally:
+        get_settings().github.publish_as_check_run = original
+
+    assert result is True
+    assert provider.removed_comment is comment
+    assert any(call[0] == "PATCH" for call in requester.calls)

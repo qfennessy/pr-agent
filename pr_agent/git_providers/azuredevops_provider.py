@@ -10,9 +10,9 @@ from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 from ..algo.file_filter import filter_ignored
 from ..algo.language_handler import is_valid_file
-from ..algo.utils import (PRDescriptionHeader, comment_matches_any_identity,
-                          find_line_number_of_relevant_line_in_file,
-                          get_pr_review_comment_identifiers, load_large_diff)
+from ..algo.utils import (PRDescriptionHeader, comment_matches_pr_review_identity,
+                          find_line_number_of_relevant_line_in_file, get_pr_review_comment_identifiers,
+                          load_large_diff)
 from ..config_loader import get_settings
 from ..log import get_logger
 from .git_provider import GitProvider, IncrementalPR
@@ -364,7 +364,11 @@ class AzureDevopsProvider(GitProvider):
             raw.reverse()
             self.pr_commits = [_AzureCommitAdapter(c) for c in raw]
 
-        self.previous_review = self.get_previous_review(full=True, incremental=True)
+        self.previous_review = self.get_previous_review(
+            full=True,
+            incremental=True,
+            review_profile=self.incremental.review_profile,
+        )
         if not self.previous_review:
             get_logger().info("No previous review found, will review the entire PR")
             self.incremental.is_incremental = False
@@ -461,14 +465,18 @@ class AzureDevopsProvider(GitProvider):
             self.incremental.first_new_commit = commits_range[0]
         return commits_range
 
-    def get_previous_review(self, *, full: bool, incremental: bool):
+    def get_previous_review(self, *, full: bool, incremental: bool, review_profile: str = "full"):
         if not (full or incremental):
             raise ValueError("At least one of full or incremental must be True")
-        identifiers = get_pr_review_comment_identifiers(full=full, incremental=incremental)
+        identifiers = get_pr_review_comment_identifiers(
+            full=full,
+            incremental=incremental,
+            review_profile=review_profile,
+        )
         matches = []
         for comment in self.get_issue_comments():
             body = getattr(comment, "body", None)
-            if body and comment_matches_any_identity(body, identifiers):
+            if body and comment_matches_pr_review_identity(body, identifiers, review_profile):
                 matches.append(comment)
         if not matches:
             return None
