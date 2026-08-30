@@ -977,7 +977,12 @@ def test_deleted_files_have_distinct_unsupported_coverage():
 
 @pytest.mark.parametrize(
     ("relevant_file", "start_line", "end_line"),
-    [("other.py", 1, 1), ("x", 2, 2), ("x", 1, 2)],
+    [
+        ("other.py", 1, 1),
+        ("x", 2, 2),
+        ("x", 1, 2),
+        ("x", 1, 10**30),
+    ],
 )
 def test_findings_must_match_captured_files_and_hunk_lines(
     relevant_file, start_line, end_line

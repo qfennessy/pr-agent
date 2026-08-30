@@ -857,7 +857,12 @@ def _findings_match_snapshot(
         except ValueError:
             return False
         allowed_lines = reviewable_lines.get(filename, set())
-        if not allowed_lines or not set(range(start_line, end_line + 1)).issubset(allowed_lines):
+        if (
+            not allowed_lines
+            or start_line < min(allowed_lines)
+            or end_line > max(allowed_lines)
+            or any(line not in allowed_lines for line in range(start_line, end_line + 1))
+        ):
             return False
     return True
 
