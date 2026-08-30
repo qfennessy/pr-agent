@@ -23,9 +23,9 @@ from ..algo.inline_comment_dedup import (body_fingerprint, body_with_markers,
                                          get_inline_comment_store, has_marker)
 from ..algo.language_handler import is_valid_file
 from ..algo.types import EDIT_TYPE
-from ..algo.utils import (Range, clip_tokens, find_line_number_of_relevant_line_in_file,
-                          get_pr_review_comment_identifiers, load_large_diff,
-                          set_file_languages)
+from ..algo.utils import (Range, clip_tokens, comment_matches_pr_review_identity,
+                          find_line_number_of_relevant_line_in_file, get_pr_review_comment_identifiers,
+                          load_large_diff, set_file_languages)
 from ..config_loader import get_settings
 from ..log import get_logger
 from ..servers.utils import RateLimitExceeded
@@ -43,6 +43,14 @@ def _next_page_url(headers: dict) -> str:
         if match:
             return match.group(1)
     return ""
+
+
+def _bounded_ci_text(value, limit: int = 1000) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+MAX_CI_FAILURES = 20
+MAX_CI_CHECK_RUNS = 100
 
 
 class GithubProvider(GitProvider):
@@ -172,7 +180,11 @@ class GithubProvider(GitProvider):
         if not self.pr_commits:
             self.pr_commits = list(self.pr.get_commits())
 
-        self.previous_review = self.get_previous_review(full=True, incremental=True)
+        self.previous_review = self.get_previous_review(
+            full=True,
+            incremental=True,
+            review_profile=self.incremental.review_profile,
+        )
         if self.previous_review:
             self.incremental.commits_range = self.get_commit_range()
             # Get all files changed during the commit range
@@ -198,14 +210,21 @@ class GithubProvider(GitProvider):
                 break
         return self.pr_commits[first_new_commit_index:] if first_new_commit_index is not None else []
 
-    def get_previous_review(self, *, full: bool, incremental: bool):
+    def get_previous_review(self, *, full: bool, incremental: bool, review_profile: str = "full"):
         if not (full or incremental):
             raise ValueError("At least one of full or incremental must be True")
         if not getattr(self, "comments", None):
             self.comments = list(self.pr.get_issue_comments())
-        identifiers = get_pr_review_comment_identifiers(full=full, incremental=incremental)
+        identifiers = get_pr_review_comment_identifiers(
+            full=full,
+            incremental=incremental,
+            review_profile=review_profile,
+        )
         for index in range(len(self.comments) - 1, -1, -1):
-            if is_own_persistent_comment_for_identities(self.comments[index].body, identifiers):
+            body = self.comments[index].body
+            if not comment_matches_pr_review_identity(body, identifiers, review_profile):
+                continue
+            if is_own_persistent_comment_for_identities(body, identifiers):
                 return self.comments[index]
         return None
 
@@ -385,6 +404,11 @@ class GithubProvider(GitProvider):
     def get_latest_commit_url(self) -> str:
         return self.last_commit_id.html_url
 
+    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
+        if refresh:
+            return self._get_repo().get_pull(self.pr_num).head.sha
+        return self.last_commit_id.sha if getattr(self, "last_commit_id", None) else None
+
     def get_comment_url(self, comment) -> str:
         return comment.html_url
 
@@ -411,52 +435,101 @@ class GithubProvider(GitProvider):
     def supports_review_comment_identity(self) -> bool:
         return True
 
+    def get_ci_failure_context(self) -> dict:
+        """Return bounded failed check-run details for the current PR head."""
+        if not getattr(self, "last_commit_id", None) or not getattr(self, "pr", None):
+            return {"status": "unavailable", "failures": []}
+        failure_conclusions = {"action_required", "cancelled", "failure", "startup_failure", "timed_out"}
+        failures = []
+        examined_runs = 0
+        try:
+            url = f"{self.base_url}/repos/{self.repo}/commits/{self.last_commit_id.sha}/check-runs"
+            while url and len(failures) < MAX_CI_FAILURES and examined_runs < MAX_CI_CHECK_RUNS:
+                headers, data = self.pr._requester.requestJsonAndCheck("GET", url)
+                for run in data.get("check_runs", []):
+                    examined_runs += 1
+                    conclusion = str(run.get("conclusion") or "").strip().lower()
+                    if conclusion in failure_conclusions:
+                        output = run.get("output") or {}
+                        failures.append({
+                            "name": _bounded_ci_text(run.get("name"), 200),
+                            "conclusion": conclusion,
+                            "title": _bounded_ci_text(output.get("title")),
+                            "summary": _bounded_ci_text(output.get("summary")),
+                        })
+                    if len(failures) >= MAX_CI_FAILURES or examined_runs >= MAX_CI_CHECK_RUNS:
+                        break
+                url = _next_page_url(headers)
+        except Exception:
+            get_logger().warning("Failed to load CI failure context")
+            return {"status": "unavailable", "failures": []}
+        return {"status": "available", "failures": failures}
+
+    def clear_persistent_review(self, identity_marker: str, name: str = "review") -> bool:
+        """Clear the matching comment, or update an existing GitHub check to a clean result."""
+        if not get_settings().github.publish_as_check_run:
+            return super().clear_persistent_review(identity_marker, name)
+        if not getattr(self, "last_commit_id", None):
+            return False
+        check_run_name = f"PR Agent - {name.capitalize()}"
+        existing_id = self._check_run_ids.get(name) or self._find_existing_check_run(
+            check_run_name, self.last_commit_id.sha
+        )
+        if not existing_id:
+            return super().clear_persistent_review(identity_marker, name)
+        if self._update_check_run(
+            existing_id,
+            "No qualifying defects found in the latest bugs-only review.",
+            name,
+        ):
+            super().clear_persistent_review(identity_marker, name)
+            return True
+        return super().clear_persistent_review(identity_marker, name)
+
+    def _check_run_output(self, text: str, name: str) -> tuple[str, dict]:
+        check_run_name = f"PR Agent - {name.capitalize()}"
+        summary = text.split("\n\n")[0] if "\n\n" in text else text[:200]
+        summary = summary.strip(" #")
+        text = text[:65535]
+        return check_run_name, {
+            "title": check_run_name,
+            "summary": summary[:300],
+            "text": text,
+        }
+
+    def _update_check_run(self, check_run_id: int, text: str, name: str) -> bool:
+        check_run_name, output = self._check_run_output(text, name)
+        try:
+            self.pr._requester.requestJsonAndCheck(
+                "PATCH",
+                f"{self.base_url}/repos/{self.repo}/check-runs/{check_run_id}",
+                input={"status": "completed", "conclusion": "neutral", "output": output},
+            )
+            self._check_run_ids[name] = check_run_id
+            return True
+        except Exception:
+            get_logger().warning(f"Failed to update check run {check_run_id}")
+            return False
+
     def _publish_check_run(self, text: str, name: str) -> bool:
         if not getattr(self, 'last_commit_id', None):
             get_logger().error("Cannot publish check run without a commit SHA")
             return False
-        conclusion = "neutral"
-        check_run_name = f"PR Agent - {name.capitalize()}"
-        summary = text.split("\n\n")[0] if "\n\n" in text else text[:200]
-        summary = summary.strip(" #")
-        # GitHub Checks API limits: text 65535 chars, summary 65535 chars
-        max_text = 65535
-        if len(text) > max_text:
-            text = text[:max_text]
+        check_run_name, output = self._check_run_output(text, name)
         create_body = {
             "name": check_run_name,
             "head_sha": self.last_commit_id.sha,
             "status": "completed",
-            "conclusion": conclusion,
-            "output": {
-                "title": check_run_name,
-                "summary": summary[:300],
-                "text": text,
-            },
-        }
-        update_body = {
-            "status": "completed",
-            "conclusion": conclusion,
-            "output": {
-                "title": check_run_name,
-                "summary": summary[:300],
-                "text": text,
-            },
+            "conclusion": "neutral",
+            "output": output,
         }
         existing_id = self._check_run_ids.get(name)
         if not existing_id:
             existing_id = self._find_existing_check_run(check_run_name, self.last_commit_id.sha)
         if existing_id:
-            try:
-                self.pr._requester.requestJsonAndCheck(
-                    "PATCH",
-                    f"{self.base_url}/repos/{self.repo}/check-runs/{existing_id}",
-                    input=update_body,
-                )
-                self._check_run_ids[name] = existing_id
+            if self._update_check_run(existing_id, text, name):
                 return True
-            except Exception:
-                get_logger().warning(f"Failed to update check run {existing_id}, creating new one")
+            get_logger().warning(f"Creating a new check run after update failed for {existing_id}")
         try:
             headers, data = self.pr._requester.requestJsonAndCheck(
                 "POST",
