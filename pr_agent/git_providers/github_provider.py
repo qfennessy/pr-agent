@@ -49,6 +49,10 @@ def _bounded_ci_text(value, limit: int = 1000) -> str:
     return " ".join(str(value or "").split())[:limit]
 
 
+MAX_CI_FAILURES = 20
+MAX_CI_CHECK_RUNS = 100
+
+
 class GithubProvider(GitProvider):
     def __init__(self, pr_url: Optional[str] = None):
         self.repo_obj = None
@@ -421,22 +425,23 @@ class GithubProvider(GitProvider):
             return {"status": "unavailable", "failures": []}
         failure_conclusions = {"action_required", "cancelled", "failure", "startup_failure", "timed_out"}
         failures = []
+        examined_runs = 0
         try:
             url = f"{self.base_url}/repos/{self.repo}/commits/{self.last_commit_id.sha}/check-runs"
-            while url and len(failures) < 20:
+            while url and len(failures) < MAX_CI_FAILURES and examined_runs < MAX_CI_CHECK_RUNS:
                 headers, data = self.pr._requester.requestJsonAndCheck("GET", url)
                 for run in data.get("check_runs", []):
+                    examined_runs += 1
                     conclusion = str(run.get("conclusion") or "").strip().lower()
-                    if conclusion not in failure_conclusions:
-                        continue
-                    output = run.get("output") or {}
-                    failures.append({
-                        "name": _bounded_ci_text(run.get("name"), 200),
-                        "conclusion": conclusion,
-                        "title": _bounded_ci_text(output.get("title")),
-                        "summary": _bounded_ci_text(output.get("summary")),
-                    })
-                    if len(failures) >= 20:
+                    if conclusion in failure_conclusions:
+                        output = run.get("output") or {}
+                        failures.append({
+                            "name": _bounded_ci_text(run.get("name"), 200),
+                            "conclusion": conclusion,
+                            "title": _bounded_ci_text(output.get("title")),
+                            "summary": _bounded_ci_text(output.get("summary")),
+                        })
+                    if len(failures) >= MAX_CI_FAILURES or examined_runs >= MAX_CI_CHECK_RUNS:
                         break
                 url = _next_page_url(headers)
         except Exception:

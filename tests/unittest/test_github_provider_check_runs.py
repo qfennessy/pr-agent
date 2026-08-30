@@ -274,6 +274,25 @@ def test_get_ci_failure_context_returns_only_bounded_failed_checks():
     }
 
 
+def test_get_ci_failure_context_bounds_total_examined_check_runs():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    first_url = f"{provider.base_url}/repos/{provider.repo}/commits/deadbeef/check-runs"
+    second_url = f"{first_url}?page=2"
+    requester.set_response(
+        "GET",
+        first_url,
+        (
+            {"Link": f'<{second_url}>; rel="next"'},
+            {"check_runs": [{"name": f"Passing {index}", "conclusion": "success"} for index in range(100)]},
+        ),
+    )
+    requester.set_response("GET", second_url, ({}, {"check_runs": []}))
+
+    assert provider.get_ci_failure_context() == {"status": "available", "failures": []}
+    assert [call[1] for call in requester.calls] == [first_url]
+
+
 def test_get_ci_failure_context_is_explicitly_unavailable_on_api_error():
     requester = _FakeRequester()
     provider = _make_provider(requester=requester)
