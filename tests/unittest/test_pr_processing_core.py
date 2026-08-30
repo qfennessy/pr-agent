@@ -47,7 +47,7 @@ def test_get_pr_diff_reports_pruned_deletions_separately(monkeypatch):
     )
     monkeypatch.setattr(pr_processing, "get_max_tokens", lambda model: 2_500)
 
-    diff, omitted, deleted = pr_processing.get_pr_diff(
+    output = pr_processing.get_pr_diff(
         provider,
         token_handler,
         "model",
@@ -55,9 +55,10 @@ def test_get_pr_diff_reports_pruned_deletions_separately(monkeypatch):
         return_deleted_files=True,
     )
 
-    assert "deleted.py" not in diff
-    assert omitted == ["remaining.py"]
-    assert deleted == ["deleted.py"]
+    assert isinstance(output, pr_processing.PRDiffCoverage)
+    assert "deleted.py" not in output.diff
+    assert output.remaining_files == ["remaining.py"]
+    assert output.deleted_files == ["deleted.py"]
 
 
 def test_get_pr_diff_does_not_label_deletions_as_token_budget_omissions(monkeypatch):

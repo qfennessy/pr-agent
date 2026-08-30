@@ -12,7 +12,8 @@ from pr_agent.algo.inline_comment_dedup import (
     InlineCommentStore, can_verify_inline_comment_publication,
     get_inline_comment_store, key_issue_body_with_markers,
     key_issue_fingerprint, key_issue_location_fingerprint)
-from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
+from pr_agent.algo.pr_processing import (PRDiffCoverage,
+                                         add_ai_metadata_to_diff_files,
                                          get_pr_diff,
                                          retry_with_fallback_models)
 from pr_agent.algo.repo_context import build_repo_context
@@ -274,8 +275,10 @@ class PRReviewer:
                              disable_extra_lines=False,
                              return_remaining_files=True,
                              return_deleted_files=True,)
-        if isinstance(output, tuple):
-            self.patches_diff, self.remaining_files_list, self.deleted_files_list = output
+        if isinstance(output, PRDiffCoverage):
+            self.patches_diff = output.diff
+            self.remaining_files_list = output.remaining_files
+            self.deleted_files_list = output.deleted_files
         else:
             self.patches_diff = output
             self.remaining_files_list = []

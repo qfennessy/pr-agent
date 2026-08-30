@@ -4,6 +4,7 @@ import os
 import re
 import time
 import traceback
+from dataclasses import dataclass
 from typing import Callable, List, Tuple
 
 from github import RateLimitExceededException
@@ -31,6 +32,13 @@ ADDED_FILES_ = "Additional added files (insufficient token budget to process):\n
 OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD = 1500
 OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD = 1000
 MAX_EXTRA_LINES = 10
+
+
+@dataclass(frozen=True)
+class PRDiffCoverage:
+    diff: str
+    remaining_files: list[str]
+    deleted_files: list[str]
 
 
 def cap_and_log_extra_lines(value, direction) -> int:
@@ -151,7 +159,7 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
     if not return_remaining_files:
         return final_diff
     if return_deleted_files:
-        return final_diff, remaining_files_list, deleted_files_list
+        return PRDiffCoverage(final_diff, remaining_files_list, deleted_files_list)
     return final_diff, remaining_files_list
 
 

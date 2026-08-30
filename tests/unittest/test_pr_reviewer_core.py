@@ -6,6 +6,7 @@ import pytest
 from pr_agent.algo.inline_comment_dedup import (body_with_markers,
                                                 get_inline_comment_store,
                                                 key_issue_fingerprint)
+from pr_agent.algo.pr_processing import PRDiffCoverage
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity
 from pr_agent.config_loader import get_settings
@@ -41,7 +42,7 @@ async def test_prepare_prediction_requests_remaining_files_and_preserves_tuple_r
 
     with patch(
         "pr_agent.tools.pr_reviewer.get_pr_diff",
-        return_value=("diff", ["src/one.py", "docs/two.md"], ["deleted.py"]),
+        return_value=PRDiffCoverage("diff", ["src/one.py", "docs/two.md"], ["deleted.py"]),
     ) as get_pr_diff:
         await reviewer._prepare_prediction("model")
 
@@ -82,7 +83,7 @@ async def test_prepare_prediction_keeps_incremental_review_compatible_with_tuple
 
     with patch(
         "pr_agent.tools.pr_reviewer.get_pr_diff",
-        return_value=("diff", ["skipped.py"], ["deleted.py"]),
+        return_value=PRDiffCoverage("diff", ["skipped.py"], ["deleted.py"]),
     ):
         await reviewer._prepare_prediction("model")
 
