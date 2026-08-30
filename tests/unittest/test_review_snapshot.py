@@ -621,6 +621,20 @@ def test_file_save_requires_a_safe_focused_path_and_captures_untracked_addition(
         reviewer.capture(event="file-save")
 
 
+def test_file_save_rejects_a_directory_focus_path(tmp_path):
+    repo = _repo(tmp_path)
+    directory = repo / "saved"
+    directory.mkdir()
+    (directory / "tracked.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "saved/tracked.py")
+    _git(repo, "commit", "-m", "add saved file")
+    (directory / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+    (directory / "untracked.py").write_text("value = 3\n", encoding="utf-8")
+
+    with pytest.raises(SnapshotCaptureError, match="must identify a file"):
+        LocalPairReview(str(repo)).capture(event="file-save", focus_path="saved")
+
+
 def test_binary_and_excluded_files_are_visible_partial_coverage(tmp_path):
     repo = _repo(tmp_path)
     (repo / "binary.dat").write_bytes(b"\0secret")
@@ -675,6 +689,34 @@ def test_snapshot_diff_read_is_bounded_by_remaining_budget(tmp_path):
 
     assert snapshot.diff == ""
     assert CoverageIssue(path="tracked.py", reason="snapshot_byte_budget") in snapshot.coverage_issues
+
+
+def test_tracked_diff_capture_batches_all_selected_paths(monkeypatch, tmp_path):
+    repo = _repo(tmp_path, "batched-diff")
+    for index in range(3):
+        (repo / f"file_{index}.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "add batch")
+    for index in range(3):
+        (repo / f"file_{index}.py").write_text("value = 2\n", encoding="utf-8")
+
+    reviewer = LocalPairReview(str(repo))
+    original_capture_diff = reviewer._capture_diff
+    captured_path_sets = []
+
+    def capture_diff(event, base_revision, paths, **kwargs):
+        captured_path_sets.append(tuple(paths))
+        return original_capture_diff(event, base_revision, paths, **kwargs)
+
+    monkeypatch.setattr(reviewer, "_capture_diff", capture_diff)
+
+    snapshot = reviewer.capture(event="worktree-idle")
+
+    assert set(snapshot.changed_paths) == {"file_0.py", "file_1.py", "file_2.py"}
+    assert captured_path_sets == [
+        ("file_0.py", "file_1.py", "file_2.py"),
+        ("file_0.py", "file_1.py", "file_2.py"),
+    ]
 
 
 def test_changed_path_discovery_is_bounded_and_reports_stage_coverage(tmp_path):

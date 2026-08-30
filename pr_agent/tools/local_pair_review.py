@@ -551,6 +551,12 @@ class LocalPairReview:
         if review_configuration_hash_factory is not None:
             review_configuration_hash = review_configuration_hash_factory(base_revision)
         normalized_focus = self._relative_path(focus_path) if focus_path else None
+        if (
+            event is ReviewEvent.FILE_SAVE
+            and normalized_focus
+            and (self.repository_root / normalized_focus).is_dir()
+        ):
+            raise SnapshotCaptureError("file-save --path must identify a file, not a directory")
         selected_tracked: list[str] = []
         selected_tracked_groups: list[tuple[str, ...]] = []
         selected_untracked: list[str] = []
@@ -667,25 +673,22 @@ class LocalPairReview:
             diff_parts = []
             omitted_paths: set[str] = set()
             remaining_bytes = self.max_snapshot_bytes
-            for selected_group in selected_tracked_groups:
-                if remaining_bytes <= 0:
-                    omitted_paths.update(selected_group)
-                    continue
-                part = self._capture_diff(
+            if selected_tracked:
+                part = None if remaining_bytes <= 0 else self._capture_diff(
                     event,
                     base_revision,
-                    selected_group,
+                    selected_tracked,
                     max_output_bytes=remaining_bytes,
                 )
                 if part is None:
-                    omitted_paths.update(selected_group)
-                    continue
-                part_size = len(part.encode("utf-8", errors="surrogateescape"))
-                if part_size > remaining_bytes:
-                    omitted_paths.update(selected_group)
-                    continue
-                diff_parts.append(part)
-                remaining_bytes -= part_size
+                    omitted_paths.update(selected_tracked)
+                else:
+                    part_size = len(part.encode("utf-8", errors="surrogateescape"))
+                    if part_size > remaining_bytes:
+                        omitted_paths.update(selected_tracked)
+                    else:
+                        diff_parts.append(part)
+                        remaining_bytes -= part_size
             for selected_path in selected_untracked:
                 if remaining_bytes <= 0:
                     omitted_paths.add(selected_path)
