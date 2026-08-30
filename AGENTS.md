@@ -19,7 +19,7 @@ PR-Agent automates AI-assisted reviews for pull requests across multiple git pro
 - `pr_agent/settings/` stores Dynaconf defaults (prompts, configuration templates, ignore lists) respected at runtime; `.pr_agent.toml` overrides repository-level behavior.
 - `tests/unittest/`, `tests/e2e_tests/`, and `tests/health_test/` contain pytest-based unit, end-to-end, and smoke checks.
 - `docs/` holds the MkDocs site (`docs/mkdocs.yml` plus content under `docs/docs/`); overrides live in `docs/overrides/`.
-- `.github/workflows/` defines CI pipelines for unit tests, coverage, docs deployment, pre-commit, and PR-agent self-review.
+- `.github/workflows/` defines CI pipelines for unit tests, CodeQL scanning, docs validation and deployment, pre-commit, and PR-agent self-review.
 - `docker/` and the root Dockerfiles provide build targets for services (`github_app`, `gitlab_webhook`, etc.) and the `test` stage used in CI.
 
 ## Build, Test, and Development Commands
@@ -53,7 +53,7 @@ PR-Agent automates AI-assisted reviews for pull requests across multiple git pro
 - Follow `CONTRIBUTING.md`: keep changes focused, add or update tests, and use Conventional Commit-style messages (e.g., `fix: handle missing repo settings gracefully`).
 - Target branch names follow `feature/<name>` or `fix/<issue>` patterns for substantial work.
 - Reference related issues and update README or docs when user-facing behavior shifts.
-- Ensure CI workflows (`build-and-test`, `code-coverage`, `docs-ci`) succeed locally or in draft PRs before requesting review; reproduce failures with the documented commands above.
+- Ensure applicable CI workflows (`build-and-test`, `codeql`, `docs-ci`) succeed locally or in draft PRs before requesting review; reproduce failures with the documented commands above.
 - Include screenshots or terminal captures when modifying user-visible output or documentation previews.
 
 ## Safety and Permissions
