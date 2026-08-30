@@ -55,6 +55,16 @@ _DEFAULT_SECRET_EXCLUSIONS = (
     "**/id_rsa",
     "id_ed25519",
     "**/id_ed25519",
+    "id_ed25519_sk",
+    "**/id_ed25519_sk",
+    "id_ecdsa",
+    "**/id_ecdsa",
+    "id_ecdsa_sk",
+    "**/id_ecdsa_sk",
+    "id_dsa",
+    "**/id_dsa",
+    "id_xmss",
+    "**/id_xmss",
 )
 
 
