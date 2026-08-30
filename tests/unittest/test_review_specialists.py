@@ -12,11 +12,13 @@ from pr_agent.algo.review_specialists import (
     SpecialistRole,
     SpecialistRoleConfig,
     SpecialistState,
+    _render_prompt,
     build_specialist_input,
     clear_specialist_cache,
     load_specialist_pipeline_config,
     run_shadow_specialists,
     specialists_enabled,
+    unavailable_specialist_batch,
     validate_specialist_output,
 )
 from pr_agent.algo.run_details import get_run_details, init_run_details, record_ai_call
@@ -87,12 +89,19 @@ def _prompt(role, *, suffix=""):
     )
 
 
-def _pipeline(*, aggregate_token_budget=50_000, cache_enabled=False, roles=None, prompt_suffix=""):
+def _pipeline(
+    *,
+    aggregate_timeout_seconds=2,
+    aggregate_token_budget=50_000,
+    cache_enabled=False,
+    roles=None,
+    prompt_suffix="",
+):
     role_configs = roles or tuple(_role_config(role) for role in SpecialistRole)
     return SpecialistPipelineConfig(
         enabled=True,
         mode="shadow",
-        aggregate_timeout_seconds=2,
+        aggregate_timeout_seconds=aggregate_timeout_seconds,
         aggregate_token_budget=aggregate_token_budget,
         max_concurrency=3,
         cache_enabled=cache_enabled,
@@ -225,6 +234,31 @@ def test_outputs_reject_unsupported_evidence_and_down_routing_fields():
             pipeline,
         )
 
+
+def test_schema_rejects_bool_rank_and_non_integral_evidence_line():
+    specialist_input = _input()
+    pipeline = _pipeline()
+
+    prioritization = _outputs(specialist_input)[SpecialistRole.DIFF_PRIORITIZATION.value]
+    prioritization["ranked_hunks"][0]["rank"] = True
+    with pytest.raises(SpecialistOutputError, match="rank must be an integer"):
+        validate_specialist_output(
+            SpecialistRole.DIFF_PRIORITIZATION,
+            json.dumps(prioritization),
+            specialist_input,
+            pipeline,
+        )
+
+    classification = _outputs(specialist_input)[SpecialistRole.CHANGE_CLASSIFICATION.value]
+    classification["labels"][0]["evidence"][0]["line"] = 2.0
+    with pytest.raises(SpecialistOutputError, match="line must be an integer"):
+        validate_specialist_output(
+            SpecialistRole.CHANGE_CLASSIFICATION,
+            json.dumps(classification),
+            specialist_input,
+            pipeline,
+        )
+
     classification = _outputs(specialist_input)[SpecialistRole.CHANGE_CLASSIFICATION.value]
     classification["labels"][0]["evidence"][0]["line"] = 999
     with pytest.raises(SpecialistOutputError, match="added line"):
@@ -284,6 +318,71 @@ def test_repository_configuration_is_default_off_and_loads_three_versioned_roles
         assert pipeline.mode == "shadow"
     finally:
         settings.set("specialist_pipeline.enabled", original)
+
+
+def test_specialist_prompt_rendering_preserves_plain_text_and_source_bytes():
+    specialist_input = replace(
+        _input(),
+        title='<release>&"\' $title',
+        description="Keep {{ repository_text }} and <script>& exactly as source data.",
+    )
+    prompt = SpecialistPrompt(
+        role=SpecialistRole.RISK_RECOMMENDATION,
+        prompt_version="risk-recommendation-prompt-v1",
+        input_schema_version="risk-recommendation-input-v1",
+        schema_version="risk-recommendation-output-v1",
+        system="input={{ input_schema_version }} output={{ output_schema_version }}",
+        user="<specialist_input_json>\n{{ specialist_input_json }}\n</specialist_input_json>",
+    )
+
+    system, user = _render_prompt(prompt, specialist_input)
+    expected_input = specialist_input.to_dict()
+    expected_input["schema_version"] = prompt.input_schema_version
+    expected_json = json.dumps(expected_input, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+    assert system == "input=risk-recommendation-input-v1 output=risk-recommendation-output-v1"
+    assert user == f"<specialist_input_json>\n{expected_json}\n</specialist_input_json>"
+    assert '<release>&\\"\'' in user
+    assert "<script>&" in user
+    assert "&lt;" not in user
+    assert "&amp;" not in user
+
+
+def test_specialist_input_deep_freezes_deterministic_results_before_hashing():
+    source = {"id": "rule-a", "result": {"forced": True, "reasons": ["original"]}}
+    specialist_input = replace(_input(), deterministic_results=(source,))
+    original_hash = specialist_input.input_hash
+
+    source["id"] = "rule-b"
+    source["result"]["forced"] = False
+    source["result"]["reasons"].append("mutated")
+    serialized = specialist_input.to_dict()
+    serialized["deterministic_results"][0]["result"]["forced"] = False
+
+    assert specialist_input.input_hash == original_hash
+    assert specialist_input.deterministic_results[0]["id"] == "rule-a"
+    assert specialist_input.deterministic_results[0]["result"]["forced"] is True
+    assert specialist_input.to_dict()["deterministic_results"][0]["result"]["reasons"] == ["original"]
+    with pytest.raises(TypeError):
+        specialist_input.deterministic_results[0]["id"] = "rule-c"
+
+
+def test_unavailable_provider_records_versioned_role_evidence():
+    init_run_details()
+    pipeline = _pipeline()
+
+    result = unavailable_specialist_batch(
+        pipeline,
+        failure_reason="stable_head_identity_unavailable",
+    )
+
+    assert result.snapshot_id == "unavailable"
+    assert result.head_sha == ""
+    assert all(record.state is SpecialistState.UNAVAILABLE for record in result.records)
+    assert all(
+        record["failure_reason"] == "stable_head_identity_unavailable"
+        for record in result.to_dict()["roles"].values()
+    )
 
 
 @pytest.mark.asyncio
@@ -397,8 +496,9 @@ async def test_role_validation_failure_uses_its_request_local_fallback():
 @pytest.mark.asyncio
 async def test_one_role_failure_keeps_other_successes():
     specialist_input = _input()
-    failures = {SpecialistRole.RISK_RECOMMENDATION.value: "not-json"}
-    handler = _Handler(_outputs(specialist_input), failures=failures)
+    outputs = _outputs(specialist_input)
+    outputs[SpecialistRole.RISK_RECOMMENDATION.value] = "not-json"
+    handler = _Handler(outputs)
     init_run_details()
 
     result = await run_shadow_specialists(
@@ -412,6 +512,46 @@ async def test_one_role_failure_keeps_other_successes():
     assert states[SpecialistRole.CHANGE_CLASSIFICATION] is SpecialistState.SUCCESS
     assert states[SpecialistRole.RISK_RECOMMENDATION] is SpecialistState.MALFORMED_OUTPUT
     assert states[SpecialistRole.DIFF_PRIORITIZATION] is SpecialistState.SUCCESS
+    risk = result.to_dict()["roles"][SpecialistRole.RISK_RECOMMENDATION.value]
+    assert risk["model"] == "model-risk_recommendation"
+    assert risk["deployment"] == "deployment-risk_recommendation"
+    assert risk["usage"]["ai_calls"] == 1
+    assert risk["cost"]["status"] == "complete"
+    assert risk["reservation"]["input_tokens"] > 0
+    assert risk["reservation"]["output_tokens"] == 600
+    assert risk["latency_seconds"] > 0
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_preserves_attempted_route_without_claiming_usage_or_cost():
+    specialist_input = _input()
+    role = SpecialistRole.RISK_RECOMMENDATION
+    roles = tuple(
+        replace(_role_config(candidate), enabled=candidate is role)
+        for candidate in SpecialistRole
+    )
+    handler = _Handler(
+        _outputs(specialist_input),
+        failures={role.value: RuntimeError("provider unavailable")},
+    )
+    init_run_details()
+
+    result = await run_shadow_specialists(
+        specialist_input,
+        _pipeline(roles=roles),
+        handler,
+        current_identity=lambda: specialist_input.head_sha,
+    )
+    record = result.to_dict()["roles"][role.value]
+
+    assert record["state"] == SpecialistState.PROVIDER_FAILURE.value
+    assert record["model"] == "model-risk_recommendation"
+    assert record["deployment"] == "deployment-risk_recommendation"
+    assert record["latency_seconds"] > 0
+    assert record["reservation"]["input_tokens"] > 0
+    assert record["reservation"]["output_tokens"] == 600
+    assert record["usage"]["ai_calls"] == 0
+    assert record["cost"]["status"] == "unavailable"
 
 
 @pytest.mark.asyncio
@@ -429,6 +569,98 @@ async def test_aggregate_reservations_prevent_calls_beyond_budget():
 
     assert handler.calls == []
     assert all(record.state is SpecialistState.AGGREGATE_BUDGET_EXHAUSTED for record in result.records)
+
+
+@pytest.mark.asyncio
+async def test_aggregate_budget_reserves_fallback_model_and_provider_retry_worst_case():
+    specialist_input = _input()
+    classification = _role_config(
+        SpecialistRole.CHANGE_CLASSIFICATION,
+        fallback_models=("classification-fallback",),
+        fallback_deployments=("classification-fallback-deployment",),
+        model_retries=2,
+        provider_retries=1,
+    )
+    roles = (
+        classification,
+        replace(_role_config(SpecialistRole.RISK_RECOMMENDATION), enabled=False),
+        replace(_role_config(SpecialistRole.DIFF_PRIORITIZATION), enabled=False),
+    )
+    rejected_handler = _Handler(_outputs(specialist_input))
+    init_run_details()
+
+    rejected = await run_shadow_specialists(
+        specialist_input,
+        _pipeline(aggregate_token_budget=1, roles=roles),
+        rejected_handler,
+        current_identity=lambda: specialist_input.head_sha,
+    )
+    reservation = rejected.records[0].input_tokens + rejected.records[0].output_tokens
+
+    assert classification.worst_case_provider_calls == 8
+    assert rejected.records[0].output_tokens == classification.output_token_budget * 8
+    assert rejected_handler.calls == []
+
+    below_handler = _Handler(_outputs(specialist_input))
+    init_run_details()
+    below = await run_shadow_specialists(
+        specialist_input,
+        _pipeline(aggregate_token_budget=reservation - 1, roles=roles),
+        below_handler,
+        current_identity=lambda: specialist_input.head_sha,
+    )
+    assert below.records[0].state is SpecialistState.AGGREGATE_BUDGET_EXHAUSTED
+    assert below_handler.calls == []
+
+    admitted_handler = _Handler(_outputs(specialist_input))
+    init_run_details()
+    admitted = await run_shadow_specialists(
+        specialist_input,
+        _pipeline(aggregate_token_budget=reservation, roles=roles),
+        admitted_handler,
+        current_identity=lambda: specialist_input.head_sha,
+    )
+    assert admitted.records[0].state is SpecialistState.SUCCESS
+    assert len(admitted_handler.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_aggregate_timeout_preserves_billed_attempt_and_full_reservation():
+    specialist_input = _input()
+    role = SpecialistRole.CHANGE_CLASSIFICATION
+    roles = (
+        _role_config(role),
+        replace(_role_config(SpecialistRole.RISK_RECOMMENDATION), enabled=False),
+        replace(_role_config(SpecialistRole.DIFF_PRIORITIZATION), enabled=False),
+    )
+
+    class BilledBlockingHandler:
+        async def chat_completion(self, model, system, user, temperature=0.2, img_path=None):
+            record_ai_call(
+                {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+                model=model,
+                cost_usd="0.001",
+            )
+            await asyncio.Event().wait()
+
+    init_run_details()
+    result = await run_shadow_specialists(
+        specialist_input,
+        _pipeline(aggregate_timeout_seconds=0.01, roles=roles),
+        BilledBlockingHandler(),
+        current_identity=lambda: specialist_input.head_sha,
+    )
+    record = result.to_dict()["roles"][role.value]
+
+    assert record["state"] == SpecialistState.TIMEOUT.value
+    assert record["failure_reason"] == "aggregate_timeout"
+    assert record["model"] == "model-change_classification"
+    assert record["deployment"] == "deployment-change_classification"
+    assert record["latency_seconds"] > 0
+    assert record["reservation"]["input_tokens"] > 0
+    assert record["reservation"]["output_tokens"] == 600
+    assert record["usage"]["ai_calls"] == 1
+    assert record["cost"]["status"] == "complete"
 
 
 @pytest.mark.asyncio
@@ -460,6 +692,36 @@ async def test_stale_head_discards_all_role_outputs_and_cache_writes():
     )
     assert all(record.state is SpecialistState.SUCCESS for record in second.records)
     assert len(second_handler.calls) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unavailable_identity", [None, RuntimeError("refresh failed")])
+async def test_unavailable_identity_refresh_discards_outputs_without_claiming_staleness(unavailable_identity):
+    specialist_input = _input()
+    handler = _Handler(_outputs(specialist_input))
+    identities = iter((specialist_input.head_sha, unavailable_identity))
+
+    def current_identity():
+        identity = next(identities)
+        if isinstance(identity, BaseException):
+            raise identity
+        return identity
+
+    init_run_details()
+    result = await run_shadow_specialists(
+        specialist_input,
+        _pipeline(),
+        handler,
+        current_identity=current_identity,
+    )
+
+    assert result.stale is False
+    assert all(record.state is SpecialistState.UNAVAILABLE for record in result.records)
+    assert all(record.output is None for record in result.records)
+    assert all(
+        record["failure_reason"] == "stable_head_identity_unavailable"
+        for record in result.to_dict()["roles"].values()
+    )
 
 
 @pytest.mark.asyncio
@@ -545,3 +807,12 @@ async def test_low_confidence_role_is_rejected_without_blocking_main_telemetry()
     assert states[SpecialistRole.CHANGE_CLASSIFICATION] is SpecialistState.LOW_CONFIDENCE
     assert get_run_details().model_used is None
     assert get_run_details().num_ai_calls == 0
+    classification = result.to_dict()["roles"][SpecialistRole.CHANGE_CLASSIFICATION.value]
+    assert classification["model"] == "model-change_classification"
+    assert classification["deployment"] == "deployment-change_classification"
+    assert classification["confidence"] == 0.1
+    assert classification["output"]["confidence"] == 0.1
+    assert classification["usage"]["ai_calls"] == 1
+    assert classification["cost"]["status"] == "complete"
+    assert classification["reservation"]["input_tokens"] > 0
+    assert classification["reservation"]["output_tokens"] == 600

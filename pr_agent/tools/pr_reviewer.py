@@ -24,6 +24,7 @@ from pr_agent.algo.review_specialists import (
     load_specialist_pipeline_config,
     run_shadow_specialists,
     specialists_enabled,
+    unavailable_specialist_batch,
 )
 from pr_agent.algo.run_details import (get_run_details, init_run_details,
                                        record_review_profile)
@@ -372,10 +373,21 @@ class PRReviewer:
                 current_identity = snapshot_context.current_snapshot_id
             else:
                 snapshot = None
-                head_sha = self.git_provider.get_pr_head_sha(refresh=False)
-                if not head_sha:
+                try:
+                    head_sha = self.git_provider.get_pr_head_sha(refresh=False)
+                except Exception as exc:
+                    head_sha = None
                     get_logger().warning(
-                        "Skipping specialist shadow batch because the provider has no stable head identity"
+                        "Could not read a stable provider head identity for specialist shadow mode",
+                        artifact={"error_class": type(exc).__name__},
+                    )
+                if not head_sha:
+                    self.specialist_shadow_result = unavailable_specialist_batch(
+                        pipeline,
+                        failure_reason="stable_head_identity_unavailable",
+                    )
+                    get_logger().warning(
+                        "Specialist shadow batch is unavailable because the provider has no stable head identity"
                     )
                     return
                 def current_identity():

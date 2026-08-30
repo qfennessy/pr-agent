@@ -482,7 +482,12 @@ class LiteLLMAIHandler(BaseAiHandler):
             )
         )
 
-    def _configure_claude_extended_thinking(self, model: str, kwargs: dict) -> dict:
+    def _configure_claude_extended_thinking(
+        self,
+        model: str,
+        kwargs: dict,
+        request_max_output_tokens: int | None = None,
+    ) -> dict:
         """
         Configure Claude extended thinking parameters if applicable.
 
@@ -503,6 +508,17 @@ class LiteLLMAIHandler(BaseAiHandler):
             raise ValueError(f"extended_thinking_max_output_tokens must be a positive integer, got {extended_thinking_max_output_tokens}")
         if extended_thinking_max_output_tokens < extended_thinking_budget_tokens:
             raise ValueError(f"extended_thinking_max_output_tokens ({extended_thinking_max_output_tokens}) must be greater than or equal to extended_thinking_budget_tokens ({extended_thinking_budget_tokens})")
+        if request_max_output_tokens is not None:
+            extended_thinking_max_output_tokens = min(
+                extended_thinking_max_output_tokens,
+                request_max_output_tokens,
+            )
+            if extended_thinking_max_output_tokens < extended_thinking_budget_tokens:
+                get_logger().info(
+                    "Skipping Claude extended thinking because the request-local output cap "
+                    "is smaller than the thinking budget"
+                )
+                return kwargs
 
         kwargs["thinking"] = {
             "type": "enabled",
@@ -848,13 +864,9 @@ class LiteLLMAIHandler(BaseAiHandler):
                         kwargs["reasoning_effort"] = reasoning_effort
 
                 # https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
-                if (model in self.claude_extended_thinking_models) and get_settings().config.get("enable_claude_extended_thinking", False):
-                    kwargs = self._configure_claude_extended_thinking(model, kwargs)
-
                 # Optional output token limit; 0 = unset. Without max_tokens some
                 # providers apply a low service-side default (Bedrock Converse: 4096,
                 # which reasoning can fully consume, returning empty content).
-                # setdefault keeps the extended-thinking limit authoritative.
                 configured_max_output_tokens = (
                     request_options.max_output_tokens
                     if request_options is not None and request_options.max_output_tokens is not None
@@ -864,8 +876,24 @@ class LiteLLMAIHandler(BaseAiHandler):
                     max_output_tokens = int(configured_max_output_tokens)
                 except (TypeError, ValueError):
                     max_output_tokens = 0
+
+                request_max_output_tokens = (
+                    max_output_tokens
+                    if request_options is not None and request_options.max_output_tokens is not None
+                    else None
+                )
+                if (model in self.claude_extended_thinking_models) and get_settings().config.get("enable_claude_extended_thinking", False):
+                    kwargs = self._configure_claude_extended_thinking(
+                        model,
+                        kwargs,
+                        request_max_output_tokens=request_max_output_tokens,
+                    )
+
                 if max_output_tokens > 0:
-                    kwargs.setdefault("max_tokens", max_output_tokens)
+                    if request_max_output_tokens is not None:
+                        kwargs["max_tokens"] = min(kwargs.get("max_tokens", max_output_tokens), max_output_tokens)
+                    else:
+                        kwargs.setdefault("max_tokens", max_output_tokens)
 
                 if get_settings().litellm.get("enable_callbacks", False):
                     kwargs = self.add_litellm_callbacks(kwargs)

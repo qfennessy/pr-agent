@@ -58,6 +58,18 @@ def test_primary_model_success_invoked_once_and_returns_value():
         _restore_settings(snapshot)
 
 
+def test_empty_explicit_route_raises_instead_of_returning_implicitly():
+    class EmptyRoute:
+        models = ()
+        deployments = ()
+
+    async def fake_f(_model):
+        raise AssertionError("an empty route must not invoke the model callback")
+
+    with pytest.raises(RuntimeError, match="Model route exhausted"):
+        asyncio.run(retry_with_fallback_models(fake_f, model_route=EmptyRoute()))
+
+
 def test_request_local_deployment_is_visible_to_all_legacy_handler_properties():
     snapshot = _snapshot_settings()
     try:

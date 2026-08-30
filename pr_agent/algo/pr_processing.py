@@ -15,7 +15,7 @@ from pr_agent.algo.git_patch_processing import (
     decouple_and_convert_to_hunks_with_lines_numbers, extend_patch,
     handle_patch_deletions)
 from pr_agent.algo.language_handler import sort_files_by_main_languages
-from pr_agent.algo.run_details import record_model_used
+from pr_agent.algo.run_details import record_model_used, record_specialist_model_attempt
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.algo.utils import (ModelType, clip_tokens, get_max_tokens,
@@ -387,6 +387,12 @@ async def retry_with_fallback_models(
     # try each (model, deployment_id) pair until one is successful, otherwise raise exception
     for i, (model, deployment_id) in enumerate(zip(all_models, all_deployments, strict=True)):
         started_at = time.monotonic()
+        record_specialist_model_attempt(
+            model,
+            attribution=model_route.attribution,
+            deployment_id=deployment_id,
+            is_fallback=i > 0,
+        )
         try:
             get_logger().debug(
                 f"Generating prediction with {model} (attempt {i + 1}/{len(all_models)})"
@@ -432,6 +438,8 @@ async def retry_with_fallback_models(
                 deployment_id=deployment_id,
             )
             return result
+
+    raise RuntimeError("Model route exhausted without returning or raising an error")
 
 
 # Redacts anything shaped like a credential before a provider error is copied into a CI

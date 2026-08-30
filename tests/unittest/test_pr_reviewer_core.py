@@ -129,6 +129,38 @@ async def test_enabled_shadow_specialists_run_at_most_once_across_main_fallback_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("head_result", [None, RuntimeError("identity failed")])
+async def test_enabled_provider_without_stable_identity_records_unavailable_batch(head_result):
+    git_provider = MagicMock()
+    if isinstance(head_result, BaseException):
+        git_provider.get_pr_head_sha.side_effect = head_result
+    else:
+        git_provider.get_pr_head_sha.return_value = head_result
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer._specialists_started = False
+    reviewer.vars = {"title": "Change behavior"}
+    reviewer.pr_description = "Description"
+    reviewer.ai_handler = MagicMock()
+    pipeline = MagicMock()
+    unavailable = MagicMock()
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.load_specialist_pipeline_config", return_value=pipeline),
+        patch("pr_agent.tools.pr_reviewer.get_specialist_snapshot_context", return_value=None),
+        patch("pr_agent.tools.pr_reviewer.unavailable_specialist_batch", return_value=unavailable) as build_unavailable,
+        patch("pr_agent.tools.pr_reviewer.run_shadow_specialists", new_callable=AsyncMock) as run_shadow,
+    ):
+        await reviewer._run_shadow_specialists_once()
+
+    assert reviewer.specialist_shadow_result is unavailable
+    build_unavailable.assert_called_once_with(
+        pipeline,
+        failure_reason="stable_head_identity_unavailable",
+    )
+    run_shadow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_prepare_prediction_keeps_incremental_review_compatible_with_tuple_result():
     reviewer = _make_prediction_reviewer()
     reviewer.incremental = SimpleNamespace(is_incremental=True)

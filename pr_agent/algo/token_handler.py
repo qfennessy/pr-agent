@@ -1,6 +1,7 @@
 import re
 from math import ceil
 from threading import Lock
+from typing import Mapping
 
 from jinja2 import Environment, StrictUndefined
 from tiktoken import encoding_for_model, get_encoding
@@ -65,6 +66,27 @@ class TokenHandler:
     # Constants
     CLAUDE_MODEL = "claude-3-7-sonnet-20250219"
     CLAUDE_MAX_CONTENT_SIZE = 9_000_000 # Maximum allowed content size (9MB) for Claude API
+    _PLAIN_TEXT_PLACEHOLDER = re.compile(r"{{\s*([A-Za-z_][A-Za-z0-9_]*)\s*}}")
+    _JINJA_DELIMITERS = ("{{", "}}", "{%", "%}", "{#", "#}")
+
+    @classmethod
+    def render_plain_text_prompt(cls, template: str, variables: Mapping[str, str]) -> str:
+        """Insert literal values into a prompt without evaluating or escaping them."""
+
+        literal_template = cls._PLAIN_TEXT_PLACEHOLDER.sub("", template)
+        if any(delimiter in literal_template for delimiter in cls._JINJA_DELIMITERS):
+            raise ValueError("plain-text prompts support named placeholders only")
+
+        def substitute(match: re.Match) -> str:
+            name = match.group(1)
+            if name not in variables:
+                raise ValueError(f"missing plain-text prompt variable: {name}")
+            value = variables[name]
+            if not isinstance(value, str):
+                raise TypeError(f"plain-text prompt variable must be a string: {name}")
+            return value
+
+        return cls._PLAIN_TEXT_PLACEHOLDER.sub(substitute, template)
 
     def __init__(self, pr=None, vars: dict | None = None, system="", user="", model: str = None):
         """

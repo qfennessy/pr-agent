@@ -197,6 +197,26 @@ def record_model_used(
         details.fallback_used = True
 
 
+def record_specialist_model_attempt(
+    model: str,
+    *,
+    attribution: Optional[str],
+    deployment_id: Optional[str],
+    is_fallback: bool,
+) -> None:
+    """Preserve the last attempted specialist route even when its output is rejected."""
+
+    if not attribution:
+        return
+    specialist = _get_specialist_details(attribution)
+    if specialist is None:
+        return
+    specialist.model_used = model
+    specialist.deployment_id = deployment_id
+    if is_fallback:
+        specialist.fallback_used = True
+
+
 def record_review_profile(profile: str) -> None:
     """Record the selected reviewer profile in the current run metadata."""
     details = get_run_details()

@@ -96,6 +96,11 @@ prompted models. Calls share one
 immutable input and reserve their worst-case token budget before concurrent execution. A failed, timed-out, malformed,
 low-confidence, or stale role is recorded separately and never blocks the ordinary review.
 
+Worst-case reservation includes every configured fallback model, model attempt, and provider retry. GitHub and GitLab
+reviews use a refreshable head commit for stale-run cancellation, while local file-save reviews use their immutable
+snapshot. Other hosted providers record `unavailable` role evidence and make no specialist calls until their adapter can
+provide a stable, refreshable head identity; they are never silently treated as successful shadow runs.
+
 Issue #11 is the only consumer of upward risk recommendations. Issue #9 is the only consumer of ranked hunks and
 context requests. Those guarded consumers remain disabled until issue #27 completes the frozen benchmark, target-repo
 pilot, live-shadow evidence window, and rollout decisions.

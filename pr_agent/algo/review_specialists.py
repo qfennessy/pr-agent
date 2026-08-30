@@ -16,9 +16,8 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import PurePosixPath
 from threading import Lock
+from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
-
-from jinja2 import Environment, StrictUndefined
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_request_context import AIModelRoute
@@ -54,6 +53,7 @@ class SpecialistState(str, Enum):
     AGGREGATE_BUDGET_EXHAUSTED = "aggregate_budget_exhausted"
     TIMEOUT = "timeout"
     PROVIDER_FAILURE = "provider_failure"
+    UNAVAILABLE = "unavailable"
     MALFORMED_OUTPUT = "malformed_output"
     LOW_CONFIDENCE = "low_confidence"
     STALE = "stale"
@@ -69,11 +69,29 @@ class SpecialistOutputError(ValueError):
 
 
 class SpecialistLowConfidenceError(SpecialistOutputError):
-    pass
+    def __init__(self, output: Mapping[str, Any]):
+        super().__init__("specialist response confidence is below the role threshold")
+        self.output = copy.deepcopy(dict(output))
 
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return copy.deepcopy(value)
 
 
 def _sha256(value: str) -> str:
@@ -128,7 +146,11 @@ class SpecialistInput:
             "hunks",
             tuple(sorted(self.hunks, key=lambda hunk: (hunk.path, hunk.start_line, hunk.hunk_id))),
         )
-        object.__setattr__(self, "deterministic_results", tuple(self.deterministic_results))
+        object.__setattr__(
+            self,
+            "deterministic_results",
+            tuple(_freeze_json(result) for result in self.deterministic_results),
+        )
         identity = self.to_dict(include_hash=False)
         object.__setattr__(self, "input_hash", _sha256(_canonical_json(identity)))
 
@@ -142,7 +164,7 @@ class SpecialistInput:
             "changed_paths": list(self.changed_paths),
             "diff": self.diff,
             "hunks": [asdict(hunk) for hunk in self.hunks],
-            "deterministic_results": list(self.deterministic_results),
+            "deterministic_results": [_thaw_json(result) for result in self.deterministic_results],
             "event": self.event,
             "policy_version": self.policy_version,
             "review_configuration_hash": self.review_configuration_hash,
@@ -195,7 +217,7 @@ class SpecialistRoleConfig:
     fallback_deployments: tuple[Optional[str], ...]
     timeout_seconds: float
     model_retries: int
-    provider_retries: Optional[int]
+    provider_retries: int
     input_token_budget: int
     output_token_budget: int
     minimum_confidence: float
@@ -210,6 +232,10 @@ class SpecialistRoleConfig:
             max_output_tokens=self.output_token_budget,
             attribution=self.role.value,
         )
+
+    @property
+    def worst_case_provider_calls(self) -> int:
+        return len(self.model_route().models) * self.model_retries * (1 + self.provider_retries)
 
 
 @dataclass(frozen=True)
@@ -334,6 +360,35 @@ class SpecialistBatchResult:
         }
 
 
+def unavailable_specialist_batch(
+    pipeline: SpecialistPipelineConfig,
+    *,
+    failure_reason: str,
+) -> SpecialistBatchResult:
+    """Return explicit role evidence when a provider cannot supply a stable head identity."""
+
+    records = tuple(
+        RoleExecution(
+            role=config.role,
+            state=SpecialistState.UNAVAILABLE,
+            failure_reason=failure_reason,
+        )
+        for config in pipeline.roles
+        if config.enabled
+    )
+    _record_role_results(records, pipeline)
+    return SpecialistBatchResult(
+        snapshot_id="unavailable",
+        head_sha="",
+        input_hash="",
+        configuration_hash=pipeline.configuration_hash,
+        records=records,
+        role_records=_role_records(records, pipeline),
+        changed_path_count=0,
+        hunk_count=0,
+    )
+
+
 @dataclass(frozen=True)
 class _CachedRoleOutput:
     output: Mapping[str, Any]
@@ -398,9 +453,7 @@ def _positive_int(value: Any, key: str) -> int:
     return parsed
 
 
-def _nonnegative_int_or_none(value: Any, key: str) -> Optional[int]:
-    if value is None:
-        return None
+def _nonnegative_int(value: Any, key: str) -> int:
     if isinstance(value, bool):
         raise SpecialistConfigurationError(f"{key} must be a non-negative integer")
     try:
@@ -508,7 +561,7 @@ def load_specialist_pipeline_config() -> SpecialistPipelineConfig:
                 fallback_deployments=fallback_deployments,
                 timeout_seconds=_positive_float(role_section.get("timeout_seconds", 5), f"{role.value}.timeout"),
                 model_retries=_positive_int(role_section.get("model_retries", 1), f"{role.value}.retries"),
-                provider_retries=_nonnegative_int_or_none(
+                provider_retries=_nonnegative_int(
                     role_section.get("provider_retries", 0), f"{role.value}.provider_retries"
                 ),
                 input_token_budget=_positive_int(
@@ -685,9 +738,8 @@ def _render_prompt(prompt: SpecialistPrompt, specialist_input: SpecialistInput) 
         "input_schema_version": prompt.input_schema_version,
         "output_schema_version": prompt.schema_version,
     }
-    environment = Environment(undefined=StrictUndefined)
-    system = environment.from_string(prompt.system).render(copy.deepcopy(variables))
-    user = environment.from_string(prompt.user).render(copy.deepcopy(variables))
+    system = TokenHandler.render_plain_text_prompt(prompt.system, variables)
+    user = TokenHandler.render_plain_text_prompt(prompt.user, variables)
     return system, user
 
 
@@ -727,9 +779,11 @@ def _validate_evidence(value: Any, specialist_input: SpecialistInput) -> dict[st
         _require_exact_keys(value, {"source", "path", "hunk_id", "line"}, "diff_hunk evidence")
         try:
             path = _normalized_path(str(value["path"]))
-            line = int(value["line"])
         except (TypeError, ValueError) as exc:
             raise SpecialistOutputError("diff_hunk evidence is malformed") from exc
+        line = value["line"]
+        if isinstance(line, bool) or not isinstance(line, int):
+            raise SpecialistOutputError("diff_hunk evidence line must be an integer")
         hunk = next(
             (
                 item
@@ -835,9 +889,11 @@ def _validate_diff_prioritization(
         _require_exact_keys(item, {"rank", "path", "hunk_id", "reason", "evidence"}, "ranked hunk")
         try:
             path = _normalized_path(str(item["path"]))
-            rank = int(item["rank"])
         except (TypeError, ValueError) as exc:
             raise SpecialistOutputError("ranked hunk is malformed") from exc
+        rank = item["rank"]
+        if isinstance(rank, bool) or not isinstance(rank, int):
+            raise SpecialistOutputError("ranked hunk rank must be an integer")
         hunk_id = str(item["hunk_id"])
         if rank < 1 or rank in seen_ranks or hunk_id in seen_hunks:
             raise SpecialistOutputError("ranked hunk rank or identity is duplicated")
@@ -946,20 +1002,22 @@ def _cache_key(
     )
 
 
-async def _current_identity(current_identity: Optional[Callable[[], Any]]) -> Optional[str]:
+async def _current_identity(
+    current_identity: Optional[Callable[[], Any]],
+) -> tuple[bool, Optional[str]]:
     if current_identity is None:
-        return None
+        return False, None
     try:
         value = current_identity()
         if inspect.isawaitable(value):
             value = await value
-        return str(value) if value else None
+        return (True, str(value)) if value else (False, None)
     except Exception as exc:
         get_logger().warning(
-            "Could not refresh specialist input identity; treating the batch as stale",
+            "Could not refresh specialist input identity; treating the batch as unavailable",
             artifact={"error_class": type(exc).__name__},
         )
-        return None
+        return False, None
 
 
 def _failure_state(exc: BaseException) -> tuple[SpecialistState, str]:
@@ -981,7 +1039,8 @@ async def _execute_role(
     prompt: SpecialistPrompt,
     ai_handler: BaseAiHandler,
     semaphore: asyncio.Semaphore,
-    input_tokens: int,
+    input_token_reservation: int,
+    output_token_reservation: int,
     cache_key: str,
 ) -> RoleExecution:
     started_at = time.monotonic()
@@ -1000,7 +1059,7 @@ async def _execute_role(
             raise SpecialistOutputError("specialist response exceeded its output token budget")
         output = validate_specialist_output(config.role, response, specialist_input, pipeline)
         if output["confidence"] < config.minimum_confidence:
-            raise SpecialistLowConfidenceError("specialist response confidence is below the role threshold")
+            raise SpecialistLowConfidenceError(output)
         return output
 
     try:
@@ -1015,21 +1074,25 @@ async def _execute_role(
             state=SpecialistState.TIMEOUT,
             failure_reason="TimeoutError",
             latency_seconds=time.monotonic() - started_at,
-            input_tokens=input_tokens,
-            output_tokens=config.output_token_budget,
+            input_tokens=input_token_reservation,
+            output_tokens=output_token_reservation,
             cache_key=cache_key,
         )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         state, failure_reason = _failure_state(exc)
+        cause = exc.__cause__ or exc
+        rejected_output = cause.output if isinstance(cause, SpecialistLowConfidenceError) else None
         return RoleExecution(
             role=config.role,
             state=state,
+            output=rejected_output,
+            confidence=(float(rejected_output["confidence"]) if rejected_output is not None else None),
             failure_reason=failure_reason,
             latency_seconds=time.monotonic() - started_at,
-            input_tokens=input_tokens,
-            output_tokens=config.output_token_budget,
+            input_tokens=input_token_reservation,
+            output_tokens=output_token_reservation,
             cache_key=cache_key,
         )
     return RoleExecution(
@@ -1038,8 +1101,8 @@ async def _execute_role(
         output=output,
         confidence=float(output["confidence"]),
         latency_seconds=time.monotonic() - started_at,
-        input_tokens=input_tokens,
-        output_tokens=config.output_token_budget,
+        input_tokens=input_token_reservation,
+        output_tokens=output_token_reservation,
         cache_key=cache_key,
     )
 
@@ -1059,9 +1122,12 @@ async def run_shadow_specialists(
         else specialist_input.head_sha
     )
     if pipeline.cancel_stale_inputs and current_identity is not None:
-        if await _current_identity(current_identity) != expected_identity:
+        identity_available, refreshed_identity = await _current_identity(current_identity)
+        if not identity_available or refreshed_identity != expected_identity:
+            state = SpecialistState.STALE if identity_available else SpecialistState.UNAVAILABLE
+            failure_reason = "stale_input" if identity_available else "stable_head_identity_unavailable"
             stale_records = tuple(
-                RoleExecution(role=config.role, state=SpecialistState.STALE, failure_reason="stale_input")
+                RoleExecution(role=config.role, state=state, failure_reason=failure_reason)
                 for config in pipeline.roles
                 if config.enabled
             )
@@ -1075,12 +1141,13 @@ async def run_shadow_specialists(
                 role_records=_role_records(stale_records, pipeline),
                 changed_path_count=len(specialist_input.changed_paths),
                 hunk_count=len(specialist_input.hunks),
-                stale=True,
+                stale=identity_available,
             )
 
     semaphore = asyncio.Semaphore(min(pipeline.max_concurrency, len(_ROLE_ORDER)))
     results: dict[SpecialistRole, RoleExecution] = {}
     tasks: dict[asyncio.Task, SpecialistRole] = {}
+    task_reservations: dict[asyncio.Task, tuple[float, int, int]] = {}
     reserved_tokens = 0
     for role in _ROLE_ORDER:
         config = pipeline.role_config(role)
@@ -1118,14 +1185,17 @@ async def run_shadow_specialists(
                 cache_key=key,
             )
             continue
-        reservation = input_tokens + config.output_token_budget
+        provider_calls = config.worst_case_provider_calls
+        input_token_reservation = input_tokens * provider_calls
+        output_token_reservation = config.output_token_budget * provider_calls
+        reservation = input_token_reservation + output_token_reservation
         if reserved_tokens + reservation > pipeline.aggregate_token_budget:
             results[role] = RoleExecution(
                 role=role,
                 state=SpecialistState.AGGREGATE_BUDGET_EXHAUSTED,
                 failure_reason="aggregate_token_budget",
-                input_tokens=input_tokens,
-                output_tokens=config.output_token_budget,
+                input_tokens=input_token_reservation,
+                output_tokens=output_token_reservation,
                 cache_key=key,
             )
             continue
@@ -1140,11 +1210,17 @@ async def run_shadow_specialists(
                 prompt=prompt,
                 ai_handler=ai_handler,
                 semaphore=semaphore,
-                input_tokens=input_tokens,
+                input_token_reservation=input_token_reservation,
+                output_token_reservation=output_token_reservation,
                 cache_key=key,
             )
         )
         tasks[task] = role
+        task_reservations[task] = (
+            time.monotonic(),
+            input_token_reservation,
+            output_token_reservation,
+        )
 
     if tasks:
         done, pending = await asyncio.wait(tasks, timeout=pipeline.aggregate_timeout_seconds)
@@ -1161,28 +1237,43 @@ async def run_shadow_specialists(
             await asyncio.gather(*pending, return_exceptions=True)
             for task in pending:
                 role = tasks[task]
-                config = pipeline.role_config(role)
+                started_at, input_token_reservation, output_token_reservation = task_reservations[task]
+                details = get_run_details()
+                telemetry = details.specialist_runs.get(role.value) if details is not None else None
                 results[role] = RoleExecution(
                     role=role,
                     state=SpecialistState.TIMEOUT,
                     failure_reason="aggregate_timeout",
-                    output_tokens=config.output_token_budget,
+                    latency_seconds=time.monotonic() - started_at,
+                    input_tokens=input_token_reservation,
+                    output_tokens=output_token_reservation,
+                    model=telemetry.model_used if telemetry is not None else None,
+                    deployment=telemetry.deployment_id if telemetry is not None else None,
+                    fallback_used=telemetry.fallback_used if telemetry is not None else False,
                 )
 
     stale = False
+    identity_unavailable = False
     if pipeline.cancel_stale_inputs and current_identity is not None:
-        stale = await _current_identity(current_identity) != expected_identity
+        identity_available, refreshed_identity = await _current_identity(current_identity)
+        identity_unavailable = not identity_available
+        stale = identity_available and refreshed_identity != expected_identity
     ordered = tuple(results[role] for role in _ROLE_ORDER if role in results)
-    if stale:
+    if stale or identity_unavailable:
+        state = SpecialistState.STALE if stale else SpecialistState.UNAVAILABLE
+        failure_reason = "stale_input" if stale else "stable_head_identity_unavailable"
         ordered = tuple(
             RoleExecution(
                 role=result.role,
-                state=SpecialistState.STALE,
-                failure_reason="stale_input",
+                state=state,
+                failure_reason=failure_reason,
                 latency_seconds=result.latency_seconds,
                 input_tokens=result.input_tokens,
                 output_tokens=result.output_tokens,
                 cache_key=result.cache_key,
+                model=result.model,
+                deployment=result.deployment,
+                fallback_used=result.fallback_used,
             )
             for result in ordered
         )

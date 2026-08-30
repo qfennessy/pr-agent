@@ -397,6 +397,7 @@ cancel_stale_snapshots = true
 enabled = false
 mode = "shadow"
 aggregate_timeout_seconds = 8
+# Conservatively reserves each role's input + output for every fallback, model attempt, and provider retry.
 aggregate_token_budget = 12000
 max_concurrency = 3
 cache_enabled = true
