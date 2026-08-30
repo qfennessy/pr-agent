@@ -71,6 +71,7 @@ enabled = true
 mode = "shadow"
 aggregate_timeout_seconds = 8
 aggregate_token_budget = 12000
+allowed_change_labels = ["schema", "tests", "docs", "dependencies", "other"]
 
 [specialist_pipeline.change_classification]
 enabled = true
@@ -95,6 +96,17 @@ budget, confidence, and enablement settings. Compatible tuned endpoints use the 
 prompted models. Calls share one
 immutable input and reserve their worst-case token budget before concurrent execution. A failed, timed-out, malformed,
 low-confidence, or stale role is recorded separately and never blocks the ordinary review.
+
+The configured `allowed_change_labels` are part of the classifier's immutable, hashed model input. Diff evidence is
+side-aware: `new` references must identify exact added lines and `old` references must identify exact deleted lines,
+so deletion-only authorization or security changes remain citable without inventing a target-side line.
+
+Every completed or explicitly unavailable batch is emitted immediately as a provider-neutral structured log artifact,
+before any optional review publication. The artifact excludes the raw diff, pull-request title and description, prompts,
+unvalidated responses, and cache keys. It retains bounded schema-validated role outputs (including short reasons and
+repository-relative evidence paths), confidence, usage, cost, reservations, and failure states for issue #27. Apply the
+same access and retention controls to this artifact as other hosted PR-Agent logs. Plain-diff JSON output also embeds
+the same versioned batch; neither export publishes a review comment or changes review behavior.
 
 Worst-case reservation includes every configured fallback model, model attempt, and provider retry. GitHub and GitLab
 reviews use a refreshable head commit for stale-run cancellation, while local file-save reviews use their immutable

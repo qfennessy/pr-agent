@@ -11,6 +11,7 @@ import pytest
 
 from pr_agent.algo.review_snapshot import CoverageIssue, ReviewEvent, ReviewResultState, ReviewSnapshot
 from pr_agent.git_providers.plain_diff_provider import parse_plain_diff
+from pr_agent.tools import local_pair_review as local_pair_review_module
 from pr_agent.tools.local_pair_review import (
     LocalPairReview,
     SnapshotCache,
@@ -724,12 +725,1048 @@ def test_modified_tracked_file_embedding_excluded_source_is_omitted(event, tmp_p
 
 
 @pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_modified_file_removing_excluded_source_bytes_is_omitted(event, tmp_path):
+    repo = _repo(tmp_path, f"modified-removed-excluded-copy-{event}")
+    secret_line = "API_TOKEN=removed-production-secret"
+    (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    destination.write_text(
+        f"{secret_line}\nFEATURE_FLAG=disabled\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add source and destination")
+    destination.write_text("FEATURE_FLAG=enabled\n", encoding="utf-8")
+    if event == "pre-commit":
+        _git(repo, "add", "feature.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="feature.py", reason="rename_group_omitted"
+    ) in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_modified_file_with_distant_existing_unsafe_content_remains_reviewable(event, tmp_path):
+    repo = _repo(tmp_path, f"distant-existing-excluded-content-{event}")
+    (repo / ".env").write_text("API_TOKEN=existing-secret\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    destination.write_text(
+        "API_TOKEN=existing-secret\n"
+        + "".join(f"FILLER_{index}=unchanged\n" for index in range(12))
+        + "FEATURE_FLAG=disabled\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add historical content")
+    destination.write_text(
+        "API_TOKEN=existing-secret\n"
+        + "".join(f"FILLER_{index}=unchanged\n" for index in range(12))
+        + "FEATURE_FLAG=enabled\n",
+        encoding="utf-8",
+    )
+    if event == "pre-commit":
+        _git(repo, "add", "feature.py")
+
+    reviewer = LocalPairReview(str(repo))
+    snapshot = reviewer.capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+    recaptured = reviewer.recapture(snapshot)
+
+    assert snapshot.changed_paths == ("feature.py",)
+    assert "+FEATURE_FLAG=enabled" in snapshot.diff
+    assert "existing-secret" not in snapshot.diff
+    assert recaptured.snapshot_id == snapshot.snapshot_id
+    assert not any(
+        issue.path == "feature.py" and issue.reason == "rename_group_omitted"
+        for issue in snapshot.coverage_issues
+    )
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "def API_TOKEN_super_secret_value():",
+        "class API_TOKEN_super_secret_value:",
+    ],
+)
+def test_modified_file_hunk_header_context_from_excluded_source_is_omitted(
+    event, declaration, tmp_path
+):
+    repo = _repo(tmp_path, f"excluded-hunk-header-{event}-{declaration[:3]}")
+    (repo / ".env").write_text(f"{declaration}\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    body = "".join(f"    filler_{index} = {index}\n" for index in range(12))
+    destination.write_text(
+        f"{declaration}\n{body}    feature_flag = False\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add hunk header fixture")
+    destination.write_text(
+        f"{declaration}\n{body}    feature_flag = True\n",
+        encoding="utf-8",
+    )
+    if event == "pre-commit":
+        _git(repo, "add", "feature.py")
+
+    reviewer = LocalPairReview(str(repo))
+    review_event = ReviewEvent.parse(event)
+    stage = {
+        "file-save": "combined",
+        "worktree-idle": "worktree",
+        "pre-commit": "index",
+    }[event]
+    patch = reviewer._capture_diff(
+        review_event,
+        _git(repo, "rev-parse", "HEAD"),
+        ("feature.py",),
+        diff_stage=stage,
+    )
+    assert patch is not None
+    assert any(
+        match is not None and match.group(5) == declaration
+        for line in patch.splitlines()
+        if (match := local_pair_review_module.RE_HUNK_HEADER.match(line))
+    )
+
+    snapshot = reviewer.capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert declaration not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="feature.py", reason="rename_group_omitted"
+    ) in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+@pytest.mark.parametrize("exposure", ["added", "deleted", "context"])
+def test_modified_file_unicode_separator_bytes_from_excluded_source_are_omitted(
+    event, unicode_separator, exposure, tmp_path
+):
+    repo = _repo(
+        tmp_path,
+        f"excluded-unicode-separator-{event}-{ord(unicode_separator)}-{exposure}",
+    )
+    unsafe_line = f"x{unicode_separator}API_TOKEN=unicode-secret"
+    (repo / ".env").write_text(
+        "SOURCE_FILLER=abcdefghijklmnopqrstuvwxyz0123456789\n"
+        "OTHER_FILLER=abcdefghijklmnopqrstuvwxyz0123456789\n"
+        f"{unsafe_line}\n",
+        encoding="utf-8",
+    )
+    destination = repo / "feature.py"
+    baseline_unsafe_line = f"{unsafe_line}\n" if exposure != "added" else ""
+    destination.write_text(
+        f"{baseline_unsafe_line}FEATURE_FLAG=disabled\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add unicode separator fixture")
+    modified_unsafe_line = f"{unsafe_line}\n" if exposure != "deleted" else ""
+    destination.write_text(
+        f"{modified_unsafe_line}FEATURE_FLAG=enabled\n", encoding="utf-8"
+    )
+    if event == "pre-commit":
+        _git(repo, "add", "feature.py")
+
+    reviewer = LocalPairReview(str(repo))
+    review_event = ReviewEvent.parse(event)
+    patch = reviewer._capture_diff(
+        review_event,
+        _git(repo, "rev-parse", "HEAD"),
+        ("feature.py",),
+        diff_stage={
+            "file-save": "combined",
+            "worktree-idle": "worktree",
+            "pre-commit": "index",
+        }[event],
+    )
+    assert patch is not None
+    assert unsafe_line in patch
+    expected_prefix = {"added": "+", "deleted": "-", "context": " "}[exposure]
+    assert f"{expected_prefix}{unsafe_line}" in patch
+    assert any(
+        unsafe_line.encode("utf-8") in region
+        for region in local_pair_review_module._patch_model_visible_regions(patch)
+    )
+
+    snapshot = reviewer.capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "unicode-secret" not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="feature.py", reason="rename_group_omitted"
+    ) in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("unicode_separator", ["\r", "\u0085", "\u2028", "\u2029"])
+def test_patch_model_visible_regions_preserve_unicode_hunk_header_context(
+    unicode_separator,
+):
+    header_context = f"def helper():{unicode_separator}API_TOKEN=header-secret"
+    patch = f"@@ -1 +1 @@ {header_context}\n-old\n+new\n"
+
+    regions = local_pair_review_module._patch_model_visible_regions(patch)
+
+    assert header_context.encode("utf-8") in regions
+
+
+def test_worktree_idle_scopes_staged_and_current_modified_variants(tmp_path):
+    repo = _repo(tmp_path, "distant-existing-excluded-content-both-stages")
+    (repo / ".env").write_text("API_TOKEN=existing-secret\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    filler = "".join(f"FILLER_{index}=unchanged\n" for index in range(12))
+    base_content = (
+        "API_TOKEN=existing-secret\n"
+        f"{filler}STAGED_FLAG=disabled\n"
+        f"{filler}WORKTREE_FLAG=disabled\n"
+    )
+    destination.write_text(base_content, encoding="utf-8")
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add historical staged fixture")
+    staged_content = base_content.replace("STAGED_FLAG=disabled", "STAGED_FLAG=enabled")
+    destination.write_text(staged_content, encoding="utf-8")
+    _git(repo, "add", "feature.py")
+    destination.write_text(
+        staged_content.replace("WORKTREE_FLAG=disabled", "WORKTREE_FLAG=enabled"),
+        encoding="utf-8",
+    )
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.changed_paths == ("feature.py",)
+    assert "+STAGED_FLAG=enabled" in snapshot.diff
+    assert "+WORKTREE_FLAG=enabled" in snapshot.diff
+    assert "existing-secret" not in snapshot.diff
+    assert not any(
+        issue.path == "feature.py" and issue.reason == "rename_group_omitted"
+        for issue in snapshot.coverage_issues
+    )
+
+
+def test_patch_scoped_rename_uses_source_and_destination_pathspecs(tmp_path):
+    repo = _repo(tmp_path, "grouped-patch-scoped-rename")
+    secret_line = "API_TOKEN=distant-historical-secret"
+    (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
+    source = repo / "feature.py"
+    filler = "".join(f"FILLER_{index}=unchanged\n" for index in range(12))
+    source.write_text(
+        f"{secret_line}\n{filler}FEATURE_FLAG=disabled\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add grouped rename fixture")
+    destination = repo / "renamed.py"
+    _git(repo, "mv", "feature.py", "renamed.py")
+    destination.write_text(
+        destination.read_text(encoding="utf-8").replace(
+            "FEATURE_FLAG=disabled", "FEATURE_FLAG=enabled"
+        ),
+        encoding="utf-8",
+    )
+    _git(repo, "add", "renamed.py")
+    reviewer = LocalPairReview(str(repo))
+    base_revision = _git(repo, "rev-parse", "HEAD")
+
+    destination_only = reviewer._capture_diff(
+        ReviewEvent.PRE_COMMIT,
+        base_revision,
+        ("renamed.py",),
+        diff_stage="index",
+    )
+    grouped = reviewer._capture_diff(
+        ReviewEvent.PRE_COMMIT,
+        base_revision,
+        ("feature.py", "renamed.py"),
+        diff_stage="index",
+    )
+
+    assert destination_only is not None and secret_line in destination_only
+    assert grouped is not None and secret_line not in grouped
+    assert "+FEATURE_FLAG=enabled" in grouped
+
+
+@pytest.mark.parametrize("change_kind", ["rename", "copy"])
+@pytest.mark.parametrize(
+    ("event", "expected_stage", "add_worktree_edit"),
+    [
+        ("file-save", "combined", False),
+        ("worktree-idle", "index", True),
+        ("pre-commit", "index", False),
+    ],
+)
+def test_rename_copy_edits_scope_provenance_to_captured_group_patch(
+    change_kind, event, expected_stage, add_worktree_edit, tmp_path
+):
+    repo = _repo(tmp_path, f"patch-scoped-{change_kind}-{event}")
+    secret_line = "API_TOKEN=distant-rename-copy-secret"
+    (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
+    source = repo / "feature.py"
+    filler = "".join(f"FILLER_{index}=unchanged\n" for index in range(12))
+    base_content = (
+        f"{secret_line}\n"
+        f"{filler}FEATURE_FLAG=disabled\n"
+        f"{filler}WORKTREE_FLAG=disabled\n"
+    )
+    source.write_text(base_content, encoding="utf-8")
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add rename copy fixture")
+    destination_name = "renamed.py" if change_kind == "rename" else "copied.py"
+    destination = repo / destination_name
+    if change_kind == "rename":
+        _git(repo, "mv", "feature.py", destination_name)
+    else:
+        destination.write_text(base_content, encoding="utf-8")
+    destination.write_text(
+        destination.read_text(encoding="utf-8").replace(
+            "FEATURE_FLAG=disabled", "FEATURE_FLAG=enabled"
+        ),
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-A")
+    if add_worktree_edit:
+        destination.write_text(
+            destination.read_text(encoding="utf-8").replace(
+                "WORKTREE_FLAG=disabled", "WORKTREE_FLAG=enabled"
+            ),
+            encoding="utf-8",
+        )
+
+    reviewer = LocalPairReview(str(repo))
+    parsed_event = ReviewEvent.parse(event)
+    focus_path = destination_name if parsed_event is ReviewEvent.FILE_SAVE else None
+    groups = reviewer._tracked_path_groups(
+        parsed_event,
+        _git(repo, "rev-parse", "HEAD"),
+        focus_path,
+    )
+    assert groups is not None
+    assert any(
+        stage == expected_stage
+        and status.startswith(change_kind[0].upper())
+        and group == ("feature.py", destination_name)
+        for stage, status, group in groups
+    )
+
+    snapshot = reviewer.capture(event=event, focus_path=focus_path)
+
+    assert destination_name in snapshot.changed_paths
+    assert "+FEATURE_FLAG=enabled" in snapshot.diff
+    if add_worktree_edit:
+        assert "+WORKTREE_FLAG=enabled" in snapshot.diff
+    assert secret_line not in snapshot.diff
+    assert not any(
+        issue.path == destination_name and issue.reason == "rename_group_omitted"
+        for issue in snapshot.coverage_issues
+    )
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+@pytest.mark.parametrize("change_kind", ["rename", "copy"])
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+def test_metadata_only_rename_copy_with_unicode_separator_path_is_not_a_fake_hunk(
+    event, change_kind, unicode_separator, tmp_path
+):
+    repo = _repo(
+        tmp_path,
+        f"metadata-{change_kind}-{event}-{ord(unicode_separator)}-path",
+    )
+    source_name = "feature.py"
+    source = repo / source_name
+    source.write_text("FEATURE_FLAG=disabled\n", encoding="utf-8")
+    _git(repo, "add", source_name)
+    _git(repo, "commit", "-m", "add metadata path fixture")
+    destination_name = (
+        f"destination{unicode_separator}@@ -1 +1 @@ fake.py"
+    )
+    destination = repo / destination_name
+    if change_kind == "rename":
+        _git(repo, "mv", source_name, destination_name)
+    else:
+        destination.write_bytes(source.read_bytes())
+        _git(repo, "add", destination_name)
+
+    reviewer = LocalPairReview(str(repo))
+    review_event = ReviewEvent.parse(event)
+    focus_path = destination_name if review_event is ReviewEvent.FILE_SAVE else None
+    groups = reviewer._tracked_path_groups(
+        review_event,
+        _git(repo, "rev-parse", "HEAD"),
+        focus_path,
+    )
+    expected_status = "R100" if change_kind == "rename" else "C100"
+    assert groups is not None
+    assert any(
+        status == expected_status and group == (source_name, destination_name)
+        for _stage, status, group in groups
+    )
+
+    snapshot = reviewer.capture(event=event, focus_path=focus_path)
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(
+        path=source_name, reason="metadata_only_diff"
+    ) in snapshot.coverage_issues
+    assert CoverageIssue(
+        path=destination_name, reason="metadata_only_diff"
+    ) in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("change_kind", ["rename", "copy"])
+def test_metadata_only_staged_group_does_not_suppress_safe_worktree_edit(
+    change_kind, tmp_path
+):
+    repo = _repo(tmp_path, f"metadata-{change_kind}-safe-worktree-edit")
+    secret_line = "API_TOKEN=distant-metadata-rename-secret"
+    (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
+    source = repo / "feature.py"
+    filler = "".join(f"FILLER_{index}=unchanged\n" for index in range(12))
+    source.write_text(
+        f"{secret_line}\n{filler}FEATURE_FLAG=disabled\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add metadata rename fixture")
+    destination_name = "renamed.py" if change_kind == "rename" else "copied.py"
+    destination = repo / destination_name
+    if change_kind == "rename":
+        _git(repo, "mv", "feature.py", destination_name)
+    else:
+        destination.write_text(
+            source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        _git(repo, "add", destination_name)
+    destination.write_text(
+        destination.read_text(encoding="utf-8").replace(
+            "FEATURE_FLAG=disabled", "FEATURE_FLAG=enabled"
+        ),
+        encoding="utf-8",
+    )
+    reviewer = LocalPairReview(str(repo))
+    groups = reviewer._tracked_path_groups(
+        ReviewEvent.WORKTREE_IDLE,
+        _git(repo, "rev-parse", "HEAD"),
+    )
+
+    assert groups is not None
+    expected_status = "R100" if change_kind == "rename" else "C100"
+    assert ("index", expected_status, ("feature.py", destination_name)) in groups
+    assert ("worktree", "M", (destination_name,)) in groups
+
+    snapshot = reviewer.capture(event="worktree-idle")
+
+    assert destination_name in snapshot.changed_paths
+    assert "+FEATURE_FLAG=enabled" in snapshot.diff
+    assert secret_line not in snapshot.diff
+    assert not any(
+        issue.path == destination_name and issue.reason == "rename_group_omitted"
+        for issue in snapshot.coverage_issues
+    )
+
+
+@pytest.mark.parametrize("change_kind", ["rename", "copy"])
+def test_oversized_rename_copy_group_is_omitted_without_split_capture(
+    change_kind, tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path, f"oversized-{change_kind}-group")
+    secret_line = "API_TOKEN=oversized-group-secret"
+    (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
+    source_name = f"source_{'s' * 40}.py"
+    destination_name = f"destination_{'d' * 40}.py"
+    source = repo / source_name
+    source.write_text(
+        f"{secret_line}\nPUBLIC_FLAG=unchanged\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", source_name)
+    _git(repo, "commit", "-m", "add oversized group fixture")
+    destination = repo / destination_name
+    if change_kind == "rename":
+        _git(repo, "mv", source_name, destination_name)
+    else:
+        destination.write_bytes(source.read_bytes())
+        _git(repo, "add", destination_name)
+
+    reviewer = LocalPairReview(str(repo))
+    parsed_event = ReviewEvent.PRE_COMMIT
+    base_revision = _git(repo, "rev-parse", "HEAD")
+    groups = reviewer._tracked_path_groups(parsed_event, base_revision)
+    expected_status = "R100" if change_kind == "rename" else "C100"
+    expected_group = (source_name, destination_name)
+    assert groups is not None
+    assert ("index", expected_status, expected_group) in groups
+    single_path_budget = max(
+        len(path.encode("utf-8")) + 1 for path in expected_group
+    )
+    original_batch_path_groups = local_pair_review_module._batch_path_groups
+
+    def forced_small_batches(path_groups):
+        return original_batch_path_groups(
+            path_groups,
+            max_path_bytes=single_path_budget,
+        )
+
+    captured_path_sets = []
+    original_capture_diff = reviewer._capture_diff
+
+    def capture_diff(event, captured_base, paths, **kwargs):
+        captured_path_sets.append(tuple(paths))
+        return original_capture_diff(event, captured_base, paths, **kwargs)
+
+    monkeypatch.setattr(
+        local_pair_review_module, "_batch_path_groups", forced_small_batches
+    )
+    monkeypatch.setattr(reviewer, "_capture_diff", capture_diff)
+
+    snapshot = reviewer.capture(event=parsed_event)
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert captured_path_sets
+    assert set(captured_path_sets) == {expected_group}
+    assert CoverageIssue(
+        path=source_name, reason="snapshot_byte_budget"
+    ) in snapshot.coverage_issues
+    assert CoverageIssue(
+        path=destination_name, reason="snapshot_byte_budget"
+    ) in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_modified_file_exposing_large_unsafe_source_context_is_omitted(event, tmp_path):
+    repo = _repo(tmp_path, f"exposed-large-excluded-context-{event}")
+    secret_line = "API_TOKEN=large-exposed-context-secret-1234567890"
+    (repo / ".env").write_text(
+        "".join(f"SOURCE_FILLER_{index}=unchanged\n" for index in range(150))
+        + f"{secret_line}\n",
+        encoding="utf-8",
+    )
+    destination = repo / "feature.py"
+    destination.write_text(
+        f"{secret_line}\nFEATURE_FLAG=disabled\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add contextual content")
+    destination.write_text(
+        f"{secret_line}\nFEATURE_FLAG=enabled\n",
+        encoding="utf-8",
+    )
+    if event == "pre-commit":
+        _git(repo, "add", "feature.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="feature.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_modified_file_exposing_short_line_from_large_unsafe_source_is_omitted(
+    event, tmp_path
+):
+    repo = _repo(tmp_path, f"short-line-large-excluded-source-{event}")
+    secret_line = "TOKEN=short"
+    (repo / ".env").write_text(
+        "SOURCE_FILLER=abcdefghijklmnopqrstuvwxyz0123456789\n"
+        "OTHER_FILLER=abcdefghijklmnopqrstuvwxyz0123456789\n"
+        f"{secret_line}\n",
+        encoding="utf-8",
+    )
+    destination = repo / "feature.py"
+    destination.write_text("FEATURE_FLAG=disabled\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add large source with short secret")
+    destination.write_text(
+        f"{secret_line}\nFEATURE_FLAG=enabled\n",
+        encoding="utf-8",
+    )
+    if event == "pre-commit":
+        _git(repo, "add", "feature.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="feature.py", reason="rename_group_omitted"
+    ) in snapshot.coverage_issues
+
+
+def test_unsafe_exact_line_index_budget_fails_closed(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, "unsafe-exact-line-index-budget")
+    (repo / ".env").write_text(
+        "FIRST=one\nSECOND=two\n",
+        encoding="utf-8",
+    )
+    destination = repo / "feature.py"
+    destination.write_text("FEATURE_FLAG=disabled\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add exact line budget fixture")
+    destination.write_text("FEATURE_FLAG=enabled\n", encoding="utf-8")
+    monkeypatch.setattr(
+        local_pair_review_module, "_UNSAFE_COPY_MAX_TOTAL_EXACT_LINES", 1
+    )
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event="file-save", focus_path="feature.py"
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "FIRST=one" not in snapshot.diff
+    assert CoverageIssue(reason="copy_source_discovery_budget") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("unsafe_stage", ["index", "worktree"])
+def test_worktree_idle_rejects_unsafe_modified_variant_in_either_stage(unsafe_stage, tmp_path):
+    repo = _repo(tmp_path, f"unsafe-modified-{unsafe_stage}-variant")
+    secret_line = "API_TOKEN=stage-specific-secret"
+    (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    destination.write_text("FEATURE_FLAG=disabled\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add staged parity fixture")
+    if unsafe_stage == "index":
+        destination.write_text(f"{secret_line}\nSTAGED_FLAG=enabled\n", encoding="utf-8")
+        _git(repo, "add", "feature.py")
+        destination.write_text("WORKTREE_FLAG=enabled\n", encoding="utf-8")
+    else:
+        destination.write_text("STAGED_FLAG=enabled\n", encoding="utf-8")
+        _git(repo, "add", "feature.py")
+        destination.write_text(
+            f"STAGED_FLAG=enabled\n{secret_line}\n",
+            encoding="utf-8",
+        )
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="feature.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("unsafe_stage", ["index", "worktree"])
+def test_worktree_idle_rejects_removed_unsafe_bytes_in_either_stage(
+    unsafe_stage, tmp_path
+):
+    repo = _repo(tmp_path, f"removed-unsafe-{unsafe_stage}-variant")
+    secret_line = "API_TOKEN=removed-stage-specific-secret"
+    (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    filler = "".join(f"FILLER_{index}=unchanged\n" for index in range(12))
+    base_content = (
+        f"{secret_line}\n"
+        "NEAR_FLAG=disabled\n"
+        f"{filler}FAR_FLAG=disabled\n"
+    )
+    destination.write_text(base_content, encoding="utf-8")
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add removed staged parity fixture")
+    if unsafe_stage == "index":
+        staged_content = base_content.replace(f"{secret_line}\n", "").replace(
+            "NEAR_FLAG=disabled", "NEAR_FLAG=enabled"
+        )
+        destination.write_text(staged_content, encoding="utf-8")
+        _git(repo, "add", "feature.py")
+        destination.write_text(
+            staged_content.replace("FAR_FLAG=disabled", "FAR_FLAG=enabled"),
+            encoding="utf-8",
+        )
+    else:
+        staged_content = base_content.replace("FAR_FLAG=disabled", "FAR_FLAG=enabled")
+        destination.write_text(staged_content, encoding="utf-8")
+        _git(repo, "add", "feature.py")
+        destination.write_text(
+            staged_content.replace(f"{secret_line}\n", "").replace(
+                "NEAR_FLAG=disabled", "NEAR_FLAG=enabled"
+            ),
+            encoding="utf-8",
+        )
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="feature.py", reason="rename_group_omitted"
+    ) in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+@pytest.mark.parametrize("source_policy", ["excluded", "filtered"])
+def test_non_regular_unsafe_symlink_source_fails_closed_without_following(
+    event, source_policy, tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path, f"unsafe-symlink-{source_policy}-{event}")
+    target = tmp_path / f"private-target-{source_policy}-{event}"
+    secret_line = "API_TOKEN=symlink-target-secret"
+    target.write_text(f"{secret_line}\n", encoding="utf-8")
+    if source_policy == "filtered":
+        (repo / ".gitattributes").write_text(
+            "*.secret filter=crypt\n", encoding="utf-8"
+        )
+        _git(repo, "add", ".gitattributes")
+        _git(repo, "commit", "-m", "mark filtered sources")
+        source = repo / "vault.secret"
+    else:
+        source = repo / ".env"
+    source.symlink_to(target)
+    destination = repo / "public.txt"
+    destination.write_text(f"{secret_line}\n", encoding="utf-8")
+    if event == "pre-commit":
+        _git(repo, "add", "public.txt")
+    stable_reads = []
+    original_stable_read = local_pair_review_module._read_stable_regular_file
+
+    def track_stable_read(path, max_bytes):
+        stable_reads.append(path)
+        return original_stable_read(path, max_bytes)
+
+    monkeypatch.setattr(
+        local_pair_review_module, "_read_stable_regular_file", track_stable_read
+    )
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="public.txt" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert source not in stable_reads
+    assert source.is_symlink()
+    assert CoverageIssue(reason="copy_source_discovery_budget") in snapshot.coverage_issues
+
+
+def test_operational_symlink_alias_uses_independently_inventoried_target(tmp_path):
+    repo = _repo(tmp_path, "operational-symlink-with-inventoried-target")
+    secret_line = "API_TOKEN=operational-alias-secret"
+    target = repo / "provider-secrets.toml"
+    target.write_text(f"{secret_line}\n", encoding="utf-8")
+    (repo / ".pr_agent.toml").symlink_to(target.name)
+    (repo / "public.txt").write_text(f"{secret_line}\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(
+        str(repo), ignored_paths=[".pr_agent.toml", "provider-secrets.toml"]
+    ).capture(event="file-save", focus_path="public.txt")
+
+    assert snapshot.diff == ""
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(
+        path="provider-secrets.toml", reason="excluded"
+    ) in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="public.txt", reason="rename_group_omitted"
+    ) in snapshot.coverage_issues
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="platform has no FIFO support")
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_non_regular_unsafe_fifo_source_fails_closed(event, tmp_path):
+    repo = _repo(tmp_path, f"unsafe-fifo-{event}")
+    source = repo / ".env"
+    os.mkfifo(source)
+    secret_line = "API_TOKEN=unavailable-fifo-source"
+    destination = repo / "public.txt"
+    destination.write_text(f"{secret_line}\n", encoding="utf-8")
+    if event == "pre-commit":
+        _git(repo, "add", "public.txt")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="public.txt" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(reason="copy_source_discovery_budget") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+@pytest.mark.parametrize("source_kind", ["symlink", "fifo"])
+def test_nested_git_named_non_regular_unsafe_source_fails_closed(
+    event, source_kind, tmp_path
+):
+    if source_kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("platform has no FIFO support")
+    repo = _repo(tmp_path, f"nested-git-{source_kind}-{event}")
+    nested = repo / "scratch"
+    nested.mkdir()
+    source = nested / ".git"
+    if source_kind == "symlink":
+        target = tmp_path / f"nested-git-private-target-{event}"
+        target.write_text("API_TOKEN=nested-git-secret\n", encoding="utf-8")
+        source.symlink_to(target)
+    else:
+        os.mkfifo(source)
+    secret_line = "API_TOKEN=nested-git-secret"
+    destination = repo / "public.txt"
+    destination.write_text(f"{secret_line}\n", encoding="utf-8")
+    if event == "pre-commit":
+        _git(repo, "add", "public.txt")
+
+    reviewer = LocalPairReview(
+        str(repo), ignored_paths=["scratch/.git"]
+    )
+    discovered = reviewer._non_regular_source_paths(
+        reviewer.max_path_discovery_bytes
+    )
+    snapshot = reviewer.capture(
+        event=event,
+        focus_path="public.txt" if event == "file-save" else None,
+    )
+
+    assert discovered is not None and "scratch/.git" in discovered
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(
+        reason="copy_source_discovery_budget"
+    ) in snapshot.coverage_issues
+
+
+def test_non_regular_source_discovery_never_descends_into_root_git_directory(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path, "root-git-directory-skip")
+    root_git = repo / ".git"
+    scanned = []
+    original_scandir = local_pair_review_module.os.scandir
+
+    def guarded_scandir(directory):
+        directory_path = Path(directory)
+        scanned.append(directory_path)
+        if directory_path == root_git:
+            raise AssertionError("descended into repository metadata")
+        return original_scandir(directory)
+
+    monkeypatch.setattr(local_pair_review_module.os, "scandir", guarded_scandir)
+
+    paths = LocalPairReview(str(repo))._non_regular_source_paths(1024)
+
+    assert paths == []
+    assert repo in scanned
+    assert root_git not in scanned
+
+
+def test_non_regular_source_discovery_stops_before_materializing_over_budget(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path, "bounded-non-regular-source-discovery")
+
+    class CountingScandir:
+        def __init__(self):
+            self.produced = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.produced >= 100_000:
+                raise StopIteration
+            self.produced += 1
+            return object()
+
+    iterator = CountingScandir()
+    monkeypatch.setattr(local_pair_review_module.os, "scandir", lambda path: iterator)
+    reviewer = LocalPairReview(str(repo), max_path_discovery_bytes=0)
+
+    assert reviewer._non_regular_source_paths(0) is None
+    assert iterator.produced == 1
+
+
+@pytest.mark.parametrize("target_kind", ["external", "cycle"])
+def test_non_regular_source_discovery_rejects_junction_target_before_descending(
+    target_kind, tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path, f"junction-{target_kind}-source-discovery")
+    junction = repo / "junction"
+    junction.mkdir()
+    if target_kind == "external":
+        junction_target = tmp_path / "outside-target"
+        junction_target.mkdir()
+        (junction_target / "outside-secret.txt").write_text(
+            "must-not-be-scanned\n",
+            encoding="utf-8",
+        )
+    else:
+        junction_target = repo
+    (junction / "target").symlink_to(junction_target, target_is_directory=True)
+    (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+    original_scandir = local_pair_review_module.os.scandir
+    scanned_directories = []
+
+    def track_scandir(path):
+        scanned_directories.append(Path(path))
+        if Path(path) == junction:
+            raise AssertionError(f"followed {target_kind} junction target")
+        return original_scandir(path)
+
+    monkeypatch.setattr(local_pair_review_module.os, "scandir", track_scandir)
+    monkeypatch.setattr(
+        local_pair_review_module.os.path,
+        "isjunction",
+        lambda path: Path(path) == junction,
+    )
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert junction not in scanned_directories
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "must-not-be-scanned" not in snapshot.diff
+    assert CoverageIssue(
+        reason="untracked_source_discovery_budget"
+    ) in snapshot.coverage_issues
+
+
+def test_modified_destination_copy_scan_budget_fails_closed(tmp_path):
+    repo = _repo(tmp_path, "modified-destination-copy-budget")
+    secret_line = "API_TOKEN=copy-budget-secret"
+    (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    destination.write_text("FEATURE_FLAG=disabled\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add copy budget fixture")
+    destination.write_text(
+        f"{secret_line}\nFEATURE_FLAG=enabled\n",
+        encoding="utf-8",
+    )
+
+    snapshot = LocalPairReview(str(repo), max_snapshot_bytes=32).capture(
+        event="file-save", focus_path="feature.py"
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert CoverageIssue(reason="copy_source_discovery_budget") in snapshot.coverage_issues
+
+
+def test_modified_destination_copy_scan_revalidates_unsafe_source_state(tmp_path):
+    repo = _repo(tmp_path, "modified-destination-copy-source-race")
+    source = repo / ".env"
+    source.write_text("API_TOKEN=initial-unrelated-value\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    destination.write_text("FEATURE_FLAG=disabled\n", encoding="utf-8")
+    _git(repo, "add", "feature.py")
+    _git(repo, "commit", "-m", "add source race fixture")
+    secret_line = "API_TOKEN=late-symlink-secret"
+    destination.write_text(
+        f"{secret_line}\nFEATURE_FLAG=enabled\n",
+        encoding="utf-8",
+    )
+    target = tmp_path / "late-private-target"
+    target.write_text(f"{secret_line}\n", encoding="utf-8")
+
+    class RacingReview(LocalPairReview):
+        source_replaced = False
+
+        def _unsafe_copy_sources(self, *args, **kwargs):
+            result = super()._unsafe_copy_sources(*args, **kwargs)
+            if not self.source_replaced:
+                self.source_replaced = True
+                source.unlink()
+                source.symlink_to(target)
+            return result
+
+    snapshot = RacingReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert source.is_symlink()
+    assert CoverageIssue(reason="content_changed_during_capture") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
 def test_deletion_only_modified_file_is_unsupported_coverage(event, tmp_path):
     repo = _repo(tmp_path, f"deletion-only-modified-{event}")
     path = repo / "tracked.py"
     path.write_text("remove_me = True\nkeep_me = True\n", encoding="utf-8")
     _git(repo, "add", "tracked.py")
     _git(repo, "commit", "-m", "add deletion fixture")
+    path.write_text("keep_me = True\n", encoding="utf-8")
+    if event == "pre-commit":
+        _git(repo, "add", "tracked.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="tracked.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(
+        path="tracked.py", reason="deleted_file_unsupported"
+    ) in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+def test_deletion_only_unicode_separator_line_is_unsupported_coverage(
+    event, unicode_separator, tmp_path
+):
+    repo = _repo(
+        tmp_path, f"deletion-only-unicode-separator-{event}-{ord(unicode_separator)}"
+    )
+    path = repo / "tracked.py"
+    path.write_text(
+        f"safe{unicode_separator}+looks_added\nkeep_me = True\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "tracked.py")
+    _git(repo, "commit", "-m", "add unicode deletion fixture")
     path.write_text("keep_me = True\n", encoding="utf-8")
     if event == "pre-commit":
         _git(repo, "add", "tracked.py")
@@ -887,7 +1924,7 @@ def test_file_save_rejects_a_focused_rename_with_an_excluded_source(tmp_path):
     assert CoverageIssue(path="allowed.py", reason="rename_group_omitted") in snapshot.coverage_issues
 
 
-def test_file_save_does_not_select_a_copy_by_its_unchanged_source(tmp_path):
+def test_file_save_treats_an_identical_copy_as_metadata_only(tmp_path):
     repo = _repo(tmp_path, "file-save-copy-source")
     source = repo / "source.txt"
     source.write_text("shared content\n", encoding="utf-8")
@@ -906,9 +1943,14 @@ def test_file_save_does_not_select_a_copy_by_its_unchanged_source(tmp_path):
 
     assert source_snapshot.changed_paths == ()
     assert source_snapshot.diff == ""
-    assert destination_snapshot.changed_paths == ("other.txt",)
-    assert "+shared content" in destination_snapshot.diff
-    assert destination_snapshot.coverage_issues == ()
+    assert destination_snapshot.changed_paths == ()
+    assert destination_snapshot.diff == ""
+    assert CoverageIssue(
+        path="source.txt", reason="metadata_only_diff"
+    ) in destination_snapshot.coverage_issues
+    assert CoverageIssue(
+        path="other.txt", reason="metadata_only_diff"
+    ) in destination_snapshot.coverage_issues
 
 
 def test_file_save_checks_copy_source_filter_from_base(tmp_path):
@@ -1629,6 +2671,37 @@ def test_findings_must_match_captured_files_and_hunk_lines(
     assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
     assert result.review is None
     assert CoverageIssue(reason="review_failed:InvalidStructuredReview") in result.coverage_issues
+
+
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+def test_finding_cannot_target_a_unicode_separator_fragment(unicode_separator):
+    diff = (
+        "--- a/x\n"
+        "+++ b/x\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        f"+new{unicode_separator}+looks_like_a_second_line\n"
+    )
+    snapshot = _snapshot("/repo/one", diff=diff)
+
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={"review": {"key_issues_to_review": [{
+            "relevant_file": "x",
+            "issue_header": "Bug",
+            "issue_content": "This finding targets a nonexistent patch line.",
+            "start_line": 2,
+            "end_line": 2,
+        }]}},
+        started_at=monotonic(),
+    )
+
+    assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert result.review is None
+    assert CoverageIssue(
+        reason="review_failed:InvalidStructuredReview"
+    ) in result.coverage_issues
 
 
 def test_finding_range_may_include_adjacent_unchanged_context():

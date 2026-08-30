@@ -15,7 +15,9 @@ from gitlab import (GitlabAuthenticationError, GitlabCreateError,
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 from ..algo.file_filter import filter_ignored
-from ..algo.git_patch_processing import decode_if_bytes
+from ..algo.git_patch_processing import (decode_if_bytes, iter_git_patch_lines,
+                                         split_git_file_lines,
+                                         strip_git_line_ending)
 from ..algo.inline_comment_dedup import (body_fingerprint, body_with_markers,
                                          code_fingerprint,
                                          get_inline_comment_store,
@@ -875,7 +877,7 @@ class GitLabProvider(GitProvider):
 
 
             # count number of lines added and removed
-            patch_lines = patch.splitlines(keepends=True)
+            patch_lines = list(iter_git_patch_lines(patch))
             num_plus_lines = len([line for line in patch_lines if line.startswith('+')])
             num_minus_lines = len([line for line in patch_lines if line.startswith('-')])
             diff_files.append(
@@ -1170,7 +1172,10 @@ class GitLabProvider(GitProvider):
                 diff_patch = difflib.unified_diff(old_code_snippet.split('\n'),
                                             new_code_snippet.split('\n'), n=999)
                 patch_orig = "\n".join(diff_patch)
-                patch = "\n".join(patch_orig.splitlines()[5:]).strip('\n')
+                patch = "\n".join(
+                    strip_git_line_ending(line)
+                    for line in list(iter_git_patch_lines(patch_orig))[5:]
+                ).strip('\n')
                 diff_code = f"\n\n```diff\n{patch.rstrip()}\n```"
                 body_fallback += diff_code
 
@@ -1246,7 +1251,7 @@ class GitLabProvider(GitProvider):
                     continue
                 range = relevant_lines_end - relevant_lines_start # no need to add 1
                 body = body.replace('```suggestion', f'```suggestion:-0+{range}')
-                lines = target_file.head_file.splitlines()
+                lines = split_git_file_lines(target_file.head_file)
                 relevant_line_in_file = lines[relevant_lines_start - 1]
 
                 # edit_type, found, source_line_no, target_file, target_line_no = self.find_in_file(target_file,
@@ -1315,7 +1320,10 @@ class GitLabProvider(GitProvider):
         found = False
         target_file = file
         patch = file.patch
-        patch_lines = patch.splitlines()
+        patch_lines = [
+            strip_git_line_ending(line)
+            for line in iter_git_patch_lines(patch)
+        ]
         for line in patch_lines:
             if line.startswith('@@'):
                 match = self.RE_HUNK_HEADER.match(line)
