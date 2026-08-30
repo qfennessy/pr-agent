@@ -270,17 +270,20 @@ class LocalPairReview:
             return ""
         args = [
             *self._diff_filter_overrides(),
+            "-c", "core.quotePath=false",
             "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--find-renames",
         ]
         if event is ReviewEvent.PRE_COMMIT:
             args.append("--cached")
         args.extend([base_revision, "--", *paths])
-        return _run_git(self.repository_root, *args).decode("utf-8", errors="strict")
+        return _run_git(self.repository_root, *args).decode("utf-8", errors="surrogateescape")
 
     def _capture_untracked_addition(self, path: str) -> str:
         output = _run_git(
             self.repository_root,
             *self._diff_filter_overrides(),
+            "-c",
+            "core.quotePath=false",
             "diff",
             "--no-index",
             "--no-ext-diff",
@@ -290,7 +293,7 @@ class LocalPairReview:
             path,
             allowed_returncodes=(0, 1),
         )
-        return output.decode("utf-8", errors="strict")
+        return output.decode("utf-8", errors="surrogateescape")
 
     def capture(
         self,

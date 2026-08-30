@@ -307,6 +307,7 @@ def _reject_existing_repository_outputs(
         if (
             (resolved_worktree and not lexical_worktree)
             or (resolved_metadata and not lexical_metadata)
+            or (lexical_metadata and not resolved_metadata)
             or (
                 exists
                 and not lexical_worktree

@@ -94,6 +94,21 @@ def test_worktree_snapshot_captures_modified_untracked_deleted_and_renamed_files
     assert parsed["renamed.py"].old_filename == "rename_me.py"
 
 
+def test_worktree_snapshot_round_trips_non_ascii_git_path(tmp_path):
+    repo = _repo(tmp_path, "non-ascii-path")
+    path = repo / "café.py"
+    path.write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "café.py")
+    _git(repo, "commit", "-m", "add non-ascii path")
+    path.write_text("value = 2\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.changed_paths == ("café.py",)
+    assert snapshot.coverage_issues == ()
+    assert "café.py" in snapshot.diff
+
+
 def test_pre_commit_snapshot_uses_only_the_index(tmp_path):
     repo = _repo(tmp_path)
     (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")

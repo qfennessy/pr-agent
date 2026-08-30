@@ -190,6 +190,31 @@ def test_review_snapshot_rejects_external_symlink_into_git_metadata(monkeypatch,
     assert (repo / ".git" / "config").read_text(encoding="utf-8") == original_config
 
 
+def test_review_snapshot_rejects_metadata_symlink_to_external_file(monkeypatch, tmp_path, capsys):
+    import subprocess
+
+    repo = tmp_path / "repo-metadata-external-alias"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    source = repo / "changed.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    external = tmp_path / "external.txt"
+    external.write_text("keep this external file\n", encoding="utf-8")
+    artifact_dir = repo / ".git" / "pr-agent"
+    artifact_dir.mkdir()
+    (artifact_dir / "result.json").symlink_to(external)
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--json-output", ".git/pr-agent/result.json", "--no-cache",
+        ])
+
+    assert "aliases an existing repository path" in capsys.readouterr().err
+    assert external.read_text(encoding="utf-8") == "keep this external file\n"
+
+
 @pytest.mark.parametrize("repository_target", ["changed.py", ".git/config"])
 def test_review_snapshot_rejects_external_hard_link_into_repository(
     monkeypatch, tmp_path, capsys, repository_target
