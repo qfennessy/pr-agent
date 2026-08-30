@@ -202,6 +202,7 @@ def test_plan_is_stable_and_pairs_every_enabled_arm_with_same_snapshot():
         prompt_hash=_hash("general-prompt"),
         model_id="openai/model-version-2026-08-30",
         provider_id="openai/responses-v1",
+        model_revision="2026-08-30.1",
     )
     disabled = EvaluationArm(
         arm_id="disabled",
@@ -220,6 +221,7 @@ def test_plan_is_stable_and_pairs_every_enabled_arm_with_same_snapshot():
     assert {item["snapshot_id"] for item in plan["items"]} == {case.snapshot_id}
     assert plan["network_calls"] == 0
     assert plan["model_calls"] == 0
+    assert next(item for item in plan["items"] if item["arm_id"] == "general")["model_revision"] == "2026-08-30.1"
 
 
 def test_snapshot_result_adapter_preserves_partial_and_unavailable_telemetry():

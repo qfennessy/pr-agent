@@ -47,3 +47,6 @@ enabled = false
 allow_paid_execution = false
 shadow_journal_enabled = false
 publish_output = false
+paid_cost_cap_usd = 0.0
+shadow_journal_path = ""
+shadow_journal_max_queue_entries = 256

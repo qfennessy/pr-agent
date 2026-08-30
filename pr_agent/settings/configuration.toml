@@ -398,6 +398,13 @@ enabled = false
 allow_paid_execution = false
 shadow_journal_enabled = false
 publish_output = false
+# Zero is deliberately non-authorizing. Each paid run must supply and freeze a
+# positive cap after projected cost and provider credentials are known.
+paid_cost_cap_usd = 0.0
+# Empty means no shadow artifact may be opened. When explicitly enabled, use a
+# private path outside the source tree (normally below the Git common directory).
+shadow_journal_path = ""
+shadow_journal_max_queue_entries = 256
 
 [gerrit]
 # endpoint to the gerrit service

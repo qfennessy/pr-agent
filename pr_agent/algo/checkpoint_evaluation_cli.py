@@ -13,6 +13,10 @@ from pr_agent.algo.checkpoint_evaluation import (
     TruthArtifact,
     build_evaluation_plan,
 )
+from pr_agent.algo.checkpoint_evaluation_cocos import (
+    CocosCorpusLock,
+    validate_cocos_story_corpus,
+)
 
 _MAX_EVALUATION_ARTIFACT_BYTES = 10_000_000
 
@@ -66,6 +70,21 @@ def evaluation_plan_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional local answer-only truth JSON to validate separately from the plan",
     )
+    parser.add_argument(
+        "--cocos-corpus-root",
+        default=None,
+        help="Optional path to the external Cocos Story corpus; requires --cocos-lock",
+    )
+    parser.add_argument(
+        "--cocos-lock",
+        default=None,
+        help="Approved immutable hash lock for the external Cocos Story corpus",
+    )
+    parser.add_argument(
+        "--checkpoint-controls",
+        default=None,
+        help="Optional separate 15-20 case intermediate-checkpoint control ledger",
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--list", action="store_true", help="List validated cases and enabled arms")
     mode.add_argument("--dry-run", action="store_true", help="Print the deterministic paired execution plan")
@@ -79,12 +98,29 @@ def run_evaluation_plan(inargs: Optional[Sequence[str]] = None) -> dict[str, Any
     try:
         manifest = load_evaluation_manifest(args.manifest)
         truth = load_truth_artifact(args.truth, manifest) if args.truth else None
+        if bool(args.cocos_corpus_root) != bool(args.cocos_lock):
+            raise EvaluationValidationError("--cocos-corpus-root and --cocos-lock must be supplied together")
+        if args.checkpoint_controls and not args.cocos_corpus_root:
+            raise EvaluationValidationError("--checkpoint-controls requires the Cocos external corpus adapter")
+        external_corpus = None
+        if args.cocos_corpus_root:
+            lock = CocosCorpusLock.from_dict(_load_json_object(args.cocos_lock, "--cocos-lock"))
+            external_corpus = validate_cocos_story_corpus(
+                args.cocos_corpus_root,
+                lock,
+                checkpoint_controls_path=args.checkpoint_controls,
+            )
+            if manifest.corpus_hash != external_corpus.corpus_hash:
+                raise EvaluationValidationError(
+                    "evaluation manifest corpus_hash does not match the validated Cocos corpus"
+                )
     except EvaluationValidationError as exc:
         parser.error(str(exc))
 
     if args.list:
         payload = {
             "schema_version": manifest.schema_version,
+            "schema_hash": manifest.schema_hash,
             "manifest_id": manifest.manifest_id,
             "network_calls": 0,
             "model_calls": 0,
@@ -109,5 +145,7 @@ def run_evaluation_plan(inargs: Optional[Sequence[str]] = None) -> dict[str, Any
             "status": "valid",
             "truth_artifact_id": truth.truth_artifact_id,
         }
+    if external_corpus is not None:
+        payload["external_corpus"] = external_corpus.to_dict()
     print(json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2))
     return payload

@@ -1,0 +1,19 @@
+{
+  "artifact_hashes": {
+    "controls-ledger.json": "sha256:1e9e47ba48b273fc7fb45e32e1e632058364d3b62c4dff75416f70ebc6a47d77",
+    "ledger.json": "sha256:8a0ce4e2a4b46c8e653a5ea1f5f96c732e6338c83999e6d567b970b5795f15d5",
+    "specialist-annotations.json": "sha256:8263935dd662a4fd3a3aaa06c3502477ba55429985508f837e5fc1de3f22e990",
+    "temporal-backtest-ledger.json": "sha256:661cd710f39da98dc71e82e673de97edf315c6551cf183feb928d30876bd42cb"
+  },
+  "assignment_hash": "sha256:79fff80fca48719ff5152163d4aa983f76500aa3af9d979cd9c26def61dd80ca",
+  "expected_cohort_counts": {
+    "calibration": 12,
+    "control": 16,
+    "holdout": 18,
+    "temporal": 10,
+    "unique_snapshots": 55
+  },
+  "repository": "sagacious-heritage/cocos-story",
+  "schema_version": "cocos-story-checkpoint-corpus-v1",
+  "source_revision": "6b98bae67bae4056c4567187454e24cca78b9467"
+}

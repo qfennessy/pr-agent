@@ -98,6 +98,83 @@ class FindingSeverity(str, Enum):
     CRITICAL = "critical"
 
 
+class FindingLifecycleState(str, Enum):
+    ACTIVE = "active"
+    WITHDRAWN = "withdrawn"
+
+
+_EVALUATION_SCHEMA_DESCRIPTOR = {
+    "version": EVALUATION_SCHEMA_VERSION,
+    "artifacts": {
+        "arm": (
+            "arm_id", "kind", "configuration_hash", "prompt_hash", "model_id", "provider_id",
+            "model_revision", "fallback_models", "enabled",
+        ),
+        "model_identity": ("model_id", "provider_id", "model_revision"),
+        "checkpoint_case": (
+            "case_id", "snapshot_id", "snapshot_artifact_hash", "event", "cohort", "parent_case_id",
+            "lineage_elapsed_seconds", "developer_elapsed_seconds", "model_visible_metadata",
+        ),
+        "finding_truth": (
+            "finding_id", "fingerprint", "severity", "earliest_opportunity", "required_context",
+            "earliest_case_id", "withdrawn_at_case_id",
+        ),
+        "checkpoint_truth": ("case_id", "is_clean", "adjudication_hash", "findings"),
+        "manifest": (
+            "schema_version", "schema_hash", "name", "corpus_hash", "policy_hash",
+            "configuration_hash", "cases", "arms", "manifest_id",
+        ),
+        "truth_artifact": ("schema_version", "manifest_id", "truths", "truth_artifact_id"),
+        "measurement": ("status", "value"),
+        "observed_finding": (
+            "fingerprint", "severity", "lifecycle_state", "deterministic_overlap", "stage",
+        ),
+        "run_record": (
+            "schema_version", "manifest_id", "case_id", "arm_id", "snapshot_id", "attempt", "state",
+            "terminal", "findings", "snapshot_result_state", "latency_seconds", "tokens", "cost_usd",
+            "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id", "provider_id",
+            "model_revision", "record_id",
+        ),
+        "gate_rule": ("metric", "comparator", "threshold", "minimum_support"),
+        "score_metric": ("status", "value", "support"),
+        "arm_scorecard": (
+            "schema_version", "arm_id", "case_count", "attempt_count", "failed_attempt_count",
+            "completed_case_count", "duplicate_finding_count", "true_positive_count",
+            "false_positive_count", "false_negative_count", "clean_checkpoint_count",
+            "false_interruption_count", "escalated_case_count", "high_critical_case_count",
+            "high_critical_escalated_count", "stale_finding_count", "deterministic_overlap_count",
+            "metrics", "cohort_metrics",
+        ),
+        "paired_comparison": (
+            "baseline_arm_id", "arm_id", "metric", "support", "delta", "lower_95", "upper_95",
+        ),
+        "matched_scorecard": (
+            "schema_version", "manifest_id", "truth_artifact_id", "arms", "paired_comparisons",
+            "scorecard_id",
+        ),
+        "gate_rule_result": ("rule", "status", "observed", "reason"),
+        "gate_decision": (
+            "schema_version", "gate_name", "arm_id", "scorecard_id", "gate_spec_hash", "status",
+            "rule_results", "decision_id",
+        ),
+    },
+    "enums": {
+        "arm_kind": tuple(item.value for item in EvaluationArmKind),
+        "cohort": tuple(item.value for item in EvaluationCohort),
+        "run_state": tuple(item.value for item in EvaluationRunState),
+        "measurement_status": tuple(item.value for item in MeasurementStatus),
+        "gate_status": tuple(item.value for item in GateStatus),
+        "severity": tuple(item.value for item in FindingSeverity),
+        "finding_lifecycle": tuple(item.value for item in FindingLifecycleState),
+        "review_event": tuple(item.value for item in ReviewEvent),
+        "snapshot_result_state": tuple(item.value for item in ReviewResultState),
+        "gate_comparator": ("at_least", "at_most"),
+    },
+    "model_visible_metadata_keys": tuple(sorted(_MODEL_VISIBLE_METADATA_KEYS)),
+    "answer_only_keys": tuple(sorted(_ANSWER_ONLY_KEYS)),
+}
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, allow_nan=False, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
@@ -106,6 +183,11 @@ def content_hash(value: Any) -> str:
     """Return a stable sha256 identity for a JSON-compatible value."""
     digest = hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
+
+
+def evaluation_schema_hash() -> str:
+    """Hash the concrete serialized contract, not just its version label."""
+    return content_hash(_EVALUATION_SCHEMA_DESCRIPTOR)
 
 
 def _validate_hash(name: str, value: str) -> None:
@@ -180,6 +262,40 @@ def _validate_model_visible_metadata(value: Mapping[str, Any]) -> None:
 
 
 @dataclass(frozen=True)
+class EvaluationModelIdentity:
+    """One provider/model/revision triple that production fallback may select."""
+
+    model_id: str
+    provider_id: str
+    model_revision: str
+
+    def __post_init__(self) -> None:
+        _validate_identifier("fallback model_id", self.model_id)
+        _validate_identifier("fallback provider_id", self.provider_id)
+        _validate_identifier("fallback model_revision", self.model_revision)
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "model_id": self.model_id,
+            "provider_id": self.provider_id,
+            "model_revision": self.model_revision,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "EvaluationModelIdentity":
+        _reject_unknown_fields(
+            "evaluation model identity",
+            value,
+            {"model_id", "provider_id", "model_revision"},
+        )
+        return cls(
+            model_id=value["model_id"],
+            provider_id=value["provider_id"],
+            model_revision=value["model_revision"],
+        )
+
+
+@dataclass(frozen=True)
 class EvaluationArm:
     """One production-backed arm in a paired evaluation."""
 
@@ -189,6 +305,8 @@ class EvaluationArm:
     prompt_hash: str
     model_id: Optional[str] = None
     provider_id: Optional[str] = None
+    model_revision: Optional[str] = None
+    fallback_models: tuple[EvaluationModelIdentity, ...] = field(default_factory=tuple)
     enabled: bool = True
 
     def __post_init__(self) -> None:
@@ -199,14 +317,54 @@ class EvaluationArm:
         _validate_hash("prompt_hash", self.prompt_hash)
         if not isinstance(self.enabled, bool):
             raise EvaluationValidationError("evaluation arm enabled must be a boolean")
+        object.__setattr__(self, "fallback_models", tuple(self.fallback_models))
+        if any(not isinstance(identity, EvaluationModelIdentity) for identity in self.fallback_models):
+            raise EvaluationValidationError("fallback_models must use EvaluationModelIdentity")
         if self.kind is EvaluationArmKind.DETERMINISTIC:
-            if self.model_id is not None or self.provider_id is not None:
-                raise EvaluationValidationError("the deterministic arm cannot name a model or provider")
+            if (
+                self.model_id is not None
+                or self.provider_id is not None
+                or self.model_revision is not None
+                or self.fallback_models
+            ):
+                raise EvaluationValidationError(
+                    "the deterministic arm cannot name a model, provider, revision, or fallback"
+                )
         elif not self.model_id or not self.provider_id:
             raise EvaluationValidationError("model-backed arms require immutable model_id and provider_id values")
         else:
             _validate_identifier("model_id", self.model_id)
             _validate_identifier("provider_id", self.provider_id)
+            if self.model_revision is not None:
+                _validate_identifier("model_revision", self.model_revision)
+            model_ids = [self.model_id, *(identity.model_id for identity in self.fallback_models)]
+            if len(model_ids) != len(set(model_ids)):
+                raise EvaluationValidationError("primary and fallback model ids must be unique within an arm")
+
+    def model_identities(self) -> tuple[tuple[Optional[str], Optional[str], Optional[str]], ...]:
+        if self.kind is EvaluationArmKind.DETERMINISTIC:
+            return ((None, None, None),)
+        return (
+            (self.model_id, self.provider_id, self.model_revision),
+            *(
+                (identity.model_id, identity.provider_id, identity.model_revision)
+                for identity in self.fallback_models
+            ),
+        )
+
+    def accepts_run_identity(
+        self,
+        model_id: Optional[str],
+        provider_id: Optional[str],
+        model_revision: Optional[str],
+    ) -> bool:
+        return (model_id, provider_id, model_revision) in self.model_identities()
+
+    def resolve_model_identity(self, model_id: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        matches = [identity for identity in self.model_identities() if identity[0] == model_id]
+        if len(matches) != 1:
+            raise EvaluationValidationError(f"run selected an unpinned model identity: {model_id}")
+        return matches[0]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -216,6 +374,8 @@ class EvaluationArm:
             "prompt_hash": self.prompt_hash,
             "model_id": self.model_id,
             "provider_id": self.provider_id,
+            "model_revision": self.model_revision,
+            "fallback_models": [identity.to_dict() for identity in self.fallback_models],
             "enabled": self.enabled,
         }
 
@@ -224,7 +384,10 @@ class EvaluationArm:
         _reject_unknown_fields(
             "evaluation arm",
             value,
-            {"arm_id", "kind", "configuration_hash", "prompt_hash", "model_id", "provider_id", "enabled"},
+            {
+                "arm_id", "kind", "configuration_hash", "prompt_hash", "model_id", "provider_id",
+                "model_revision", "fallback_models", "enabled",
+            },
         )
         return cls(
             arm_id=value["arm_id"],
@@ -233,6 +396,11 @@ class EvaluationArm:
             prompt_hash=value["prompt_hash"],
             model_id=value.get("model_id"),
             provider_id=value.get("provider_id"),
+            model_revision=value.get("model_revision"),
+            fallback_models=tuple(
+                EvaluationModelIdentity.from_dict(identity)
+                for identity in value.get("fallback_models", [])
+            ),
             enabled=value.get("enabled", True),
         )
 
@@ -247,6 +415,8 @@ class CheckpointCase:
     event: ReviewEvent
     cohort: EvaluationCohort
     parent_case_id: Optional[str] = None
+    lineage_elapsed_seconds: Optional[float] = None
+    developer_elapsed_seconds: Optional[float] = None
     model_visible_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -261,6 +431,12 @@ class CheckpointCase:
             _validate_identifier("parent_case_id", self.parent_case_id)
             if self.parent_case_id == self.case_id:
                 raise EvaluationValidationError("a checkpoint cannot be its own parent")
+        for field_name in ("lineage_elapsed_seconds", "developer_elapsed_seconds"):
+            field_value = getattr(self, field_name)
+            if field_value is not None:
+                numeric = isinstance(field_value, (int, float)) and not isinstance(field_value, bool)
+                if not numeric or not math.isfinite(field_value) or field_value < 0:
+                    raise EvaluationValidationError(f"{field_name} must be a finite non-negative number")
         copied_metadata = _copy_json_mapping("model_visible_metadata", self.model_visible_metadata)
         leaked_paths = _answer_only_paths(copied_metadata)
         if leaked_paths:
@@ -288,6 +464,8 @@ class CheckpointCase:
             "event": self.event.value,
             "cohort": self.cohort.value,
             "parent_case_id": self.parent_case_id,
+            "lineage_elapsed_seconds": self.lineage_elapsed_seconds,
+            "developer_elapsed_seconds": self.developer_elapsed_seconds,
             "model_visible_metadata": _thaw_json(self.model_visible_metadata),
         }
 
@@ -298,7 +476,7 @@ class CheckpointCase:
             value,
             {
                 "case_id", "snapshot_id", "snapshot_artifact_hash", "event", "cohort", "parent_case_id",
-                "model_visible_metadata",
+                "lineage_elapsed_seconds", "developer_elapsed_seconds", "model_visible_metadata",
             },
         )
         return cls(
@@ -308,6 +486,8 @@ class CheckpointCase:
             event=ReviewEvent.parse(value["event"]),
             cohort=EvaluationCohort(value["cohort"]),
             parent_case_id=value.get("parent_case_id"),
+            lineage_elapsed_seconds=value.get("lineage_elapsed_seconds"),
+            developer_elapsed_seconds=value.get("developer_elapsed_seconds"),
             model_visible_metadata=value.get("model_visible_metadata", {}),
         )
 
@@ -321,6 +501,7 @@ class FindingTruth:
     severity: FindingSeverity
     earliest_opportunity: ReviewEvent
     required_context: tuple[str, ...]
+    earliest_case_id: Optional[str] = None
     withdrawn_at_case_id: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -338,6 +519,8 @@ class FindingTruth:
         object.__setattr__(self, "required_context", normalized_context)
         if self.withdrawn_at_case_id is not None:
             _validate_identifier("withdrawn_at_case_id", self.withdrawn_at_case_id)
+        if self.earliest_case_id is not None:
+            _validate_identifier("earliest_case_id", self.earliest_case_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -346,6 +529,7 @@ class FindingTruth:
             "severity": self.severity.value,
             "earliest_opportunity": self.earliest_opportunity.value,
             "required_context": list(self.required_context),
+            "earliest_case_id": self.earliest_case_id,
             "withdrawn_at_case_id": self.withdrawn_at_case_id,
         }
 
@@ -356,7 +540,7 @@ class FindingTruth:
             value,
             {
                 "finding_id", "fingerprint", "severity", "earliest_opportunity", "required_context",
-                "withdrawn_at_case_id",
+                "earliest_case_id", "withdrawn_at_case_id",
             },
         )
         return cls(
@@ -365,6 +549,7 @@ class FindingTruth:
             severity=FindingSeverity(value["severity"]),
             earliest_opportunity=ReviewEvent.parse(value["earliest_opportunity"]),
             required_context=tuple(value["required_context"]),
+            earliest_case_id=value.get("earliest_case_id"),
             withdrawn_at_case_id=value.get("withdrawn_at_case_id"),
         )
 
@@ -428,11 +613,16 @@ class EvaluationManifest:
     cases: tuple[CheckpointCase, ...]
     arms: tuple[EvaluationArm, ...]
     schema_version: str = EVALUATION_SCHEMA_VERSION
+    schema_hash: str = field(default_factory=evaluation_schema_hash)
     manifest_id: str = field(init=False)
 
     def __post_init__(self) -> None:
         if self.schema_version != EVALUATION_SCHEMA_VERSION:
             raise EvaluationValidationError(f"unsupported evaluation schema_version: {self.schema_version}")
+        _validate_hash("schema_hash", self.schema_hash)
+        expected_schema_hash = evaluation_schema_hash()
+        if self.schema_hash != expected_schema_hash:
+            raise EvaluationValidationError("schema_hash does not match the evaluation schema version")
         _validate_identifier("name", self.name)
         _validate_hash("corpus_hash", self.corpus_hash)
         _validate_hash("policy_hash", self.policy_hash)
@@ -470,6 +660,12 @@ class EvaluationManifest:
                 raise EvaluationValidationError(f"checkpoint {case.case_id} names an unknown parent")
             if parent.cohort is not case.cohort:
                 raise EvaluationValidationError("checkpoint lineages cannot cross evaluation cohorts")
+            if (
+                parent.lineage_elapsed_seconds is not None
+                and case.lineage_elapsed_seconds is not None
+                and case.lineage_elapsed_seconds < parent.lineage_elapsed_seconds
+            ):
+                raise EvaluationValidationError("checkpoint lineage time cannot move backwards")
         for case in self.cases:
             visited: set[str] = set()
             current = case
@@ -489,6 +685,7 @@ class EvaluationManifest:
     def _identity_payload(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
+            "schema_hash": self.schema_hash,
             "name": self.name,
             "corpus_hash": self.corpus_hash,
             "policy_hash": self.policy_hash,
@@ -506,8 +703,8 @@ class EvaluationManifest:
             "evaluation manifest",
             value,
             {
-                "schema_version", "name", "corpus_hash", "policy_hash", "configuration_hash", "cases", "arms",
-                "manifest_id",
+                "schema_version", "schema_hash", "name", "corpus_hash", "policy_hash", "configuration_hash",
+                "cases", "arms", "manifest_id",
             },
         )
         manifest = cls(
@@ -518,6 +715,10 @@ class EvaluationManifest:
             cases=tuple(CheckpointCase.from_dict(item) for item in value["cases"]),
             arms=tuple(EvaluationArm.from_dict(item) for item in value["arms"]),
             schema_version=value.get("schema_version", EVALUATION_SCHEMA_VERSION),
+            schema_hash=value.get(
+                "schema_hash",
+                evaluation_schema_hash(),
+            ),
         )
         supplied_manifest_id = value.get("manifest_id")
         if supplied_manifest_id is not None and supplied_manifest_id != manifest.manifest_id:
@@ -560,15 +761,64 @@ class TruthArtifact:
         extra = sorted(truth_cases - manifest_cases)
         if missing or extra:
             raise EvaluationValidationError(f"truth cases do not match manifest; missing={missing}, extra={extra}")
-        cohort_by_case = {case.case_id: case.cohort for case in manifest.cases}
+        case_by_id = {case.case_id: case for case in manifest.cases}
+
+        def is_descendant(candidate_id: str, ancestor_id: str) -> bool:
+            current = case_by_id[candidate_id]
+            while current.parent_case_id is not None:
+                if current.parent_case_id == ancestor_id:
+                    return True
+                current = case_by_id[current.parent_case_id]
+            return False
+
+        def lineage_root(case_id: str) -> str:
+            current = case_by_id[case_id]
+            while current.parent_case_id is not None:
+                current = case_by_id[current.parent_case_id]
+            return current.case_id
+
+        defect_lineages = {
+            lineage_root(truth.case_id)
+            for truth in self.truths
+            if not truth.is_clean
+        }
+
         for truth in self.truths:
-            if truth.is_clean and cohort_by_case[truth.case_id] is not EvaluationCohort.CLEAN_CONTROL:
-                raise EvaluationValidationError("clean truth must use the clean_control cohort")
-            if not truth.is_clean and cohort_by_case[truth.case_id] is EvaluationCohort.CLEAN_CONTROL:
+            case = case_by_id[truth.case_id]
+            if (
+                truth.is_clean
+                and case.cohort is not EvaluationCohort.CLEAN_CONTROL
+                and lineage_root(truth.case_id) not in defect_lineages
+            ):
+                raise EvaluationValidationError(
+                    "clean truth outside clean_control must share a lineage with defect truth"
+                )
+            if not truth.is_clean and case.cohort is EvaluationCohort.CLEAN_CONTROL:
                 raise EvaluationValidationError("clean_control cohort cannot contain defect truth")
             for finding in truth.findings:
-                if finding.withdrawn_at_case_id and finding.withdrawn_at_case_id not in manifest_cases:
-                    raise EvaluationValidationError("finding truth names an unknown withdrawal checkpoint")
+                earliest_case_id = finding.earliest_case_id
+                if earliest_case_id is not None:
+                    if earliest_case_id not in manifest_cases:
+                        raise EvaluationValidationError("finding truth names an unknown earliest checkpoint")
+                    if case_by_id[earliest_case_id].event is not finding.earliest_opportunity:
+                        raise EvaluationValidationError(
+                            "finding earliest checkpoint event does not match earliest_opportunity"
+                        )
+                    if earliest_case_id != truth.case_id and not is_descendant(truth.case_id, earliest_case_id):
+                        raise EvaluationValidationError(
+                            "finding earliest checkpoint must be in the same ancestor lineage"
+                        )
+                elif case.event is not finding.earliest_opportunity:
+                    raise EvaluationValidationError(
+                        "finding earliest_opportunity must match its checkpoint when earliest_case_id is omitted"
+                    )
+                if finding.withdrawn_at_case_id:
+                    if finding.withdrawn_at_case_id not in manifest_cases:
+                        raise EvaluationValidationError("finding truth names an unknown withdrawal checkpoint")
+                    if not is_descendant(finding.withdrawn_at_case_id, truth.case_id):
+                        raise EvaluationValidationError(
+                            "finding withdrawal checkpoint must be a later lineage descendant"
+                        )
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -628,19 +878,44 @@ class NumericMeasurement:
 class ObservedFinding:
     fingerprint: str
     severity: FindingSeverity
+    lifecycle_state: FindingLifecycleState = FindingLifecycleState.ACTIVE
+    deterministic_overlap: Optional[bool] = None
+    stage: Optional[str] = None
 
     def __post_init__(self) -> None:
         _validate_identifier("fingerprint", self.fingerprint)
         if not isinstance(self.severity, FindingSeverity):
             raise EvaluationValidationError("observed finding severity must be a FindingSeverity")
+        if not isinstance(self.lifecycle_state, FindingLifecycleState):
+            raise EvaluationValidationError("observed finding lifecycle_state must be a FindingLifecycleState")
+        if self.deterministic_overlap is not None and not isinstance(self.deterministic_overlap, bool):
+            raise EvaluationValidationError("deterministic_overlap must be a boolean or null")
+        if self.stage is not None:
+            _validate_identifier("observed finding stage", self.stage)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"fingerprint": self.fingerprint, "severity": self.severity.value}
+        return {
+            "fingerprint": self.fingerprint,
+            "severity": self.severity.value,
+            "lifecycle_state": self.lifecycle_state.value,
+            "deterministic_overlap": self.deterministic_overlap,
+            "stage": self.stage,
+        }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ObservedFinding":
-        _reject_unknown_fields("observed finding", value, {"fingerprint", "severity"})
-        return cls(fingerprint=value["fingerprint"], severity=FindingSeverity(value["severity"]))
+        _reject_unknown_fields(
+            "observed finding",
+            value,
+            {"fingerprint", "severity", "lifecycle_state", "deterministic_overlap", "stage"},
+        )
+        return cls(
+            fingerprint=value["fingerprint"],
+            severity=FindingSeverity(value["severity"]),
+            lifecycle_state=FindingLifecycleState(value.get("lifecycle_state", FindingLifecycleState.ACTIVE.value)),
+            deterministic_overlap=value.get("deterministic_overlap"),
+            stage=value.get("stage"),
+        )
 
 
 @dataclass(frozen=True)
@@ -666,8 +941,12 @@ class EvaluationRunRecord:
         default_factory=lambda: NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
     )
     retry_count: int = 0
+    cached: bool = False
+    escalated: Optional[bool] = None
+    stage_latencies_seconds: Mapping[str, NumericMeasurement] = field(default_factory=dict)
     model_id: Optional[str] = None
     provider_id: Optional[str] = None
+    model_revision: Optional[str] = None
     schema_version: str = EVALUATION_SCHEMA_VERSION
     record_id: str = field(init=False)
 
@@ -686,11 +965,50 @@ class EvaluationRunRecord:
             raise EvaluationValidationError("retry_count must be a non-negative integer")
         if not isinstance(self.terminal, bool):
             raise EvaluationValidationError("terminal must be a boolean")
+        if not isinstance(self.cached, bool):
+            raise EvaluationValidationError("cached must be a boolean")
+        if self.escalated is not None and not isinstance(self.escalated, bool):
+            raise EvaluationValidationError("escalated must be a boolean or null")
+        if self.snapshot_result_state is not None and not isinstance(self.snapshot_result_state, ReviewResultState):
+            raise EvaluationValidationError("snapshot_result_state must be a ReviewResultState or null")
+        expected_state_by_snapshot_result = {
+            ReviewResultState.FINDINGS: EvaluationRunState.COMPLETED,
+            ReviewResultState.NO_FINDINGS: EvaluationRunState.COMPLETED,
+            ReviewResultState.COVERAGE_UNAVAILABLE: EvaluationRunState.COVERAGE_UNAVAILABLE,
+            ReviewResultState.CANCELLED: EvaluationRunState.CANCELLED,
+            ReviewResultState.STALE: EvaluationRunState.STALE,
+        }
+        if (
+            self.snapshot_result_state is not None
+            and self.state is not expected_state_by_snapshot_result[self.snapshot_result_state]
+        ):
+            raise EvaluationValidationError("run state contradicts snapshot_result_state")
+        for name, measurement in (
+            ("latency_seconds", self.latency_seconds),
+            ("tokens", self.tokens),
+            ("cost_usd", self.cost_usd),
+        ):
+            if not isinstance(measurement, NumericMeasurement):
+                raise EvaluationValidationError(f"{name} must use NumericMeasurement")
         object.__setattr__(self, "findings", tuple(self.findings))
         if any(not isinstance(finding, ObservedFinding) for finding in self.findings):
             raise EvaluationValidationError("run findings must use ObservedFinding")
         if self.state is not EvaluationRunState.COMPLETED and self.findings:
             raise EvaluationValidationError("only completed run records may contain findings")
+        if not isinstance(self.stage_latencies_seconds, Mapping) or any(
+            not isinstance(name, str)
+            or not name.strip()
+            or not isinstance(measurement, NumericMeasurement)
+            for name, measurement in self.stage_latencies_seconds.items()
+        ):
+            raise EvaluationValidationError("stage latencies must map stage names to NumericMeasurement values")
+        object.__setattr__(self, "stage_latencies_seconds", MappingProxyType(dict(self.stage_latencies_seconds)))
+        if self.model_id is not None:
+            _validate_identifier("run model_id", self.model_id)
+        if self.provider_id is not None:
+            _validate_identifier("run provider_id", self.provider_id)
+        if self.model_revision is not None:
+            _validate_identifier("run model_revision", self.model_revision)
         payload = self._identity_payload()
         object.__setattr__(self, "record_id", content_hash(payload))
 
@@ -710,8 +1028,15 @@ class EvaluationRunRecord:
             "tokens": self.tokens.to_dict(),
             "cost_usd": self.cost_usd.to_dict(),
             "retry_count": self.retry_count,
+            "cached": self.cached,
+            "escalated": self.escalated,
+            "stage_latencies_seconds": {
+                name: measurement.to_dict()
+                for name, measurement in sorted(self.stage_latencies_seconds.items())
+            },
             "model_id": self.model_id,
             "provider_id": self.provider_id,
+            "model_revision": self.model_revision,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -725,7 +1050,8 @@ class EvaluationRunRecord:
             {
                 "schema_version", "manifest_id", "case_id", "arm_id", "snapshot_id", "attempt", "state",
                 "terminal", "findings", "snapshot_result_state", "latency_seconds", "tokens", "cost_usd",
-                "retry_count", "model_id", "provider_id", "record_id",
+                "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id", "provider_id",
+                "model_revision", "record_id",
             },
         )
         snapshot_result_state = value.get("snapshot_result_state")
@@ -743,8 +1069,15 @@ class EvaluationRunRecord:
             tokens=NumericMeasurement.from_dict(value["tokens"]),
             cost_usd=NumericMeasurement.from_dict(value["cost_usd"]),
             retry_count=value.get("retry_count", 0),
+            cached=value.get("cached", False),
+            escalated=value.get("escalated"),
+            stage_latencies_seconds={
+                name: NumericMeasurement.from_dict(measurement)
+                for name, measurement in value.get("stage_latencies_seconds", {}).items()
+            },
             model_id=value.get("model_id"),
             provider_id=value.get("provider_id"),
+            model_revision=value.get("model_revision"),
             schema_version=value.get("schema_version", EVALUATION_SCHEMA_VERSION),
         )
         supplied_id = value.get("record_id")
@@ -765,6 +1098,8 @@ class EvaluationRunRecord:
         terminal: bool,
         findings: Sequence[ObservedFinding] = (),
         retry_count: int = 0,
+        escalated: Optional[bool] = None,
+        stage_latencies_seconds: Optional[Mapping[str, NumericMeasurement]] = None,
     ) -> "EvaluationRunRecord":
         """Bind shipped snapshot/run telemetry to one evaluation attempt."""
         if case not in manifest.cases:
@@ -789,6 +1124,14 @@ class EvaluationRunRecord:
             cost_status = MeasurementStatus(details.cost_status)
             cost_value = float(details.total_cost_usd) if cost_status is not MeasurementStatus.UNAVAILABLE else None
             cost_measurement = NumericMeasurement(cost_status, cost_value)
+        selected_model_id = (
+            None
+            if arm.kind is EvaluationArmKind.DETERMINISTIC
+            else details.model_used if details and details.model_used else arm.model_id
+        )
+        selected_model_id, selected_provider_id, selected_model_revision = arm.resolve_model_identity(
+            selected_model_id
+        )
         return cls(
             manifest_id=manifest.manifest_id,
             case_id=case.case_id,
@@ -803,8 +1146,12 @@ class EvaluationRunRecord:
             tokens=token_measurement,
             cost_usd=cost_measurement,
             retry_count=retry_count,
-            model_id=details.model_used if details and details.model_used else arm.model_id,
-            provider_id=arm.provider_id,
+            cached=result.cached,
+            escalated=escalated,
+            stage_latencies_seconds=stage_latencies_seconds or {},
+            model_id=selected_model_id,
+            provider_id=selected_provider_id,
+            model_revision=selected_model_revision,
         )
 
 
@@ -813,18 +1160,28 @@ class EvaluationPlanItem:
     case_id: str
     arm_id: str
     snapshot_id: str
+    snapshot_artifact_hash: str
     event: ReviewEvent
+    configuration_hash: str
+    prompt_hash: str
     model_id: Optional[str]
     provider_id: Optional[str]
+    model_revision: Optional[str]
+    fallback_models: tuple[EvaluationModelIdentity, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "case_id": self.case_id,
             "arm_id": self.arm_id,
             "snapshot_id": self.snapshot_id,
+            "snapshot_artifact_hash": self.snapshot_artifact_hash,
             "event": self.event.value,
+            "configuration_hash": self.configuration_hash,
+            "prompt_hash": self.prompt_hash,
             "model_id": self.model_id,
             "provider_id": self.provider_id,
+            "model_revision": self.model_revision,
+            "fallback_models": [identity.to_dict() for identity in self.fallback_models],
         }
 
 
@@ -833,6 +1190,7 @@ class EvaluationPlan:
     """Credential-free deterministic expansion of one manifest."""
 
     manifest_id: str
+    schema_hash: str
     items: tuple[EvaluationPlanItem, ...]
     schema_version: str = EVALUATION_SCHEMA_VERSION
 
@@ -840,6 +1198,7 @@ class EvaluationPlan:
         return {
             "schema_version": self.schema_version,
             "manifest_id": self.manifest_id,
+            "schema_hash": self.schema_hash,
             "network_calls": 0,
             "model_calls": 0,
             "items": [item.to_dict() for item in self.items],
@@ -853,11 +1212,20 @@ def build_evaluation_plan(manifest: EvaluationManifest) -> EvaluationPlan:
             case_id=case.case_id,
             arm_id=arm.arm_id,
             snapshot_id=case.snapshot_id,
+            snapshot_artifact_hash=case.snapshot_artifact_hash,
             event=case.event,
+            configuration_hash=arm.configuration_hash,
+            prompt_hash=arm.prompt_hash,
             model_id=arm.model_id,
             provider_id=arm.provider_id,
+            model_revision=arm.model_revision,
+            fallback_models=arm.fallback_models,
         )
         for case in sorted(manifest.cases, key=lambda item: item.case_id)
         for arm in sorted((item for item in manifest.arms if item.enabled), key=lambda item: item.arm_id)
     )
-    return EvaluationPlan(manifest_id=manifest.manifest_id, items=items)
+    return EvaluationPlan(
+        manifest_id=manifest.manifest_id,
+        schema_hash=manifest.schema_hash,
+        items=items,
+    )
