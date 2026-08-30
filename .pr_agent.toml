@@ -33,6 +33,7 @@ events = ["file_save", "worktree_idle", "pre_commit"]
 excluded_paths = []
 max_file_bytes = 1000000
 max_snapshot_bytes = 5000000
+max_path_discovery_bytes = 1000000
 cache_enabled = true
 cache_max_entries = 50
 file_save_debounce_ms = 1500

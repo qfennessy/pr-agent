@@ -604,9 +604,14 @@ def _git_artifact_root(repository_root: Path) -> Path:
     supplied = Path(
         process.stdout.decode("utf-8", errors="surrogateescape").rstrip("\r\n")
     )
-    return (supplied if supplied.is_absolute() else repository_root / supplied).resolve(
-        strict=False
-    )
+    try:
+        return (supplied if supplied.is_absolute() else repository_root / supplied).resolve(
+            strict=False
+        )
+    except RuntimeError as exc:
+        raise SnapshotCaptureError(
+            "could not resolve the repository artifact directory"
+        ) from exc
 
 
 def _is_hard_linked_to_repository(candidate: Path, *roots: Path) -> bool:
@@ -686,10 +691,10 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         ]
     else:
         configured_exclusions = []
-    git_metadata_root = SnapshotCache(repository_root).cache_dir.parents[1]
-    git_artifact_root = _git_artifact_root(repository_root)
     output_parent_identities = {}
     try:
+        git_metadata_root = SnapshotCache(repository_root).cache_dir.parents[1]
+        git_artifact_root = _git_artifact_root(repository_root)
         _reject_existing_repository_outputs(
             repository_root,
             git_metadata_root,

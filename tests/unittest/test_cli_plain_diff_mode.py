@@ -398,6 +398,23 @@ def test_review_snapshot_rejects_tracked_deleted_output(monkeypatch, tmp_path, c
     assert not output.exists()
 
 
+def test_review_snapshot_reports_looped_git_artifact_root(monkeypatch, tmp_path, capsys):
+    import subprocess
+
+    repo = tmp_path / "repo-looped-artifact-root"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    (repo / ".git" / "pr-agent").symlink_to("pr-agent", target_is_directory=True)
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=["review-snapshot", "--event", "worktree-idle", "--no-cache"])
+
+    error = capsys.readouterr().err
+    assert "could not resolve the repository artifact directory" in error
+    assert "Traceback" not in error
+
+
 def test_git_artifact_root_uses_linked_worktree_git_directory(tmp_path):
     import os
     import subprocess
