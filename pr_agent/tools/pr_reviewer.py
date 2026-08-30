@@ -242,6 +242,12 @@ class PRReviewer:
             self._prepare_review_route()
             if self._specialist_escalation_consumption_enabled():
                 await self._run_guarded_specialist_escalation()
+            if getattr(self, "_review_shadow_only", False):
+                # Shadow output is consumed through the same request-local artifact
+                # channel as local, health, and MOSAICO runs. Clear any value left by
+                # an earlier command so a failed/unavailable shadow attempt cannot be
+                # mistaken for a fresh review.
+                get_settings().data = {"artifact": ""}
 
             # if isinstance(self.args, list) and self.args and self.args[0] == 'auto_approve':
             #     get_logger().info(f'Auto approve flow PR: {self.pr_url} ...')
@@ -613,17 +619,18 @@ class PRReviewer:
                 else "none"
             )
             self.vars["max_verification_candidates"] = self._review_max_verification_candidates
-        serialized = review_route_decision_to_dict(decision)
-        record_review_route(serialized)
-        get_logger().info(
-            "Review depth selected",
-            artifact={
-                "requested_depth": decision.requested_depth,
-                "applied_depth": decision.applied_depth.value,
-                "reason_codes": [reason.code for reason in decision.reasons],
-                "policy_version": decision.policy_version,
-            },
-        )
+        if decision.routing_enabled:
+            serialized = review_route_decision_to_dict(decision)
+            record_review_route(serialized)
+            get_logger().info(
+                "Review depth selected",
+                artifact={
+                    "requested_depth": decision.requested_depth,
+                    "applied_depth": decision.applied_depth.value,
+                    "reason_codes": [reason.code for reason in decision.reasons],
+                    "policy_version": decision.policy_version,
+                },
+            )
 
     def _specialist_escalation_consumption_enabled(self) -> bool:
         configuration = self._routing_configuration()
@@ -1187,7 +1194,7 @@ class PRReviewer:
                 "deleted_files": sorted(set(getattr(self, "deleted_files_list", []))),
             }
             review_route_decision = getattr(self, "review_route_decision", None)
-            if review_route_decision is not None:
+            if review_route_decision is not None and review_route_decision.routing_enabled:
                 structured_data["metadata"]["review_route"] = review_route_decision_to_dict(
                     review_route_decision
                 )
@@ -1196,15 +1203,13 @@ class PRReviewer:
                 structured_data["metadata"]["specialist_shadow"] = specialist_shadow_result.to_dict()
             structured_publisher(structured_data)
 
-        if getattr(self, "_review_shadow_only", False):
-            return ""
-
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
         if 'key_issues_to_review' in data['review']:
             key_issues_to_review = data['review'].pop('key_issues_to_review')
             data['review']['key_issues_to_review'] = key_issues_to_review
 
-        if get_settings().config.publish_output and get_settings().pr_reviewer.get('inline_key_issues', False):
+        if (self._provider_mutations_allowed() and get_settings().config.publish_output and
+                get_settings().pr_reviewer.get('inline_key_issues', False)):
             data = self._publish_key_issues_as_inline_comments(data)
 
         if self._review_profile() == "bugs_only" and not (
@@ -1255,7 +1260,7 @@ class PRReviewer:
             markdown_text += show_run_details(self.git_provider.is_supported("gfm_markdown"))
 
         # Add custom labels from the review prediction (effort, security)
-        if self._review_profile() != "bugs_only":
+        if self._provider_mutations_allowed() and self._review_profile() != "bugs_only":
             self.set_review_labels(data)
 
         if markdown_text == None or len(markdown_text) == 0:

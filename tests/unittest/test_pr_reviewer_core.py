@@ -23,13 +23,17 @@ from pr_agent.algo.review_specialists import (
     SpecialistRole,
     SpecialistState,
 )
-from pr_agent.algo.run_details import get_run_details, init_run_details
+from pr_agent.algo.run_details import (get_run_details, init_run_details,
+                                       record_model_used)
 from pr_agent.algo.types import FilePatchInfo
-from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity
+from pr_agent.algo.utils import (PRReviewHeader, PRReviewIdentity,
+                                 show_run_details)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
 from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.tools.pr_reviewer import PRReviewer
+from tests.unittest._settings_helpers import (restore_settings,
+                                              snapshot_settings)
 
 # _prepare_prediction now rejects output it cannot parse, so the model's answer can fall
 # back to another model instead of failing after every retry is spent.
@@ -574,6 +578,115 @@ def test_deterministic_route_runs_from_provider_metadata_and_records_structured_
     assert reviewer.vars["max_verification_candidates"] == 1
     assert reviewer._review_context_tokens == 8_000
     assert get_run_details().review_route == review_route_decision_to_dict(decision)
+
+
+@pytest.mark.parametrize(
+    ("raw_configuration", "configuration_name"),
+    [(None, "absent"), ({"enabled": False}, "disabled")],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_disabled_or_absent_routing_preserves_run_details_byte_for_byte(
+    monkeypatch, raw_configuration, configuration_name
+):
+    from pr_agent.algo import run_details
+
+    monkeypatch.setattr(run_details.time, "monotonic", lambda: 108.2)
+    provider = MagicMock()
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = load_review_routing_configuration(raw_configuration)
+
+    baseline_details = init_run_details()
+    baseline_details.start_time = 100.0
+    record_model_used("model-a", is_fallback=False)
+    baseline = show_run_details(gfm_supported=True)
+
+    routed_details = init_run_details()
+    routed_details.start_time = 100.0
+    record_model_used("model-a", is_fallback=False)
+    decision = reviewer._prepare_review_route()
+    routed = show_run_details(gfm_supported=True)
+
+    assert configuration_name in {"absent", "disabled"}
+    assert decision.routing_enabled is False
+    assert get_run_details().review_route is None
+    assert routed == baseline
+    provider.get_files.assert_not_called()
+    provider.get_diff_files.assert_not_called()
+    provider.get_pr_labels.assert_not_called()
+
+
+def test_enabled_standard_route_is_recorded_and_rendered():
+    provider = MagicMock()
+    provider.get_files.return_value = ["docs/guide.md"]
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(requested_depth="standard")
+    init_run_details()
+    record_model_used("model-a", is_fallback=False)
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.routing_enabled is True
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert get_run_details().review_route == review_route_decision_to_dict(decision)
+    assert "Review depth: standard" in show_run_details(gfm_supported=True)
+
+
+@pytest.mark.asyncio
+async def test_disabled_routing_adds_no_provider_inventory_or_model_calls(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.get_files.return_value = ["docs/guide.md"]
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = False
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
+
+    async def fake_retry(prepare_fn, model_type=None):
+        reviewer.prediction = VALID_PREDICTION
+
+    retry = AsyncMock(side_effect=fake_retry)
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", AsyncMock())
+    monkeypatch.setattr(pr_reviewer_module, "convert_to_markdown_v2", MagicMock(return_value="legacy review"))
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.publish_output",
+        "config.is_auto_command",
+        "config.output_run_details",
+        "data",
+        "pr_reviewer.enable_help_text",
+    ))
+    try:
+        settings.config.publish_output = False
+        settings.config.is_auto_command = False
+        settings.config.output_run_details = True
+        settings.pr_reviewer.enable_help_text = False
+        settings.data = {"artifact": ""}
+
+        await reviewer.run()
+        artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert artifact == "legacy review"
+    assert get_run_details().review_route is None
+    retry.assert_awaited_once()
+    assert provider.get_files.call_count == 1
+    assert provider.get_diff_files.call_count == 1
+    provider.get_pr_labels.assert_not_called()
+    structured = provider.publish_structured_review.call_args.args[0]
+    assert "review_route" not in structured["metadata"]
 
 
 @pytest.mark.parametrize("file_count", [1, 12, 13])
@@ -1953,7 +2066,9 @@ async def test_clean_bugs_only_rerun_clears_only_bugs_only_persistent_review(mon
 
 
 @pytest.mark.asyncio
-async def test_shadow_only_run_performs_no_provider_mutations(monkeypatch):
+@pytest.mark.parametrize("consumer", ["local", "health", "mosaico"])
+async def test_shadow_only_run_retains_bounded_artifact_without_provider_mutations(
+        monkeypatch, consumer):
     from pr_agent.tools import pr_reviewer as pr_reviewer_module
 
     git_provider = MagicMock()
@@ -1962,37 +2077,72 @@ async def test_shadow_only_run_performs_no_provider_mutations(monkeypatch):
     git_provider.is_supported.return_value = True
     git_provider.get_pr_labels.return_value = []
     reviewer = _make_prediction_reviewer(git_provider)
-    reviewer.review_profile = "bugs_only"
+    reviewer.review_profile = "full"
     reviewer.vars = {}
     reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
 
     async def fake_retry(prepare_fn, model_type=None, model_route=None):
-        reviewer.prediction = "review:\n  key_issues_to_review: []\n"
+        reviewer.prediction = """\
+review:
+  estimated_effort_to_review_[1-5]: '2'
+  score: '85'
+  key_issues_to_review:
+    - issue_header: first bounded finding
+    - issue_header: second bounded finding
+    - issue_header: third over-budget finding
+  security_concerns: 'No'
+"""
+
+    def render_bounded_review(data, *_args, **_kwargs):
+        headers = [
+            issue["issue_header"]
+            for issue in data["review"]["key_issues_to_review"]
+        ]
+        return "## PR Reviewer Guide\n\n" + "\n".join(headers)
 
     monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", AsyncMock())
+    monkeypatch.setattr(pr_reviewer_module, "convert_to_markdown_v2", render_bounded_review)
 
     settings = get_settings()
-    original = {
-        "publish_output": settings.config.publish_output,
-        "persistent_comment": settings.pr_reviewer.persistent_comment,
-        "inline_key_issues": settings.pr_reviewer.get("inline_key_issues", False),
-        "is_auto_command": settings.config.get("is_auto_command", False),
-    }
+    snapshot = snapshot_settings((
+        "config.publish_output",
+        "config.is_auto_command",
+        "config.output_run_details",
+        "config.output_relevant_configurations",
+        "data",
+        "pr_reviewer.persistent_comment",
+        "pr_reviewer.inline_key_issues",
+        "pr_reviewer.enable_help_text",
+    ))
     try:
         settings.config.publish_output = True
         settings.config.is_auto_command = False
+        settings.config.output_run_details = False
+        settings.config.output_relevant_configurations = False
         settings.pr_reviewer.persistent_comment = True
         settings.pr_reviewer.inline_key_issues = True
+        settings.pr_reviewer.enable_help_text = False
+        settings.data = {"artifact": "STALE REVIEW"}
 
         await reviewer.run()
+
+        if consumer == "local":
+            artifact = settings.data["artifact"]
+        elif consumer == "health":
+            artifact = dict(settings.data)["artifact"]
+        else:
+            from pr_agent.mosaico.dispatch import _capture_artifact
+            artifact = _capture_artifact()
     finally:
-        settings.config.publish_output = original["publish_output"]
-        settings.config.is_auto_command = original["is_auto_command"]
-        settings.pr_reviewer.persistent_comment = original["persistent_comment"]
-        settings.pr_reviewer.inline_key_issues = original["inline_key_issues"]
+        restore_settings(snapshot)
 
     assert reviewer.review_route_decision.applied_depth is ReviewDepth.QUICK
     assert reviewer._review_shadow_only is True
+    assert artifact.startswith("## PR Reviewer Guide")
+    assert "first bounded finding" in artifact
+    assert "second bounded finding" in artifact
+    assert "third over-budget finding" not in artifact
     for method_name in (
         "publish_comment",
         "remove_comment",
@@ -2001,7 +2151,70 @@ async def test_shadow_only_run_performs_no_provider_mutations(monkeypatch):
         "publish_persistent_comment",
         "publish_structured_review",
         "publish_code_suggestions",
+        "publish_inline_comments",
+        "publish_labels",
         "set_pr_labels",
+    ):
+        getattr(git_provider, method_name).assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", ["unavailable", "failed"])
+async def test_shadow_only_unavailable_or_failed_result_clears_stale_artifact_without_mutations(
+        monkeypatch, result):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["docs/guide.md"]
+    git_provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    git_provider.is_supported.return_value = True
+    git_provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(shadow_only=True)
+
+    async def unavailable_retry(prepare_fn, model_type=None, model_route=None):
+        return None
+
+    retry = unavailable_retry
+    if result == "failed":
+        retry = AsyncMock(side_effect=RuntimeError("shadow model failed"))
+    render = MagicMock(return_value="must not render")
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", AsyncMock())
+    monkeypatch.setattr(pr_reviewer_module, "convert_to_markdown_v2", render)
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.publish_output",
+        "config.is_auto_command",
+        "config.propagate_tool_errors",
+        "data",
+    ))
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.config.propagate_tool_errors = False
+        settings.data = {"artifact": "STALE REVIEW"}
+
+        await reviewer.run()
+        artifact = settings.data["artifact"]
+    finally:
+        restore_settings(snapshot)
+
+    assert artifact == ""
+    render.assert_not_called()
+    for method_name in (
+        "publish_comment",
+        "remove_comment",
+        "remove_initial_comment",
+        "clear_persistent_review",
+        "publish_persistent_comment",
+        "publish_structured_review",
+        "publish_code_suggestions",
+        "publish_inline_comments",
+        "publish_labels",
     ):
         getattr(git_provider, method_name).assert_not_called()
 
