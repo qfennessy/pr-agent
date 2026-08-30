@@ -480,6 +480,30 @@ def test_review_snapshot_cli_emits_snapshot_bound_json(cfg, monkeypatch, tmp_pat
     assert result.state.value == "no_findings"
 
 
+def test_snapshot_repo_context_skips_oversized_git_blob_before_read(cfg, monkeypatch, tmp_path):
+    from pr_agent.cli import _load_snapshot_repo_context
+
+    cfg("config.repo_context_files", ["AGENTS.md"])
+    calls = []
+
+    class CompletedProcess:
+        def __init__(self, stdout=b"", returncode=0):
+            self.stdout = stdout
+            self.stderr = b""
+            self.returncode = returncode
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "cat-file" in args:
+            return CompletedProcess(stdout=b"1000001\n")
+        raise AssertionError("oversized repository context must not be materialized")
+
+    monkeypatch.setattr("pr_agent.cli.subprocess.run", fake_run)
+
+    assert _load_snapshot_repo_context(tmp_path, "a" * 40) == {}
+    assert len(calls) == 1
+
+
 def test_review_snapshot_atomically_replaces_json_symlink_swapped_during_review(
     cfg, monkeypatch, tmp_path, capsys
 ):
@@ -854,6 +878,51 @@ def test_review_snapshot_forwards_context_and_publishes_only_fresh_markdown(
     assert result.state.value == "stale"
     assert not output.exists()
     assert json.loads(capsys.readouterr().out)["state"] == "stale"
+
+
+def test_review_snapshot_returns_stale_when_base_ref_disappears(
+    cfg, monkeypatch, tmp_path, capsys
+):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo-disappearing-base"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "branch", "snapshot-base"], check=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            subprocess.run(
+                ["git", "-C", str(repo), "update-ref", "-d", "refs/heads/snapshot-base"],
+                check=True,
+            )
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    result = run(inargs=[
+        "review-snapshot", "--event", "worktree-idle", "--base", "snapshot-base", "--no-cache",
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result.state.value == "stale"
+    assert result.current_snapshot_id is None
+    assert result.review is None
+    assert payload["coverage_issues"] == [
+        {"fingerprint": None, "path": None, "reason": "current_snapshot_unavailable"}
+    ]
 
 
 def test_review_snapshot_restores_snapshot_only_instructions(cfg, monkeypatch, tmp_path, capsys):

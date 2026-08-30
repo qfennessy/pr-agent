@@ -549,7 +549,7 @@ class SnapshotCache:
 def build_snapshot_result(
     snapshot: ReviewSnapshot,
     *,
-    current_snapshot: ReviewSnapshot,
+    current_snapshot: Optional[ReviewSnapshot],
     structured_review: Optional[Mapping[str, Any]],
     started_at: float,
     error: Optional[str] = None,
@@ -562,6 +562,16 @@ def build_snapshot_result(
             CoverageIssue(path=str(path), reason="token_budget_omitted")
             for path in omitted_files
             if isinstance(path, str) and path
+        )
+    if current_snapshot is None:
+        coverage.append(CoverageIssue(reason="current_snapshot_unavailable"))
+        return ReviewSnapshotResult(
+            snapshot_id=snapshot.snapshot_id,
+            state=ReviewResultState.STALE,
+            current_snapshot_id=None,
+            review=None,
+            coverage_issues=tuple(coverage),
+            latency_seconds=monotonic() - started_at,
         )
     if current_snapshot.snapshot_id != snapshot.snapshot_id:
         return ReviewSnapshotResult(

@@ -40,6 +40,7 @@ setup_logger(log_level)
 _MISSING_SETTING = object()
 _SNAPSHOT_ARTIFACT_TYPE = "pr-agent-review-snapshot"
 _SNAPSHOT_MARKDOWN_MARKER = b"<!-- pr-agent-review-snapshot -->\n"
+_MAX_SNAPSHOT_REPO_CONTEXT_BYTES = 1_000_000
 _SNAPSHOT_PROVIDER_SETTINGS = (
     "config.git_provider",
     "config.publish_output",
@@ -385,10 +386,23 @@ def _load_snapshot_repo_context(repository_root: Path, base_revision: str) -> di
         if normalized.is_absolute() or ".." in normalized.parts or normalized == PurePosixPath("."):
             continue
         path = normalized.as_posix()
+        object_name = f"{base_revision}:{path}"
+        size_process = subprocess.run(
+            ["git", "-C", str(repository_root), "cat-file", "-s", object_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        try:
+            object_size = int(size_process.stdout.strip())
+        except ValueError:
+            continue
+        if size_process.returncode != 0 or object_size > _MAX_SNAPSHOT_REPO_CONTEXT_BYTES:
+            continue
         process = subprocess.run(
             [
                 "git", "-C", str(repository_root), "--literal-pathspecs",
-                "show", f"{base_revision}:{path}",
+                "show", object_name,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -699,10 +713,29 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         reviewer.repository_root,
         max_entries=int(settings.get("cache_max_entries", 50)),
     )
-    current = reviewer.recapture(snapshot)
+    try:
+        current = reviewer.recapture(snapshot)
+    except SnapshotCaptureError:
+        current = None
+    if current is None:
+        stale_result = build_snapshot_result(
+            snapshot,
+            current_snapshot=None,
+            structured_review=None,
+            started_at=monotonic(),
+        )
+        _emit_snapshot_result(
+            stale_result, json_output, output_parent_identities.get(json_output)
+        )
+        return stale_result
     # Cached structured results cannot reproduce the exact Markdown rendering.
     # Bypass the cache when the caller explicitly requests that artifact.
-    if cache_enabled and not markdown_output and current.snapshot_id == snapshot.snapshot_id:
+    if (
+        cache_enabled
+        and not markdown_output
+        and current is not None
+        and current.snapshot_id == snapshot.snapshot_id
+    ):
         cached_result = cache.read(snapshot.snapshot_id)
         if cached_result is not None:
             _emit_snapshot_result(
@@ -759,13 +792,17 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
                 except (OSError, ValueError):
                     review_error = review_error or "InvalidStructuredReview"
 
-            current = reviewer.recapture(snapshot)
+            try:
+                current = reviewer.recapture(snapshot)
+            except SnapshotCaptureError:
+                current = None
             if (
                 markdown_output
                 and markdown_path is not None
                 and markdown_path.exists()
                 and structured_review is not None
                 and review_error is None
+                and current is not None
                 and current.snapshot_id == snapshot.snapshot_id
             ):
                 try:
