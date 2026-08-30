@@ -1,6 +1,7 @@
 import shlex
 import stat
 import subprocess
+from io import BytesIO
 from pathlib import Path
 from time import monotonic
 
@@ -328,6 +329,27 @@ def test_skipped_mode_change_invalidates_snapshot_identity(tmp_path):
     second = reviewer.capture(event="worktree-idle")
 
     assert first.snapshot_id != second.snapshot_id
+
+
+def test_skipped_file_fingerprint_reads_only_bounded_samples(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, "bounded-fingerprint")
+    skipped = repo / "skipped.py"
+    skipped.write_bytes(b"x" * 100)
+    reviewer = LocalPairReview(str(repo), excluded_paths=["skipped.py"], max_file_bytes=10)
+
+    class TrackingStream(BytesIO):
+        bytes_read = 0
+
+        def read(self, size=-1):
+            chunk = super().read(size)
+            self.bytes_read += len(chunk)
+            return chunk
+
+    stream = TrackingStream(b"x" * 100)
+    monkeypatch.setattr(Path, "open", lambda self, mode="r", **kwargs: stream)
+
+    assert reviewer._path_fingerprint(ReviewEvent.WORKTREE_IDLE, "skipped.py", "HEAD")
+    assert stream.bytes_read <= 22
 
 
 def test_file_save_requires_a_safe_focused_path_and_captures_untracked_addition(tmp_path):

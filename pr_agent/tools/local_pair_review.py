@@ -149,11 +149,19 @@ class LocalPairReview:
                 digest.update(os.readlink(candidate).encode("utf-8", errors="surrogateescape"))
                 return "sha256:" + digest.hexdigest()
             if candidate.is_file():
-                worktree_mode = "100755" if candidate.stat().st_mode & stat.S_IXUSR else "100644"
+                file_stat = candidate.stat()
+                worktree_mode = "100755" if file_stat.st_mode & stat.S_IXUSR else "100644"
                 digest.update(f"mode:{worktree_mode}\0".encode("ascii"))
+                digest.update(
+                    f"size:{file_stat.st_size}\0mtime:{file_stat.st_mtime_ns}\0"
+                    f"ctime:{file_stat.st_ctime_ns}\0".encode("ascii")
+                )
+                sample_size = max(1, min(self.max_file_bytes + 1, 64 * 1024))
                 with candidate.open("rb") as handle:
-                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                        digest.update(chunk)
+                    digest.update(handle.read(sample_size))
+                    if file_stat.st_size > sample_size:
+                        handle.seek(max(0, file_stat.st_size - sample_size))
+                        digest.update(handle.read(sample_size))
                 return "sha256:" + digest.hexdigest()
         except OSError:
             return None

@@ -99,6 +99,29 @@ def test_review_snapshot_rejects_output_that_aliases_review_input(monkeypatch, t
     assert source.read_text(encoding="utf-8") == "keep this source\n"
 
 
+def test_review_snapshot_rejects_worktree_symlink_into_git_metadata(monkeypatch, tmp_path, capsys):
+    import subprocess
+
+    repo = tmp_path / "repo-metadata-alias"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    source = repo / "changed.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    alias = repo / "result.json"
+    alias.symlink_to(repo / ".git" / "config")
+    original_config = (repo / ".git" / "config").read_text(encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--json-output", "result.json", "--no-cache",
+        ])
+
+    assert "aliases an existing repository path" in capsys.readouterr().err
+    assert (repo / ".git" / "config").read_text(encoding="utf-8") == original_config
+
+
 _DIFF = (
     "diff --git a/foo.py b/foo.py\n"
     "index 1111111..2222222 100644\n"

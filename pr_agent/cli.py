@@ -241,7 +241,7 @@ def _reject_existing_repository_outputs(
         if not lexical.exists() and not lexical.is_symlink():
             continue
         resolved = lexical.resolve(strict=False)
-        if resolved.is_relative_to(git_metadata_root):
+        if lexical.is_relative_to(git_metadata_root):
             continue
         if lexical.is_relative_to(repository_root) or resolved.is_relative_to(repository_root):
             raise SnapshotCaptureError(
