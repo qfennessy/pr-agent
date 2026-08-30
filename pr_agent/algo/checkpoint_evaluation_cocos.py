@@ -18,6 +18,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 from pr_agent.algo.checkpoint_evaluation import EvaluationValidationError, content_hash
+from pr_agent.algo.local_artifact_io import read_regular_file_without_symlinks
 from pr_agent.algo.review_snapshot import ReviewEvent
 
 COCOS_ADAPTER_SCHEMA_VERSION = "cocos-story-checkpoint-corpus-v2"
@@ -59,6 +60,7 @@ _CHECKPOINT_CONTROL_FIELDS = {
 }
 _CHECKPOINT_CONTROL_TOP_LEVEL_FIELDS = {"schema_version", "answer_only", "entries"}
 _CHECKPOINT_STAGES = {event.value for event in ReviewEvent}
+_MAX_COCOS_ARTIFACT_BYTES = 25_000_000
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -69,30 +71,11 @@ def _read_regular_file(root: Path, relative_path: str) -> bytes:
     relative = Path(relative_path)
     if relative.is_absolute() or ".." in relative.parts:
         raise EvaluationValidationError("Cocos corpus lock paths must stay below the corpus root")
-    parent = root
-    for part in relative.parts[:-1]:
-        parent /= part
-        try:
-            parent_metadata = parent.lstat()
-        except OSError as exc:
-            raise EvaluationValidationError(
-                f"missing Cocos corpus artifact directory: {relative_path}"
-            ) from exc
-        if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
-            raise EvaluationValidationError(
-                f"Cocos corpus artifact directory is not a real directory: {relative_path}"
-            )
-    path = root / relative
-    try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise EvaluationValidationError(f"missing Cocos corpus artifact: {relative_path}") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise EvaluationValidationError(f"Cocos corpus artifact is not a regular file: {relative_path}")
-    try:
-        return path.read_bytes()
-    except OSError as exc:
-        raise EvaluationValidationError(f"cannot read Cocos corpus artifact: {relative_path}") from exc
+    return read_regular_file_without_symlinks(
+        root / relative,
+        label=f"Cocos corpus artifact {relative_path}",
+        max_bytes=_MAX_COCOS_ARTIFACT_BYTES,
+    )
 
 
 @dataclass(frozen=True)

@@ -28,6 +28,7 @@ _ANSWER_ONLY_KEYS = frozenset({
     "answer",
     "clean_control",
     "earliest_opportunity",
+    "expected_withdrawn_fingerprints",
     "expected_finding",
     "expected_findings",
     "finding_truth",

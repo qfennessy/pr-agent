@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 SNAPSHOT_SCHEMA_VERSION = "review-snapshot-v1"
@@ -39,7 +40,23 @@ class CoverageIssue:
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return json.dumps(_thaw_json(value), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json(child) for key, child in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(child) for child in value)
+    return value
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw_json(child) for child in value]
+    return value
 
 
 def _repository_identity(repository_root: str) -> str:
@@ -82,7 +99,11 @@ class ReviewSnapshot:
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_selector", self.base_selector or self.base_revision)
         object.__setattr__(self, "changed_paths", tuple(sorted(set(self.changed_paths))))
-        object.__setattr__(self, "deterministic_results", tuple(self.deterministic_results))
+        object.__setattr__(
+            self,
+            "deterministic_results",
+            tuple(_freeze_json(result) for result in self.deterministic_results),
+        )
         object.__setattr__(self, "coverage_issues", tuple(self.coverage_issues))
         identity = {
             "schema_version": self.schema_version,
@@ -107,9 +128,26 @@ class ReviewSnapshot:
         return bool(self.coverage_issues)
 
     def to_dict(self, include_diff: bool = True) -> dict[str, Any]:
-        data = asdict(self)
-        data["event"] = self.event.value
-        data["snapshot_id"] = self.snapshot_id
+        data = {
+            "event": self.event.value,
+            "repository_root": self.repository_root,
+            "base_revision": self.base_revision,
+            "changed_paths": self.changed_paths,
+            "diff": self.diff,
+            "policy_version": self.policy_version,
+            "created_at": self.created_at,
+            "base_selector": self.base_selector,
+            "focus_path": self.focus_path,
+            "task_intent": self.task_intent,
+            "deterministic_results": tuple(
+                _thaw_json(result) for result in self.deterministic_results
+            ),
+            "review_configuration_hash": self.review_configuration_hash,
+            "parent_snapshot_id": self.parent_snapshot_id,
+            "schema_version": self.schema_version,
+            "coverage_issues": tuple(asdict(issue) for issue in self.coverage_issues),
+            "snapshot_id": self.snapshot_id,
+        }
         if not include_diff:
             data.pop("diff", None)
         return data

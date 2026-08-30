@@ -924,6 +924,19 @@ def test_cocos_adapter_reads_external_locked_corpus_without_copying(tmp_path, ca
     assert inventory.checkpoint_controls_hash is not None
     assert str(corpus) not in json.dumps(inventory.to_dict())
 
+    real_control_parent = tmp_path / "real-control-parent"
+    real_control_parent.mkdir()
+    linked_checkpoint_controls = real_control_parent / "checkpoint-controls.json"
+    _write_json(linked_checkpoint_controls, checkpoint_payload)
+    control_parent_alias = tmp_path / "control-parent-alias"
+    control_parent_alias.symlink_to(real_control_parent, target_is_directory=True)
+    with pytest.raises(EvaluationValidationError, match="parent components"):
+        validate_cocos_story_corpus(
+            corpus,
+            lock,
+            checkpoint_controls_path=control_parent_alias / "checkpoint-controls.json",
+        )
+
     for invalid_version in (None, "future-unknown-v99"):
         invalid_payload = dict(checkpoint_payload)
         if invalid_version is None:
@@ -1005,8 +1018,16 @@ def test_cocos_adapter_reads_external_locked_corpus_without_copying(tmp_path, ca
     real_confirmation_directory = corpus / "confirmation-real"
     (corpus / "confirmation").rename(real_confirmation_directory)
     (corpus / "confirmation").symlink_to(real_confirmation_directory, target_is_directory=True)
-    with pytest.raises(EvaluationValidationError, match="not a real directory"):
+    with pytest.raises(EvaluationValidationError, match="parent components"):
         validate_cocos_story_corpus(corpus, changed_lock)
+
+    real_corpus_parent = tmp_path / "real-corpus-parent"
+    real_corpus_parent.mkdir()
+    corpus.rename(real_corpus_parent / "cocos-corpus")
+    corpus_parent_alias = tmp_path / "corpus-parent-alias"
+    corpus_parent_alias.symlink_to(real_corpus_parent, target_is_directory=True)
+    with pytest.raises(EvaluationValidationError, match="parent components"):
+        validate_cocos_story_corpus(corpus_parent_alias / "cocos-corpus", changed_lock)
 
 
 def test_checked_in_cocos_lock_is_schema_valid():

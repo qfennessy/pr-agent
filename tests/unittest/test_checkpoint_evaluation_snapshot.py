@@ -95,7 +95,11 @@ def test_review_snapshot_loader_rejects_content_id_and_event_mismatches(tmp_path
 
 
 def test_review_snapshot_loader_rejects_answer_leakage_and_unknown_fields(tmp_path):
-    leaking = _snapshot(deterministic_results=({"ground_truth": "known bug"},))
+    leaking = _snapshot(deterministic_results=({
+        "results": [{
+            "nested": {"expected_withdrawn_fingerprints": ["known-bug"]},
+        }],
+    },))
     payload = _serialize(leaking)
     path = tmp_path / "snapshot.json"
     path.write_bytes(payload)
@@ -111,6 +115,25 @@ def test_review_snapshot_loader_rejects_answer_leakage_and_unknown_fields(tmp_pa
         load_review_snapshot_artifact(path, _case(clean, unknown_payload))
 
 
+def test_review_snapshot_loader_deep_freezes_deterministic_results(tmp_path):
+    evidence = {"check": {"items": [{"status": "passed"}]}}
+    snapshot = _snapshot(deterministic_results=(evidence,))
+    evidence["check"]["items"][0]["status"] = "changed-after-capture"
+    payload = _serialize(snapshot)
+    path = tmp_path / "snapshot.json"
+    path.write_bytes(payload)
+
+    loaded = load_review_snapshot_artifact(path, _case(snapshot, payload))
+    nested = loaded.deterministic_results[0]["check"]["items"][0]
+
+    assert nested["status"] == "passed"
+    with pytest.raises(TypeError):
+        nested["status"] = "mutated"
+    with pytest.raises(AttributeError):
+        loaded.deterministic_results[0]["check"]["items"].append({"status": "mutated"})
+    assert json.loads(json.dumps(loaded.to_dict())) == json.loads(json.dumps(snapshot.to_dict()))
+
+
 def test_review_snapshot_loader_rejects_symlinks_duplicate_keys_and_oversized_files(tmp_path):
     snapshot = _snapshot()
     payload = _serialize(snapshot)
@@ -122,6 +145,15 @@ def test_review_snapshot_loader_rejects_symlinks_duplicate_keys_and_oversized_fi
 
     with pytest.raises(EvaluationValidationError, match="regular file, not a symlink"):
         load_review_snapshot_artifact(symlink, case)
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    nested_target = real_parent / "snapshot.json"
+    nested_target.write_bytes(payload)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(EvaluationValidationError, match="parent components"):
+        load_review_snapshot_artifact(linked_parent / "snapshot.json", case)
 
     duplicate_payload = b'{"schema_version":"review-snapshot-v1","schema_version":"review-snapshot-v1"}'
     target.write_bytes(duplicate_payload)

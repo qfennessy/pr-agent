@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import stat
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -19,6 +17,7 @@ from pr_agent.algo.checkpoint_evaluation import (
     EvaluationValidationError,
     _answer_only_paths,
 )
+from pr_agent.algo.local_artifact_io import read_regular_file_without_symlinks
 from pr_agent.algo.review_snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
     CoverageIssue,
@@ -53,63 +52,11 @@ def _sha256_bytes(value: bytes) -> str:
 
 
 def _read_bounded_regular_file(path: Path, max_bytes: int) -> bytes:
-    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
-        raise EvaluationValidationError("snapshot artifact byte limit must be a positive integer")
-    try:
-        lexical_metadata = path.lstat()
-    except OSError as exc:
-        raise EvaluationValidationError(f"cannot inspect ReviewSnapshot artifact: {path}") from exc
-    if stat.S_ISLNK(lexical_metadata.st_mode) or not stat.S_ISREG(lexical_metadata.st_mode):
-        raise EvaluationValidationError("ReviewSnapshot artifact must be a regular file, not a symlink")
-    if lexical_metadata.st_size > max_bytes:
-        raise EvaluationValidationError(
-            f"ReviewSnapshot artifact exceeds the {max_bytes}-byte validation limit"
-        )
-
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise EvaluationValidationError(f"cannot open ReviewSnapshot artifact: {path}") from exc
-    try:
-        opened_metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(opened_metadata.st_mode):
-            raise EvaluationValidationError("ReviewSnapshot artifact must remain a regular file")
-        if (
-            lexical_metadata.st_dev,
-            lexical_metadata.st_ino,
-        ) != (
-            opened_metadata.st_dev,
-            opened_metadata.st_ino,
-        ):
-            raise EvaluationValidationError("ReviewSnapshot artifact changed before it was opened")
-        chunks: list[bytes] = []
-        remaining = max_bytes + 1
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 64 * 1024))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        raw = b"".join(chunks)
-        if len(raw) > max_bytes:
-            raise EvaluationValidationError(
-                f"ReviewSnapshot artifact exceeds the {max_bytes}-byte validation limit"
-            )
-        final_metadata = os.fstat(descriptor)
-        if (
-            opened_metadata.st_size,
-            opened_metadata.st_mtime_ns,
-            opened_metadata.st_ctime_ns,
-        ) != (
-            final_metadata.st_size,
-            final_metadata.st_mtime_ns,
-            final_metadata.st_ctime_ns,
-        ):
-            raise EvaluationValidationError("ReviewSnapshot artifact changed while it was read")
-        return raw
-    finally:
-        os.close(descriptor)
+    return read_regular_file_without_symlinks(
+        path,
+        label="ReviewSnapshot artifact",
+        max_bytes=max_bytes,
+    )
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

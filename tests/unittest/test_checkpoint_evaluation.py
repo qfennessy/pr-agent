@@ -152,6 +152,7 @@ def test_manifest_round_trip_has_content_identity_and_no_answers():
         {"ground_truth": "bug"},
         {"nested": {"severity": "critical"}},
         {"items": [{"required-context": ["caller"]}]},
+        {"items": [{"nested": {"expected_withdrawn_fingerprints": ["finding-1"]}}]},
     ],
 )
 def test_checkpoint_rejects_answer_only_model_metadata(metadata):

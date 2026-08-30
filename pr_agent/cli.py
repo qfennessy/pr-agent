@@ -459,7 +459,7 @@ def _emit_snapshot_result(
 def _snapshot_review_instructions(snapshot) -> str:
     context = {
         "task_intent": snapshot.task_intent,
-        "deterministic_checks": list(snapshot.deterministic_results),
+        "deterministic_checks": snapshot.to_dict(include_diff=False)["deterministic_results"],
     }
     supplied = json.dumps(context, ensure_ascii=True, sort_keys=True, indent=2)
     existing = str(get_settings().get("pr_reviewer.extra_instructions", "") or "").strip()

@@ -50,10 +50,13 @@ match its canonical JSON.
 
 Before any future runner may use a source-bearing snapshot, it must call
 `load_review_snapshot_artifact()`. The loader reads one bounded regular file without
-following symlinks, rejects duplicate keys and non-finite JSON, verifies the exact file-byte
-hash against the checkpoint, reconstructs the `ReviewSnapshot`, and then verifies its
-content-derived snapshot id and event. Unknown snapshot fields and answer-only keys in
-deterministic evidence fail closed. Loading performs no network or model call.
+following any supplied path component (using descriptor-relative component walking), rejects
+duplicate keys and non-finite JSON, verifies the exact file-byte hash against the checkpoint,
+reconstructs the `ReviewSnapshot`, and then verifies its content-derived snapshot id and
+event. Unknown snapshot fields and answer-only keys in deterministic evidence fail closed.
+Nested deterministic evidence is copied into immutable mappings and tuples before the
+validated snapshot is returned, while `to_dict()` still emits ordinary JSON-compatible
+copies. Loading performs no network or model call.
 
 The evaluation artifacts above contain no source text, full diff, secret, hidden reasoning,
 provider request identifier, or credential. The separate serialized `ReviewSnapshot` is
@@ -215,8 +218,9 @@ hash-addressed, independently adjudicated clean intermediate checkpoints. It mus
 partial-but-correct saves, coherent clean worktrees, temporary mistakes corrected before
 commit, staged checkpoints, and stale-candidate withdrawal lineages. The adapter rejects
 source-bearing or unknown fields and final clean PR heads as substitutes, and includes the
-control artifact hash in the pilot corpus identity. The evaluation manifest must bind that
-exact resulting corpus identity. Until the ledger is supplied, its status is
+control artifact hash in the pilot corpus identity. Its file, corpus root, and every supplied
+parent component must be real directories/files rather than symlinks. The evaluation manifest
+must bind that exact resulting corpus identity. Until the ledger is supplied, its status is
 `not_evaluable`.
 
 ## Reproduction, privacy, and rollback
