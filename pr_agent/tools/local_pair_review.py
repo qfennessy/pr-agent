@@ -266,8 +266,14 @@ def _patch_model_visible_regions(patch: str) -> tuple[bytes, ...]:
                 )
 
     for line in patch.splitlines(keepends=True):
-        if RE_HUNK_HEADER.match(line):
+        hunk_match = RE_HUNK_HEADER.match(line)
+        if hunk_match:
             flush_hunk()
+            header_context = hunk_match.group(5).rstrip("\r\n")
+            if header_context:
+                regions.append(
+                    header_context.encode("utf-8", errors="surrogateescape")
+                )
             old_region = []
             new_region = []
             inside_hunk = True

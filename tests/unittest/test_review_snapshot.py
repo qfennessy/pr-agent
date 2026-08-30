@@ -793,6 +793,68 @@ def test_modified_file_with_distant_existing_unsafe_content_remains_reviewable(e
     )
 
 
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "def API_TOKEN_super_secret_value():",
+        "class API_TOKEN_super_secret_value:",
+    ],
+)
+def test_modified_file_hunk_header_context_from_excluded_source_is_omitted(
+    event, declaration, tmp_path
+):
+    repo = _repo(tmp_path, f"excluded-hunk-header-{event}-{declaration[:3]}")
+    (repo / ".env").write_text(f"{declaration}\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    body = "".join(f"    filler_{index} = {index}\n" for index in range(12))
+    destination.write_text(
+        f"{declaration}\n{body}    feature_flag = False\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add hunk header fixture")
+    destination.write_text(
+        f"{declaration}\n{body}    feature_flag = True\n",
+        encoding="utf-8",
+    )
+    if event == "pre-commit":
+        _git(repo, "add", "feature.py")
+
+    reviewer = LocalPairReview(str(repo))
+    review_event = ReviewEvent.parse(event)
+    stage = {
+        "file-save": "combined",
+        "worktree-idle": "worktree",
+        "pre-commit": "index",
+    }[event]
+    patch = reviewer._capture_diff(
+        review_event,
+        _git(repo, "rev-parse", "HEAD"),
+        ("feature.py",),
+        diff_stage=stage,
+    )
+    assert patch is not None
+    assert any(
+        match is not None and match.group(5) == declaration
+        for line in patch.splitlines()
+        if (match := local_pair_review_module.RE_HUNK_HEADER.match(line))
+    )
+
+    snapshot = reviewer.capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert declaration not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(
+        path="feature.py", reason="rename_group_omitted"
+    ) in snapshot.coverage_issues
+
+
 def test_worktree_idle_scopes_staged_and_current_modified_variants(tmp_path):
     repo = _repo(tmp_path, "distant-existing-excluded-content-both-stages")
     (repo / ".env").write_text("API_TOKEN=existing-secret\n", encoding="utf-8")
