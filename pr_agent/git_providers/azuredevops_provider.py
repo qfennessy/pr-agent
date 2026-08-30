@@ -188,6 +188,7 @@ class AzureDevopsProvider(GitProvider):
         self.diff_files = None
         self._diff_path_map = None
         self._latest_pr_iteration_changes = None
+        self._latest_pr_iteration_changes_incomplete = None
         self._routing_incremental_files = None
         self.workspace_slug = None
         self.repo_slug = None
@@ -435,6 +436,7 @@ class AzureDevopsProvider(GitProvider):
         self.diff_files = None
         self._diff_path_map = None
         self._latest_pr_iteration_changes = None
+        self._latest_pr_iteration_changes_incomplete = None
         self._routing_incremental_files = None
         self._published_inline_comment_bodies = []
         self._inline_comment_store = None
@@ -453,6 +455,7 @@ class AzureDevopsProvider(GitProvider):
             self.diff_files = None
             self._diff_path_map = None
             self._latest_pr_iteration_changes = None
+            self._latest_pr_iteration_changes_incomplete = None
             self._routing_incremental_files = None
             self.unreviewed_files_map = {}
             self._get_incremental_commits()
@@ -486,6 +489,8 @@ class AzureDevopsProvider(GitProvider):
         routing_files = []
         routing_file_keys = set()
         net_changes, had_errors = self._get_incremental_net_changes()
+        net_changes, scope_incomplete = self._scope_incremental_changes_to_pr(net_changes)
+        had_errors = had_errors or scope_incomplete
         for change in net_changes:
             routing_file = _azure_change_for_routing(change)
             if routing_file is not None:
@@ -522,6 +527,56 @@ class AzureDevopsProvider(GitProvider):
                 "Failed to fetch the incremental net diff; falling back to full review."
             )
             self.incremental.is_incremental = False
+
+    def _scope_incremental_changes_to_pr(self, net_changes: list) -> tuple[list, bool]:
+        """Exclude target-branch merge noise using the current PR's own inventory."""
+
+        try:
+            current_pr_changes = self._get_latest_pr_iteration_changes()
+        except Exception as error:
+            get_logger().warning(
+                "Failed to scope Azure incremental net changes to the pull request; "
+                f"preserving net evidence and marking it incomplete: {error}"
+            )
+            return net_changes, True
+        if getattr(self, "_latest_pr_iteration_changes_incomplete", None) is True:
+            return net_changes, True
+
+        current_pr_paths = set()
+        for change in current_pr_changes:
+            if _is_azure_tree_change(change):
+                continue
+            path = _get_azure_change_path(change)
+            if not isinstance(path, str) or not path.strip():
+                get_logger().warning(
+                    "Azure pull-request inventory contains a non-tree change without a path; "
+                    "preserving incremental net evidence and marking it incomplete."
+                )
+                return net_changes, True
+            current_pr_paths.add(path.strip())
+            old_path = _azure_change_old_path(change)
+            if isinstance(old_path, str) and old_path.strip():
+                current_pr_paths.add(old_path.strip())
+
+        scoped_changes = []
+        scope_incomplete = False
+        for change in net_changes:
+            if _is_azure_tree_change(change):
+                continue
+            path = _get_azure_change_path(change)
+            old_path = _azure_change_old_path(change)
+            paths = {
+                candidate.strip()
+                for candidate in (path, old_path)
+                if isinstance(candidate, str) and candidate.strip()
+            }
+            if not paths:
+                # Retain malformed compare evidence so routing sees its UNKNOWN shape.
+                scoped_changes.append(change)
+                scope_incomplete = True
+            elif paths & current_pr_paths:
+                scoped_changes.append(change)
+        return scoped_changes, scope_incomplete
 
     def _get_incremental_net_changes(self) -> tuple[list, bool]:
         """Fetch the baseline-to-head net diff, retaining evidence before a later failure."""
@@ -728,40 +783,97 @@ class AzureDevopsProvider(GitProvider):
         return path[1:] if path.startswith("/") else path
 
     def _get_latest_pr_iteration_changes(self):
-        """Return the unfiltered net PR changes, cached for routing and diff loading."""
+        """Return cached unfiltered net PR changes and retain completeness state."""
         cached = getattr(self, "_latest_pr_iteration_changes", None)
         if cached is not None:
             return cached
 
-        iterations = self.azure_devops_client.get_pull_request_iterations(
-            repository_id=self.repo_slug,
-            pull_request_id=self.pr_num,
-            project=self.workspace_slug,
-        )
-        if not iterations:
-            self._latest_pr_iteration_changes = ()
-            return self._latest_pr_iteration_changes
-
-        iteration_id = iterations[-1].id
         entries = []
-        skip = 0
-        while True:
-            changes = self.azure_devops_client.get_pull_request_iteration_changes(
+        incomplete = False
+        try:
+            raw_iterations = self.azure_devops_client.get_pull_request_iterations(
                 repository_id=self.repo_slug,
                 pull_request_id=self.pr_num,
-                iteration_id=iteration_id,
                 project=self.workspace_slug,
-                top=2000,
-                skip=skip,
-                compare_to=0,
             )
-            entries.extend(getattr(changes, "change_entries", None) or [])
-            next_skip = getattr(changes, "next_skip", None)
-            if not isinstance(next_skip, int) or isinstance(next_skip, bool) or next_skip <= skip:
+            if not isinstance(raw_iterations, (list, tuple)):
+                raise TypeError("Azure pull-request iterations must be a sequence")
+            iterations = list(raw_iterations)
+        except Exception as error:
+            get_logger().warning(
+                "Failed to fetch Azure pull-request iterations; marking the current "
+                f"PR inventory incomplete: {error}"
+            )
+            iterations = []
+            incomplete = True
+        if not iterations:
+            self._latest_pr_iteration_changes = ()
+            # A PR with no iteration descriptor cannot prove an authoritative empty
+            # change set. Preserve baseline-to-head evidence and fail safe.
+            self._latest_pr_iteration_changes_incomplete = True
+            return self._latest_pr_iteration_changes
+
+        iteration_id = getattr(iterations[-1], "id", None)
+        if iteration_id is None:
+            get_logger().warning(
+                "Azure pull-request iteration is missing its id; marking the current "
+                "PR inventory incomplete."
+            )
+            self._latest_pr_iteration_changes = ()
+            self._latest_pr_iteration_changes_incomplete = True
+            return self._latest_pr_iteration_changes
+
+        skip = 0
+        page_size = 2000
+        while True:
+            try:
+                changes = self.azure_devops_client.get_pull_request_iteration_changes(
+                    repository_id=self.repo_slug,
+                    pull_request_id=self.pr_num,
+                    iteration_id=iteration_id,
+                    project=self.workspace_slug,
+                    top=page_size,
+                    skip=skip,
+                    compare_to=0,
+                )
+                if isinstance(changes, Mapping):
+                    has_entries = "change_entries" in changes or "changeEntries" in changes
+                else:
+                    has_entries = hasattr(changes, "change_entries") or hasattr(changes, "changeEntries")
+                if not has_entries:
+                    raise TypeError("Azure iteration response is missing change entries")
+                raw_page = _get_azure_change_property(
+                    changes,
+                    "change_entries",
+                    "changeEntries",
+                )
+                if raw_page is None:
+                    page = []
+                elif isinstance(raw_page, (str, bytes, Mapping)):
+                    raise TypeError("Azure iteration changes must be a sequence")
+                else:
+                    page = list(raw_page)
+                entries.extend(page)
+                next_skip = _get_azure_change_property(changes, "next_skip", "nextSkip")
+            except Exception as error:
+                get_logger().warning(
+                    "Failed to fetch the complete Azure pull-request inventory; preserving "
+                    f"known paths and marking it incomplete: {error}"
+                )
+                incomplete = True
+                break
+            if not isinstance(next_skip, int) or isinstance(next_skip, bool):
+                incomplete = True
+                break
+            if next_skip == 0:
+                break
+            if next_skip <= skip:
+                incomplete = True
                 break
             skip = next_skip
 
         self._latest_pr_iteration_changes = tuple(entries)
+        self._latest_pr_iteration_changes_incomplete = incomplete
         return self._latest_pr_iteration_changes
 
     def get_files_for_routing(self):
@@ -784,6 +896,14 @@ class AzureDevopsProvider(GitProvider):
             routing_file = _azure_change_for_routing(change)
             if routing_file is not None:
                 files.append(routing_file)
+        if getattr(self, "_latest_pr_iteration_changes_incomplete", None) is True:
+            files.append(FilePatchInfo(
+                base_file="",
+                head_file="",
+                patch="",
+                filename="",
+                edit_type=EDIT_TYPE.UNKNOWN,
+            ))
         return files
 
     def is_incremental_scope_empty(self) -> bool | None:
