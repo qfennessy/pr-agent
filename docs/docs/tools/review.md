@@ -47,6 +47,26 @@ same root cause are collapsed, and PR-Agent publishes no summary when no qualify
 output still contains `review.key_issues_to_review`, using an empty list for that case. Set `inline_key_issues = true`
 to keep supported inline publication behavior.
 
+#### Stable review-thread lifecycle foundation
+
+PR-Agent contains a disabled foundation for keeping one verified finding in one GitHub review thread across pushes.
+It defines versioned finding identities, paginated thread inventory, explicit create/update/resolve operations, and a
+fail-closed action plan tied to one pull-request head commit. Existing persistent inline comments still use the
+simpler duplicate-suppression behavior described in the [improve tool](./improve.md#persistent-inline-comments).
+
+The lifecycle foundation is not connected to `/review` publication yet. Enabling it before verified findings expose
+stable root-cause identities and rollout evidence exists could update the wrong discussion, so the reserved setting
+remains off and has no runtime effect:
+
+```toml
+[review_thread_lifecycle]
+enabled = false
+obsolete_thread_policy = "keep"
+```
+
+`obsolete_thread_policy = "resolve"` is reserved for the later gated integration. Even then, plans preserve resolved
+threads, human-owned threads, and every thread with replies.
+
 If you want to edit [configurations](#configuration-options), add the relevant ones to the command:
 
 ```

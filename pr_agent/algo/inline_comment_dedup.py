@@ -38,6 +38,9 @@ from typing import Iterator, Optional
 BODY_MARKER_RE = re.compile(r"<!-- pr-agent-dedup: ([a-f0-9]{12}) -->")
 CODE_MARKER_RE = re.compile(r"<!-- pr-agent-dedup-code: ([a-f0-9]{12}) -->")
 KEY_ISSUE_LOCATION_MARKER_RE = re.compile(r"<!-- pr-agent-key-issue-location: ([a-f0-9]{12}) -->")
+FINDING_IDENTITY_MARKER_RE = re.compile(
+    r"<!-- pr-agent-finding:(v[1-9][0-9]*) id=(sha256:[a-f0-9]{64}) -->"
+)
 _MARKER_RES = (BODY_MARKER_RE, CODE_MARKER_RE, KEY_ISSUE_LOCATION_MARKER_RE)
 
 _LEAD_RE = re.compile(r"^\*\*Suggestion:\*\*\s*", re.IGNORECASE)
@@ -49,7 +52,11 @@ _CODE_BLOCK_RE = re.compile(r"```suggestion[^\n]*\n(.*?)```", re.DOTALL)
 def has_marker(body: str) -> bool:
     """True only if the body carries a well-formed dedup marker (12-hex),
     so incidental text mentioning the marker syntax is not mistaken for one."""
-    return bool(BODY_MARKER_RE.search(body or "") or CODE_MARKER_RE.search(body or ""))
+    return bool(
+        BODY_MARKER_RE.search(body or "")
+        or CODE_MARKER_RE.search(body or "")
+        or FINDING_IDENTITY_MARKER_RE.search(body or "")
+    )
 
 
 def is_agent_inline_comment(body: str) -> bool:
@@ -58,7 +65,7 @@ def is_agent_inline_comment(body: str) -> bool:
 
 
 def marker_fingerprints(body: str) -> set:
-    """All dedup-marker fingerprints embedded in one comment body."""
+    """All legacy dedup-marker fingerprints embedded in one comment body."""
     found = set()
     for marker_re in _MARKER_RES:
         for match in marker_re.finditer(body or ""):
@@ -66,12 +73,47 @@ def marker_fingerprints(body: str) -> set:
     return found
 
 
+def finding_identity_markers(body: str) -> tuple[tuple[str, str], ...]:
+    """Return versioned lifecycle markers without changing legacy marker parsing."""
+    return tuple((match.group(1), match.group(2)) for match in FINDING_IDENTITY_MARKER_RE.finditer(body or ""))
+
+
+def build_finding_identity_marker(finding_id: str, marker_version: str = "v1") -> str:
+    """Build a versioned stable-finding marker.
+
+    Marker versions are independent from the reconciler's full schema version,
+    allowing later payload formats while existing ``pr-agent-dedup`` markers
+    remain readable by older releases.
+    """
+    if not re.fullmatch(r"v[1-9][0-9]*", marker_version):
+        raise ValueError("marker_version must look like v1")
+    if not re.fullmatch(r"sha256:[a-f0-9]{64}", finding_id or ""):
+        raise ValueError("finding_id must be a sha256 identity")
+    return f"<!-- pr-agent-finding:{marker_version} id={finding_id} -->"
+
+
+def body_with_finding_identity_marker(body: str, finding_id: str, marker_version: str = "v1",
+                                      max_chars: Optional[int] = None) -> str:
+    return _append_markers(body, build_finding_identity_marker(finding_id, marker_version), max_chars)
+
+
+def strip_identity_markers(body: str) -> str:
+    """Remove lifecycle markers while leaving the legacy dedup behavior intact."""
+    return FINDING_IDENTITY_MARKER_RE.sub("", body or "")
+
+
 def _strip_markers(body: str) -> str:
     """Remove embedded dedup markers so a pre-marked body fingerprints the
     same as its original (markers are appended after marking)."""
     body = BODY_MARKER_RE.sub("", body or "")
     body = CODE_MARKER_RE.sub("", body)
+    body = FINDING_IDENTITY_MARKER_RE.sub("", body)
     return body
+
+
+def strip_inline_comment_markers(body: str) -> str:
+    """Remove legacy and lifecycle markers before comparing visible bodies."""
+    return _strip_markers(body)
 
 
 def body_fingerprint(relevant_file: str, target_line_no, body: str) -> str:

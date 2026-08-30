@@ -18,20 +18,44 @@ from starlette_context import context
 
 from ..algo.file_filter import filter_ignored
 from ..algo.git_patch_processing import extract_hunk_headers
-from ..algo.inline_comment_dedup import (body_fingerprint, body_with_markers,
-                                         code_fingerprint,
-                                         get_inline_comment_store, has_marker)
+from ..algo.inline_comment_dedup import (
+    body_fingerprint,
+    body_with_markers,
+    code_fingerprint,
+    finding_identity_markers,
+    get_inline_comment_store,
+    has_marker,
+    is_agent_inline_comment,
+)
 from ..algo.language_handler import is_valid_file
+from ..algo.review_thread_reconciler import (
+    ReviewThreadActionKind,
+    ReviewThreadActionOutcome,
+    ReviewThreadActionState,
+    ReviewThreadAnchor,
+    ReviewThreadCommentSnapshot,
+    ReviewThreadSnapshot,
+)
 from ..algo.types import EDIT_TYPE
-from ..algo.utils import (Range, clip_tokens, find_line_number_of_relevant_line_in_file,
-                          get_pr_review_comment_identifiers, load_large_diff,
-                          set_file_languages)
+from ..algo.utils import (
+    Range,
+    clip_tokens,
+    find_line_number_of_relevant_line_in_file,
+    get_pr_review_comment_identifiers,
+    load_large_diff,
+    set_file_languages,
+)
 from ..config_loader import get_settings
 from ..log import get_logger
 from ..servers.utils import RateLimitExceeded
-from .git_provider import (MAX_FILES_ALLOWED_FULL, FilePatchInfo, GitProvider,
-                           IncrementalPR, get_cached_global_settings,
-                           is_own_persistent_comment_for_identities)
+from .git_provider import (
+    MAX_FILES_ALLOWED_FULL,
+    FilePatchInfo,
+    GitProvider,
+    IncrementalPR,
+    get_cached_global_settings,
+    is_own_persistent_comment_for_identities,
+)
 
 
 def _next_page_url(headers: dict) -> str:
@@ -643,6 +667,305 @@ class GithubProvider(GitProvider):
 
     def supports_thread_resolution(self) -> bool:
         return True
+
+    def _request_review_thread_graphql(self, query: str, variables: Optional[dict] = None) -> dict:
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+        response = self.github_client._Github__requester.requestJson(
+            "POST", "/graphql", input=payload
+        )
+        if not isinstance(response, tuple) or len(response) != 3:
+            raise RuntimeError("unexpected GitHub GraphQL response format")
+        body = json.loads(response[2]) if isinstance(response[2], str) else response[2]
+        if not isinstance(body, dict):
+            raise RuntimeError("GitHub GraphQL response body is not an object")
+        if body.get("errors"):
+            raise RuntimeError(f"GitHub GraphQL errors: {body['errors']}")
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise RuntimeError("GitHub GraphQL response has no data object")
+        return data
+
+    def _get_additional_review_thread_comments(self, thread_id: str, cursor: str) -> tuple[list[dict], str]:
+        query = """
+        query($threadId: ID!, $after: String) {
+          node(id: $threadId) {
+            ... on PullRequestReviewThread {
+              comments(first: 100, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  id databaseId body createdAt url
+                  author { login }
+                  pullRequestReview { commit { oid } }
+                }
+              }
+            }
+          }
+        }
+        """
+        data = self._request_review_thread_graphql(query, {"threadId": thread_id, "after": cursor})
+        node = data.get("node")
+        if not isinstance(node, dict) or not isinstance(node.get("comments"), dict):
+            raise RuntimeError(f"GitHub returned incomplete comments for review thread {thread_id}")
+        connection = node["comments"]
+        comments = connection.get("nodes")
+        page_info = connection.get("pageInfo")
+        if not isinstance(comments, list) or not isinstance(page_info, dict):
+            raise RuntimeError(f"GitHub returned malformed comments for review thread {thread_id}")
+        next_cursor = page_info.get("endCursor") if page_info.get("hasNextPage") else ""
+        if page_info.get("hasNextPage") and not next_cursor:
+            raise RuntimeError(f"GitHub omitted the next comment cursor for review thread {thread_id}")
+        return comments, next_cursor or ""
+
+    def get_review_thread_snapshots(self) -> tuple[ReviewThreadSnapshot, ...]:
+        """Return an authoritative, paginated snapshot of GitHub review threads.
+
+        API and pagination failures raise instead of returning an empty inventory;
+        callers must not confuse an unreadable PR with a PR that has no threads.
+        """
+        owner, repo_name = self.repo.split("/", 1)
+        query = """
+        query($owner: String!, $name: String!, $number: Int!, $after: String) {
+          viewer { login }
+          repository(owner: $owner, name: $name) {
+            pullRequest(number: $number) {
+              reviewThreads(first: 100, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  id isResolved isOutdated path line startLine diffSide startDiffSide
+                  originalLine originalStartLine
+                  comments(first: 100) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      id databaseId body createdAt url
+                      author { login }
+                      pullRequestReview { commit { oid } }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        cursor = None
+        viewer_login = None
+        raw_threads = []
+        while True:
+            data = self._request_review_thread_graphql(
+                query,
+                {"owner": owner, "name": repo_name, "number": self.pr_num, "after": cursor},
+            )
+            viewer = data.get("viewer")
+            if not isinstance(viewer, dict) or not viewer.get("login"):
+                raise RuntimeError("GitHub review-thread inventory has no authenticated viewer")
+            viewer_login = viewer["login"]
+            repository = data.get("repository")
+            pull_request = repository.get("pullRequest") if isinstance(repository, dict) else None
+            connection = pull_request.get("reviewThreads") if isinstance(pull_request, dict) else None
+            if not isinstance(connection, dict):
+                raise RuntimeError("GitHub review-thread inventory has no pull request connection")
+            nodes = connection.get("nodes")
+            page_info = connection.get("pageInfo")
+            if not isinstance(nodes, list) or not isinstance(page_info, dict):
+                raise RuntimeError("GitHub review-thread inventory is malformed")
+            raw_threads.extend(nodes)
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                raise RuntimeError("GitHub omitted the next review-thread cursor")
+
+        snapshots = []
+        for thread in raw_threads:
+            if not isinstance(thread, dict) or not thread.get("id"):
+                raise RuntimeError("GitHub returned a review thread without an id")
+            comment_connection = thread.get("comments")
+            if not isinstance(comment_connection, dict):
+                raise RuntimeError(f"GitHub returned review thread {thread['id']} without comments")
+            raw_comments = comment_connection.get("nodes")
+            comment_page_info = comment_connection.get("pageInfo")
+            if not isinstance(raw_comments, list) or not isinstance(comment_page_info, dict):
+                raise RuntimeError(f"GitHub returned malformed comments for review thread {thread['id']}")
+            raw_comments = list(raw_comments)
+            comment_cursor = comment_page_info.get("endCursor") if comment_page_info.get("hasNextPage") else ""
+            if comment_page_info.get("hasNextPage") and not comment_cursor:
+                raise RuntimeError(f"GitHub omitted the next comment cursor for review thread {thread['id']}")
+            while comment_cursor:
+                page, comment_cursor = self._get_additional_review_thread_comments(thread["id"], comment_cursor)
+                raw_comments.extend(page)
+
+            comments = []
+            for comment in raw_comments:
+                if not isinstance(comment, dict) or not comment.get("id"):
+                    raise RuntimeError(f"GitHub returned an invalid comment in review thread {thread['id']}")
+                author = comment.get("author")
+                comments.append(ReviewThreadCommentSnapshot(
+                    node_id=comment["id"],
+                    database_id=comment.get("databaseId"),
+                    author_login=author.get("login") if isinstance(author, dict) else None,
+                    body=comment.get("body") or "",
+                    created_at=comment.get("createdAt"),
+                    url=comment.get("url"),
+                ))
+
+            root = comments[0] if comments else None
+            marker_values = finding_identity_markers(root.body if root else "")
+            marker_ids = {finding_id for _, finding_id in marker_values}
+            finding_id = next(iter(marker_ids)) if len(marker_ids) == 1 else None
+            root_author_is_viewer = bool(root and root.author_login and root.author_login == viewer_login)
+            bot_owned = bool(root_author_is_viewer and is_agent_inline_comment(root.body))
+            line = thread.get("line") or thread.get("originalLine")
+            start_line = thread.get("startLine") or thread.get("originalStartLine")
+            anchor = None
+            if thread.get("path") and isinstance(line, int) and line > 0:
+                anchor = ReviewThreadAnchor(
+                    path=thread["path"],
+                    line=line,
+                    start_line=start_line if isinstance(start_line, int) else None,
+                    side=thread.get("diffSide") or "RIGHT",
+                    start_side=thread.get("startDiffSide"),
+                )
+            review = raw_comments[0].get("pullRequestReview") if raw_comments else None
+            commit = review.get("commit") if isinstance(review, dict) else None
+            snapshots.append(ReviewThreadSnapshot(
+                thread_id=thread["id"],
+                finding_id=finding_id,
+                anchor=anchor,
+                is_resolved=bool(thread.get("isResolved")),
+                is_outdated=bool(thread.get("isOutdated")),
+                bot_owned=bot_owned,
+                has_replies=len(comments) > 1,
+                reviewed_head_sha=commit.get("oid") if isinstance(commit, dict) else None,
+                comments=tuple(comments),
+            ))
+        return tuple(snapshots)
+
+    def _live_review_head_sha(self) -> str:
+        _, data = self.pr._requester.requestJsonAndCheck(
+            "GET", f"{self.base_url}/repos/{self.repo}/pulls/{self.pr_num}"
+        )
+        head = data.get("head") if isinstance(data, dict) else None
+        sha = head.get("sha") if isinstance(head, dict) else None
+        if not sha:
+            raise RuntimeError("GitHub pull request response has no head SHA")
+        return sha
+
+    def _check_review_thread_head(self, kind: ReviewThreadActionKind,
+                                  expected_head_sha: str) -> tuple[Optional[str], Optional[ReviewThreadActionOutcome]]:
+        try:
+            current_head_sha = self._live_review_head_sha()
+        except Exception as e:
+            return None, ReviewThreadActionOutcome(
+                kind=kind,
+                state=ReviewThreadActionState.FAILED,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=None,
+                reason=f"head_check_failed: {e}",
+            )
+        if current_head_sha != expected_head_sha:
+            return current_head_sha, ReviewThreadActionOutcome(
+                kind=kind,
+                state=ReviewThreadActionState.STALE_HEAD,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                reason="pull_request_head_changed",
+            )
+        return current_head_sha, None
+
+    def create_review_thread(self, comment: dict, expected_head_sha: str) -> ReviewThreadActionOutcome:
+        current_head_sha, blocked = self._check_review_thread_head(
+            ReviewThreadActionKind.CREATE, expected_head_sha
+        )
+        if blocked:
+            return blocked
+        payload = dict(comment)
+        payload["commit_id"] = expected_head_sha
+        try:
+            _, data = self.pr._requester.requestJsonAndCheck(
+                "POST", f"{self.base_url}/repos/{self.repo}/pulls/{self.pr_num}/comments", input=payload
+            )
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.CREATE,
+                state=ReviewThreadActionState.APPLIED,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                comment_id=data.get("id") if isinstance(data, dict) else None,
+                comment_node_id=data.get("node_id") if isinstance(data, dict) else None,
+            )
+        except Exception as e:
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.CREATE,
+                state=ReviewThreadActionState.FAILED,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                reason=f"create_failed: {e}",
+            )
+
+    def update_review_thread(self, comment_id: int, body: str,
+                             expected_head_sha: str) -> ReviewThreadActionOutcome:
+        current_head_sha, blocked = self._check_review_thread_head(
+            ReviewThreadActionKind.UPDATE, expected_head_sha
+        )
+        if blocked:
+            return blocked
+        try:
+            _, data = self.pr._requester.requestJsonAndCheck(
+                "PATCH", f"{self.base_url}/repos/{self.repo}/pulls/comments/{comment_id}", input={"body": body}
+            )
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.UPDATE,
+                state=ReviewThreadActionState.APPLIED,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                comment_id=data.get("id", comment_id) if isinstance(data, dict) else comment_id,
+                comment_node_id=data.get("node_id") if isinstance(data, dict) else None,
+            )
+        except Exception as e:
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.UPDATE,
+                state=ReviewThreadActionState.FAILED,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                comment_id=comment_id,
+                reason=f"update_failed: {e}",
+            )
+
+    def resolve_review_thread(self, thread_id: str, expected_head_sha: str) -> ReviewThreadActionOutcome:
+        current_head_sha, blocked = self._check_review_thread_head(
+            ReviewThreadActionKind.RESOLVE, expected_head_sha
+        )
+        if blocked:
+            return blocked
+        mutation = """
+        mutation($threadId: ID!) {
+          resolveReviewThread(input: {threadId: $threadId}) {
+            thread { id isResolved }
+          }
+        }
+        """
+        try:
+            data = self._request_review_thread_graphql(mutation, {"threadId": thread_id})
+            thread = data.get("resolveReviewThread", {}).get("thread")
+            if not isinstance(thread, dict) or not thread.get("isResolved"):
+                raise RuntimeError("resolveReviewThread did not return a resolved thread")
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.RESOLVE,
+                state=ReviewThreadActionState.APPLIED,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                thread_id=thread.get("id") or thread_id,
+            )
+        except Exception as e:
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.RESOLVE,
+                state=ReviewThreadActionState.FAILED,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                thread_id=thread_id,
+                reason=f"resolve_failed: {e}",
+            )
 
     def resolve_comment_thread(self, comment_id: int) -> bool:
         """Resolve the review thread containing the given comment via GitHub GraphQL API."""
