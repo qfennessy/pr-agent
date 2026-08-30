@@ -11,10 +11,9 @@ GitHub when changing required checks or release permissions.
 
 | Workflow | Trigger | Purpose | Credentials or write access |
 | --- | --- | --- | --- |
-| `Build-and-test` | Push or pull request targeting `main` | Builds the `test` target in `docker/Dockerfile` and runs `tests/unittest` | Read-only checkout |
-| `Code-coverage` | Pull request targeting `main`, or manual dispatch | Runs the unit suite with coverage and uploads `coverage.xml` to Codecov | `CODECOV_TOKEN` |
-| `CodeQL` | Push or pull request targeting `main`; Mondays at 06:00 UTC | Scans Python with the extended security and quality query suites | `security-events: write` |
-| `docs-ci` | Changes under `docs/**` pushed to `main` or `add-docs-portal` | Builds and force-deploys the MkDocs site to GitHub Pages | `contents: write` |
+| `Build-and-test` | Non-documentation push or pull request targeting `main` | Builds the `test` target in `docker/Dockerfile` and runs `tests/unittest` | Read-only checkout |
+| `CodeQL` | Non-documentation push or pull request targeting `main`; Mondays at 06:00 UTC | Scans Python with the extended security and quality query suites | `security-events: write` |
+| `docs-ci` | Pull requests changing `docs/**`; documentation pushes to `main` or `add-docs-portal` | Validates documentation on pull requests and deploys pushes to GitHub Pages | Read access for validation; `contents: write` for deployment |
 | `PR-Agent E2E tests` | Manual dispatch | Builds the test image and tests the GitHub, GitLab, and Bitbucket integrations | Provider test tokens listed below |
 | `pre-commit` | Manual dispatch | Runs the hooks in `.pre-commit-config.yaml` | Read-only checkout |
 | `PR-Agent` | A non-draft pull request is opened, reopened, or marked ready | Runs describe, review, and improve through the fork's own action | Model and Pinecone secrets; PR and issue write access |
@@ -35,9 +34,9 @@ docker build -f docker/Dockerfile --target test -t pragent/pr-agent:test .
 docker run --rm pragent/pr-agent:test pytest -v tests/unittest
 ```
 
-BuildKit's GitHub Actions cache uses the shared `dev` scope. `code_coverage.yaml` builds the same target with the
-same cache scope and reruns the unit suite with `pytest-cov`. It copies `coverage.xml` out of the container and fails
-before upload if the report is absent. There is no coverage threshold in the workflow.
+BuildKit's GitHub Actions cache uses the shared `dev` scope. Changes limited to `docs/**` or Markdown files skip this
+workflow. The former coverage workflow was removed because it reran the complete unit suite without enforcing a
+coverage threshold.
 
 For a faster local run, use the repository virtual environment and preserve the import path:
 
@@ -51,8 +50,9 @@ The `pre-commit` workflow is intentionally manual. Its active hooks check large 
 newlines, trailing whitespace, and import order. Ruff, Bandit, and actionlint hooks are present only as commented
 configuration and therefore do not run through this workflow.
 
-CodeQL runs on every push and pull request targeting `main`, and is also scheduled weekly so newly published queries
-can scan an unchanged repository. It analyzes Python with `build-mode: none`; it does not build or execute the project.
+CodeQL runs on non-documentation pushes and pull requests targeting `main`, and is also scheduled weekly so newly
+published queries can scan an unchanged repository. It analyzes Python with `build-mode: none`; it does not build or
+execute the project.
 
 Run the configured formatting checks locally with:
 
@@ -101,11 +101,12 @@ The merge policy and post-merge verification steps are documented in the reposit
 
 ## Documentation deployment
 
-`docs-ci.yaml` deploys the MkDocs site after a documentation change is pushed to `main` or `add-docs-portal`.
-It installs MkDocs Material, its imaging extras, and `mkdocs-glightbox`, then runs `mkdocs gh-deploy --force`.
-The cache is keyed by the UTC week number.
+`docs-ci.yaml` validates documentation changes on pull requests targeting `main` and deploys them after a push to
+`main` or `add-docs-portal`. Both paths install MkDocs Material, its imaging extras, and `mkdocs-glightbox`. Pull
+requests run `mkdocs build`; pushes run `mkdocs gh-deploy --force`. Only the deployment job receives `contents: write`.
+Its cache is keyed by the UTC week number.
 
-The workflow is a deployment job, not a pull-request validation job. Preview changes locally before merging:
+Preview changes locally with:
 
 ```bash
 pip install mkdocs-material "mkdocs-material[imaging]" mkdocs-glightbox
@@ -169,15 +170,12 @@ The two release entry points have different tag behavior:
 The current workflows are deliberately conservative around untrusted pull requests and upstream synchronization.
 Before treating all CI as comprehensive, account for these boundaries:
 
-- Documentation is deployed after pushes but is not built on pull requests. A broken MkDocs page can therefore be
-  discovered only after merge unless contributors run the local build.
 - A strict MkDocs build currently stops on the existing missing-`site_url` warning, so deployment uses the default
   non-strict mode.
 - Pre-commit and provider E2E tests are manual, so their absence from a PR is not evidence that they passed.
 - The active `check-yaml` pre-commit hook cannot construct the Python-specific emoji tags in `docs/mkdocs.yml`, so
   the manual pre-commit workflow currently fails when it checks that existing file.
-- Unit tests run once in `Build-and-test` and again in `Code-coverage`, which provides independent coverage evidence
-  at the cost of duplicate execution.
+- Documentation-only changes skip Docker unit tests and CodeQL and run the focused MkDocs validation instead.
 - The self-review workflow trusts the moving `qfennessy/pr-agent@main` ref. That is consistent with the fork policy
   only while `main` remains protected and reviewed.
 - The upstream provenance workflow runs from the pull-request merge ref. A sync PR can alter its own verification
