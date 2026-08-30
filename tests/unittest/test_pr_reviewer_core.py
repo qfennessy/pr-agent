@@ -30,6 +30,8 @@ from pr_agent.algo.utils import (PRReviewHeader, PRReviewIdentity,
                                  show_run_details)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
+from pr_agent.git_providers.bitbucket_provider import BitbucketProvider
+from pr_agent.git_providers.gitea_provider import GiteaProvider
 from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.tools.pr_reviewer import PRReviewer
 from tests.unittest._settings_helpers import (restore_settings,
@@ -1105,6 +1107,184 @@ def test_untrusted_provider_absolute_paths_remain_invalid_and_force_deep():
     assert decision.applied_depth is ReviewDepth.DEEP
     assert "input_invalid" in [reason.code for reason in decision.reasons]
     assert reviewer.review_route_request.files[0].new_path == "/docs/guide.md"
+
+
+@pytest.mark.parametrize("provider_type", [GiteaProvider, BitbucketProvider])
+def test_provider_rich_inventory_restores_sensitive_old_rename_path(provider_type):
+    from pr_agent.algo.types import EDIT_TYPE
+
+    old_path = "services/auth/guard.py"
+    new_path = "docs/guard.md"
+    if provider_type is GiteaProvider:
+        provider = GiteaProvider.__new__(GiteaProvider)
+        provider._routing_git_files = ({
+            "filename": new_path,
+            "previous_filename": old_path,
+            "status": "renamed",
+            "additions": 2,
+            "deletions": 1,
+        },)
+        provider.git_files = [{"filename": new_path, "status": "renamed"}]
+        provider.pr = SimpleNamespace(labels=[])
+        provider.logger = MagicMock()
+    else:
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        diffstat = SimpleNamespace(
+            new=SimpleNamespace(path=new_path),
+            old=SimpleNamespace(path=old_path),
+            data={
+                "status": "renamed",
+                "lines_added": 2,
+                "lines_removed": 1,
+            },
+        )
+        provider.pr = MagicMock()
+        provider.pr.diffstat.return_value = [diffstat]
+    provider.get_diff_files = MagicMock(return_value=[
+        _route_file(new_path, edit_type=EDIT_TYPE.RENAMED, old_filename=None)
+    ])
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert reviewer.review_route_request.files[0].old_path == old_path
+    assert reviewer.review_route_request.files[0].new_path == new_path
+
+
+def test_incomplete_rename_provenance_prevents_quick_without_inventing_old_path():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = MagicMock()
+    provider.get_files.return_value = [{
+        "filename": "docs/guard.md",
+        "status": "renamed",
+        "additions": 2,
+        "deletions": 1,
+    }]
+    provider.get_diff_files.return_value = [
+        _route_file("docs/guard.md", edit_type=EDIT_TYPE.RENAMED, old_filename=None)
+    ]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert reviewer.review_route_request.files[0].old_path is None
+    assert "files[0].old_path" in decision.missing_inputs
+
+
+def test_malformed_old_rename_path_remains_invalid_and_forces_deep():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = MagicMock()
+    provider.get_files.return_value = [{
+        "filename": "docs/guard.md",
+        "previous_filename": "/services/auth/guard.py",
+        "status": "renamed",
+        "additions": 2,
+        "deletions": 1,
+    }]
+    provider.get_diff_files.return_value = [
+        _route_file("docs/guard.md", edit_type=EDIT_TYPE.RENAMED, old_filename=None)
+    ]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert reviewer.review_route_request.files[0].old_path == "/services/auth/guard.py"
+    assert "input_invalid" in [reason.code for reason in decision.reasons]
+
+
+def test_conflicting_old_rename_paths_retain_both_and_fail_safe():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = MagicMock()
+    provider.get_files.return_value = [{
+        "filename": "docs/guard.md",
+        "previous_filename": "services/auth/guard.py",
+        "status": "renamed",
+        "additions": 2,
+        "deletions": 1,
+    }]
+    provider.get_diff_files.return_value = [
+        _route_file(
+            "docs/guard.md",
+            edit_type=EDIT_TYPE.RENAMED,
+            old_filename="docs/other-old.md",
+        )
+    ]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+    assert {file.old_path for file in reviewer.review_route_request.files if file.old_path} == {
+        "services/auth/guard.py",
+        "docs/other-old.md",
+    }
+
+
+def test_same_old_and_new_rename_path_is_incomplete_and_prevents_quick():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = MagicMock()
+    provider.get_files.return_value = [{
+        "filename": "docs/guard.md",
+        "previous_filename": "docs/guard.md",
+        "status": "renamed",
+        "additions": 2,
+        "deletions": 1,
+    }]
+    provider.get_diff_files.return_value = [
+        _route_file("docs/guard.md", edit_type=EDIT_TYPE.RENAMED, old_filename=None)
+    ]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
 
 
 def test_changed_file_metadata_failure_is_recorded_and_prevents_quick():

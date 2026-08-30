@@ -500,7 +500,12 @@ class PRReviewer:
             if detailed_index is None:
                 reconciled.append(raw_changed_file)
                 continue
-            reconciled.append(detailed[detailed_index])
+            merged_files, merge_incomplete = self._merge_changed_file_routing_evidence(
+                raw_changed_file,
+                detailed[detailed_index],
+            )
+            reconciled.extend(merged_files)
+            evidence_incomplete = evidence_incomplete or merge_incomplete
             matched_detailed.add(detailed_index)
 
         unmatched_detailed = [
@@ -514,6 +519,47 @@ class PRReviewer:
         if evidence_incomplete:
             reconciled.append(ChangedFile(new_path=None, kind=ChangeKind.UNKNOWN))
         return tuple(reconciled)
+
+    @staticmethod
+    def _merge_changed_file_routing_evidence(
+        raw: ChangedFile,
+        detailed: ChangedFile,
+    ) -> tuple[tuple[ChangedFile, ...], bool]:
+        """Retain authoritative rename provenance while preferring detailed counts.
+
+        Some providers expose the old path only in their raw file inventory while
+        their patch adapter reports a rename with only the new filename. Conflicting
+        rename provenance remains as separate evidence plus an incomplete marker so
+        routing fails safe instead of choosing one path silently.
+        """
+        if raw.kind is not ChangeKind.RENAMED and detailed.kind is not ChangeKind.RENAMED:
+            return (detailed,), False
+
+        incompatible_kinds = {
+            kind
+            for kind in (raw.kind, detailed.kind)
+            if kind not in {ChangeKind.RENAMED, ChangeKind.MODIFIED, ChangeKind.UNKNOWN}
+        }
+        new_paths = {path for path in (raw.new_path, detailed.new_path) if path}
+        old_paths = {path for path in (raw.old_path, detailed.old_path) if path}
+        if incompatible_kinds or len(new_paths) > 1 or len(old_paths) > 1:
+            return (raw, detailed), True
+
+        merged = replace(
+            detailed,
+            kind=ChangeKind.RENAMED,
+            old_path=next(iter(old_paths), None),
+            new_path=next(iter(new_paths), None),
+            additions=(detailed.additions if detailed.additions is not None else raw.additions),
+            deletions=(detailed.deletions if detailed.deletions is not None else raw.deletions),
+            generated=(detailed.generated if detailed.generated is not None else raw.generated),
+        )
+        incomplete = (
+            not merged.old_path
+            or not merged.new_path
+            or merged.old_path == merged.new_path
+        )
+        return (merged,), incomplete
 
     def _provider_changed_file_for_routing(self, file: Any) -> ChangedFile:
         """Convert routing evidence and apply only the provider's path adapter."""
