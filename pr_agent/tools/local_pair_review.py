@@ -162,6 +162,45 @@ _LOCAL_PAIR_REVIEW_LIMIT_DEFAULTS = {
     "cache_max_entries": 50,
 }
 
+# Keep pathspec arguments comfortably below Windows' CreateProcess command-line
+# limit while also leaving room for Git options and repository/config paths.
+_MAX_GIT_DIFF_PATH_BYTES = 16_384
+
+
+def _batch_path_groups(
+    groups: Sequence[Sequence[str]],
+    max_path_bytes: int = _MAX_GIT_DIFF_PATH_BYTES,
+) -> Iterable[tuple[str, ...]]:
+    """Batch pathspec groups without splitting rename/copy pairs when possible."""
+    batch: list[str] = []
+    batch_bytes = 0
+    for group in groups:
+        group_paths = tuple(group)
+        group_bytes = sum(
+            len(path.encode("utf-8", errors="surrogateescape")) + 1
+            for path in group_paths
+        )
+        if batch and batch_bytes + group_bytes > max_path_bytes:
+            yield tuple(batch)
+            batch = []
+            batch_bytes = 0
+        if group_bytes <= max_path_bytes:
+            batch.extend(group_paths)
+            batch_bytes += group_bytes
+            continue
+        # A rename/copy pair with unusually long paths cannot fit as a unit.
+        # Split only that group so the overall invocation remains bounded.
+        for path in group_paths:
+            path_bytes = len(path.encode("utf-8", errors="surrogateescape")) + 1
+            if batch and batch_bytes + path_bytes > max_path_bytes:
+                yield tuple(batch)
+                batch = []
+                batch_bytes = 0
+            batch.append(path)
+            batch_bytes += path_bytes
+    if batch:
+        yield tuple(batch)
+
 
 def validate_local_pair_review_limits(settings: Mapping[str, Any]) -> dict[str, int]:
     limits = {}
@@ -232,7 +271,9 @@ class LocalPairReview:
             except ValueError as exc:
                 raise SnapshotCaptureError(f"path is outside repository root: {supplied_path}") from exc
             if relative == Path("."):
-                raise SnapshotCaptureError("a repository root is not a reviewable file path")
+                raise SnapshotCaptureError(
+                    "a repository root is not a reviewable file path"
+                ) from None
             return relative.as_posix()
         try:
             resolved.relative_to(self.repository_root)
@@ -749,19 +790,19 @@ class LocalPairReview:
             diff_parts = []
             omitted_paths: set[str] = set()
             remaining_bytes = self.max_snapshot_bytes
-            if selected_tracked:
+            for tracked_batch in _batch_path_groups(selected_tracked_groups):
                 part = None if remaining_bytes <= 0 else self._capture_diff(
                     event,
                     base_revision,
-                    selected_tracked,
+                    tracked_batch,
                     max_output_bytes=remaining_bytes,
                 )
                 if part is None:
-                    omitted_paths.update(selected_tracked)
+                    omitted_paths.update(tracked_batch)
                 else:
                     part_size = len(part.encode("utf-8", errors="surrogateescape"))
                     if part_size > remaining_bytes:
-                        omitted_paths.update(selected_tracked)
+                        omitted_paths.update(tracked_batch)
                     else:
                         diff_parts.append(part)
                         remaining_bytes -= part_size

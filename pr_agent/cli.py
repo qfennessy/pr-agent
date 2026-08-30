@@ -828,15 +828,25 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         outer_parser.error(str(exc))
     _validate_configured_snapshot_event(event, settings, parser)
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
-    raw_exclusions = settings.get("excluded_paths", []) or []
+    raw_exclusions = settings.get("excluded_paths", [])
+    if raw_exclusions is None:
+        raw_exclusions = []
     if isinstance(raw_exclusions, str):
+        if not raw_exclusions:
+            outer_parser.error(
+                "local_pair_review.excluded_paths must contain non-empty strings"
+            )
         configured_exclusions = [raw_exclusions]
     elif isinstance(raw_exclusions, (list, tuple)):
-        configured_exclusions = [
-            pattern for pattern in raw_exclusions if isinstance(pattern, str) and pattern
-        ]
+        if any(not isinstance(pattern, str) or not pattern for pattern in raw_exclusions):
+            outer_parser.error(
+                "local_pair_review.excluded_paths must contain only non-empty strings"
+            )
+        configured_exclusions = list(raw_exclusions)
     else:
-        configured_exclusions = []
+        outer_parser.error(
+            "local_pair_review.excluded_paths must be a string or list of strings"
+        )
     artifact_exclusions = _output_artifact_exclusions(
         repository_root, markdown_output, json_output
     )

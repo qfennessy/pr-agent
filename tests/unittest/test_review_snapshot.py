@@ -881,6 +881,38 @@ def test_tracked_diff_capture_batches_all_selected_paths(monkeypatch, tmp_path):
     ]
 
 
+def test_tracked_diff_capture_bounds_path_arguments(monkeypatch, tmp_path):
+    repo = _repo(tmp_path, "bounded-diff-arguments")
+    paths = []
+    for index in range(80):
+        path = f"file_{index:03d}_{'x' * 220}.py"
+        (repo / path).write_text("value = 1\n", encoding="utf-8")
+        paths.append(path)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "add many files")
+    for path in paths:
+        (repo / path).write_text("value = 2\n", encoding="utf-8")
+
+    reviewer = LocalPairReview(str(repo))
+    original_capture_diff = reviewer._capture_diff
+    captured_path_sets = []
+
+    def capture_diff(event, base_revision, batch, **kwargs):
+        captured_path_sets.append(tuple(batch))
+        return original_capture_diff(event, base_revision, batch, **kwargs)
+
+    monkeypatch.setattr(reviewer, "_capture_diff", capture_diff)
+
+    snapshot = reviewer.capture(event="worktree-idle")
+
+    assert set(snapshot.changed_paths) == set(paths)
+    assert len(captured_path_sets) >= 4
+    assert all(
+        sum(len(path.encode("utf-8")) + 1 for path in batch) <= 16_384
+        for batch in captured_path_sets
+    )
+
+
 def test_changed_path_discovery_is_bounded_and_reports_stage_coverage(tmp_path):
     repo = _repo(tmp_path, "bounded-path-discovery")
     (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")

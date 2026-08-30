@@ -1051,6 +1051,26 @@ def test_review_snapshot_loads_repo_policy_before_capture(
     assert json.loads(capsys.readouterr().out)["state"] == "coverage_unavailable"
 
 
+@pytest.mark.parametrize("excluded_paths_toml", ["7", "[\"secret.py\", 7]", "{ path = \"secret.py\" }"])
+def test_review_snapshot_rejects_malformed_repo_exclusions(
+    cfg, monkeypatch, tmp_path, capsys, excluded_paths_toml
+):
+    import subprocess
+
+    repo = tmp_path / "repo-invalid-policy"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    (repo / ".pr_agent.toml").write_text(
+        f"[local_pair_review]\nexcluded_paths = {excluded_paths_toml}\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit, match="2"):
+        run(inargs=["review-snapshot", "--event", "worktree-idle", "--no-cache"])
+
+    assert "local_pair_review.excluded_paths must" in capsys.readouterr().err
+
+
 def test_review_snapshot_honors_disabled_repo_settings(cfg, monkeypatch, tmp_path, capsys):
     import json
     import subprocess
