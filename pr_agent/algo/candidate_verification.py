@@ -2,20 +2,35 @@
 
 import asyncio
 import fnmatch
+import hashlib
 import json
 import re
 import time
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional
 
-from pr_agent.algo.review_specialists import (SpecialistBatchResult,
-                                              SpecialistInput,
-                                              SpecialistRole,
-                                              SpecialistState)
+from pr_agent.algo.git_patch_processing import (
+    RE_HUNK_HEADER,
+    iter_git_patch_lines,
+    split_git_file_lines,
+    strip_git_line_ending,
+)
+from pr_agent.algo.review_specialists import SpecialistBatchResult, SpecialistInput, SpecialistRole, SpecialistState
 from pr_agent.log import get_logger
 
-_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_TELEMETRY_SAFE_DECISION_REASONS = frozenset({
+    "duplicate_decision",
+    "duplicate_verified_finding",
+    "location_not_in_changed_lines",
+    "missing_decision",
+    "required_context_unavailable",
+    "changed_code_evidence_unavailable",
+    "trusted_identity_collision",
+    "trusted_identity_unavailable",
+    "unknown_candidate",
+    "unverified_or_incomplete_evidence",
+})
 
 
 @dataclass(frozen=True)
@@ -26,6 +41,89 @@ class VerificationBudgets:
     max_total_lines: int = 600
     max_context_tokens: int = 6000
     timeout_seconds: float = 10.0
+
+
+def telemetry_safe_artifact(artifact: dict) -> dict:
+    """Return provider-neutral telemetry without repository or model-generated text."""
+    safe = {}
+    scalar_keys = {
+        "enabled", "status", "model_calls", "candidate_count", "verified_count", "model",
+        "verifier_verified_count", "finding_limit_dropped", "rejected_count", "failure",
+        "verifier_latency_seconds",
+    }
+    mapping_keys = {"specialist_prioritization", "prompt_budget", "verifier_usage", "verifier_cost"}
+    for key in scalar_keys:
+        if key in artifact and isinstance(artifact[key], (str, int, float, bool, type(None))):
+            safe[key] = artifact[key]
+    for key in mapping_keys:
+        value = artifact.get(key)
+        if isinstance(value, dict):
+            safe[key] = {
+                item_key: item_value for item_key, item_value in value.items()
+                if isinstance(item_key, str) and isinstance(item_value, (str, int, float, bool, type(None)))
+            }
+
+    rejections = artifact.get("candidate_rejections")
+    if isinstance(rejections, list):
+        safe["candidate_rejections"] = [
+            {key: item[key] for key in ("candidate_id", "reason", "sensitive_path") if key in item}
+            for item in rejections if isinstance(item, dict)
+        ]
+
+    decisions = artifact.get("decisions")
+    if isinstance(decisions, list):
+        safe["decisions"] = []
+        for item in decisions:
+            if not isinstance(item, dict):
+                continue
+            decision = {
+                key: item[key] for key in ("candidate_id", "verdict", "evidence_paths") if key in item
+            }
+            if "reason" in item:
+                reason = str(item.get("reason") or "")
+                decision["reason"] = (
+                    reason if reason in _TELEMETRY_SAFE_DECISION_REASONS else "rejected_by_verifier"
+                )
+            safe["decisions"].append(decision)
+
+    retrieval = artifact.get("retrieval")
+    if isinstance(retrieval, dict):
+        safe_retrieval = {
+            key: retrieval[key]
+            for key in (
+                "budget_exhausted", "files_read", "changed_evidence_count", "lines_retrieved",
+                "context_tokens", "duration_seconds",
+            )
+            if key in retrieval and isinstance(retrieval[key], (str, int, float, bool, type(None)))
+        }
+        requests = retrieval.get("requests")
+        if isinstance(requests, list):
+            safe_retrieval["requests"] = [
+                {
+                    key: item[key]
+                    for key in (
+                        "candidate_id", "path", "status", "error", "required", "source",
+                        "start_line", "end_line",
+                    )
+                    if key in item and isinstance(item[key], (str, int, float, bool, type(None)))
+                }
+                for item in requests if isinstance(item, dict)
+            ]
+        retrieved = retrieval.get("retrieved_evidence")
+        if isinstance(retrieved, list):
+            safe_retrieval["retrieved_evidence"] = []
+            for item in retrieved:
+                if not isinstance(item, dict):
+                    continue
+                summary = {
+                    key: item[key]
+                    for key in ("candidate_id", "source", "path", "start_line", "end_line")
+                    if key in item and isinstance(item[key], (str, int, float, bool, type(None)))
+                }
+                summary["content_characters"] = len(str(item.get("content") or ""))
+                safe_retrieval["retrieved_evidence"].append(summary)
+        safe["retrieval"] = safe_retrieval
+    return safe
 
 
 def safe_repo_path(value) -> Optional[str]:
@@ -44,10 +142,11 @@ def safe_repo_path(value) -> Optional[str]:
 
 def _first_changed_line(patch: str) -> int:
     new_line = None
-    for line in (patch or "").splitlines():
-        header = _HUNK_HEADER_RE.match(line)
+    for record in iter_git_patch_lines(patch or ""):
+        line = strip_git_line_ending(record)
+        header = RE_HUNK_HEADER.match(line)
         if header:
-            new_line = int(header.group(1))
+            new_line = int(header.group(3))
             continue
         if new_line is None or line.startswith("\\ No newline at end of file"):
             continue
@@ -61,10 +160,11 @@ def _first_changed_line(patch: str) -> int:
 def _added_line_ranges(patch: str) -> list[tuple[int, int]]:
     added_lines = []
     new_line = None
-    for line in (patch or "").splitlines():
-        header = _HUNK_HEADER_RE.match(line)
+    for record in iter_git_patch_lines(patch or ""):
+        line = strip_git_line_ending(record)
+        header = RE_HUNK_HEADER.match(line)
         if header:
-            new_line = int(header.group(1))
+            new_line = int(header.group(3))
             continue
         if new_line is None or line.startswith("\\ No newline at end of file"):
             continue
@@ -79,6 +179,40 @@ def _added_line_ranges(patch: str) -> list[tuple[int, int]]:
         else:
             ranges.append((line, line))
     return ranges
+
+
+def _deleted_line_ranges(patch: str) -> list[tuple[int, int]]:
+    deleted_lines = []
+    old_line = None
+    for record in iter_git_patch_lines(patch or ""):
+        line = strip_git_line_ending(record)
+        header = RE_HUNK_HEADER.match(line)
+        if header:
+            old_line = int(header.group(1))
+            continue
+        if old_line is None or line.startswith("\\ No newline at end of file"):
+            continue
+        if line.startswith("-") and not line.startswith("---"):
+            deleted_lines.append(old_line)
+        if not line.startswith("+"):
+            old_line += 1
+    ranges = []
+    for line in deleted_lines:
+        if ranges and line == ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], line)
+        else:
+            ranges.append((line, line))
+    return ranges
+
+
+def _first_changed_anchor(patch: str) -> tuple[str, int, list[tuple[int, int]]]:
+    added = _added_line_ranges(patch)
+    if added:
+        return "new", added[0][0], added
+    deleted = _deleted_line_ranges(patch)
+    if deleted:
+        return "old", deleted[0][0], deleted
+    return "new", _first_changed_line(patch), []
 
 
 def _line_is_changed(line: int, ranges: list) -> bool:
@@ -96,8 +230,78 @@ def _candidate_key(candidate: dict) -> tuple:
     )
 
 
+_IDENTIFIER_TOKEN = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+_NUMBER_TOKEN = re.compile(r"\b(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?)\b")
+_STRING_TOKEN = re.compile(r"(['\"])(?:\\.|(?!\1).)*\1")
+_STRUCTURAL_KEYWORDS = frozenset({
+    "and", "async", "await", "break", "case", "catch", "class", "continue", "def", "do",
+    "else", "except", "false", "finally", "for", "foreach", "function", "if", "in", "is",
+    "lambda", "match", "new", "none", "not", "null", "or", "raise", "return", "switch",
+    "throw", "true", "try", "while", "with", "yield",
+})
+
+
+def _normalized_evidence_shape(content: str) -> str:
+    """Normalize names, literals, paths, whitespace, and line numbers while preserving control flow."""
+    shaped = _STRING_TOKEN.sub("<literal>", str(content or ""))
+    shaped = _NUMBER_TOKEN.sub("<number>", shaped)
+    shaped = _IDENTIFIER_TOKEN.sub(
+        lambda match: match.group(0).casefold()
+        if match.group(0).casefold() in _STRUCTURAL_KEYWORDS else "<identifier>",
+        shaped,
+    )
+    return "".join(shaped.split())
+
+
+def _changed_anchor_shape(patch: str, start_line: int, end_line: int, side: str = "new") -> str:
+    old_line = None
+    new_line = None
+    changed = []
+    for record in iter_git_patch_lines(patch or ""):
+        line = strip_git_line_ending(record)
+        header = RE_HUNK_HEADER.match(line)
+        if header:
+            old_line = int(header.group(1))
+            new_line = int(header.group(3))
+            continue
+        if old_line is None or new_line is None or line.startswith("\\ No newline at end of file"):
+            continue
+        if (side == "new" and line.startswith("+") and not line.startswith("+++")
+                and start_line <= new_line <= end_line):
+            changed.append(line[1:])
+        if (side == "old" and line.startswith("-") and not line.startswith("---")
+                and start_line <= old_line <= end_line):
+            changed.append(line[1:])
+        if not line.startswith("+"):
+            old_line += 1
+        if not line.startswith("-"):
+            new_line += 1
+    return _normalized_evidence_shape("\n".join(changed))
+
+
+def _changed_anchor_ordinal(patch: str, start_line: int, side: str = "new") -> int:
+    """Return the ordinal among equal-shaped anchors within one file lineage."""
+    ranges = _added_line_ranges(patch) if side == "new" else _deleted_line_ranges(patch)
+    changed_lines = [line for range_start, range_end in ranges for line in range(range_start, range_end + 1)]
+    target_shape = _changed_anchor_shape(patch, start_line, start_line, side)
+    if not target_shape or start_line not in changed_lines:
+        return 0
+    return sum(
+        1 for line in changed_lines
+        if line <= start_line and _changed_anchor_shape(patch, line, line, side) == target_shape
+    )
+
+
+def _trusted_file_lineage(diff_file) -> Optional[str]:
+    """Use the base-side path as stable rename lineage when the provider supplies it."""
+    old_path = safe_repo_path(getattr(diff_file, "old_filename", None))
+    current_path = safe_repo_path(getattr(diff_file, "filename", None))
+    path = old_path or current_path
+    return f"file:{path}" if path else None
+
+
 def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: list,
-                       max_candidates: int, max_sensitive_files: int) -> tuple[list[dict], list[dict]]:
+                       max_candidates: int) -> tuple[list[dict], list[dict]]:
     """Normalize model candidates, deduplicate them, and add deterministic sensitive-file audits."""
     raw_candidates = (review_data.get("review") or {}).get("key_issues_to_review") or []
     candidates = []
@@ -114,12 +318,8 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
         relevant_file = safe_repo_path(getattr(diff_file, "filename", ""))
         if not relevant_file or not any(fnmatch.fnmatch(relevant_file, pattern) for pattern in normalized_globs):
             continue
-        if sensitive_count >= max_sensitive_files:
-            rejected.append({"candidate_id": f"sensitive-{relevant_file}", "reason": "sensitive_file_budget_exhausted",
-                             "sensitive_path": True})
-            continue
         sensitive_count += 1
-        line = _first_changed_line(getattr(diff_file, "patch", ""))
+        side, line, changed_line_ranges = _first_changed_anchor(getattr(diff_file, "patch", ""))
         candidates.append({
             "candidate_id": f"sensitive-{sensitive_count}",
             "candidate_type": "sensitive_path_audit",
@@ -131,10 +331,18 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             "root_cause": f"sensitive audit for {relevant_file}",
             "start_line": line,
             "end_line": line,
+            "side": side,
             "context_files": [relevant_file],
             "context_symbols": [],
             "sensitive_path": True,
-            "_changed_line_ranges": _added_line_ranges(getattr(diff_file, "patch", "")),
+            "_changed_line_ranges": changed_line_ranges,
+            "_changed_anchor_shape": _changed_anchor_shape(
+                getattr(diff_file, "patch", ""), line, line, side
+            ),
+            "_changed_anchor_ordinal": _changed_anchor_ordinal(
+                getattr(diff_file, "patch", ""), line, side
+            ),
+            "_trusted_lineage_key": _trusted_file_lineage(diff_file),
         })
 
     model_candidate_count = 0
@@ -146,8 +354,13 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             rejected.append({"candidate_id": f"candidate-{index + 1}", "reason": "invalid_candidate"})
             continue
         candidate = dict(raw_candidate)
+        for key in list(candidate):
+            if str(key).startswith("_"):
+                candidate.pop(key, None)
         candidate["candidate_id"] = f"candidate-{index + 1}"
         candidate["candidate_type"] = "model_finding"
+        candidate["sensitive_path"] = False
+        candidate["side"] = "new"
         candidate["relevant_file"] = safe_repo_path(candidate.get("relevant_file"))
         try:
             candidate["start_line"] = int(candidate.get("start_line"))
@@ -155,7 +368,7 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
         except (TypeError, ValueError):
             candidate["start_line"] = 0
             candidate["end_line"] = 0
-        required_text = ("issue_header", "issue_content", "trigger", "impact")
+        required_text = ("issue_header", "issue_content", "trigger", "impact", "root_cause")
         diff_file = diff_by_file.get(candidate["relevant_file"])
         changed_line_ranges = _added_line_ranges(getattr(diff_file, "patch", "")) if diff_file else []
         if (not candidate["relevant_file"] or not diff_file or
@@ -170,6 +383,13 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             continue
         seen.add(key)
         candidate["_changed_line_ranges"] = changed_line_ranges
+        candidate["_changed_anchor_shape"] = _changed_anchor_shape(
+            getattr(diff_file, "patch", ""), candidate["start_line"], candidate["end_line"]
+        )
+        candidate["_changed_anchor_ordinal"] = _changed_anchor_ordinal(
+            getattr(diff_file, "patch", ""), candidate["start_line"]
+        )
+        candidate["_trusted_lineage_key"] = _trusted_file_lineage(diff_file)
         candidates.append(candidate)
         model_candidate_count += 1
     return candidates, rejected
@@ -240,6 +460,9 @@ def _append_context_hint(candidate: dict, kind: str, target: str) -> bool:
     if value in current:
         return False
     candidate[key] = [*current, value]
+    if key == "context_files":
+        optional = candidate.get("_specialist_optional_context_files") or []
+        candidate["_specialist_optional_context_files"] = [*optional, value]
     return True
 
 
@@ -299,23 +522,36 @@ def apply_specialist_prioritization(
     }
 
 
-def _requested_paths(candidate: dict) -> list[str]:
-    paths = [candidate.get("relevant_file")]
+def _requested_path_specs(candidate: dict) -> list[dict]:
+    relevant_file = candidate.get("relevant_file")
+    paths = [(relevant_file, False)]
+    optional_context = {
+        path for value in (candidate.get("_specialist_optional_context_files") or [])
+        if (path := safe_repo_path(value))
+    }
     context_files = candidate.get("context_files") or []
     if isinstance(context_files, str):
         context_files = [context_files]
     if isinstance(context_files, list):
-        paths.extend(context_files)
+        paths.extend(
+            (value, value != relevant_file and safe_repo_path(value) not in optional_context)
+            for value in context_files
+        )
     normalized = []
-    for value in paths:
+    seen = set()
+    for value, required in paths:
         path = safe_repo_path(value)
-        if path and path not in normalized:
-            normalized.append(path)
+        if path:
+            if path not in seen:
+                normalized.append({"path": path, "required": required})
+                seen.add(path)
+        elif required:
+            normalized.append({"path": None, "required": True, "status": "unsafe_path"})
     return normalized
 
 
 def _select_excerpt(content: str, candidate: dict, path: str, max_lines: int) -> tuple[str, int, int]:
-    lines = content.splitlines()
+    lines = split_git_file_lines(content)
     if not lines or max_lines < 1:
         return "", 0, 0
     center = None
@@ -363,7 +599,8 @@ def _matching_static_evidence(candidate: dict, static_evidence: list) -> list[di
 
 
 async def retrieve_evidence(git_provider, candidates: list[dict], budgets: VerificationBudgets,
-                            static_evidence: list, diff_files: Optional[list] = None) -> tuple[list[dict], dict]:
+                            static_evidence: list, diff_files: Optional[list] = None,
+                            token_counter: Optional[Callable[[str], int]] = None) -> tuple[list[dict], dict]:
     """Fetch bounded base-branch excerpts and return them with an auditable retrieval record."""
     started = time.monotonic()
     deadline = started + max(0.0, budgets.timeout_seconds)
@@ -371,10 +608,12 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
     requests = []
     cache = {}
     unique_files = set()
+    lines_by_path = {}
     total_lines = 0
-    total_chars = 0
-    max_chars = max(0, budgets.max_context_tokens) * 4
+    total_tokens = 0
+    count_tokens = token_counter or (lambda value: len(str(value).encode("utf-8")))
     budget_exhausted = False
+    time_budget_exhausted = False
     changed_evidence_count = 0
     diff_by_file = {
         path: diff_file
@@ -382,46 +621,115 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         if (path := safe_repo_path(getattr(diff_file, "filename", "")))
     }
 
+    def remaining_lines(path: str) -> int:
+        return max(0, min(
+            budgets.max_lines_per_file - lines_by_path.get(path, 0),
+            budgets.max_total_lines - total_lines,
+        ))
+
+    def append_evidence(item: dict, candidate: dict, path: str) -> bool:
+        nonlocal budget_exhausted, changed_evidence_count, time_budget_exhausted, total_lines, total_tokens
+        if time.monotonic() >= deadline:
+            budget_exhausted = True
+            time_budget_exhausted = True
+            return False
+        content = str(item.get("content") or "")
+        line_budget = remaining_lines(path)
+        token_budget = budgets.max_context_tokens - total_tokens
+        if line_budget < 1 or token_budget < 1:
+            budget_exhausted = True
+            return False
+        excerpt, start_line, end_line = _select_excerpt(content, candidate, path, line_budget)
+        if not excerpt:
+            budget_exhausted = True
+            return False
+        prepared = dict(item)
+        prepared.update({"path": path, "content": excerpt})
+        prepared.setdefault("start_line", start_line)
+        prepared.setdefault("end_line", end_line)
+        if prepared.get("source") == "changed_head":
+            prepared["anchor_start_line"] = candidate.get("start_line")
+            prepared["anchor_end_line"] = candidate.get("end_line")
+        evidence_tokens = count_tokens(excerpt)
+        if evidence_tokens > token_budget:
+            budget_exhausted = True
+            if prepared.get("source") == "changed_head":
+                best = None
+                lower = 0.0
+                upper = 1.0
+                for _ in range(24):
+                    midpoint = (lower + upper) / 2
+                    bounded = bounded_verification_evidence([prepared], midpoint)
+                    if bounded and count_tokens(bounded[0]["content"]) <= token_budget:
+                        best = bounded[0]
+                        lower = midpoint
+                    else:
+                        upper = midpoint
+                if best is None:
+                    return False
+                prepared = best
+            else:
+                lower = 0
+                upper = len(excerpt)
+                while lower < upper:
+                    midpoint = (lower + upper + 1) // 2
+                    if count_tokens(excerpt[:midpoint]) <= token_budget:
+                        lower = midpoint
+                    else:
+                        upper = midpoint - 1
+                if lower < 1:
+                    return False
+                prepared["content"] = excerpt[:lower]
+                prepared["content_truncated"] = True
+                prepared["end_line"] = prepared["start_line"] + prepared["content"].count("\n")
+            evidence_tokens = count_tokens(prepared["content"])
+        if time.monotonic() > deadline:
+            budget_exhausted = True
+            time_budget_exhausted = True
+            return False
+        line_count = prepared["content"].count("\n") + 1
+        evidence.append(prepared)
+        lines_by_path[path] = lines_by_path.get(path, 0) + line_count
+        total_lines += line_count
+        total_tokens += evidence_tokens
+        if prepared.get("source") == "changed_head":
+            changed_evidence_count += 1
+        return True
+
     for candidate in candidates:
+        candidate_id = candidate["candidate_id"]
+        relevant_file = candidate.get("relevant_file")
         diff_file = diff_by_file.get(candidate.get("relevant_file"))
         head_file = getattr(diff_file, "head_file", "") if diff_file is not None else ""
-        if head_file and getattr(diff_file, "head_file_is_complete", True):
-            available_lines = min(budgets.max_lines_per_file, budgets.max_total_lines - total_lines)
-            excerpt, start_line, end_line = _select_excerpt(
-                str(head_file), candidate, candidate.get("relevant_file"), available_lines
-            )
-            available_chars = max_chars - total_chars
-            if len(excerpt) > available_chars:
-                excerpt = excerpt[:available_chars]
-                budget_exhausted = True
-            if excerpt:
-                evidence.append({
-                    "candidate_id": candidate["candidate_id"],
-                    "source": "changed_head",
-                    "path": candidate["relevant_file"],
-                    "start_line": start_line,
-                    "end_line": end_line,
-                    "content": excerpt,
-                })
-                line_count = excerpt.count("\n") + 1
-                total_lines += line_count
-                total_chars += len(excerpt)
-                changed_evidence_count += 1
-        for static_item in _matching_static_evidence(candidate, static_evidence):
-            if total_chars + len(static_item["content"]) > max_chars:
-                budget_exhausted = True
-                break
-            evidence_item = {"candidate_id": candidate["candidate_id"], **static_item}
-            evidence.append(evidence_item)
-            total_chars += len(static_item["content"])
-        for path in _requested_paths(candidate):
-            request = {"candidate_id": candidate["candidate_id"], "path": path, "status": "pending"}
+        changed_head_available = False
+        for static_index, static_item in enumerate(_matching_static_evidence(candidate, static_evidence)):
+            evidence_item = {"candidate_id": candidate_id, **static_item}
+            static_path = static_item.get("path") or f"@static/{candidate_id}/{static_index + 1}"
+            append_evidence(evidence_item, candidate, static_path)
+        if (candidate.get("side", "new") == "new" and head_file
+                and getattr(diff_file, "head_file_is_complete", True)):
+            changed_head_available = append_evidence({
+                "candidate_id": candidate_id,
+                "source": "changed_head",
+                "content": str(head_file),
+            }, candidate, relevant_file)
+        for request_spec in _requested_path_specs(candidate):
+            request = {"candidate_id": candidate_id, **request_spec}
+            if request.get("status") == "unsafe_path":
+                requests.append(request)
+                continue
+            path = request["path"]
+            request["status"] = "pending"
             requests.append(request)
+            if path == relevant_file and changed_head_available:
+                request["status"] = "satisfied_by_changed_head"
+                request["source"] = "changed_head"
+                continue
             if path not in unique_files and len(unique_files) >= budgets.max_files:
                 request["status"] = "file_budget_exhausted"
                 budget_exhausted = True
                 continue
-            if total_lines >= budgets.max_total_lines or total_chars >= max_chars:
+            if remaining_lines(path) < 1 or total_tokens >= budgets.max_context_tokens:
                 request["status"] = "context_budget_exhausted"
                 budget_exhausted = True
                 continue
@@ -452,28 +760,24 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 continue
             if isinstance(content, bytes):
                 content = content.decode("utf-8", errors="replace")
-            available_lines = min(budgets.max_lines_per_file, budgets.max_total_lines - total_lines)
-            excerpt, start_line, end_line = _select_excerpt(str(content), candidate, path, available_lines)
-            available_chars = max_chars - total_chars
-            if len(excerpt) > available_chars:
-                excerpt = excerpt[:available_chars]
-                budget_exhausted = True
-            if not excerpt:
-                request["status"] = "context_budget_exhausted"
-                budget_exhausted = True
-                continue
-            evidence.append({
-                "candidate_id": candidate["candidate_id"],
+            evidence_item = {
+                "candidate_id": candidate_id,
                 "source": "repository_file",
                 "path": path,
-                "start_line": start_line,
-                "end_line": end_line,
-                "content": excerpt,
+                "content": str(content),
+            }
+            before = len(evidence)
+            if not append_evidence(evidence_item, candidate, path):
+                request["status"] = (
+                    "time_budget_exhausted" if time_budget_exhausted else "context_budget_exhausted"
+                )
+                continue
+            appended = evidence[before]
+            request.update({
+                "status": "retrieved",
+                "start_line": appended["start_line"],
+                "end_line": appended["end_line"],
             })
-            request.update({"status": "retrieved", "start_line": start_line, "end_line": end_line})
-            line_count = excerpt.count("\n") + 1
-            total_lines += line_count
-            total_chars += len(excerpt)
 
     artifact = {
         "requests": requests,
@@ -482,7 +786,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         "files_read": len(unique_files),
         "changed_evidence_count": changed_evidence_count,
         "lines_retrieved": total_lines,
-        "estimated_context_tokens": (total_chars + 3) // 4,
+        "context_tokens": total_tokens,
         "duration_seconds": round(time.monotonic() - started, 3),
     }
     return evidence, artifact
@@ -497,40 +801,137 @@ def render_verification_payload(candidates: list[dict], changed_diff: str, evide
         changed_diff_fraction = content_fraction
     changed_diff_fraction = min(1.0, max(0.0, float(changed_diff_fraction)))
 
-    def bounded_content(value, fraction: float) -> str:
-        value = str(value or "")
-        if fraction >= 1.0 or not value:
-            return value
-        kept_characters = int(len(value) * fraction)
-        if kept_characters < 1:
-            return ""
-        if kept_characters >= len(value):
-            return value
-        return f"{value[:kept_characters]}\n...(truncated)"
-
-    bounded_evidence = []
-    for item in evidence:
-        bounded_item = dict(item)
-        if "content" in bounded_item:
-            bounded_item["content"] = bounded_content(bounded_item["content"], content_fraction)
-        bounded_evidence.append(bounded_item)
+    bounded_evidence = bounded_verification_evidence(evidence, content_fraction)
     return json.dumps({"candidates": candidates,
-                       "changed_diff": bounded_content(changed_diff, changed_diff_fraction),
+                       "changed_diff": _bounded_content(changed_diff, changed_diff_fraction),
                        "evidence": bounded_evidence},
                       ensure_ascii=False, indent=2)
 
 
-def apply_verification_decisions(candidates: list[dict], evidence: list[dict], verification_data: dict
-                                 ) -> tuple[list[dict], list[dict]]:
+def _bounded_content(value, fraction: float) -> str:
+    value = str(value or "")
+    if fraction >= 1.0 or not value:
+        return value
+    kept_characters = int(len(value) * fraction)
+    if kept_characters < 1:
+        return ""
+    if kept_characters >= len(value):
+        return value
+    return f"{value[:kept_characters]}\n...(truncated)"
+
+
+def bounded_verification_evidence(evidence: list[dict], content_fraction: float) -> list[dict]:
+    """Return the exact evidence material made visible in a bounded verifier prompt."""
+    fraction = min(1.0, max(0.0, float(content_fraction)))
+    bounded = []
+    for item in evidence:
+        bounded_item = dict(item)
+        if "content" in bounded_item:
+            content = str(bounded_item["content"] or "")
+            allowed_characters = int(len(content) * fraction)
+            anchor_start = bounded_item.get("anchor_start_line")
+            anchor_end = bounded_item.get("anchor_end_line")
+            excerpt_start = bounded_item.get("start_line")
+            if (fraction < 1.0 and bounded_item.get("source") == "changed_head"
+                    and all(isinstance(value, int) for value in (anchor_start, anchor_end, excerpt_start))):
+                lines = split_git_file_lines(content)
+                relative_start = anchor_start - excerpt_start
+                relative_end = anchor_end - excerpt_start
+                if (relative_start < 0 or relative_end >= len(lines) or relative_end < relative_start):
+                    bounded_item["content"] = ""
+                else:
+                    selected_start = relative_start
+                    selected_end = relative_end
+                    selected = "\n".join(lines[selected_start:selected_end + 1])
+                    if not selected or len(selected) > allowed_characters:
+                        bounded_item["content"] = ""
+                    else:
+                        while True:
+                            before = selected_start - 1
+                            after = selected_end + 1
+                            choices = []
+                            if before >= 0:
+                                choices.append((before, selected_end))
+                            if after < len(lines):
+                                choices.append((selected_start, after))
+                            expanded = None
+                            for candidate_start, candidate_end in choices:
+                                candidate_content = "\n".join(lines[candidate_start:candidate_end + 1])
+                                if len(candidate_content) <= allowed_characters:
+                                    expanded = candidate_start, candidate_end, candidate_content
+                                    break
+                            if expanded is None:
+                                break
+                            selected_start, selected_end, selected = expanded
+                        bounded_item["content"] = selected
+                        bounded_item["start_line"] = excerpt_start + selected_start
+                        bounded_item["end_line"] = excerpt_start + selected_end
+                        bounded_item["content_truncated"] = True
+            else:
+                bounded_item["content"] = _bounded_content(content, fraction)
+        if str(bounded_item.get("content") or "").strip():
+            bounded.append(bounded_item)
+    return bounded
+
+
+def _verified_finding_identity(candidate: dict, cited_evidence: list[dict]) -> Optional[tuple[str, str]]:
+    """Derive identities internally from a verified assertion and its cited proof.
+
+    The verifier cannot supply either identifier. The stable key ignores paths,
+    line numbers, and identifier spelling so a file or symbol rename preserves it,
+    while code shape keeps distinct verified defects from collapsing together.
+    """
+    anchor_shape = str(candidate.get("_changed_anchor_shape") or "")
+    anchor_ordinal = candidate.get("_changed_anchor_ordinal")
+    lineage_key = str(candidate.get("_trusted_lineage_key") or "")
+    if (not anchor_shape or not lineage_key
+            or not isinstance(anchor_ordinal, int) or anchor_ordinal < 1):
+        return None
+    root_digest = hashlib.sha256(
+        json.dumps({
+            "schema": "verified-root-cause-v1",
+            "changed_anchor_shape": anchor_shape,
+            "changed_anchor_ordinal": anchor_ordinal,
+        },
+                   sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    root_cause_id = f"sha256:{root_digest}"
+    evidence_shapes = sorted({
+        f"{str(item.get('source') or 'unknown')}:{_normalized_evidence_shape(item.get('content'))}"
+        for item in cited_evidence
+    })
+    stable_digest = hashlib.sha256(
+        json.dumps({
+            "schema": "verified-finding-stable-key-v1",
+            "root_cause_id": root_cause_id,
+            "trusted_lineage_key": lineage_key,
+            "evidence_shapes": evidence_shapes,
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return root_cause_id, f"sha256:{stable_digest}"
+
+
+def apply_verification_decisions(
+    candidates: list[dict],
+    evidence: list[dict],
+    verification_data: dict,
+    retrieval_requests: Optional[list[dict]] = None,
+    changed_diff_available: bool = True,
+) -> tuple[list[dict], list[dict]]:
     """Accept only complete verified decisions backed by retrieved evidence."""
     candidates_by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
     evidence_by_candidate = {}
     for item in evidence:
         evidence_by_candidate.setdefault(item.get("candidate_id"), []).append(item)
+    requests_by_candidate = {}
+    for request in retrieval_requests if isinstance(retrieval_requests, list) else []:
+        if isinstance(request, dict):
+            requests_by_candidate.setdefault(request.get("candidate_id"), []).append(request)
     decisions = (verification_data.get("verification") or {}).get("decisions") or []
     verified_findings = []
     result_records = []
     seen_findings = set()
+    seen_identities = set()
     decision_ids = [
         str(decision.get("candidate_id") or "").strip()
         for decision in decisions if isinstance(decision, dict)
@@ -567,6 +968,32 @@ def apply_verification_decisions(candidates: list[dict], evidence: list[dict], v
         if isinstance(cited_paths, str):
             cited_paths = [cited_paths]
         available_evidence = evidence_by_candidate.get(candidate_id, [])
+        failed_required_requests = [
+            request for request in requests_by_candidate.get(candidate_id, [])
+            if request.get("required") and request.get("status") not in {
+                "retrieved", "satisfied_by_changed_head"
+            }
+        ]
+        if failed_required_requests:
+            record["verdict"] = "rejected"
+            record["reason"] = "required_context_unavailable"
+            result_records.append(record)
+            continue
+        candidate_side = candidate.get("side", "new")
+        if not changed_diff_available and not (
+            candidate_side == "new" and any(
+                item.get("source") == "changed_head"
+                and str(item.get("content") or "").strip()
+                and isinstance(item.get("start_line"), int)
+                and isinstance(item.get("end_line"), int)
+                and item["start_line"] <= candidate.get("start_line") <= item["end_line"]
+                for item in available_evidence
+            )
+        ):
+            record["verdict"] = "rejected"
+            record["reason"] = "changed_code_evidence_unavailable"
+            result_records.append(record)
+            continue
         available_paths = {item.get("path") for item in available_evidence}
         normalized_citations = [safe_repo_path(path) for path in cited_paths]
         normalized_citations = [path for path in normalized_citations if path in available_paths]
@@ -593,6 +1020,7 @@ def apply_verification_decisions(candidates: list[dict], evidence: list[dict], v
             result_records.append(record)
             continue
         finding = {
+            "_candidate_id": candidate_id,
             "relevant_file": relevant_file,
             "issue_header": str(decision.get("issue_header") or candidate.get("issue_header") or "Issue").strip(),
             "issue_content": (
@@ -601,10 +1029,24 @@ def apply_verification_decisions(candidates: list[dict], evidence: list[dict], v
             ),
             "start_line": start_line,
             "end_line": end_line,
+            "side": candidate_side,
             "trigger": trigger,
             "impact": impact,
             "verification_evidence": normalized_citations,
         }
+        cited_evidence = [item for item in available_evidence if item.get("path") in normalized_citations]
+        identity = _verified_finding_identity(candidate, cited_evidence)
+        if identity is None:
+            record["verdict"] = "rejected"
+            record["reason"] = "trusted_identity_unavailable"
+            result_records.append(record)
+            continue
+        finding["root_cause_id"], finding["trusted_stable_key"] = identity
+        if identity in seen_identities:
+            record["verdict"] = "rejected"
+            record["reason"] = "trusted_identity_collision"
+            result_records.append(record)
+            continue
         finding_key = _candidate_key(finding)
         if finding_key in seen_findings:
             record["verdict"] = "rejected"
@@ -612,6 +1054,7 @@ def apply_verification_decisions(candidates: list[dict], evidence: list[dict], v
             result_records.append(record)
             continue
         seen_findings.add(finding_key)
+        seen_identities.add(identity)
         verified_findings.append(finding)
         record["evidence_paths"] = normalized_citations
         result_records.append(record)
@@ -619,5 +1062,14 @@ def apply_verification_decisions(candidates: list[dict], evidence: list[dict], v
     decided_ids = {record["candidate_id"] for record in result_records}
     for candidate_id in candidates_by_id.keys() - decided_ids:
         result_records.append({"candidate_id": candidate_id, "verdict": "rejected", "reason": "missing_decision"})
-    get_logger().debug("Candidate verification decisions validated", artifact={"decisions": result_records})
+    candidate_order = {candidate["candidate_id"]: index for index, candidate in enumerate(candidates)}
+    verified_findings.sort(
+        key=lambda finding: candidate_order.get(finding["_candidate_id"], len(candidate_order))
+    )
+    for finding in verified_findings:
+        finding.pop("_candidate_id", None)
+    get_logger().debug(
+        "Candidate verification decisions validated",
+        artifact=telemetry_safe_artifact({"decisions": result_records}),
+    )
     return verified_findings, result_records

@@ -14,21 +14,29 @@ from pr_agent.algo.candidate_verification import (
     VerificationBudgets,
     apply_specialist_prioritization,
     apply_verification_decisions,
+    bounded_verification_evidence,
     prepare_candidates,
     render_verification_payload,
     retrieve_evidence,
+    telemetry_safe_artifact,
     validated_specialist_prioritization,
 )
 from pr_agent.algo.git_patch_processing import iter_git_patch_lines, split_git_file_lines
 from pr_agent.algo.inline_comment_dedup import (
-    InlineCommentStore, can_verify_inline_comment_publication,
-    get_inline_comment_store, key_issue_body_with_markers,
-    key_issue_fingerprint, key_issue_location_fingerprint)
-from pr_agent.algo.pr_processing import (OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
-                                         PRDiffCoverage,
-                                         add_ai_metadata_to_diff_files,
-                                         get_pr_diff,
-                                         retry_with_fallback_models)
+    InlineCommentStore,
+    can_verify_inline_comment_publication,
+    get_inline_comment_store,
+    key_issue_body_with_markers,
+    key_issue_fingerprint,
+    key_issue_location_fingerprint,
+)
+from pr_agent.algo.pr_processing import (
+    OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+    PRDiffCoverage,
+    add_ai_metadata_to_diff_files,
+    get_pr_diff,
+    retry_with_fallback_models,
+)
 from pr_agent.algo.repo_context import build_repo_context
 from pr_agent.algo.review_specialists import (
     build_specialist_input,
@@ -38,23 +46,27 @@ from pr_agent.algo.review_specialists import (
     specialists_enabled,
     unavailable_specialist_batch,
 )
-from pr_agent.algo.run_details import (get_run_details, init_run_details,
-                                       record_review_profile)
+from pr_agent.algo.run_details import get_run_details, init_run_details, record_review_profile
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.token_handler import TokenEncoder, TokenHandler
-from pr_agent.algo.utils import (ModelType, PRReviewHeader, PRReviewIdentity,
-                                 add_pr_review_identity,
-                                 convert_to_markdown_v2, github_action_output,
-                                 get_max_tokens, load_yaml, show_relevant_configurations,
-                                 show_run_details)
+from pr_agent.algo.utils import (
+    ModelType,
+    PRReviewHeader,
+    PRReviewIdentity,
+    add_pr_review_identity,
+    convert_to_markdown_v2,
+    get_max_tokens,
+    github_action_output,
+    load_yaml,
+    show_relevant_configurations,
+    show_run_details,
+)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider_with_context
-from pr_agent.git_providers.git_provider import (IncrementalPR,
-                                                 get_main_pr_language)
+from pr_agent.git_providers.git_provider import IncrementalPR, get_main_pr_language
 from pr_agent.log import get_logger
 from pr_agent.servers.help import HelpMessage
-from pr_agent.tools.ticket_pr_compliance_check import \
-    extract_and_cache_pr_tickets
+from pr_agent.tools.ticket_pr_compliance_check import extract_and_cache_pr_tickets
 
 MAX_REVIEW_COVERAGE_FILES = 50
 _SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
@@ -688,7 +700,6 @@ class PRReviewer:
                 diff_files,
                 sensitive_globs,
                 budgets.max_candidates,
-                budgets.max_files,
             )
             if consume_specialist_prioritization:
                 specialist_input = getattr(self, "specialist_shadow_input", None)
@@ -711,10 +722,20 @@ class PRReviewer:
                 artifact["status"] = "no_candidates"
                 return
 
+            model = str(
+                config.get("candidate_verification_model", "") or get_settings().config.model
+            ).strip()
+            artifact["model"] = model
+            encoder = TokenEncoder.get_token_encoder(model)
             runtime_data = get_settings().get("data", {}) or {}
             static_evidence = runtime_data.get("static_analysis_evidence", []) if isinstance(runtime_data, dict) else []
             evidence, retrieval_artifact = await retrieve_evidence(
-                self.git_provider, candidates, budgets, static_evidence, diff_files=diff_files
+                self.git_provider,
+                candidates,
+                budgets,
+                static_evidence,
+                diff_files=diff_files,
+                token_counter=lambda value: len(encoder.encode(value, disallowed_special=())),
             )
             artifact["retrieval"] = retrieval_artifact
             if int(config.get("candidate_verification_max_model_calls", 1)) < 1:
@@ -726,9 +747,6 @@ class PRReviewer:
                 undefined=StrictUndefined,
             )
             verification_prompt = get_settings().pr_review_verification_prompt
-            model = str(config.get("candidate_verification_model", "") or get_settings().config.model).strip()
-            artifact["model"] = model
-            encoder = TokenEncoder.get_token_encoder(model)
             model_max_tokens = get_max_tokens(model)
             max_prompt_tokens = max(0, model_max_tokens - OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD)
 
@@ -821,13 +839,23 @@ class PRReviewer:
                 first_key="verification",
                 last_key="decisions",
             )
-            verified_findings, decisions = apply_verification_decisions(candidates, evidence, verification_data)
+            prompt_evidence = bounded_verification_evidence(evidence, evidence_fraction)
+            verified_findings, decisions = apply_verification_decisions(
+                candidates,
+                prompt_evidence,
+                verification_data,
+                retrieval_requests=retrieval_artifact["requests"],
+                changed_diff_available=(
+                    changed_diff_fraction == 1.0 and bool((self.patches_diff or "").strip())
+                ),
+            )
             max_findings = max(0, int(config.get("num_max_findings", 3)))
             published_findings = verified_findings[:max_findings]
             self.verified_review_data["review"]["key_issues_to_review"] = published_findings
             artifact.update({
                 "status": "partial" if retrieval_artifact["budget_exhausted"] or any(
-                    request["status"] != "retrieved" for request in retrieval_artifact["requests"]
+                    request["status"] not in {"retrieved", "satisfied_by_changed_head"}
+                    for request in retrieval_artifact["requests"]
                 ) else "complete",
                 "decisions": decisions,
                 "verified_count": len(published_findings),
@@ -837,7 +865,9 @@ class PRReviewer:
             })
         except Exception as exc:
             artifact.update({"status": "verifier_failed", "failure": type(exc).__name__, "verified_count": 0})
-            get_logger().exception("Candidate verification failed", artifact=artifact)
+            get_logger().exception(
+                "Candidate verification failed", artifact=telemetry_safe_artifact(artifact)
+            )
         finally:
             if verifier_started is not None:
                 artifact["verifier_latency_seconds"] = round(time.monotonic() - verifier_started, 3)
@@ -854,7 +884,7 @@ class PRReviewer:
                         "usd": str(details.total_cost_usd - details_before["total_cost_usd"])
                         if known_cost_delta > 0 else None,
                     }
-            get_logger().info("Candidate verification finished", artifact=artifact)
+            get_logger().info("Candidate verification finished", artifact=telemetry_safe_artifact(artifact))
 
     def _prepare_pr_review(self) -> str:
         """
@@ -979,6 +1009,12 @@ class PRReviewer:
             get_logger().warning("Review finding has no usable location, keeping it in the summary",
                                  artifact={"relevant_file": relevant_file, "start_line": start_line,
                                            "end_line": end_line})
+            return None
+        if issue.get("side") == "old":
+            get_logger().info(
+                "Review finding targets deleted code, keeping its old-side location in the summary",
+                artifact={"relevant_file": relevant_file, "start_line": start_line, "end_line": end_line},
+            )
             return None
 
         file = diff_files.get(relevant_file) or diff_files.get(relevant_file.lstrip("/"))
