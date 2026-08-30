@@ -990,9 +990,15 @@ def build_snapshot_result(
             coverage_issues=tuple(coverage),
             latency_seconds=monotonic() - started_at,
         )
-    if error or structured_review is None or not snapshot.diff.strip():
+    unfingerprintable_coverage = any(
+        issue.path is not None and issue.fingerprint is None
+        for issue in snapshot.coverage_issues
+    )
+    if error or structured_review is None or not snapshot.diff.strip() or unfingerprintable_coverage:
         if error:
             coverage.append(CoverageIssue(reason=f"review_failed:{error}"))
+        elif unfingerprintable_coverage:
+            coverage.append(CoverageIssue(reason="unfingerprintable_coverage"))
         elif not snapshot.diff.strip() and not coverage:
             coverage.append(CoverageIssue(reason="no_reviewable_diff"))
         return ReviewSnapshotResult(

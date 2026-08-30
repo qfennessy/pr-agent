@@ -696,6 +696,36 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         ]
     else:
         configured_exclusions = []
+    artifact_exclusions = _output_artifact_exclusions(repository_root, markdown_output, json_output)
+    skills_context = get_skills_context()
+    repo_context_files = {}
+
+    def initial_configuration_hash(base_revision: str) -> str:
+        repo_context_files.update(
+            _load_snapshot_repo_context(repository_root, base_revision)
+        )
+        return _snapshot_review_configuration_hash(skills_context, repo_context_files)
+
+    try:
+        reviewer = LocalPairReview(
+            str(repository_root),
+            excluded_paths=configured_exclusions,
+            ignored_paths=artifact_exclusions,
+        )
+        snapshot = reviewer.capture(
+            event=event,
+            base=snapshot_args.base,
+            base_selector=snapshot_args.base,
+            focus_path=snapshot_args.focus_path,
+            task_intent=snapshot_args.task_intent,
+            deterministic_results=checks,
+            review_configuration_hash_factory=initial_configuration_hash,
+            policy_version=policy_version,
+            parent_snapshot_id=snapshot_args.parent_snapshot_id,
+        )
+    except SnapshotCaptureError as exc:
+        outer_parser.error(str(exc))
+
     output_parent_identities = {}
     try:
         git_metadata_root = SnapshotCache(repository_root).cache_dir.parents[1]
@@ -724,32 +754,6 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
                 Path(markdown_output), output_parent_identities[markdown_output]
             )
     except (OSError, SnapshotCaptureError) as exc:
-        outer_parser.error(str(exc))
-    artifact_exclusions = _output_artifact_exclusions(repository_root, markdown_output, json_output)
-    skills_context = get_skills_context()
-
-    try:
-        reviewer = LocalPairReview(
-            str(repository_root),
-            excluded_paths=configured_exclusions,
-            ignored_paths=artifact_exclusions,
-        )
-        base_revision = reviewer._resolve_base(snapshot_args.base)
-        repo_context_files = _load_snapshot_repo_context(repository_root, base_revision)
-        snapshot = reviewer.capture(
-            event=event,
-            base=base_revision,
-            base_selector=snapshot_args.base,
-            focus_path=snapshot_args.focus_path,
-            task_intent=snapshot_args.task_intent,
-            deterministic_results=checks,
-            review_configuration_hash=_snapshot_review_configuration_hash(
-                skills_context, repo_context_files
-            ),
-            policy_version=policy_version,
-            parent_snapshot_id=snapshot_args.parent_snapshot_id,
-        )
-    except SnapshotCaptureError as exc:
         outer_parser.error(str(exc))
 
     cache_enabled = bool(settings.get("cache_enabled", True)) and not snapshot_args.no_cache

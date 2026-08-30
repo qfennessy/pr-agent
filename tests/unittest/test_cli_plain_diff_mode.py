@@ -447,6 +447,29 @@ def test_review_snapshot_validates_numeric_limits_before_removing_output(
     assert output.read_text(encoding="utf-8") == previous
 
 
+def test_review_snapshot_validates_base_before_removing_output(monkeypatch, tmp_path, capsys):
+    import subprocess
+
+    repo = tmp_path / "repo-invalid-base"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    output = tmp_path / "previous-review.md"
+    previous = "<!-- pr-agent-review-snapshot -->\nPrevious review\n"
+    output.write_text(previous, encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "worktree-idle", "--base", "missing-base",
+            "--output", str(output),
+        ])
+
+    error = capsys.readouterr().err
+    assert "Needed a single revision" in error
+    assert "Traceback" not in error
+    assert output.read_text(encoding="utf-8") == previous
+
+
 def test_git_artifact_root_uses_linked_worktree_git_directory(tmp_path):
     import os
     import subprocess

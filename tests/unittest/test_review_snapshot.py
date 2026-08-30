@@ -537,6 +537,39 @@ def test_skipped_content_fingerprint_invalidates_snapshot_identity(tmp_path):
     assert first.snapshot_id != second.snapshot_id
 
 
+def test_unfingerprintable_coverage_suppresses_findings(tmp_path):
+    repo = _repo(tmp_path, "embedded-repository")
+    embedded = repo / "embedded"
+    embedded.mkdir()
+    _git(embedded, "init")
+    (embedded / "nested.py").write_text("value = 1\n", encoding="utf-8")
+    (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+    reviewer = LocalPairReview(str(repo))
+    snapshot = reviewer.capture(event="worktree-idle")
+    current = reviewer.recapture(snapshot)
+
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=current,
+        structured_review={"review": {"key_issues_to_review": [{
+            "relevant_file": "tracked.py",
+            "issue_header": "Bug",
+            "issue_content": "The changed value is incorrect.",
+            "start_line": 1,
+            "end_line": 1,
+        }]}},
+        started_at=monotonic(),
+    )
+
+    assert any(
+        issue.path == "embedded" and issue.fingerprint is None
+        for issue in snapshot.coverage_issues
+    )
+    assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert result.review is None
+    assert CoverageIssue(reason="unfingerprintable_coverage") in result.coverage_issues
+
+
 def test_outside_symlink_target_change_invalidates_snapshot_identity(tmp_path):
     repo = _repo(tmp_path, "outside-symlink")
     link = repo / "outside-link"
