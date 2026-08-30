@@ -51,7 +51,8 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
                 add_line_numbers_to_hunks: bool = False,
                 disable_extra_lines: bool = False,
                 large_pr_handling=False,
-                return_remaining_files=False):
+                return_remaining_files=False,
+                return_deleted_files=False):
     if disable_extra_lines:
         PATCH_EXTRA_LINES_BEFORE = 0
         PATCH_EXTRA_LINES_AFTER = 0
@@ -149,9 +150,9 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
                        f"deleted_list_str: {deleted_list_str}")
     if not return_remaining_files:
         return final_diff
-    else:
-        omitted_files = list(dict.fromkeys([*remaining_files_list, *deleted_files_list]))
-        return final_diff, omitted_files
+    if return_deleted_files:
+        return final_diff, remaining_files_list, deleted_files_list
+    return final_diff, remaining_files_list
 
 
 def get_pr_diff_multiple_patchs(git_provider: GitProvider, token_handler: TokenHandler, model: str,

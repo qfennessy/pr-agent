@@ -28,6 +28,7 @@ def _make_prediction_reviewer(git_provider=None):
     reviewer = _make_reviewer(git_provider)
     reviewer.token_handler = MagicMock()
     reviewer.remaining_files_list = []
+    reviewer.deleted_files_list = []
     reviewer.incremental = SimpleNamespace(is_incremental=False)
     reviewer.prediction = None
     return reviewer
@@ -40,7 +41,7 @@ async def test_prepare_prediction_requests_remaining_files_and_preserves_tuple_r
 
     with patch(
         "pr_agent.tools.pr_reviewer.get_pr_diff",
-        return_value=("diff", ["src/one.py", "docs/two.md"]),
+        return_value=("diff", ["src/one.py", "docs/two.md"], ["deleted.py"]),
     ) as get_pr_diff:
         await reviewer._prepare_prediction("model")
 
@@ -51,9 +52,11 @@ async def test_prepare_prediction_requests_remaining_files_and_preserves_tuple_r
         add_line_numbers_to_hunks=True,
         disable_extra_lines=False,
         return_remaining_files=True,
+        return_deleted_files=True,
     )
     assert reviewer.patches_diff == "diff"
     assert reviewer.remaining_files_list == ["src/one.py", "docs/two.md"]
+    assert reviewer.deleted_files_list == ["deleted.py"]
     assert reviewer.prediction == VALID_PREDICTION
 
 
@@ -67,6 +70,7 @@ async def test_prepare_prediction_accepts_full_diff_string_when_token_budget_is_
 
     assert reviewer.patches_diff == "diff"
     assert reviewer.remaining_files_list == []
+    assert reviewer.deleted_files_list == []
     assert reviewer.prediction == VALID_PREDICTION
 
 
@@ -76,11 +80,15 @@ async def test_prepare_prediction_keeps_incremental_review_compatible_with_tuple
     reviewer.incremental = SimpleNamespace(is_incremental=True)
     reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
 
-    with patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value=("diff", ["skipped.py"])):
+    with patch(
+        "pr_agent.tools.pr_reviewer.get_pr_diff",
+        return_value=("diff", ["skipped.py"], ["deleted.py"]),
+    ):
         await reviewer._prepare_prediction("model")
 
     assert reviewer.patches_diff == "diff"
     assert reviewer.remaining_files_list == ["skipped.py"]
+    assert reviewer.deleted_files_list == ["deleted.py"]
     assert reviewer.prediction == VALID_PREDICTION
 
 
@@ -165,6 +173,7 @@ def test_prepare_pr_review_publishes_omitted_files_in_structured_metadata():
     reviewer = _make_prediction_reviewer(git_provider)
     reviewer.prediction = "review: {}"
     reviewer.remaining_files_list = ["src/two.py", "src/one.py", "src/two.py"]
+    reviewer.deleted_files_list = ["old/two.py", "old/one.py", "old/two.py"]
     reviewer.incremental = SimpleNamespace(is_incremental=False)
     git_provider.get_diff_files.return_value = []
     git_provider.is_supported.return_value = False
@@ -179,6 +188,7 @@ def test_prepare_pr_review_publishes_omitted_files_in_structured_metadata():
 
     structured = git_provider.publish_structured_review.call_args.args[0]
     assert structured["metadata"]["omitted_files"] == ["src/one.py", "src/two.py"]
+    assert structured["metadata"]["deleted_files"] == ["old/one.py", "old/two.py"]
 
 
 def test_prepare_pr_review_limits_coverage_footer_to_50_files():
@@ -982,7 +992,7 @@ def test_prepare_review_publishes_provider_neutral_structured_data(monkeypatch):
             "security_concerns": False,
         },
         "usage": {"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42},
-        "metadata": {"review_profile": "full", "omitted_files": []},
+        "metadata": {"review_profile": "full", "omitted_files": [], "deleted_files": []},
     })
     # Assert key order to prove the snapshot is isolated: _prepare_pr_review moves
     # key_issues_to_review to the end of its own dict after the hook fires, so an
@@ -1009,7 +1019,7 @@ def test_bugs_only_publishes_structured_empty_list_but_no_markdown():
     reviewer.git_provider.publish_structured_review.assert_called_once_with({
         "review": {"key_issues_to_review": []},
         "usage": {},
-        "metadata": {"review_profile": "bugs_only", "omitted_files": []},
+        "metadata": {"review_profile": "bugs_only", "omitted_files": [], "deleted_files": []},
     })
 
 

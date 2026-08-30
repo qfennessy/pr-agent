@@ -232,6 +232,19 @@ def test_snapshot_diff_disables_textconv_filters(tmp_path, monkeypatch):
     assert all("--no-textconv" in args for args in diff_calls)
 
 
+def test_snapshot_diff_disables_forced_git_color(tmp_path):
+    repo = _repo(tmp_path, "no-color")
+    _git(repo, "config", "color.diff", "always")
+    (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+    (repo / "untracked.py").write_text("new = True\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert "\x1b[" not in snapshot.diff
+    parsed = parse_plain_diff(snapshot.diff)
+    assert {file.filename for file in parsed} == {"tracked.py", "untracked.py"}
+
+
 def test_snapshot_diff_neutralizes_configured_clean_and_process_filters(tmp_path, monkeypatch):
     repo = _repo(tmp_path, "neutral-filters")
     reviewer = LocalPairReview(str(repo))
@@ -652,6 +665,24 @@ def test_token_budget_omissions_cannot_be_reported_as_clean():
     assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
     assert result.review is None
     assert CoverageIssue(path="large.py", reason="token_budget_omitted") in result.coverage_issues
+
+
+def test_deleted_files_have_distinct_unsupported_coverage():
+    snapshot = _snapshot("/repo/one")
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={
+            "review": {"key_issues_to_review": []},
+            "metadata": {"deleted_files": ["removed.py"]},
+        },
+        started_at=monotonic(),
+    )
+
+    assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert result.review is None
+    assert CoverageIssue(path="removed.py", reason="deleted_file_unsupported") in result.coverage_issues
+    assert CoverageIssue(path="removed.py", reason="token_budget_omitted") not in result.coverage_issues
 
 
 @pytest.mark.parametrize(

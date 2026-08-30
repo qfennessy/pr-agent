@@ -88,6 +88,7 @@ class PRReviewer:
         self.ai_handler.main_pr_language = self.main_language
         self.patches_diff = None
         self.remaining_files_list = []
+        self.deleted_files_list = []
         self.prediction = None
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
@@ -271,12 +272,14 @@ class PRReviewer:
                              model,
                              add_line_numbers_to_hunks=True,
                              disable_extra_lines=False,
-                             return_remaining_files=True,)
+                             return_remaining_files=True,
+                             return_deleted_files=True,)
         if isinstance(output, tuple):
-            self.patches_diff, self.remaining_files_list = output
+            self.patches_diff, self.remaining_files_list, self.deleted_files_list = output
         else:
             self.patches_diff = output
             self.remaining_files_list = []
+            self.deleted_files_list = []
 
         if self.patches_diff:
             get_logger().debug(f"PR diff", diff=self.patches_diff)
@@ -470,6 +473,7 @@ class PRReviewer:
             structured_data["metadata"] = {
                 "review_profile": self._review_profile(),
                 "omitted_files": sorted(set(self.remaining_files_list)),
+                "deleted_files": sorted(set(getattr(self, "deleted_files_list", []))),
             }
             structured_publisher(structured_data)
 

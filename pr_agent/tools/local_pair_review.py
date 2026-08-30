@@ -306,7 +306,7 @@ class LocalPairReview:
         args = [
             *self._diff_filter_overrides(),
             "-c", "core.quotePath=false",
-            "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--find-renames",
+            "--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames",
         ]
         if event is ReviewEvent.PRE_COMMIT:
             args.append("--cached")
@@ -320,6 +320,7 @@ class LocalPairReview:
             "-c",
             "core.quotePath=false",
             "diff",
+            "--no-color",
             "--no-index",
             "--no-ext-diff",
             "--no-textconv",
@@ -664,6 +665,13 @@ def build_snapshot_result(
         coverage.extend(
             CoverageIssue(path=str(path), reason="token_budget_omitted")
             for path in omitted_files
+            if isinstance(path, str) and path
+        )
+    deleted_files = metadata.get("deleted_files", []) if isinstance(metadata, Mapping) else []
+    if isinstance(deleted_files, Sequence) and not isinstance(deleted_files, (str, bytes)):
+        coverage.extend(
+            CoverageIssue(path=str(path), reason="deleted_file_unsupported")
+            for path in deleted_files
             if isinstance(path, str) and path
         )
     findings = finding_count(structured_review)
