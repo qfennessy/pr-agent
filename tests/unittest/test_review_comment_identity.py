@@ -5,6 +5,7 @@ import pytest
 
 from pr_agent.algo.utils import (PRReviewIdentity, add_pr_review_identity,
                                  comment_matches_identity,
+                                 comment_matches_pr_review_identity,
                                  convert_to_markdown_v2,
                                  format_pr_review_header,
                                  get_pr_review_comment_identifiers)
@@ -149,10 +150,18 @@ def test_github_full_incremental_lookup_does_not_adopt_bugs_only_marker():
     provider = GithubProvider.__new__(GithubProvider)
     provider.pr = MagicMock()
     provider.pr.get_issue_comments.return_value = [SimpleNamespace(
-        body="## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\nmarked",
+        body="## PR Reviewer Guide 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\nmarked",
     )]
 
     assert provider.get_previous_review(full=True, incremental=True, review_profile="full") is None
+
+
+def test_explicit_bugs_only_identity_overrides_legacy_full_heading():
+    body = "## PR Reviewer Guide 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\nmarked"
+    identifiers = get_pr_review_comment_identifiers(full=True, incremental=True, review_profile="full")
+
+    assert comment_matches_identity(body, "## PR Reviewer Guide") is True
+    assert comment_matches_pr_review_identity(body, identifiers, "full") is False
 
 
 def test_github_full_incremental_lookup_does_not_adopt_ambiguous_legacy_marker():

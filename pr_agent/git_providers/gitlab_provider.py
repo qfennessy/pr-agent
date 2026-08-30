@@ -25,6 +25,7 @@ from ..algo.language_handler import is_valid_file
 from ..algo.utils import (PRCodeSuggestionsHeader,
                           PRCodeSuggestionsIdentity, clip_tokens,
                           comment_matches_any_identity,
+                          comment_matches_pr_review_identity,
                           find_line_number_of_relevant_line_in_file,
                           get_pr_review_comment_identifiers, load_large_diff)
 from ..config_loader import get_settings
@@ -522,7 +523,11 @@ class GitLabProvider(GitProvider):
             else self._INCREMENTAL_ANCHOR_PREFIXES.get(kind, ())
         )
         self.previous_review = (
-            self._find_anchor_note(prefixes, prefer_latest_activity=kind == "suggestions")
+            self._find_anchor_note(
+                prefixes,
+                prefer_latest_activity=kind == "suggestions",
+                review_profile=self.incremental.review_profile if kind == "review" else None,
+            )
             if prefixes
             else None
         )
@@ -657,9 +662,10 @@ class GitLabProvider(GitProvider):
             incremental=incremental,
             review_profile=review_profile,
         )
-        return self._find_anchor_note(identifiers)
+        return self._find_anchor_note(identifiers, review_profile=review_profile)
 
-    def _find_anchor_note(self, identities, *, prefer_latest_activity: bool = False):
+    def _find_anchor_note(
+            self, identities, *, prefer_latest_activity: bool = False, review_profile: str | None = None):
         """Return the most recent MR note whose body matches any supplied identity.
 
         Used by incremental flows (`/review -i`, `/improve -i`) to find the timestamp
@@ -696,7 +702,12 @@ class GitLabProvider(GitProvider):
             body = getattr(note, 'body', None)
             if not isinstance(body, str):
                 continue
-            if not comment_matches_any_identity(body, identities):
+            matches_identity = (
+                comment_matches_pr_review_identity(body, identities, review_profile)
+                if review_profile
+                else comment_matches_any_identity(body, identities)
+            )
+            if not matches_identity:
                 continue
             if own_user_id is not None:
                 author = getattr(note, 'author', None)

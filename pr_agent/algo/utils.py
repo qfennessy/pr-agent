@@ -151,6 +151,17 @@ def comment_matches_any_identity(body: str, identities: Iterable[str]) -> bool:
     return any(comment_matches_identity(body, identity) for identity in identities)
 
 
+def comment_matches_pr_review_identity(
+        body: str, identities: Iterable[str], review_profile: str = "full") -> bool:
+    """Match a review anchor without letting legacy headings override an explicit profile."""
+    if review_profile == "full" and comment_matches_any_identity(body, (
+        PRReviewIdentity.BUGS_ONLY.value,
+        PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value,
+    )):
+        return False
+    return comment_matches_any_identity(body, identities)
+
+
 def get_pr_review_comment_identifiers(
         *, full: bool, incremental: bool, review_profile: str = "full") -> tuple[str, ...]:
     """Return stable markers followed by legacy visible prefixes for migration."""

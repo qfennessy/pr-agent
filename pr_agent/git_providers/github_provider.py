@@ -23,9 +23,9 @@ from ..algo.inline_comment_dedup import (body_fingerprint, body_with_markers,
                                          get_inline_comment_store, has_marker)
 from ..algo.language_handler import is_valid_file
 from ..algo.types import EDIT_TYPE
-from ..algo.utils import (Range, clip_tokens, find_line_number_of_relevant_line_in_file,
-                          get_pr_review_comment_identifiers, load_large_diff,
-                          set_file_languages)
+from ..algo.utils import (Range, clip_tokens, comment_matches_pr_review_identity,
+                          find_line_number_of_relevant_line_in_file, get_pr_review_comment_identifiers,
+                          load_large_diff, set_file_languages)
 from ..config_loader import get_settings
 from ..log import get_logger
 from ..servers.utils import RateLimitExceeded
@@ -221,7 +221,10 @@ class GithubProvider(GitProvider):
             review_profile=review_profile,
         )
         for index in range(len(self.comments) - 1, -1, -1):
-            if is_own_persistent_comment_for_identities(self.comments[index].body, identifiers):
+            body = self.comments[index].body
+            if not comment_matches_pr_review_identity(body, identifiers, review_profile):
+                continue
+            if is_own_persistent_comment_for_identities(body, identifiers):
                 return self.comments[index]
         return None
 

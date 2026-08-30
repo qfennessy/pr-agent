@@ -10,9 +10,9 @@ from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 from ..algo.file_filter import filter_ignored
 from ..algo.language_handler import is_valid_file
-from ..algo.utils import (PRDescriptionHeader, comment_matches_any_identity,
-                          find_line_number_of_relevant_line_in_file,
-                          get_pr_review_comment_identifiers, load_large_diff)
+from ..algo.utils import (PRDescriptionHeader, comment_matches_pr_review_identity,
+                          find_line_number_of_relevant_line_in_file, get_pr_review_comment_identifiers,
+                          load_large_diff)
 from ..config_loader import get_settings
 from ..log import get_logger
 from .git_provider import GitProvider, IncrementalPR
@@ -476,7 +476,7 @@ class AzureDevopsProvider(GitProvider):
         matches = []
         for comment in self.get_issue_comments():
             body = getattr(comment, "body", None)
-            if body and comment_matches_any_identity(body, identifiers):
+            if body and comment_matches_pr_review_identity(body, identifiers, review_profile):
                 matches.append(comment)
         if not matches:
             return None
