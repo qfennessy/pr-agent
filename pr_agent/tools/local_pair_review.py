@@ -339,8 +339,10 @@ _MAX_GIT_DIFF_PATH_BYTES = 16_384
 def _batch_path_groups(
     groups: Sequence[Sequence[str]],
     max_path_bytes: int = _MAX_GIT_DIFF_PATH_BYTES,
-) -> Iterable[tuple[str, ...]]:
-    """Batch pathspec groups without splitting rename/copy pairs when possible."""
+) -> tuple[tuple[tuple[str, ...], ...], tuple[str, ...]]:
+    """Batch atomic pathspec groups and return paths whose group cannot fit."""
+    batches: list[tuple[str, ...]] = []
+    omitted_paths: list[str] = []
     batch: list[str] = []
     batch_bytes = 0
     for group in groups:
@@ -349,26 +351,22 @@ def _batch_path_groups(
             len(path.encode("utf-8", errors="surrogateescape")) + 1
             for path in group_paths
         )
-        if batch and batch_bytes + group_bytes > max_path_bytes:
-            yield tuple(batch)
-            batch = []
-            batch_bytes = 0
-        if group_bytes <= max_path_bytes:
-            batch.extend(group_paths)
-            batch_bytes += group_bytes
-            continue
-        # A rename/copy pair with unusually long paths cannot fit as a unit.
-        # Split only that group so the overall invocation remains bounded.
-        for path in group_paths:
-            path_bytes = len(path.encode("utf-8", errors="surrogateescape")) + 1
-            if batch and batch_bytes + path_bytes > max_path_bytes:
-                yield tuple(batch)
+        if group_bytes > max_path_bytes:
+            if batch:
+                batches.append(tuple(batch))
                 batch = []
                 batch_bytes = 0
-            batch.append(path)
-            batch_bytes += path_bytes
+            omitted_paths.extend(group_paths)
+            continue
+        if batch and batch_bytes + group_bytes > max_path_bytes:
+            batches.append(tuple(batch))
+            batch = []
+            batch_bytes = 0
+        batch.extend(group_paths)
+        batch_bytes += group_bytes
     if batch:
-        yield tuple(batch)
+        batches.append(tuple(batch))
+    return tuple(batches), tuple(omitted_paths)
 
 
 def validate_local_pair_review_limits(settings: Mapping[str, Any]) -> dict[str, int]:
@@ -1704,7 +1702,9 @@ class LocalPairReview:
                     for stage_name, group in selected_tracked_groups
                     if stage_name == stage
                 ]
-                for tracked_batch in _batch_path_groups(stage_groups):
+                tracked_batches, oversized_paths = _batch_path_groups(stage_groups)
+                omitted_paths.update(oversized_paths)
+                for tracked_batch in tracked_batches:
                     part = None if remaining_bytes <= 0 else self._capture_diff(
                         event,
                         base_revision,

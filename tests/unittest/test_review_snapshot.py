@@ -996,6 +996,75 @@ def test_metadata_only_staged_group_does_not_suppress_safe_worktree_edit(
     )
 
 
+@pytest.mark.parametrize("change_kind", ["rename", "copy"])
+def test_oversized_rename_copy_group_is_omitted_without_split_capture(
+    change_kind, tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path, f"oversized-{change_kind}-group")
+    secret_line = "API_TOKEN=oversized-group-secret"
+    (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
+    source_name = f"source_{'s' * 40}.py"
+    destination_name = f"destination_{'d' * 40}.py"
+    source = repo / source_name
+    source.write_text(
+        f"{secret_line}\nPUBLIC_FLAG=unchanged\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-f", ".env", source_name)
+    _git(repo, "commit", "-m", "add oversized group fixture")
+    destination = repo / destination_name
+    if change_kind == "rename":
+        _git(repo, "mv", source_name, destination_name)
+    else:
+        destination.write_bytes(source.read_bytes())
+        _git(repo, "add", destination_name)
+
+    reviewer = LocalPairReview(str(repo))
+    parsed_event = ReviewEvent.PRE_COMMIT
+    base_revision = _git(repo, "rev-parse", "HEAD")
+    groups = reviewer._tracked_path_groups(parsed_event, base_revision)
+    expected_status = "R100" if change_kind == "rename" else "C100"
+    expected_group = (source_name, destination_name)
+    assert groups is not None
+    assert ("index", expected_status, expected_group) in groups
+    single_path_budget = max(
+        len(path.encode("utf-8")) + 1 for path in expected_group
+    )
+    original_batch_path_groups = local_pair_review_module._batch_path_groups
+
+    def forced_small_batches(path_groups):
+        return original_batch_path_groups(
+            path_groups,
+            max_path_bytes=single_path_budget,
+        )
+
+    captured_path_sets = []
+    original_capture_diff = reviewer._capture_diff
+
+    def capture_diff(event, captured_base, paths, **kwargs):
+        captured_path_sets.append(tuple(paths))
+        return original_capture_diff(event, captured_base, paths, **kwargs)
+
+    monkeypatch.setattr(
+        local_pair_review_module, "_batch_path_groups", forced_small_batches
+    )
+    monkeypatch.setattr(reviewer, "_capture_diff", capture_diff)
+
+    snapshot = reviewer.capture(event=parsed_event)
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert secret_line not in snapshot.diff
+    assert captured_path_sets
+    assert set(captured_path_sets) == {expected_group}
+    assert CoverageIssue(
+        path=source_name, reason="snapshot_byte_budget"
+    ) in snapshot.coverage_issues
+    assert CoverageIssue(
+        path=destination_name, reason="snapshot_byte_budget"
+    ) in snapshot.coverage_issues
+
+
 @pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
 def test_modified_file_exposing_large_unsafe_source_context_is_omitted(event, tmp_path):
     repo = _repo(tmp_path, f"exposed-large-excluded-context-{event}")
