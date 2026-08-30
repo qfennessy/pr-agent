@@ -1051,3 +1051,28 @@ def test_cache_write_failure_does_not_abort_completed_review(tmp_path):
     cache.write(result)
 
     assert result.state is ReviewResultState.NO_FINDINGS
+
+
+@pytest.mark.parametrize("symlink_component", ["pr-agent", "snapshot-cache"])
+def test_cache_refuses_symlinked_directories(tmp_path, symlink_component):
+    repo = _repo(tmp_path, f"symlinked-cache-{symlink_component}")
+    cache = SnapshotCache(repo)
+    snapshot = _snapshot(str(repo))
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={"review": {"key_issues_to_review": []}},
+        started_at=monotonic(),
+    )
+    external = tmp_path / f"external-{symlink_component}"
+    external.mkdir()
+    if symlink_component == "pr-agent":
+        cache.cache_dir.parent.symlink_to(external, target_is_directory=True)
+    else:
+        cache.cache_dir.parent.mkdir()
+        cache.cache_dir.symlink_to(external, target_is_directory=True)
+
+    cache.write(result)
+
+    assert cache.read(snapshot.snapshot_id) is None
+    assert list(external.iterdir()) == []

@@ -821,16 +821,40 @@ class SnapshotCache:
         git_dir = Path(common_dir)
         if not git_dir.is_absolute():
             git_dir = repository_root / git_dir
-        self.cache_dir = git_dir.resolve() / "pr-agent" / "snapshot-cache"
+        self.git_dir = git_dir.resolve()
+        self.cache_dir = self.git_dir / "pr-agent" / "snapshot-cache"
         self.max_entries = max(1, int(max_entries))
 
     def _path(self, snapshot_id: str) -> Path:
         digest = snapshot_id.removeprefix("sha256:")
         return self.cache_dir / f"{digest}.json"
 
+    def _validated_cache_dir(self, *, create: bool) -> Optional[Path]:
+        current = self.git_dir
+        for name in ("pr-agent", "snapshot-cache"):
+            current = current / name
+            try:
+                current_stat = current.lstat()
+            except FileNotFoundError:
+                if not create:
+                    return None
+                current.mkdir()
+                current_stat = current.lstat()
+            if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISDIR(current_stat.st_mode):
+                raise OSError("snapshot cache path contains a non-directory or symlink")
+            if not current.resolve(strict=True).is_relative_to(self.git_dir):
+                raise OSError("snapshot cache path escapes the Git metadata directory")
+        return current
+
     def read(self, snapshot_id: str) -> Optional[ReviewSnapshotResult]:
-        path = self._path(snapshot_id)
         try:
+            cache_dir = self._validated_cache_dir(create=False)
+            if cache_dir is None:
+                return None
+            path = cache_dir / self._path(snapshot_id).name
+            path_stat = path.lstat()
+            if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
+                return None
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict) or data.get("snapshot_id") != snapshot_id:
                 return None
@@ -893,16 +917,20 @@ class SnapshotCache:
             )
 
     def _write(self, result: ReviewSnapshotResult) -> None:
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir = self._validated_cache_dir(create=True)
+        if cache_dir is None:
+            raise OSError("could not create snapshot cache directory")
         payload = json.dumps(result.to_dict(), ensure_ascii=True, sort_keys=True, indent=2) + "\n"
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.cache_dir, delete=False) as handle:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=cache_dir, delete=False) as handle:
             handle.write(payload)
             temporary_path = Path(handle.name)
-        os.replace(temporary_path, self._path(result.snapshot_id))
+        os.replace(temporary_path, cache_dir / self._path(result.snapshot_id).name)
         cached_paths = []
-        for cached_path in self.cache_dir.glob("*.json"):
+        for cached_path in cache_dir.glob("*.json"):
             try:
-                cached_paths.append((cached_path.stat().st_mtime, cached_path))
+                cached_stat = cached_path.lstat()
+                if stat.S_ISREG(cached_stat.st_mode):
+                    cached_paths.append((cached_stat.st_mtime, cached_path))
             except OSError:
                 # Another hook may evict the entry between glob and stat.
                 continue
