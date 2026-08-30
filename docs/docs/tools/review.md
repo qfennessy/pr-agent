@@ -58,9 +58,11 @@ It defines versioned finding identities, paginated thread inventory, explicit cr
 fail-closed action plan tied to one pull-request head commit. Existing persistent inline comments still use the
 simpler duplicate-suppression behavior described in the [improve tool](./improve.md#persistent-inline-comments).
 
-The lifecycle foundation is not connected to `/review` publication yet. Enabling it before verified findings expose
-stable root-cause identities and rollout evidence exists could update the wrong discussion, so the reserved setting
-remains off and has no runtime effect:
+The lifecycle foundation is not connected to `/review` publication yet. Its integration boundary accepts only a
+versioned verified-finding contract with precomputed SHA-256 root-cause and stable-key identities; it never derives a
+substitute identity from finding prose, candidate order, or a line number. Enabling it before issue #9 supplies that
+contract and rollout evidence exists could update the wrong discussion, so the reserved setting remains off and has
+no runtime effect:
 
 ```toml
 [review_thread_lifecycle]
@@ -72,6 +74,17 @@ obsolete_thread_policy = "keep"
 adds a fixed-or-obsolete notice before resolving the thread. Both `mark_fixed` and the lower-level `resolve` policy
 also require an explicit authoritative-absence signal from a coverage-complete run. Without that signal the planner
 keeps the thread, and it always preserves resolved threads, human-owned threads, and every thread with replies.
+
+Move recovery creates one replacement before resolving any superseded threads. If a previous run created the
+replacement but could not finish cleanup, the next inventory keeps the single thread at the current anchor and only
+resolves safe older Bot-owned copies. Two live copies at the same current anchor remain untouched for manual audit.
+A resolved finding can recur only when GitHub attributes the earlier resolution to the exact authenticated PR-Agent
+Bot; human, other-Bot, and unknown resolutions remain authoritative.
+
+Every mutation checks the pull-request head both before and after its side effect. A changed or unverifiable
+post-mutation head stops the rest of the plan and requires a fresh paginated inventory. Rate limits are reported separately
+from permission failures with available `Retry-After` or rate-limit-reset evidence; a rate-limited create is never
+blindly retried because GitHub may already have accepted it.
 
 The foundation also models invalid or rejected inline locations as de-duplicated summary fallbacks. It returns those
 fallback entries to its caller rather than publishing them itself. Runtime publication remains disconnected until

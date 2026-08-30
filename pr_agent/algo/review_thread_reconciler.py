@@ -9,18 +9,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Optional, Protocol
+from typing import Any, Mapping, Optional, Protocol
 
 from pr_agent.algo.inline_comment_dedup import (
-    body_with_finding_identity_marker,
-    build_summary_fallback_marker,
-    strip_inline_comment_markers,
-    summary_fallback_markers,
-)
+    body_with_finding_identity_marker, build_summary_fallback_marker,
+    strip_inline_comment_markers, summary_fallback_markers)
 
 REVIEW_THREAD_LIFECYCLE_SCHEMA_VERSION = "review-thread-lifecycle-v1"
+VERIFIED_FINDING_IDENTITY_CONTRACT_VERSION = "verified-finding-identity-v1"
+VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION = "verified-root-cause-v1"
 FIXED_THREAD_NOTICE = "> ✅ **PR-Agent status:** Fixed or obsolete in the latest revision."
 FIXED_THREAD_STATE_MARKER = "<!-- pr-agent-thread-state:v1 state=fixed -->"
 
@@ -48,6 +48,7 @@ class FindingIdentity:
     path: str
     symbol: Optional[str] = None
     trusted_stable_key: Optional[str] = None
+    root_cause_id_schema: Optional[str] = None
     schema_version: str = REVIEW_THREAD_LIFECYCLE_SCHEMA_VERSION
     finding_id: str = field(init=False)
 
@@ -57,12 +58,23 @@ class FindingIdentity:
         root_cause_id = _normalise_text(self.root_cause_id)
         symbol = _normalise_text(self.symbol) if self.symbol else None
         trusted_stable_key = _normalise_text(self.trusted_stable_key) if self.trusted_stable_key else None
+        root_cause_id_schema = _normalise_text(self.root_cause_id_schema) if self.root_cause_id_schema else None
+        if self.schema_version != REVIEW_THREAD_LIFECYCLE_SCHEMA_VERSION:
+            raise ValueError(f"schema_version must be {REVIEW_THREAD_LIFECYCLE_SCHEMA_VERSION!r}")
         if not repository or "/" not in repository:
             raise ValueError("repository must be in owner/name form")
-        if self.pull_request_number < 1:
+        if (
+            isinstance(self.pull_request_number, bool)
+            or not isinstance(self.pull_request_number, int)
+            or self.pull_request_number < 1
+        ):
             raise ValueError("pull_request_number must be positive")
-        if not root_cause_id:
-            raise ValueError("root_cause_id is required")
+        if not re.fullmatch(r"sha256:[a-f0-9]{64}", root_cause_id):
+            raise ValueError("root_cause_id must be a sha256 identity issued by the verified-finding pipeline")
+        if root_cause_id_schema != VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION:
+            raise ValueError(f"root_cause_id_schema must be {VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION!r}")
+        if trusted_stable_key and not re.fullmatch(r"sha256:[a-f0-9]{64}", trusted_stable_key):
+            raise ValueError("trusted_stable_key must be a sha256 identity when supplied")
         if not path:
             raise ValueError("path is required")
         object.__setattr__(self, "repository", repository)
@@ -70,6 +82,7 @@ class FindingIdentity:
         object.__setattr__(self, "path", path)
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "trusted_stable_key", trusted_stable_key)
+        object.__setattr__(self, "root_cause_id_schema", root_cause_id_schema)
         scope = {"trusted_stable_key": trusted_stable_key} if trusted_stable_key else {"path": path, "symbol": symbol}
         identity = {
             "schema_version": self.schema_version,
@@ -78,11 +91,68 @@ class FindingIdentity:
             "root_cause_id": root_cause_id,
             "scope": scope,
         }
+        identity["root_cause_id_schema"] = root_cause_id_schema
         digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
         object.__setattr__(self, "finding_id", f"sha256:{digest}")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def finding_identity_from_verified_contract(contract: Mapping[str, Any]) -> FindingIdentity:
+    """Build an identity only from a versioned upstream verified-finding contract.
+
+    Issue #9 owns the deterministic ``root_cause_id`` algorithm. This boundary
+    deliberately validates and consumes that identifier without deriving a
+    replacement from mutable finding prose, severity, or line numbers.
+    """
+    if not isinstance(contract, Mapping):
+        raise TypeError("verified finding identity contract must be a mapping")
+    if contract.get("schema_version") != VERIFIED_FINDING_IDENTITY_CONTRACT_VERSION:
+        raise ValueError(
+            f"schema_version must be {VERIFIED_FINDING_IDENTITY_CONTRACT_VERSION!r}"
+        )
+    allowed_fields = {
+        "schema_version",
+        "root_cause_id_schema",
+        "repository",
+        "pull_request_number",
+        "root_cause_id",
+        "path",
+        "symbol",
+        "trusted_stable_key",
+    }
+    unexpected_fields = sorted(set(contract) - allowed_fields)
+    if unexpected_fields:
+        raise ValueError(f"verified finding identity contract has unsupported fields: {unexpected_fields}")
+    root_cause_id = contract.get("root_cause_id")
+    root_cause_id_schema = contract.get("root_cause_id_schema")
+    if not isinstance(root_cause_id, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", root_cause_id.strip()):
+        raise ValueError("verified finding contract root_cause_id must be a sha256 identity")
+    if root_cause_id_schema != VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION:
+        raise ValueError(f"root_cause_id_schema must be {VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION!r}")
+    pull_request_number = contract.get("pull_request_number")
+    if isinstance(pull_request_number, bool) or not isinstance(pull_request_number, int):
+        raise ValueError("verified finding contract requires an integer pull_request_number")
+    for field_name in ("repository", "path"):
+        if not isinstance(contract.get(field_name), str) or not contract[field_name].strip():
+            raise ValueError(f"verified finding contract requires {field_name}")
+    for optional_name in ("symbol", "trusted_stable_key"):
+        value = contract.get(optional_name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"verified finding contract {optional_name} must be a string when supplied")
+    trusted_stable_key = contract.get("trusted_stable_key")
+    if trusted_stable_key is not None and not re.fullmatch(r"sha256:[a-f0-9]{64}", trusted_stable_key.strip()):
+        raise ValueError("verified finding contract trusted_stable_key must be a sha256 identity")
+    return FindingIdentity(
+        repository=contract["repository"],
+        pull_request_number=pull_request_number,
+        root_cause_id=root_cause_id,
+        path=contract["path"],
+        symbol=contract.get("symbol"),
+        trusted_stable_key=trusted_stable_key,
+        root_cause_id_schema=root_cause_id_schema.strip(),
+    )
 
 
 @dataclass(frozen=True)
@@ -185,11 +255,18 @@ class ReviewThreadSnapshot:
     original_anchor: Optional[ReviewThreadAnchor] = None
     subject_type: Optional[str] = None
     viewer_can_resolve: bool = False
+    resolved_by_viewer_bot: bool = False
+    resolved_by_other_actor: bool = False
     schema_version: str = REVIEW_THREAD_LIFECYCLE_SCHEMA_VERSION
 
     @property
     def root_comment(self) -> Optional[ReviewThreadCommentSnapshot]:
         return self.comments[0] if self.comments else None
+
+    @property
+    def has_fixed_state_marker(self) -> bool:
+        root = self.root_comment
+        return bool(root and FIXED_THREAD_STATE_MARKER in root.body)
 
 
 @dataclass(frozen=True)
@@ -252,11 +329,13 @@ class ReviewThreadActionState(str, Enum):
     NOT_EXECUTED = "not_executed"
     SKIPPED = "skipped"
     FALLBACK_REQUIRED = "fallback_required"
+    APPLIED_REQUIRES_REFRESH = "applied_requires_refresh"
 
 
 class ReviewThreadFailureKind(str, Enum):
     INVALID_INLINE_LOCATION = "invalid_inline_location"
     PERMISSION_DENIED = "permission_denied"
+    RATE_LIMITED = "rate_limited"
     PROVIDER_FAILURE = "provider_failure"
 
 
@@ -271,6 +350,11 @@ class ReviewThreadActionOutcome:
     comment_node_id: Optional[str] = None
     failure_kind: Optional[ReviewThreadFailureKind] = None
     reason: Optional[str] = None
+    retry_after_seconds: Optional[float] = None
+    rate_limit_reset_at: Optional[int] = None
+    retry_source: Optional[str] = None
+    mutation_attempted: bool = False
+    mutation_result_ambiguous: bool = False
     schema_version: str = REVIEW_THREAD_LIFECYCLE_SCHEMA_VERSION
 
     @property
@@ -280,11 +364,33 @@ class ReviewThreadActionOutcome:
             ReviewThreadActionState.ALREADY_APPLIED,
         }
 
+    @property
+    def requires_fresh_inventory(self) -> bool:
+        return self.state in {
+            ReviewThreadActionState.STALE_HEAD,
+            ReviewThreadActionState.APPLIED_REQUIRES_REFRESH,
+        } or (
+            self.kind == ReviewThreadActionKind.CREATE
+            and self.mutation_result_ambiguous
+        )
+
+    @property
+    def retryable(self) -> bool:
+        return (
+            self.failure_kind == ReviewThreadFailureKind.RATE_LIMITED
+            and self.state == ReviewThreadActionState.FAILED
+        )
+
+    @property
+    def retry_requires_fresh_inventory(self) -> bool:
+        return self.retryable and self.requires_fresh_inventory
+
 
 class SummaryFallbackReason(str, Enum):
     INVALID_INLINE_LOCATION = "invalid_inline_location"
     INLINE_REJECTED = "inline_rejected"
     PERMISSION_DENIED = "permission_denied"
+    RATE_LIMITED = "rate_limited"
     PROVIDER_FAILURE = "provider_failure"
 
 
@@ -350,6 +456,10 @@ class ReviewThreadReconciliationOutcome:
     def complete(self) -> bool:
         return all(outcome.succeeded for outcome in self.action_outcomes)
 
+    @property
+    def requires_fresh_inventory(self) -> bool:
+        return any(outcome.requires_fresh_inventory for outcome in self.action_outcomes)
+
 
 class ReviewThreadMutationProvider(Protocol):
     """Provider surface required by the disabled lifecycle executor."""
@@ -392,6 +502,15 @@ def deduplicate_summary_fallbacks(
 def _action_id(kind: ReviewThreadActionKind, finding_id: str, ordinal: int) -> str:
     digest = hashlib.sha256(f"{kind.value}|{finding_id}|{ordinal}".encode("utf-8")).hexdigest()[:16]
     return f"thread-action:{digest}"
+
+
+def _thread_history_key(thread: ReviewThreadSnapshot) -> tuple[str, int, str]:
+    root = thread.root_comment
+    return (
+        root.created_at or "" if root else "",
+        root.database_id or -1 if root else -1,
+        thread.thread_id,
+    )
 
 
 def plan_review_thread_actions(
@@ -454,35 +573,80 @@ def plan_review_thread_actions(
             continue
         active_matches = [thread for thread in matches if not thread.is_resolved]
         if not active_matches:
-            add(ReviewThreadActionKind.SKIP, finding_id, "existing_thread_resolved", thread_id=matches[-1].thread_id)
+            latest = max(matches, key=_thread_history_key)
+            recurrence_is_authoritative = all(
+                thread.bot_owned and not thread.has_replies and thread.resolved_by_viewer_bot
+                for thread in matches
+            )
+            if recurrence_is_authoritative:
+                reason = (
+                    "finding_reintroduced_after_fixed_marker"
+                    if latest.has_fixed_state_marker
+                    else "finding_reintroduced_after_bot_resolution"
+                )
+                add(
+                    ReviewThreadActionKind.CREATE,
+                    finding_id,
+                    reason,
+                    anchor=desired.anchor,
+                    body=desired.marked_body,
+                )
+            else:
+                add(
+                    ReviewThreadActionKind.SKIP,
+                    finding_id,
+                    "human_or_unknown_resolution_preserved",
+                    thread_id=latest.thread_id,
+                )
             continue
-        if len(active_matches) > 1:
+
+        current_anchor_matches = [
+            thread for thread in active_matches
+            if not thread.is_outdated and thread.anchor == desired.anchor
+        ]
+        if len(current_anchor_matches) > 1:
             for duplicate in active_matches:
                 add(
                     ReviewThreadActionKind.SKIP,
                     finding_id,
-                    "duplicate_existing_identity_requires_manual_audit",
+                    "duplicate_current_anchor_requires_manual_audit",
                     thread_id=duplicate.thread_id,
                 )
             continue
-        current = active_matches[0]
-        if not current.bot_owned or current.has_replies:
-            add(ReviewThreadActionKind.SKIP, finding_id, "thread_not_safe_to_mutate", thread_id=current.thread_id)
-            continue
-        root = current.root_comment
-        if not current.is_outdated and current.anchor == desired.anchor:
+
+        if current_anchor_matches:
+            current = current_anchor_matches[0]
+            if not current.bot_owned or current.has_replies:
+                for thread in active_matches:
+                    add(
+                        ReviewThreadActionKind.SKIP,
+                        finding_id,
+                        "current_thread_not_safe_to_mutate",
+                        thread_id=thread.thread_id,
+                    )
+                continue
+            root = current.root_comment
             old_body = strip_inline_comment_markers(root.body if root else "").strip()
             new_body = strip_inline_comment_markers(desired.body).strip()
             if old_body == new_body:
-                add(
+                canonical = add(
                     ReviewThreadActionKind.UNCHANGED,
                     finding_id,
                     "same_anchor_and_body",
                     thread_id=current.thread_id,
                     root_comment_id=root.database_id if root else None,
                 )
+            elif not root or not root.database_id:
+                for thread in active_matches:
+                    add(
+                        ReviewThreadActionKind.SKIP,
+                        finding_id,
+                        "current_root_comment_id_unavailable",
+                        thread_id=thread.thread_id,
+                    )
+                continue
             else:
-                add(
+                canonical = add(
                     ReviewThreadActionKind.UPDATE,
                     finding_id,
                     "same_anchor_changed_body",
@@ -490,26 +654,74 @@ def plan_review_thread_actions(
                     root_comment_id=root.database_id if root else None,
                     body=desired.marked_body,
                 )
-        else:
-            if not current.viewer_can_resolve:
+
+            for duplicate in active_matches:
+                if duplicate.thread_id == current.thread_id:
+                    continue
+                root = duplicate.root_comment
+                if duplicate.bot_owned and not duplicate.has_replies and duplicate.viewer_can_resolve:
+                    add(
+                        ReviewThreadActionKind.RESOLVE,
+                        finding_id,
+                        "superseded_by_canonical_active_thread",
+                        thread_id=duplicate.thread_id,
+                        root_comment_id=root.database_id if root else None,
+                        depends_on_action_id=canonical.action_id,
+                    )
+                else:
+                    add(
+                        ReviewThreadActionKind.SKIP,
+                        finding_id,
+                        "duplicate_thread_not_safe_to_resolve",
+                        thread_id=duplicate.thread_id,
+                    )
+            continue
+
+        if any(not thread.bot_owned for thread in active_matches) or any(
+            thread.bot_owned and not thread.has_replies and not thread.viewer_can_resolve
+            for thread in active_matches
+        ):
+            unsafe_reason = (
+                "thread_cannot_be_resolved_safely"
+                if len(active_matches) == 1
+                else "moved_thread_set_not_safe_to_replace"
+            )
+            for thread in active_matches:
                 add(
                     ReviewThreadActionKind.SKIP,
                     finding_id,
-                    "thread_cannot_be_resolved_safely",
-                    thread_id=current.thread_id,
+                    unsafe_reason,
+                    thread_id=thread.thread_id,
+                )
+            continue
+
+        move_reason = (
+            "outdated_or_deleted_anchor"
+            if any(thread.is_outdated or thread.anchor is None for thread in active_matches)
+            else "finding_moved"
+        )
+        create = add(
+            ReviewThreadActionKind.CREATE,
+            finding_id,
+            move_reason,
+            anchor=desired.anchor,
+            body=desired.marked_body,
+        )
+        for previous in active_matches:
+            root = previous.root_comment
+            if previous.has_replies:
+                add(
+                    ReviewThreadActionKind.SKIP,
+                    finding_id,
+                    "thread_with_human_replies_preserved",
+                    thread_id=previous.thread_id,
                 )
                 continue
-            move_reason = (
-                "outdated_or_deleted_anchor" if current.is_outdated or current.anchor is None else "finding_moved"
-            )
-            create = add(
-                ReviewThreadActionKind.CREATE, finding_id, move_reason, anchor=desired.anchor, body=desired.marked_body
-            )
             add(
                 ReviewThreadActionKind.RESOLVE,
                 finding_id,
                 "superseded_by_replacement_finding",
-                thread_id=current.thread_id,
+                thread_id=previous.thread_id,
                 root_comment_id=root.database_id if root else None,
                 depends_on_action_id=create.action_id,
             )
@@ -574,6 +786,8 @@ def _fallback_reason(failure_kind: Optional[ReviewThreadFailureKind]) -> Summary
         return SummaryFallbackReason.INLINE_REJECTED
     if failure_kind == ReviewThreadFailureKind.PERMISSION_DENIED:
         return SummaryFallbackReason.PERMISSION_DENIED
+    if failure_kind == ReviewThreadFailureKind.RATE_LIMITED:
+        return SummaryFallbackReason.RATE_LIMITED
     return SummaryFallbackReason.PROVIDER_FAILURE
 
 
@@ -593,6 +807,7 @@ def execute_review_thread_action_plan(
     outcomes_by_action_id: dict[str, ReviewThreadActionOutcome] = {}
     fallbacks: list[SummaryFallbackEntry] = []
     current_head_sha: Optional[str] = plan.expected_head_sha
+    refresh_required = False
 
     def local_outcome(
         action: ReviewThreadAction,
@@ -625,7 +840,9 @@ def execute_review_thread_action_plan(
 
     for action in plan.actions:
         dependency = outcomes_by_action_id.get(action.depends_on_action_id) if action.depends_on_action_id else None
-        if action.depends_on_action_id and (dependency is None or not dependency.succeeded):
+        if refresh_required:
+            outcome = local_outcome(action, ReviewThreadActionState.NOT_EXECUTED, "fresh_inventory_required")
+        elif action.depends_on_action_id and (dependency is None or not dependency.succeeded):
             outcome = local_outcome(action, ReviewThreadActionState.NOT_EXECUTED, "dependency_not_satisfied")
         elif action.kind == ReviewThreadActionKind.UNCHANGED:
             outcome = local_outcome(action, ReviewThreadActionState.ALREADY_APPLIED, action.reason)
@@ -652,7 +869,13 @@ def execute_review_thread_action_plan(
 
         if outcome.current_head_sha is not None:
             current_head_sha = outcome.current_head_sha
-        if outcome.state == ReviewThreadActionState.FAILED:
+        if outcome.requires_fresh_inventory:
+            refresh_required = True
+        if (
+            outcome.state == ReviewThreadActionState.FAILED
+            and outcome.failure_kind != ReviewThreadFailureKind.RATE_LIMITED
+            and not outcome.requires_fresh_inventory
+        ):
             add_fallback(action, _fallback_reason(outcome.failure_kind), outcome.reason)
         outcomes.append(outcome)
         outcomes_by_action_id[action.action_id] = outcome

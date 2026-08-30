@@ -17,47 +17,34 @@ from retry.api import retry_call
 from starlette_context import context
 
 from ..algo.file_filter import filter_ignored
-from ..algo.git_patch_processing import extract_hunk_headers, iter_git_patch_lines, strip_git_line_ending
-from ..algo.inline_comment_dedup import (
-    body_fingerprint,
-    body_with_markers,
-    code_fingerprint,
-    finding_identity_markers,
-    get_inline_comment_store,
-    has_marker,
-    is_agent_inline_comment,
-)
+from ..algo.git_patch_processing import (extract_hunk_headers,
+                                         iter_git_patch_lines,
+                                         strip_git_line_ending)
+from ..algo.inline_comment_dedup import (body_fingerprint, body_with_markers,
+                                         code_fingerprint,
+                                         finding_identity_markers,
+                                         get_inline_comment_store, has_marker,
+                                         is_agent_inline_comment)
 from ..algo.language_handler import is_valid_file
-from ..algo.review_thread_reconciler import (
-    ReviewThreadActionKind,
-    ReviewThreadActionOutcome,
-    ReviewThreadActionState,
-    ReviewThreadAnchor,
-    ReviewThreadCommentSnapshot,
-    ReviewThreadFailureKind,
-    ReviewThreadSnapshot,
-)
+from ..algo.review_thread_reconciler import (ReviewThreadActionKind,
+                                             ReviewThreadActionOutcome,
+                                             ReviewThreadActionState,
+                                             ReviewThreadAnchor,
+                                             ReviewThreadCommentSnapshot,
+                                             ReviewThreadFailureKind,
+                                             ReviewThreadSnapshot)
 from ..algo.types import EDIT_TYPE
-from ..algo.utils import (
-    Range,
-    clip_tokens,
-    comment_matches_pr_review_identity,
-    find_line_number_of_relevant_line_in_file,
-    get_pr_review_comment_identifiers,
-    load_large_diff,
-    set_file_languages,
-)
+from ..algo.utils import (Range, clip_tokens,
+                          comment_matches_pr_review_identity,
+                          find_line_number_of_relevant_line_in_file,
+                          get_pr_review_comment_identifiers, load_large_diff,
+                          set_file_languages)
 from ..config_loader import get_settings
 from ..log import get_logger
 from ..servers.utils import RateLimitExceeded
-from .git_provider import (
-    MAX_FILES_ALLOWED_FULL,
-    FilePatchInfo,
-    GitProvider,
-    IncrementalPR,
-    get_cached_global_settings,
-    is_own_persistent_comment_for_identities,
-)
+from .git_provider import (MAX_FILES_ALLOWED_FULL, FilePatchInfo, GitProvider,
+                           IncrementalPR, get_cached_global_settings,
+                           is_own_persistent_comment_for_identities)
 
 
 def _next_page_url(headers: dict) -> str:
@@ -71,17 +58,78 @@ def _next_page_url(headers: dict) -> str:
     return ""
 
 
-def _review_thread_failure_kind(error: Exception) -> ReviewThreadFailureKind:
-    """Classify GitHub failures without discarding the original error details."""
+class _ReviewThreadGraphQLError(RuntimeError):
+    def __init__(self, message: str, *, status=None, headers=None, data=None):
+        super().__init__(message)
+        self.status = status
+        self.headers = headers or {}
+        self.data = data
+
+
+def _github_actor_is_bot_identity(actor: object) -> bool:
+    """Recognize GitHub App bot actors without trusting a login suffix alone."""
+    return bool(
+        isinstance(actor, dict)
+        and actor.get("id")
+        and str(actor.get("login") or "").casefold().endswith("[bot]")
+        and actor.get("__typename") in {"Bot", "User"}
+    )
+
+
+def _review_thread_failure_details(error: Exception) -> dict:
+    """Classify GitHub failures and retain actionable retry evidence."""
     status = getattr(error, "status", None)
-    if status == 422:
-        return ReviewThreadFailureKind.INVALID_INLINE_LOCATION
-    if status in {401, 403}:
-        return ReviewThreadFailureKind.PERMISSION_DENIED
+    raw_headers = getattr(error, "headers", None) or {}
+    try:
+        headers = {str(key).casefold(): str(value) for key, value in raw_headers.items()}
+    except (AttributeError, TypeError, ValueError):
+        headers = {}
     details = f"{error} {getattr(error, 'data', '')}".casefold()
+    remaining = headers.get("x-ratelimit-remaining")
+    rate_limited = bool(
+        isinstance(error, RateLimitExceeded)
+        or status == 429
+        or remaining == "0"
+        or any(
+            token in details
+            for token in ("rate limit", "secondary rate", "abuse detection", "too many requests")
+        )
+    )
+    if rate_limited:
+        retry_after_seconds = None
+        retry_after = headers.get("retry-after")
+        if retry_after is not None:
+            try:
+                retry_after_seconds = max(0.0, float(retry_after))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        rate_limit_reset_at = None
+        reset_at = headers.get("x-ratelimit-reset")
+        if reset_at is not None:
+            try:
+                rate_limit_reset_at = int(reset_at)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        retry_source = (
+            "retry-after"
+            if retry_after_seconds is not None
+            else "x-ratelimit-reset"
+            if rate_limit_reset_at is not None
+            else "provider-signal"
+        )
+        return {
+            "failure_kind": ReviewThreadFailureKind.RATE_LIMITED,
+            "retry_after_seconds": retry_after_seconds,
+            "rate_limit_reset_at": rate_limit_reset_at,
+            "retry_source": retry_source,
+        }
+    if status == 422:
+        return {"failure_kind": ReviewThreadFailureKind.INVALID_INLINE_LOCATION}
+    if status in {401, 403}:
+        return {"failure_kind": ReviewThreadFailureKind.PERMISSION_DENIED}
     if any(token in details for token in ("permission denied", "forbidden", "resource not accessible")):
-        return ReviewThreadFailureKind.PERMISSION_DENIED
-    return ReviewThreadFailureKind.PROVIDER_FAILURE
+        return {"failure_kind": ReviewThreadFailureKind.PERMISSION_DENIED}
+    return {"failure_kind": ReviewThreadFailureKind.PROVIDER_FAILURE}
 
 
 def _bounded_ci_text(value, limit: int = 1000) -> str:
@@ -722,22 +770,22 @@ class GithubProvider(GitProvider):
     def get_review_thread_comments(self, comment_id: int) -> list[dict]:
         """
         Retrieves all comments in the same thread as the given comment.
-        
+
         Args:
             comment_id: Review comment ID
-                
+
         Returns:
             List of comments in the same thread
         """
         try:
             # Fetch all comments with a single API call
             all_comments = list(self.pr.get_comments())
-            
+
             # Find the target comment by ID
             target_comment = next((c for c in all_comments if c.id == comment_id), None)
             if not target_comment:
                 return []
-        
+
             # Get root comment id
             root_comment_id = target_comment.raw_data.get("in_reply_to_id", target_comment.id)
             # Build the thread - include the root comment and all replies to it
@@ -745,10 +793,10 @@ class GithubProvider(GitProvider):
                 c for c in all_comments if
                 c.id == root_comment_id or c.raw_data.get("in_reply_to_id") == root_comment_id
             ]
-        
-        
+
+
             return thread_comments
-                
+
         except Exception as e:
             get_logger().exception(f"Failed to get review comments for an inline ask command", artifact={"comment_id": comment_id, "error": e})
             return []
@@ -765,11 +813,17 @@ class GithubProvider(GitProvider):
         )
         if not isinstance(response, tuple) or len(response) != 3:
             raise RuntimeError("unexpected GitHub GraphQL response format")
-        body = json.loads(response[2]) if isinstance(response[2], str) else response[2]
+        status, headers, raw_body = response
+        body = json.loads(raw_body) if isinstance(raw_body, str) else raw_body
         if not isinstance(body, dict):
             raise RuntimeError("GitHub GraphQL response body is not an object")
         if body.get("errors"):
-            raise RuntimeError(f"GitHub GraphQL errors: {body['errors']}")
+            raise _ReviewThreadGraphQLError(
+                f"GitHub GraphQL errors: {body['errors']}",
+                status=status,
+                headers=headers,
+                data=body["errors"],
+            )
         data = body.get("data")
         if not isinstance(data, dict):
             raise RuntimeError("GitHub GraphQL response has no data object")
@@ -824,6 +878,7 @@ class GithubProvider(GitProvider):
                   id isResolved isOutdated path line startLine diffSide startDiffSide
                   originalLine originalStartLine
                   subjectType viewerCanResolve
+                  resolvedBy { id login __typename }
                   comments(first: 100) {
                     pageInfo { hasNextPage endCursor }
                     nodes {
@@ -913,16 +968,37 @@ class GithubProvider(GitProvider):
             marker_values = finding_identity_markers(root.body if root else "")
             marker_ids = {finding_id for _, finding_id in marker_values}
             finding_id = next(iter(marker_ids)) if len(marker_ids) == 1 else None
+            root_actor = {
+                "id": root.author_id if root else None,
+                "login": root.author_login if root else None,
+                "__typename": root.author_type if root else None,
+            }
             root_author_is_viewer_bot = bool(
                 root
                 and viewer_identity
-                and viewer_identity.get("__typename") == "Bot"
-                and root.author_type == "Bot"
+                and _github_actor_is_bot_identity(viewer_identity)
+                and _github_actor_is_bot_identity(root_actor)
                 and root.author_id == viewer_identity.get("id")
                 and root.author_login == viewer_identity.get("login")
             )
             bot_owned = bool(
                 finding_id and root_author_is_viewer_bot and is_agent_inline_comment(root.body)
+            )
+            resolved_by = thread.get("resolvedBy")
+            resolved_by_viewer_bot = bool(
+                thread.get("isResolved")
+                and isinstance(resolved_by, dict)
+                and viewer_identity
+                and _github_actor_is_bot_identity(viewer_identity)
+                and _github_actor_is_bot_identity(resolved_by)
+                and resolved_by.get("id") == viewer_identity.get("id")
+                and resolved_by.get("login") == viewer_identity.get("login")
+            )
+            resolved_by_other_actor = bool(
+                thread.get("isResolved")
+                and isinstance(resolved_by, dict)
+                and resolved_by.get("id")
+                and not resolved_by_viewer_bot
             )
             anchor = None
             if not thread.get("isOutdated") and thread.get("subjectType") != "FILE":
@@ -955,6 +1031,8 @@ class GithubProvider(GitProvider):
                 comments=tuple(comments),
                 subject_type=thread.get("subjectType"),
                 viewer_can_resolve=bool(thread.get("viewerCanResolve")),
+                resolved_by_viewer_bot=resolved_by_viewer_bot,
+                resolved_by_other_actor=resolved_by_other_actor,
             ))
         return tuple(snapshots)
 
@@ -978,8 +1056,8 @@ class GithubProvider(GitProvider):
                 state=ReviewThreadActionState.FAILED,
                 expected_head_sha=expected_head_sha,
                 current_head_sha=None,
-                failure_kind=_review_thread_failure_kind(e),
                 reason=f"head_check_failed: {e}",
+                **_review_thread_failure_details(e),
             )
         if current_head_sha != expected_head_sha:
             return current_head_sha, ReviewThreadActionOutcome(
@@ -990,6 +1068,63 @@ class GithubProvider(GitProvider):
                 reason="pull_request_head_changed",
             )
         return current_head_sha, None
+
+    def _review_thread_post_mutation_outcome(
+        self,
+        kind: ReviewThreadActionKind,
+        expected_head_sha: str,
+        *,
+        thread_id: Optional[str] = None,
+        comment_id: Optional[int] = None,
+        comment_node_id: Optional[str] = None,
+        force_refresh_reason: Optional[str] = None,
+    ) -> ReviewThreadActionOutcome:
+        """Confirm head stability after a side effect before dependent cleanup."""
+        try:
+            current_head_sha = self._live_review_head_sha()
+        except Exception as e:
+            return ReviewThreadActionOutcome(
+                kind=kind,
+                state=ReviewThreadActionState.APPLIED_REQUIRES_REFRESH,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=None,
+                thread_id=thread_id,
+                comment_id=comment_id,
+                comment_node_id=comment_node_id,
+                reason=f"post_mutation_head_check_failed: {e}",
+                mutation_attempted=True,
+                mutation_result_ambiguous=True,
+                **_review_thread_failure_details(e),
+            )
+        if current_head_sha != expected_head_sha:
+            return ReviewThreadActionOutcome(
+                kind=kind,
+                state=ReviewThreadActionState.APPLIED_REQUIRES_REFRESH,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                thread_id=thread_id,
+                comment_id=comment_id,
+                comment_node_id=comment_node_id,
+                reason="pull_request_head_changed_after_mutation",
+                mutation_attempted=True,
+                mutation_result_ambiguous=True,
+            )
+        return ReviewThreadActionOutcome(
+            kind=kind,
+            state=(
+                ReviewThreadActionState.APPLIED_REQUIRES_REFRESH
+                if force_refresh_reason
+                else ReviewThreadActionState.APPLIED
+            ),
+            expected_head_sha=expected_head_sha,
+            current_head_sha=current_head_sha,
+            thread_id=thread_id,
+            comment_id=comment_id,
+            comment_node_id=comment_node_id,
+            reason=force_refresh_reason,
+            mutation_attempted=True,
+            mutation_result_ambiguous=bool(force_refresh_reason),
+        )
 
     def create_review_thread(self, comment: dict, expected_head_sha: str) -> ReviewThreadActionOutcome:
         current_head_sha, blocked = self._check_review_thread_head(
@@ -1003,22 +1138,33 @@ class GithubProvider(GitProvider):
             _, data = self.pr._requester.requestJsonAndCheck(
                 "POST", f"{self.base_url}/repos/{self.repo}/pulls/{self.pr_num}/comments", input=payload
             )
-            return ReviewThreadActionOutcome(
-                kind=ReviewThreadActionKind.CREATE,
-                state=ReviewThreadActionState.APPLIED,
-                expected_head_sha=expected_head_sha,
-                current_head_sha=current_head_sha,
-                comment_id=data.get("id") if isinstance(data, dict) else None,
-                comment_node_id=data.get("node_id") if isinstance(data, dict) else None,
+            comment_id = data.get("id") if isinstance(data, dict) else None
+            comment_node_id = data.get("node_id") if isinstance(data, dict) else None
+            return self._review_thread_post_mutation_outcome(
+                ReviewThreadActionKind.CREATE,
+                expected_head_sha,
+                comment_id=comment_id,
+                comment_node_id=comment_node_id,
+                force_refresh_reason=(
+                    "created_comment_identity_incomplete"
+                    if not comment_id or not comment_node_id
+                    else None
+                ),
             )
         except Exception as e:
+            failure_details = _review_thread_failure_details(e)
             return ReviewThreadActionOutcome(
                 kind=ReviewThreadActionKind.CREATE,
                 state=ReviewThreadActionState.FAILED,
                 expected_head_sha=expected_head_sha,
                 current_head_sha=current_head_sha,
-                failure_kind=_review_thread_failure_kind(e),
                 reason=f"create_failed: {e}",
+                mutation_attempted=True,
+                mutation_result_ambiguous=failure_details["failure_kind"] in {
+                    ReviewThreadFailureKind.RATE_LIMITED,
+                    ReviewThreadFailureKind.PROVIDER_FAILURE,
+                },
+                **failure_details,
             )
 
     def update_review_thread(self, comment_id: int, body: str,
@@ -1032,11 +1178,9 @@ class GithubProvider(GitProvider):
             _, data = self.pr._requester.requestJsonAndCheck(
                 "PATCH", f"{self.base_url}/repos/{self.repo}/pulls/comments/{comment_id}", input={"body": body}
             )
-            return ReviewThreadActionOutcome(
-                kind=ReviewThreadActionKind.UPDATE,
-                state=ReviewThreadActionState.APPLIED,
-                expected_head_sha=expected_head_sha,
-                current_head_sha=current_head_sha,
+            return self._review_thread_post_mutation_outcome(
+                ReviewThreadActionKind.UPDATE,
+                expected_head_sha,
                 comment_id=data.get("id", comment_id) if isinstance(data, dict) else comment_id,
                 comment_node_id=data.get("node_id") if isinstance(data, dict) else None,
             )
@@ -1047,8 +1191,9 @@ class GithubProvider(GitProvider):
                 expected_head_sha=expected_head_sha,
                 current_head_sha=current_head_sha,
                 comment_id=comment_id,
-                failure_kind=_review_thread_failure_kind(e),
                 reason=f"update_failed: {e}",
+                mutation_attempted=True,
+                **_review_thread_failure_details(e),
             )
 
     def resolve_review_thread(self, thread_id: str, expected_head_sha: str) -> ReviewThreadActionOutcome:
@@ -1069,11 +1214,9 @@ class GithubProvider(GitProvider):
             thread = data.get("resolveReviewThread", {}).get("thread")
             if not isinstance(thread, dict) or not thread.get("isResolved"):
                 raise RuntimeError("resolveReviewThread did not return a resolved thread")
-            return ReviewThreadActionOutcome(
-                kind=ReviewThreadActionKind.RESOLVE,
-                state=ReviewThreadActionState.APPLIED,
-                expected_head_sha=expected_head_sha,
-                current_head_sha=current_head_sha,
+            return self._review_thread_post_mutation_outcome(
+                ReviewThreadActionKind.RESOLVE,
+                expected_head_sha,
                 thread_id=thread.get("id") or thread_id,
             )
         except Exception as e:
@@ -1083,8 +1226,9 @@ class GithubProvider(GitProvider):
                 expected_head_sha=expected_head_sha,
                 current_head_sha=current_head_sha,
                 thread_id=thread_id,
-                failure_kind=_review_thread_failure_kind(e),
                 reason=f"resolve_failed: {e}",
+                mutation_attempted=True,
+                **_review_thread_failure_details(e),
             )
 
     def resolve_comment_thread(self, comment_id: int) -> bool:

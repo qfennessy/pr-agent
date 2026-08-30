@@ -1,32 +1,31 @@
+import hashlib
+
 import pytest
 
 from pr_agent.algo.inline_comment_dedup import (
-    body_fingerprint,
-    body_with_finding_identity_marker,
-    build_summary_fallback_marker,
-    finding_identity_markers,
-    has_marker,
-    marker_fingerprints,
-)
+    body_fingerprint, body_with_finding_identity_marker,
+    build_summary_fallback_marker, finding_identity_markers, has_marker,
+    marker_fingerprints)
 from pr_agent.algo.review_thread_reconciler import (
-    FIXED_THREAD_NOTICE,
-    DesiredReviewThread,
-    FindingIdentity,
-    ReviewThreadActionKind,
-    ReviewThreadActionOutcome,
-    ReviewThreadActionState,
-    ReviewThreadAnchor,
-    ReviewThreadCommentSnapshot,
-    ReviewThreadFailureKind,
-    ReviewThreadReconciliationOutcome,
-    ReviewThreadSnapshot,
-    SummaryFallbackReason,
-    execute_review_thread_action_plan,
-    plan_review_thread_actions,
-)
+    FIXED_THREAD_NOTICE, FIXED_THREAD_STATE_MARKER,
+    VERIFIED_FINDING_IDENTITY_CONTRACT_VERSION,
+    VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION, DesiredReviewThread,
+    FindingIdentity, ReviewThreadActionKind, ReviewThreadActionOutcome,
+    ReviewThreadActionState, ReviewThreadAnchor, ReviewThreadCommentSnapshot,
+    ReviewThreadFailureKind, ReviewThreadReconciliationOutcome,
+    ReviewThreadSnapshot, SummaryFallbackReason,
+    execute_review_thread_action_plan, finding_identity_from_verified_contract,
+    plan_review_thread_actions)
 
 
 def _identity(root_cause_id="cause-1", path="src/app.py", symbol="run", trusted_stable_key=None):
+    root_cause_id = root_cause_id.strip()
+    if not root_cause_id.startswith("sha256:"):
+        root_cause_id = f"sha256:{hashlib.sha256(root_cause_id.encode()).hexdigest()}"
+    if trusted_stable_key:
+        trusted_stable_key = trusted_stable_key.strip()
+        if not trusted_stable_key.startswith("sha256:"):
+            trusted_stable_key = f"sha256:{hashlib.sha256(trusted_stable_key.encode()).hexdigest()}"
     return FindingIdentity(
         repository="Owner/Repo",
         pull_request_number=7,
@@ -34,10 +33,17 @@ def _identity(root_cause_id="cause-1", path="src/app.py", symbol="run", trusted_
         path=path,
         symbol=symbol,
         trusted_stable_key=trusted_stable_key,
+        root_cause_id_schema=VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
     )
 
 
-def _comment(identity, body="old wording", author="pr-agent[bot]", database_id=10):
+def _comment(
+    identity,
+    body="old wording",
+    author="pr-agent[bot]",
+    database_id=10,
+    created_at="2026-08-30T12:00:00Z",
+):
     is_bot = author.endswith("[bot]")
     return ReviewThreadCommentSnapshot(
         node_id=f"comment-{database_id}",
@@ -46,6 +52,7 @@ def _comment(identity, body="old wording", author="pr-agent[bot]", database_id=1
         author_login=author,
         author_type="Bot" if is_bot else "User",
         body=body_with_finding_identity_marker(body, identity.finding_id),
+        created_at=created_at,
     )
 
 
@@ -60,8 +67,14 @@ def _snapshot(
     replies=False,
     anchor=True,
     viewer_can_resolve=True,
+    thread_id="thread-1",
+    database_id=10,
+    reviewed_head_sha="head-old",
+    created_at="2026-08-30T12:00:00Z",
+    resolved_by_viewer_bot=False,
+    resolved_by_other_actor=False,
 ):
-    comments = [_comment(identity, body=body)]
+    comments = [_comment(identity, body=body, database_id=database_id, created_at=created_at)]
     if replies:
         comments.append(
             ReviewThreadCommentSnapshot(
@@ -75,7 +88,7 @@ def _snapshot(
         )
     thread_anchor = ReviewThreadAnchor(path=identity.path, line=line) if anchor else None
     return ReviewThreadSnapshot(
-        thread_id="thread-1",
+        thread_id=thread_id,
         finding_id=identity.finding_id,
         anchor=thread_anchor,
         original_anchor=ReviewThreadAnchor(path=identity.path, line=line),
@@ -83,10 +96,12 @@ def _snapshot(
         is_outdated=outdated,
         bot_owned=bot_owned,
         has_replies=replies,
-        reviewed_head_sha="head-old",
+        reviewed_head_sha=reviewed_head_sha,
         comments=tuple(comments),
         subject_type="LINE",
         viewer_can_resolve=viewer_can_resolve,
+        resolved_by_viewer_bot=resolved_by_viewer_bot,
+        resolved_by_other_actor=resolved_by_other_actor,
     )
 
 
@@ -123,9 +138,10 @@ def test_finding_identity_is_stable_across_cosmetic_input_and_wording_changes():
     second = FindingIdentity(
         repository=" owner/repo/ ",
         pull_request_number=7,
-        root_cause_id=" cause-1 ",
+        root_cause_id=f" sha256:{hashlib.sha256(b'cause-1').hexdigest()} ",
         path="/src/app.py",
         symbol="  run ",
+        root_cause_id_schema=VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
     )
 
     assert first.finding_id == second.finding_id
@@ -155,6 +171,80 @@ def test_trusted_stable_key_preserves_identity_across_file_move():
 
     assert before.finding_id == after.finding_id
     assert unrelated.finding_id != before.finding_id
+
+
+def test_verified_identity_contract_consumes_exact_upstream_hashes_without_deriving_a_substitute():
+    root_cause_id = f"sha256:{'a' * 64}"
+    trusted_stable_key = f"sha256:{'b' * 64}"
+
+    identity = finding_identity_from_verified_contract({
+        "schema_version": VERIFIED_FINDING_IDENTITY_CONTRACT_VERSION,
+        "root_cause_id_schema": VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
+        "repository": "owner/repo",
+        "pull_request_number": 7,
+        "root_cause_id": root_cause_id,
+        "path": "src/app.py",
+        "symbol": "run",
+        "trusted_stable_key": trusted_stable_key,
+    })
+
+    assert identity.root_cause_id == root_cause_id
+    assert identity.trusted_stable_key == trusted_stable_key
+    assert identity.root_cause_id_schema == VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION
+
+
+@pytest.mark.parametrize(
+    "replacement,error",
+    [
+        ({"schema_version": "unknown-v1"}, "schema_version"),
+        ({"root_cause_id": "model prose"}, "sha256 identity"),
+        ({"root_cause_id": None}, "root_cause_id"),
+        ({"root_cause_id_schema": "unversioned"}, "root_cause_id_schema"),
+        ({"root_cause_id_schema": "verified-root-cause-v2"}, "root_cause_id_schema"),
+        ({"trusted_stable_key": "candidate-1"}, "trusted_stable_key"),
+        ({"mutable_finding_prose": "model wording"}, "unsupported fields"),
+    ],
+)
+def test_verified_identity_contract_fails_closed_on_untrusted_or_malformed_identity(replacement, error):
+    contract = {
+        "schema_version": VERIFIED_FINDING_IDENTITY_CONTRACT_VERSION,
+        "root_cause_id_schema": VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
+        "repository": "owner/repo",
+        "pull_request_number": 7,
+        "root_cause_id": f"sha256:{'a' * 64}",
+        "path": "src/app.py",
+        "trusted_stable_key": f"sha256:{'b' * 64}",
+    }
+    contract.update(replacement)
+
+    with pytest.raises(ValueError, match=error):
+        finding_identity_from_verified_contract(contract)
+
+
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        ({"root_cause_id": "model prose"}, "sha256 identity"),
+        ({"root_cause_id_schema": None}, "root_cause_id_schema"),
+        ({"root_cause_id_schema": "verified-root-cause-v2"}, "root_cause_id_schema"),
+        ({"trusted_stable_key": "candidate-1"}, "trusted_stable_key"),
+        ({"schema_version": "untrusted-lifecycle-v2"}, "schema_version"),
+        ({"pull_request_number": True}, "pull_request_number"),
+        ({"pull_request_number": 1.5}, "pull_request_number"),
+    ],
+)
+def test_direct_finding_identity_constructor_fails_closed_on_unverified_values(overrides, error):
+    kwargs = {
+        "repository": "owner/repo",
+        "pull_request_number": 7,
+        "root_cause_id": f"sha256:{'a' * 64}",
+        "path": "src/app.py",
+        "root_cause_id_schema": VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
+    }
+    kwargs.update(overrides)
+
+    with pytest.raises(ValueError, match=error):
+        FindingIdentity(**kwargs)
 
 
 def test_anchor_canonicalizes_multiline_location_and_preserves_both_sides():
@@ -254,6 +344,178 @@ def test_moved_finding_is_not_duplicated_when_old_thread_cannot_be_resolved():
     assert plan.actions[0].reason == "thread_cannot_be_resolved_safely"
 
 
+@pytest.mark.parametrize("reverse_inventory", [False, True])
+def test_partial_move_recovery_keeps_canonical_replacement_and_resolves_old_thread(reverse_inventory):
+    identity = _identity()
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 20), "finding")
+    old = _snapshot(identity, thread_id="thread-old", line=10, outdated=True, anchor=False)
+    replacement = _snapshot(
+        identity,
+        thread_id="thread-replacement",
+        database_id=20,
+        line=20,
+        body="finding",
+        reviewed_head_sha="head-1",
+        created_at="2026-08-30T12:01:00Z",
+    )
+    inventory = (old, replacement)
+    if reverse_inventory:
+        inventory = tuple(reversed(inventory))
+
+    plan = plan_review_thread_actions((desired,), inventory, "head-1")
+
+    assert [action.kind for action in plan.actions] == [
+        ReviewThreadActionKind.UNCHANGED,
+        ReviewThreadActionKind.RESOLVE,
+    ]
+    assert plan.actions[0].thread_id == "thread-replacement"
+    assert plan.actions[1].thread_id == "thread-old"
+    assert plan.actions[1].depends_on_action_id == plan.actions[0].action_id
+
+    repaired = plan_review_thread_actions(
+        (desired,),
+        (replacement, _snapshot(identity, thread_id="thread-old", resolved=True, outdated=True, anchor=False)),
+        "head-1",
+    )
+    assert [action.kind for action in repaired.actions] == [ReviewThreadActionKind.UNCHANGED]
+
+
+def test_create_succeeds_resolve_goes_stale_then_next_plan_recovers_partial_move():
+    identity = _identity()
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 20), "finding")
+    old = _snapshot(identity, thread_id="thread-old", line=10)
+    first_plan = plan_review_thread_actions((desired,), (old,), "head-1")
+    created = ReviewThreadActionOutcome(
+        kind=ReviewThreadActionKind.CREATE,
+        state=ReviewThreadActionState.APPLIED,
+        expected_head_sha="head-1",
+        current_head_sha="head-1",
+        comment_id=20,
+    )
+    stale_resolve = ReviewThreadActionOutcome(
+        kind=ReviewThreadActionKind.RESOLVE,
+        state=ReviewThreadActionState.STALE_HEAD,
+        expected_head_sha="head-1",
+        current_head_sha="head-2",
+        thread_id="thread-old",
+    )
+
+    first_outcome = execute_review_thread_action_plan(first_plan, _MutationProvider([created, stale_resolve]))
+
+    assert [item.state for item in first_outcome.action_outcomes] == [
+        ReviewThreadActionState.APPLIED,
+        ReviewThreadActionState.STALE_HEAD,
+    ]
+    assert first_outcome.requires_fresh_inventory is True
+
+    replacement = _snapshot(
+        identity,
+        thread_id="thread-replacement",
+        database_id=20,
+        line=20,
+        body="finding",
+        reviewed_head_sha="head-1",
+    )
+    recovery = plan_review_thread_actions((desired,), (old, replacement), "head-2")
+    assert [action.kind for action in recovery.actions] == [
+        ReviewThreadActionKind.UNCHANGED,
+        ReviewThreadActionKind.RESOLVE,
+    ]
+    assert recovery.actions[1].thread_id == "thread-old"
+
+
+def test_two_outdated_safe_copies_create_once_then_resolve_both_dependencies():
+    identity = _identity()
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 30), "finding")
+    old_threads = (
+        _snapshot(identity, thread_id="thread-old-1", outdated=True, anchor=False),
+        _snapshot(identity, thread_id="thread-old-2", database_id=20, outdated=True, anchor=False),
+    )
+
+    plan = plan_review_thread_actions((desired,), old_threads, "head-1")
+
+    assert [action.kind for action in plan.actions] == [
+        ReviewThreadActionKind.CREATE,
+        ReviewThreadActionKind.RESOLVE,
+        ReviewThreadActionKind.RESOLVE,
+    ]
+    assert {action.thread_id for action in plan.actions[1:]} == {"thread-old-1", "thread-old-2"}
+    assert all(action.depends_on_action_id == plan.actions[0].action_id for action in plan.actions[1:])
+
+
+def test_create_failure_blocks_every_dependent_resolve():
+    identity = _identity()
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 30), "finding")
+    plan = plan_review_thread_actions(
+        (desired,),
+        (
+            _snapshot(identity, thread_id="thread-old-1", outdated=True, anchor=False),
+            _snapshot(identity, thread_id="thread-old-2", database_id=20, outdated=True, anchor=False),
+        ),
+        "head-1",
+    )
+    failed_create = ReviewThreadActionOutcome(
+        kind=ReviewThreadActionKind.CREATE,
+        state=ReviewThreadActionState.FAILED,
+        expected_head_sha="head-1",
+        current_head_sha="head-1",
+        failure_kind=ReviewThreadFailureKind.PROVIDER_FAILURE,
+    )
+    provider = _MutationProvider([failed_create])
+
+    outcome = execute_review_thread_action_plan(plan, provider)
+
+    assert [item.state for item in outcome.action_outcomes] == [
+        ReviewThreadActionState.FAILED,
+        ReviewThreadActionState.NOT_EXECUTED,
+        ReviewThreadActionState.NOT_EXECUTED,
+    ]
+    assert [call[0] for call in provider.calls] == ["create"]
+
+
+def test_two_current_same_anchor_copies_fail_closed():
+    identity = _identity()
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 20), "finding")
+
+    plan = plan_review_thread_actions(
+        (desired,),
+        (
+            _snapshot(identity, thread_id="thread-current-1", line=20, body="finding"),
+            _snapshot(identity, thread_id="thread-current-2", database_id=20, line=20, body="finding"),
+        ),
+        "head-1",
+    )
+
+    assert [action.kind for action in plan.actions] == [
+        ReviewThreadActionKind.SKIP,
+        ReviewThreadActionKind.SKIP,
+    ]
+    assert {action.reason for action in plan.actions} == {"duplicate_current_anchor_requires_manual_audit"}
+
+
+def test_human_reply_among_moved_duplicates_is_preserved_while_safe_copy_is_cleaned_up():
+    identity = _identity()
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 30), "finding")
+
+    plan = plan_review_thread_actions(
+        (desired,),
+        (
+            _snapshot(identity, thread_id="thread-safe", outdated=True, anchor=False),
+            _snapshot(identity, thread_id="thread-replied", database_id=20, outdated=True, anchor=False, replies=True),
+        ),
+        "head-1",
+    )
+
+    assert [action.kind for action in plan.actions] == [
+        ReviewThreadActionKind.CREATE,
+        ReviewThreadActionKind.RESOLVE,
+        ReviewThreadActionKind.SKIP,
+    ]
+    assert plan.actions[1].thread_id == "thread-safe"
+    assert plan.actions[2].thread_id == "thread-replied"
+    assert plan.actions[2].reason == "thread_with_human_replies_preserved"
+
+
 def test_resolved_history_does_not_hide_one_active_thread():
     identity = _identity()
     resolved = _snapshot(identity, line=5, resolved=True)
@@ -294,6 +556,110 @@ def test_human_controlled_or_resolved_thread_is_never_mutated(snapshot):
     plan = plan_review_thread_actions((desired,), (snapshot(identity),), "head-1")
 
     assert [action.kind for action in plan.actions] == [ReviewThreadActionKind.SKIP]
+
+
+def test_bot_fixed_marker_history_allows_exactly_one_recurrence():
+    identity = _identity()
+    resolved = _snapshot(
+        identity,
+        resolved=True,
+        body=f"old wording\n\n{FIXED_THREAD_STATE_MARKER}",
+        resolved_by_viewer_bot=True,
+    )
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 20), "returned finding")
+
+    plan = plan_review_thread_actions((desired,), (resolved,), "head-1")
+
+    assert [action.kind for action in plan.actions] == [ReviewThreadActionKind.CREATE]
+    assert plan.actions[0].reason == "finding_reintroduced_after_fixed_marker"
+
+
+def test_authoritative_bot_resolved_reply_free_history_can_recur_without_fixed_marker():
+    identity = _identity()
+    resolved = _snapshot(identity, resolved=True, resolved_by_viewer_bot=True)
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 20), "returned finding")
+
+    plan = plan_review_thread_actions((desired,), (resolved,), "head-1")
+
+    assert [action.kind for action in plan.actions] == [ReviewThreadActionKind.CREATE]
+    assert plan.actions[0].reason == "finding_reintroduced_after_bot_resolution"
+
+
+def test_bot_resolved_history_with_human_reply_does_not_recur():
+    identity = _identity()
+    resolved = _snapshot(identity, resolved=True, resolved_by_viewer_bot=True, replies=True)
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 20), "returned finding")
+
+    plan = plan_review_thread_actions((desired,), (resolved,), "head-1")
+
+    assert [action.kind for action in plan.actions] == [ReviewThreadActionKind.SKIP]
+
+
+@pytest.mark.parametrize(
+    "resolver_kwargs",
+    [
+        {},
+        {"resolved_by_other_actor": True},
+        {"resolved_by_other_actor": True, "body": f"old wording\n\n{FIXED_THREAD_STATE_MARKER}"},
+    ],
+)
+def test_human_or_unknown_resolution_stays_untouched(resolver_kwargs):
+    identity = _identity()
+    resolved = _snapshot(identity, resolved=True, **resolver_kwargs)
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 20), "returned finding")
+
+    plan = plan_review_thread_actions((desired,), (resolved,), "head-1")
+
+    assert [action.kind for action in plan.actions] == [ReviewThreadActionKind.SKIP]
+    assert plan.actions[0].reason == "human_or_unknown_resolution_preserved"
+
+
+def test_any_human_resolved_history_blocks_automatic_recurrence():
+    identity = _identity()
+    bot_history = _snapshot(
+        identity,
+        thread_id="thread-bot-history",
+        resolved=True,
+        resolved_by_viewer_bot=True,
+        created_at="2026-08-30T12:01:00Z",
+    )
+    human_history = _snapshot(
+        identity,
+        thread_id="thread-human-history",
+        database_id=20,
+        resolved=True,
+        resolved_by_other_actor=True,
+        created_at="2026-08-30T12:00:00Z",
+    )
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 20), "returned finding")
+
+    plan = plan_review_thread_actions((desired,), (human_history, bot_history), "head-1")
+
+    assert [action.kind for action in plan.actions] == [ReviewThreadActionKind.SKIP]
+
+
+def test_active_recurrence_wins_over_resolved_history_and_does_not_create_again():
+    identity = _identity()
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 20), "returned finding")
+    resolved = _snapshot(
+        identity,
+        thread_id="thread-history",
+        resolved=True,
+        resolved_by_viewer_bot=True,
+    )
+    recurrence = _snapshot(
+        identity,
+        thread_id="thread-recurrence",
+        database_id=20,
+        line=20,
+        body="returned finding",
+        reviewed_head_sha="head-1",
+    )
+
+    plan = plan_review_thread_actions((desired,), (resolved, recurrence), "head-1")
+
+    assert [action.kind for action in plan.actions] == [ReviewThreadActionKind.UNCHANGED]
+    assert plan.actions[0].thread_id == "thread-recurrence"
 
 
 def test_obsolete_mutation_requires_authoritative_absence():
@@ -367,6 +733,101 @@ def test_executor_enforces_create_before_resolve_and_emits_deduplicated_fallback
         existing_summary_bodies=(existing_body,),
     )
     assert repeated.summary_fallbacks == ()
+
+
+def test_post_create_head_change_blocks_cleanup_and_requires_fresh_inventory():
+    identity = _identity()
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 20), "finding")
+    plan = plan_review_thread_actions((desired,), (_snapshot(identity),), "head-1")
+    created_on_stale_inventory = ReviewThreadActionOutcome(
+        kind=ReviewThreadActionKind.CREATE,
+        state=ReviewThreadActionState.APPLIED_REQUIRES_REFRESH,
+        expected_head_sha="head-1",
+        current_head_sha="head-2",
+        comment_id=77,
+        reason="pull_request_head_changed_after_mutation",
+        mutation_attempted=True,
+        mutation_result_ambiguous=True,
+    )
+    provider = _MutationProvider([created_on_stale_inventory])
+
+    outcome = execute_review_thread_action_plan(plan, provider)
+
+    assert outcome.complete is False
+    assert outcome.requires_fresh_inventory is True
+    assert [item.state for item in outcome.action_outcomes] == [
+        ReviewThreadActionState.APPLIED_REQUIRES_REFRESH,
+        ReviewThreadActionState.NOT_EXECUTED,
+    ]
+    assert outcome.action_outcomes[1].reason == "fresh_inventory_required"
+    assert [call[0] for call in provider.calls] == ["create"]
+
+
+def test_rate_limited_create_requires_inventory_refresh_without_duplicate_fallback_or_cleanup():
+    identity = _identity()
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 20), "finding")
+    plan = plan_review_thread_actions((desired,), (_snapshot(identity),), "head-1")
+    rate_limited = ReviewThreadActionOutcome(
+        kind=ReviewThreadActionKind.CREATE,
+        state=ReviewThreadActionState.FAILED,
+        expected_head_sha="head-1",
+        current_head_sha="head-1",
+        failure_kind=ReviewThreadFailureKind.RATE_LIMITED,
+        retry_after_seconds=60,
+        retry_source="retry-after",
+        mutation_attempted=True,
+        mutation_result_ambiguous=True,
+    )
+    provider = _MutationProvider([rate_limited])
+
+    outcome = execute_review_thread_action_plan(plan, provider)
+
+    assert outcome.requires_fresh_inventory is True
+    assert outcome.action_outcomes[0].retryable is True
+    assert outcome.action_outcomes[0].retry_requires_fresh_inventory is True
+    assert outcome.summary_fallbacks == ()
+    assert outcome.action_outcomes[1].state == ReviewThreadActionState.NOT_EXECUTED
+    assert outcome.action_outcomes[1].reason == "fresh_inventory_required"
+    assert [call[0] for call in provider.calls] == ["create"]
+
+
+def test_ambiguous_provider_failure_create_requires_inventory_before_fallback_or_cleanup():
+    identity = _identity()
+    desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 20), "finding")
+    plan = plan_review_thread_actions((desired,), (_snapshot(identity),), "head-1")
+    ambiguous_failure = ReviewThreadActionOutcome(
+        kind=ReviewThreadActionKind.CREATE,
+        state=ReviewThreadActionState.FAILED,
+        expected_head_sha="head-1",
+        current_head_sha="head-1",
+        failure_kind=ReviewThreadFailureKind.PROVIDER_FAILURE,
+        reason="create_failed: response lost after send",
+        mutation_attempted=True,
+        mutation_result_ambiguous=True,
+    )
+
+    outcome = execute_review_thread_action_plan(plan, _MutationProvider([ambiguous_failure]))
+
+    assert outcome.requires_fresh_inventory is True
+    assert outcome.summary_fallbacks == ()
+    assert outcome.action_outcomes[1].state == ReviewThreadActionState.NOT_EXECUTED
+    assert outcome.action_outcomes[1].reason == "fresh_inventory_required"
+
+
+def test_applied_rate_limit_signal_requires_refresh_but_is_not_retryable():
+    outcome = ReviewThreadActionOutcome(
+        kind=ReviewThreadActionKind.CREATE,
+        state=ReviewThreadActionState.APPLIED_REQUIRES_REFRESH,
+        expected_head_sha="head-1",
+        current_head_sha=None,
+        failure_kind=ReviewThreadFailureKind.RATE_LIMITED,
+        mutation_attempted=True,
+        mutation_result_ambiguous=True,
+    )
+
+    assert outcome.requires_fresh_inventory is True
+    assert outcome.retryable is False
+    assert outcome.retry_requires_fresh_inventory is False
 
 
 def test_executor_returns_invalid_location_fallback_contract_without_provider_call():
