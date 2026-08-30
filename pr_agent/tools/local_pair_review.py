@@ -19,6 +19,7 @@ from pr_agent.algo.review_snapshot import (CoverageIssue, ReviewEvent,
                                            ReviewResultState, ReviewSnapshot,
                                            ReviewSnapshotResult, finding_count)
 from pr_agent.config_loader import get_settings
+from pr_agent.git_providers.diff_parsing import to_hunk_only_patch
 from pr_agent.git_providers.plain_diff_provider import parse_plain_diff
 
 
@@ -398,6 +399,17 @@ class LocalPairReview:
             captured_diff = verified_diff
 
         parsed_files = parse_plain_diff(captured_diff) if captured_diff.strip() else []
+        reviewable_files = []
+        metadata_only_paths = set()
+        for item in parsed_files:
+            if to_hunk_only_patch(item.patch).strip():
+                reviewable_files.append(item)
+                continue
+            for path in (getattr(item, "filename", None), getattr(item, "old_filename", None)):
+                if path:
+                    metadata_only_paths.add(path)
+                    add_coverage(path, "metadata_only_diff")
+        parsed_files = reviewable_files
         parsed_paths = {
             path
             for item in parsed_files
@@ -405,7 +417,7 @@ class LocalPairReview:
             if path
         }
         expected_paths = set(selected_tracked) | set(selected_untracked)
-        for missing_path in sorted(expected_paths - parsed_paths):
+        for missing_path in sorted(expected_paths - parsed_paths - metadata_only_paths):
             add_coverage(missing_path, "binary_or_unparseable_diff")
 
         # Serializing the already parsed objects is the narrow reuse seam: the

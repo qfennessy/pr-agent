@@ -87,11 +87,12 @@ def test_worktree_snapshot_captures_modified_untracked_deleted_and_renamed_files
     snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
     parsed = {item.filename: item for item in parse_plain_diff(snapshot.diff)}
 
-    assert {"tracked.py", "new.py", "deleted.py", "renamed.py"}.issubset(set(snapshot.changed_paths))
+    assert {"tracked.py", "new.py", "deleted.py"}.issubset(set(snapshot.changed_paths))
+    assert "renamed.py" not in snapshot.changed_paths
     assert parsed["new.py"].edit_type.name == "ADDED"
     assert parsed["deleted.py"].edit_type.name == "DELETED"
-    assert parsed["renamed.py"].edit_type.name == "RENAMED"
-    assert parsed["renamed.py"].old_filename == "rename_me.py"
+    assert CoverageIssue(path="rename_me.py", reason="metadata_only_diff") in snapshot.coverage_issues
+    assert CoverageIssue(path="renamed.py", reason="metadata_only_diff") in snapshot.coverage_issues
 
 
 def test_worktree_snapshot_round_trips_non_ascii_git_path(tmp_path):
@@ -107,6 +108,19 @@ def test_worktree_snapshot_round_trips_non_ascii_git_path(tmp_path):
     assert snapshot.changed_paths == ("café.py",)
     assert snapshot.coverage_issues == ()
     assert "café.py" in snapshot.diff
+
+
+def test_mixed_review_reports_metadata_only_path_as_unavailable(tmp_path):
+    repo = _repo(tmp_path, "mixed-metadata")
+    (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+    mode_only = repo / "rename_me.py"
+    mode_only.chmod(mode_only.stat().st_mode | stat.S_IXUSR)
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert snapshot.changed_paths == ("tracked.py",)
+    assert CoverageIssue(path="rename_me.py", reason="metadata_only_diff") in snapshot.coverage_issues
+    assert "@@" in snapshot.diff
 
 
 def test_pre_commit_snapshot_uses_only_the_index(tmp_path):

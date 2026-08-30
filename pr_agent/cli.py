@@ -311,7 +311,6 @@ def _reject_existing_repository_outputs(
             or (
                 exists
                 and not lexical_worktree
-                and not lexical_metadata
                 and _is_hard_linked_to_repository(lexical, repository_root, git_metadata_root)
             )
         ):
