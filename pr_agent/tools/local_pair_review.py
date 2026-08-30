@@ -19,7 +19,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
-from pr_agent.algo.git_patch_processing import RE_HUNK_HEADER
+from pr_agent.algo.git_patch_processing import RE_HUNK_HEADER, iter_git_patch_lines
 from pr_agent.algo.review_snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
     CoverageIssue,
@@ -234,23 +234,11 @@ def _copy_similarity_probes(content: bytes) -> frozenset[int]:
     return frozenset(selected)
 
 
-def _iter_git_patch_lines(patch: str) -> Iterable[str]:
-    """Yield Git's LF-delimited patch records while preserving every other byte."""
-    start = 0
-    while start < len(patch):
-        end = patch.find("\n", start)
-        if end < 0:
-            yield patch[start:]
-            return
-        yield patch[start:end + 1]
-        start = end + 1
-
-
 def _patch_has_only_deletions(patch: str) -> bool:
     inside_hunk = False
     has_addition = False
     has_deletion = False
-    for line in _iter_git_patch_lines(patch):
+    for line in iter_git_patch_lines(patch):
         if RE_HUNK_HEADER.match(line):
             inside_hunk = True
             continue
@@ -277,7 +265,7 @@ def _patch_model_visible_regions(patch: str) -> tuple[bytes, ...]:
                     "".join(region).encode("utf-8", errors="surrogateescape")
                 )
 
-    for line in _iter_git_patch_lines(patch):
+    for line in iter_git_patch_lines(patch):
         hunk_match = RE_HUNK_HEADER.match(line)
         if hunk_match:
             flush_hunk()
@@ -1901,7 +1889,7 @@ def _findings_match_snapshot(
             continue
         lines = changed_lines.setdefault(filename, set())
         new_line = None
-        for patch_line in _iter_git_patch_lines(item.patch):
+        for patch_line in iter_git_patch_lines(item.patch):
             hunk_match = RE_HUNK_HEADER.match(patch_line)
             if hunk_match:
                 new_line = int(hunk_match.group(3))

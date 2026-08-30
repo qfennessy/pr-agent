@@ -1084,6 +1084,58 @@ def test_rename_copy_edits_scope_provenance_to_captured_group_patch(
     )
 
 
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+@pytest.mark.parametrize("change_kind", ["rename", "copy"])
+@pytest.mark.parametrize("unicode_separator", ["\u0085", "\u2028", "\u2029"])
+def test_metadata_only_rename_copy_with_unicode_separator_path_is_not_a_fake_hunk(
+    event, change_kind, unicode_separator, tmp_path
+):
+    repo = _repo(
+        tmp_path,
+        f"metadata-{change_kind}-{event}-{ord(unicode_separator)}-path",
+    )
+    source_name = "feature.py"
+    source = repo / source_name
+    source.write_text("FEATURE_FLAG=disabled\n", encoding="utf-8")
+    _git(repo, "add", source_name)
+    _git(repo, "commit", "-m", "add metadata path fixture")
+    destination_name = (
+        f"destination{unicode_separator}@@ -1 +1 @@ fake.py"
+    )
+    destination = repo / destination_name
+    if change_kind == "rename":
+        _git(repo, "mv", source_name, destination_name)
+    else:
+        destination.write_bytes(source.read_bytes())
+        _git(repo, "add", destination_name)
+
+    reviewer = LocalPairReview(str(repo))
+    review_event = ReviewEvent.parse(event)
+    focus_path = destination_name if review_event is ReviewEvent.FILE_SAVE else None
+    groups = reviewer._tracked_path_groups(
+        review_event,
+        _git(repo, "rev-parse", "HEAD"),
+        focus_path,
+    )
+    expected_status = "R100" if change_kind == "rename" else "C100"
+    assert groups is not None
+    assert any(
+        status == expected_status and group == (source_name, destination_name)
+        for _stage, status, group in groups
+    )
+
+    snapshot = reviewer.capture(event=event, focus_path=focus_path)
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(
+        path=source_name, reason="metadata_only_diff"
+    ) in snapshot.coverage_issues
+    assert CoverageIssue(
+        path=destination_name, reason="metadata_only_diff"
+    ) in snapshot.coverage_issues
+
+
 @pytest.mark.parametrize("change_kind", ["rename", "copy"])
 def test_metadata_only_staged_group_does_not_suppress_safe_worktree_edit(
     change_kind, tmp_path
