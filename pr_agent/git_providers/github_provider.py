@@ -180,7 +180,11 @@ class GithubProvider(GitProvider):
         if not self.pr_commits:
             self.pr_commits = list(self.pr.get_commits())
 
-        self.previous_review = self.get_previous_review(full=True, incremental=True)
+        self.previous_review = self.get_previous_review(
+            full=True,
+            incremental=True,
+            review_profile=self.incremental.review_profile,
+        )
         if self.previous_review:
             self.incremental.commits_range = self.get_commit_range()
             # Get all files changed during the commit range
@@ -206,12 +210,16 @@ class GithubProvider(GitProvider):
                 break
         return self.pr_commits[first_new_commit_index:] if first_new_commit_index is not None else []
 
-    def get_previous_review(self, *, full: bool, incremental: bool):
+    def get_previous_review(self, *, full: bool, incremental: bool, review_profile: str = "full"):
         if not (full or incremental):
             raise ValueError("At least one of full or incremental must be True")
         if not getattr(self, "comments", None):
             self.comments = list(self.pr.get_issue_comments())
-        identifiers = get_pr_review_comment_identifiers(full=full, incremental=incremental)
+        identifiers = get_pr_review_comment_identifiers(
+            full=full,
+            incremental=incremental,
+            review_profile=review_profile,
+        )
         for index in range(len(self.comments) - 1, -1, -1):
             if is_own_persistent_comment_for_identities(self.comments[index].body, identifiers):
                 return self.comments[index]

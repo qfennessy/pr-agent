@@ -414,7 +414,7 @@ class GitLabProvider(GitProvider):
         return True
 
     def supports_incremental_kind(self, kind: str) -> bool:
-        return kind in self._INCREMENTAL_ANCHOR_PREFIXES
+        return kind == "review" or kind in self._INCREMENTAL_ANCHOR_PREFIXES
 
     def _get_project_path_from_pr_or_issue_url(self, pr_or_issue_url: str) -> str:
         repo_project_path = None
@@ -482,7 +482,6 @@ class GitLabProvider(GitProvider):
     )
     _SUGGESTIONS_LEGACY_ANCHORS = (PRCodeSuggestionsHeader.SUMMARY.value,)
     _INCREMENTAL_ANCHOR_PREFIXES = {
-        "review": get_pr_review_comment_identifiers(full=True, incremental=True),
         "suggestions": _SUGGESTIONS_STABLE_ANCHORS + _SUGGESTIONS_LEGACY_ANCHORS,
     }
 
@@ -513,7 +512,15 @@ class GitLabProvider(GitProvider):
             self.mr_commits = list(self.mr.commits())[::-1]
 
         kind = getattr(self, '_incremental_kind', 'review')
-        prefixes = self._INCREMENTAL_ANCHOR_PREFIXES.get(kind, ())
+        prefixes = (
+            get_pr_review_comment_identifiers(
+                full=True,
+                incremental=True,
+                review_profile=self.incremental.review_profile,
+            )
+            if kind == "review"
+            else self._INCREMENTAL_ANCHOR_PREFIXES.get(kind, ())
+        )
         self.previous_review = (
             self._find_anchor_note(prefixes, prefer_latest_activity=kind == "suggestions")
             if prefixes
@@ -642,10 +649,14 @@ class GitLabProvider(GitProvider):
                 break
         return self.mr_commits[first_new_commit_index:] if first_new_commit_index is not None else []
 
-    def get_previous_review(self, *, full: bool, incremental: bool):
+    def get_previous_review(self, *, full: bool, incremental: bool, review_profile: str = "full"):
         if not (full or incremental):
             raise ValueError("At least one of full or incremental must be True")
-        identifiers = get_pr_review_comment_identifiers(full=full, incremental=incremental)
+        identifiers = get_pr_review_comment_identifiers(
+            full=full,
+            incremental=incremental,
+            review_profile=review_profile,
+        )
         return self._find_anchor_note(identifiers)
 
     def _find_anchor_note(self, identities, *, prefer_latest_activity: bool = False):

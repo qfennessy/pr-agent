@@ -69,7 +69,15 @@ class PRReviewer:
         """
         self.git_provider = get_git_provider_with_context(pr_url)
         self.args = args
+        configured_profile = str(get_settings().pr_reviewer.get("review_profile", "full")).strip().lower()
+        if configured_profile not in _VALID_REVIEW_PROFILES:
+            get_logger().warning(
+                f"Unknown pr_reviewer.review_profile '{configured_profile}'; falling back to 'full'"
+            )
+            configured_profile = "full"
+        self.review_profile = configured_profile
         self.incremental = self.parse_incremental(args)  # -i command
+        self.incremental.review_profile = self.review_profile
         if self.incremental and self.incremental.is_incremental:
             self.git_provider.get_incremental_commits(self.incremental)
 
@@ -79,13 +87,6 @@ class PRReviewer:
         self.pr_url = pr_url
         self.is_answer = is_answer
         self.is_auto = is_auto
-        configured_profile = str(get_settings().pr_reviewer.get("review_profile", "full")).strip().lower()
-        if configured_profile not in _VALID_REVIEW_PROFILES:
-            get_logger().warning(
-                f"Unknown pr_reviewer.review_profile '{configured_profile}'; falling back to 'full'"
-            )
-            configured_profile = "full"
-        self.review_profile = configured_profile
 
         if self.is_answer and not self.git_provider.is_supported("get_issue_comments"):
             raise Exception(f"Answer mode is not supported for {get_settings().config.git_provider} for now")

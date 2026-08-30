@@ -149,17 +149,16 @@ def comment_matches_any_identity(body: str, identities: Iterable[str]) -> bool:
     return any(comment_matches_identity(body, identity) for identity in identities)
 
 
-def get_pr_review_comment_identifiers(*, full: bool, incremental: bool) -> tuple[str, ...]:
+def get_pr_review_comment_identifiers(
+        *, full: bool, incremental: bool, review_profile: str = "full") -> tuple[str, ...]:
     """Return stable markers followed by legacy visible prefixes for migration."""
     identifiers = []
     if full:
         identifiers.extend((PRReviewIdentity.REGULAR.value, PRReviewHeader.REGULAR.value))
     if incremental:
-        identifiers.extend((
-            PRReviewIdentity.BUGS_ONLY.value,
-            PRReviewIdentity.INCREMENTAL.value,
-            PRReviewHeader.INCREMENTAL.value,
-        ))
+        if review_profile == "bugs_only":
+            identifiers.append(PRReviewIdentity.BUGS_ONLY.value)
+        identifiers.extend((PRReviewIdentity.INCREMENTAL.value, PRReviewHeader.INCREMENTAL.value))
     return tuple(identifiers)
 
 

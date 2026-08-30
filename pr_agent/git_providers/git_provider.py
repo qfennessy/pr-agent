@@ -817,8 +817,9 @@ def get_main_pr_language(languages, files) -> str:
 
 
 class IncrementalPR:
-    def __init__(self, is_incremental: bool = False):
+    def __init__(self, is_incremental: bool = False, review_profile: str = "full"):
         self.is_incremental = is_incremental
+        self.review_profile = review_profile
         self.commits_range = None
         self.first_new_commit = None
         self.last_seen_commit = None
