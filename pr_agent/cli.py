@@ -19,6 +19,7 @@ from pr_agent.algo.ai_handlers.litellm_helpers import (
     drain_litellm_callbacks,
     litellm_callbacks_registered,
 )
+from pr_agent.algo.checkpoint_evaluation_cli import run_evaluation_plan
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState
 from pr_agent.algo.run_details import get_run_details
 from pr_agent.algo.skills_loader import get_skills_context, pin_skills_context
@@ -126,7 +127,9 @@ def set_parser():
                         help="Write the result to this file (in addition to stdout)")
     parser.add_argument("--json-output", dest="json_output", type=str, default=None,
                         help="Write the parsed review and token usage to this JSON file")
-    parser.add_argument('command', type=str, help='The', choices=commands + ['review-snapshot'], default='review')
+    parser.add_argument(
+        'command', type=str, help='The', choices=commands + ['review-snapshot', 'evaluation-plan'], default='review'
+    )
     parser.add_argument('rest', nargs=argparse.REMAINDER, default=[])
     return parser
 
@@ -1180,6 +1183,8 @@ def run(inargs=None, args=None):
     _set_invocation_settings(args)
     if args.command == "review-snapshot":
         return _run_review_snapshot(args, parser)
+    if args.command == "evaluation-plan":
+        return run_evaluation_plan(args.rest)
     diff_mode = getattr(args, "stdin", False) or getattr(args, "diff_file", None)
     if getattr(args, "json_output", None) and not diff_mode:
         parser.error("--json-output is only supported in plain-diff mode (--stdin or --diff-file)")

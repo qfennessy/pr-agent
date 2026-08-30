@@ -391,6 +391,14 @@ worktree_idle_seconds = 15
 max_concurrency = 2
 cancel_stale_snapshots = true
 
+[checkpoint_evaluation]
+# Evaluation planning is credential-free. Production replay, shadow recording, and
+# developer-visible output remain disabled until their issue #27 rollout gates pass.
+enabled = false
+allow_paid_execution = false
+shadow_journal_enabled = false
+publish_output = false
+
 [gerrit]
 # endpoint to the gerrit service
 # url = "ssh://gerrit.example.com:29418"
