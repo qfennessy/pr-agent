@@ -76,8 +76,8 @@ The workflow receives these secrets and tokens:
 | --- | --- |
 | `OPENAI_KEY` | Authenticate model requests |
 | `OPENAI_ORG` | Optional OpenAI organization selection |
-| `PINECONE.API_KEY` | Authenticate Pinecone requests |
-| `PINECONE.ENVIRONMENT` | Select the Pinecone environment |
+| `PINECONE_API_KEY` | Exported as `PINECONE.API_KEY` to authenticate Pinecone requests |
+| `PINECONE_ENVIRONMENT` | Exported as `PINECONE.ENVIRONMENT` to select the Pinecone environment |
 | `GITHUB_TOKEN` | Read pull-request data and publish descriptions, reviews, suggestions, and issue updates |
 
 ## Fork synchronization
@@ -91,8 +91,10 @@ sync/upstream-YYYYMMDD-<8-character-sha>
 ```
 
 The generated PR names high-scrutiny paths such as workflows, dependencies, prompts, secret handling, and Docker
-files. `upstream-provenance.yml` independently checks the sync PR's fixed head SHA and metadata using the protected
-base-branch workflow definition. On ordinary PRs, the provenance job reports success without checking out code.
+files. `upstream-provenance.yml` checks the sync PR's fixed head SHA and metadata. Because it runs on `pull_request`,
+GitHub executes the workflow from the PR merge ref rather than guaranteeing the protected base-branch definition.
+A sync PR that changes this workflow can therefore change its own verification logic while retaining the required
+check name. On ordinary PRs, the provenance job reports success without checking out code.
 
 The merge policy and post-merge verification steps are documented in the repository's
 [`FORK-MAINTENANCE.md`](https://github.com/qfennessy/pr-agent/blob/main/FORK-MAINTENANCE.md).
@@ -132,8 +134,10 @@ earlier provider step prevents the later provider steps from running.
 - publishing a GitHub release; or
 - manually dispatching the workflow from `main` with a SemVer 2.0.0 version.
 
-The `prepare` job normalizes both paths to a version, tag, and immutable source SHA. A concurrency group prevents a
-release event and a manual dispatch for the same version from overlapping. The two publishing jobs then:
+The `prepare` job normalizes both paths to a version, tag, and immutable source SHA. The concurrency group prevents a
+release event tagged `vX.Y.Z` and a manual dispatch for `X.Y.Z` from overlapping. Release tags must use the `v` prefix
+for that guarantee; an unprefixed `X.Y.Z` release uses a different group and can overlap the manual path. The two
+publishing jobs then:
 
 - build a Python wheel and source distribution for PyPI; and
 - build twelve Docker targets for `linux/amd64` and `linux/arm64`, push versioned and selected rolling tags, and
@@ -176,6 +180,8 @@ Before treating all CI as comprehensive, account for these boundaries:
   at the cost of duplicate execution.
 - The self-review workflow trusts the moving `qfennessy/pr-agent@main` ref. That is consistent with the fork policy
   only while `main` remains protected and reviewed.
+- The upstream provenance workflow runs from the pull-request merge ref. A sync PR can alter its own verification
+  workflow, so the check name alone does not prove that the protected verifier ran.
 - The publish workflow intentionally permits Docker/repository finalization when PyPI fails. Release operators must
   treat the warning as a partial release and complete the missing registry publication.
 - `.github/release-drafter.yml` still contains categories and version-resolution rules, but no active workflow invokes
