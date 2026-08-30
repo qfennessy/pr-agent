@@ -169,6 +169,8 @@ def _read_stable_regular_file(path: Path, max_bytes: int) -> Optional[bytes]:
             try:
                 os.close(file_descriptor)
             except OSError:
+                # The read is already complete or failing closed; a close error
+                # cannot make the captured bytes acceptable.
                 pass
     before_identity = (
         before.st_dev,
