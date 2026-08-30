@@ -25,6 +25,16 @@ class FakeProvider:
         return {"Python": 100}
 
 
+def test_effective_context_budget_caps_model_limit_without_mutating_settings(monkeypatch):
+    monkeypatch.setattr(pr_processing, "get_max_tokens", lambda model: 32_000)
+
+    assert pr_processing._effective_max_tokens("model", None) == 32_000
+    assert pr_processing._effective_max_tokens("model", 8_000) == 8_000
+    assert pr_processing._effective_max_tokens("model", 64_000) == 32_000
+    with pytest.raises(ValueError, match="positive integer"):
+        pr_processing._effective_max_tokens("model", 0)
+
+
 def test_get_pr_diff_reports_pruned_deletions_separately(monkeypatch):
     provider = FakeProvider([])
     token_handler = FakeTokenHandler(prompt_tokens=100)

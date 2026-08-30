@@ -12,6 +12,7 @@ from pr_agent.algo.run_details import (
     record_ai_call,
     record_model_used,
     record_review_profile,
+    record_review_route,
     record_specialist_result,
     specialist_runs_to_dict,
 )
@@ -73,6 +74,19 @@ def test_record_review_profile_tracks_selected_reviewer_mode():
     record_review_profile("bugs_only")
 
     assert get_run_details().review_profile == "bugs_only"
+
+
+def test_record_review_route_keeps_an_isolated_snapshot():
+    init_run_details()
+    route = {"applied_depth": "deep", "reasons": [{"code": "sensitive"}]}
+
+    record_review_route(route)
+    route["reasons"][0]["code"] = "mutated"
+
+    assert get_run_details().review_route == {
+        "applied_depth": "deep",
+        "reasons": [{"code": "sensitive"}],
+    }
 
 
 def test_fallback_flag_is_sticky_once_a_fallback_was_used():

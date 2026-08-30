@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
@@ -13,8 +14,11 @@ from pr_agent.algo.review_router import (
     ReviewRouteRequest,
     ReviewRouterPolicy,
     SensitiveCategory,
+    load_review_routing_configuration,
+    review_route_decision_to_dict,
     route_review,
 )
+from pr_agent.config_loader import get_settings
 
 
 def _file(
@@ -58,6 +62,99 @@ def _policy(**overrides) -> ReviewRouterPolicy:
 
 def _codes(decision) -> list[str]:
     return [reason.code for reason in decision.reasons]
+
+
+def _configuration(**overrides):
+    section = {
+        "enabled": True,
+        "requested_depth": "auto",
+        "profiles": {
+            "quick": {"context_tokens": 8_000, "model_route": "weak"},
+            "standard": {"context_tokens": 24_000, "model_route": "regular"},
+            "deep": {"context_tokens": 32_000, "model_route": "reasoning"},
+        },
+    }
+    section.update(overrides)
+    return section
+
+
+def test_runtime_configuration_loads_all_named_profiles_and_sensitive_categories():
+    configuration = load_review_routing_configuration(_configuration(
+        consume_specialist_escalation=True,
+        specialist_escalation_depth="deep",
+        sensitive_categories=[{
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": ["authorization"],
+        }],
+    ))
+
+    decision = route_review(
+        ReviewRouteRequest(
+            files=(_file("services/auth/guard.py"),),
+            labels=(),
+            requested_depth=configuration.requested_depth,
+        ),
+        configuration.policy,
+    )
+
+    assert configuration.enabled is True
+    assert configuration.consume_specialist_escalation is True
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.applied_budget.context_tokens == 32_000
+    assert decision.matched_sensitive_categories == ("authorization",)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"profiles": {"quick": {}, "standard": {}, "deep": {}, "unknown": {}}},
+        {"profiles": {"quick": {"model_route": "provider-specific"}, "standard": {}, "deep": {}}},
+        {"specialist_escalation_depth": "quick"},
+        {"unknown_key": True},
+    ],
+)
+def test_runtime_configuration_errors_fail_closed_with_operational_deep_budget(override):
+    configuration = load_review_routing_configuration(_configuration(**override))
+
+    decision = route_review(_request(_file("docs/guide.md")), configuration.policy)
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.policy_valid is False
+    assert decision.applied_budget.model_route == "reasoning"
+    assert decision.applied_budget.context_tokens == 32_000
+    assert decision.policy_errors
+
+
+def test_missing_or_disabled_runtime_configuration_preserves_legacy_policy():
+    assert load_review_routing_configuration(None).enabled is False
+    assert load_review_routing_configuration({"enabled": False}).policy is None
+
+
+def test_repository_default_profiles_form_a_valid_enabled_policy():
+    section = deepcopy(dict(get_settings().review_depth))
+    section["enabled"] = True
+
+    configuration = load_review_routing_configuration(section)
+    decision = route_review(_request(_file("docs/guide.md")), configuration.policy)
+
+    assert configuration.enabled is True
+    assert decision.policy_valid is True
+    assert decision.applied_depth is ReviewDepth.QUICK
+
+
+def test_route_serialization_preserves_ordered_reasons_and_all_budget_fields():
+    decision = route_review(
+        _request(_file("package-lock.json")),
+        _policy(standard=ReviewBudgetPolicy(context_tokens=12_000, max_findings=4)),
+    )
+
+    serialized = review_route_decision_to_dict(decision)
+
+    assert [reason["code"] for reason in serialized["reasons"]] == _codes(decision)
+    assert serialized["applied_depth"] == "standard"
+    assert serialized["applied_budget"]["context_tokens"] == 12_000
+    assert serialized["applied_budget"]["max_findings"] == 4
 
 
 def test_router_inputs_and_outputs_are_immutable():

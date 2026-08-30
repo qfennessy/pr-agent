@@ -2,13 +2,15 @@ import copy
 import datetime
 import json
 import re
+from dataclasses import replace
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 from jinja2 import Environment, StrictUndefined
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.ai_request_context import AIModelRoute
 from pr_agent.algo.inline_comment_dedup import (
     InlineCommentStore, can_verify_inline_comment_publication,
     get_inline_comment_store, key_issue_body_with_markers,
@@ -18,22 +20,42 @@ from pr_agent.algo.pr_processing import (PRDiffCoverage,
                                          get_pr_diff,
                                          retry_with_fallback_models)
 from pr_agent.algo.repo_context import build_repo_context
+from pr_agent.algo.review_router import (
+    ChangedFile,
+    ChangeKind,
+    ReviewDepthEscalation,
+    ReviewRouteDecision,
+    ReviewRouteRequest,
+    ReviewRoutingConfiguration,
+    load_review_routing_configuration,
+    review_route_decision_to_dict,
+    route_review,
+)
 from pr_agent.algo.review_specialists import (
+    SPECIALIST_BATCH_SCHEMA_VERSION,
+    RoleExecution,
+    SpecialistBatchResult,
+    SpecialistRole,
+    SpecialistState,
     build_specialist_input,
     get_specialist_snapshot_context,
     load_specialist_pipeline_config,
     run_shadow_specialists,
     specialists_enabled,
     unavailable_specialist_batch,
+    validate_specialist_output,
 )
 from pr_agent.algo.run_details import (get_run_details, init_run_details,
-                                       record_review_profile)
+                                       record_review_profile,
+                                       record_review_route)
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.token_handler import TokenHandler
+from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.algo.utils import (ModelType, PRReviewHeader, PRReviewIdentity,
                                  add_pr_review_identity,
-                                 convert_to_markdown_v2, github_action_output,
-                                 load_yaml, show_relevant_configurations,
+                                 convert_to_markdown_v2, get_model,
+                                 github_action_output, load_yaml,
+                                 show_relevant_configurations,
                                  show_run_details)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider_with_context
@@ -107,6 +129,14 @@ class PRReviewer:
         self.prediction = None
         self.specialist_shadow_result = None
         self._specialists_started = False
+        self.review_routing_configuration = None
+        self.review_route_request = None
+        self.review_route_decision = None
+        self._review_context_tokens = None
+        self._review_max_findings = None
+        self._review_max_verification_candidates = None
+        self._review_max_published_findings = None
+        self._review_shadow_only = False
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
             self.git_provider.get_pr_description(split_changes_walkthrough=True))
@@ -147,6 +177,7 @@ class PRReviewer:
             "diff": "",  # empty diff for initial calculation
             "num_pr_files": self.git_provider.get_num_of_files(),
             "num_max_findings": get_settings().pr_reviewer.num_max_findings,
+            "publication_threshold": "none",
             "bugs_only": bugs_only,
             "require_score": not bugs_only and get_settings().pr_reviewer.require_score_review,
             "require_tests": not bugs_only and get_settings().pr_reviewer.require_tests_review,
@@ -206,6 +237,10 @@ class PRReviewer:
                 if not can_run and self.incremental.is_incremental:
                     return None
 
+            self._prepare_review_route()
+            if self._specialist_escalation_consumption_enabled():
+                await self._run_guarded_specialist_escalation()
+
             # if isinstance(self.args, list) and self.args and self.args[0] == 'auto_approve':
             #     get_logger().info(f'Auto approve flow PR: {self.pr_url} ...')
             #     self.auto_approve_logic()
@@ -237,7 +272,15 @@ class PRReviewer:
             if get_settings().config.publish_output and not get_settings().config.get('is_auto_command', False):
                 progress_response = self.git_provider.publish_comment("Preparing review...", is_temporary=True)
 
-            await retry_with_fallback_models(self._prepare_prediction, model_type=ModelType.REGULAR)
+            model_route = self._review_model_route()
+            if model_route is None:
+                await retry_with_fallback_models(self._prepare_prediction, model_type=ModelType.REGULAR)
+            else:
+                await retry_with_fallback_models(
+                    self._prepare_prediction,
+                    model_type=ModelType.REGULAR,
+                    model_route=model_route,
+                )
             if not self.prediction:
                 return None
 
@@ -315,6 +358,8 @@ class PRReviewer:
                     get_logger().exception(f"Failed to publish review failure result, error: {e}")
 
     def _should_publish_review_no_suggestions(self, pr_review: str) -> bool:
+        if getattr(self, "_review_shadow_only", False):
+            return False
         if self._review_profile() == "bugs_only":
             return bool(pr_review.strip())
         return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
@@ -322,6 +367,300 @@ class PRReviewer:
     def _review_profile(self) -> str:
         """Return the selected profile, defaulting legacy/test instances to full review."""
         return getattr(self, "review_profile", "full")
+
+    def _routing_configuration(self) -> ReviewRoutingConfiguration:
+        configuration = getattr(self, "review_routing_configuration", None)
+        if configuration is None:
+            configuration = load_review_routing_configuration(
+                get_settings().get("review_depth", None)
+            )
+            self.review_routing_configuration = configuration
+        return configuration
+
+    def _prepare_review_route(self) -> ReviewRouteDecision:
+        """Select and apply deterministic depth before any review model call."""
+
+        configuration = self._routing_configuration()
+        if configuration.enabled:
+            try:
+                files = tuple(
+                    self._changed_file_for_routing(file)
+                    for file in (self.git_provider.get_diff_files() or [])
+                )
+            except Exception as exc:
+                # Provider metadata is routing evidence, not a reason to abort the
+                # review. An empty immutable snapshot records the missing input and
+                # prevents the router from selecting quick.
+                files = ()
+                get_logger().warning(
+                    "Review-depth routing could not read changed-file metadata",
+                    artifact={"error_class": type(exc).__name__},
+                )
+            labels = self._labels_for_routing()
+        else:
+            # Preserve legacy provider behavior: disabled routing performs no new
+            # label or diff metadata calls and inherits the ordinary review budget.
+            files = ()
+            labels = None
+        request = ReviewRouteRequest(
+            files=files,
+            requested_depth=configuration.requested_depth,
+            review_profile=self._review_profile(),
+            labels=labels,
+        )
+        self.review_route_request = request
+        decision = route_review(request, configuration.policy)
+        self._apply_review_route(decision)
+        return decision
+
+    @staticmethod
+    def _changed_file_for_routing(file: Any) -> ChangedFile:
+        edit_type = getattr(file, "edit_type", EDIT_TYPE.UNKNOWN)
+        kind = {
+            EDIT_TYPE.ADDED: ChangeKind.ADDED,
+            EDIT_TYPE.DELETED: ChangeKind.DELETED,
+            EDIT_TYPE.MODIFIED: ChangeKind.MODIFIED,
+            EDIT_TYPE.RENAMED: ChangeKind.RENAMED,
+            EDIT_TYPE.UNKNOWN: ChangeKind.UNKNOWN,
+        }.get(edit_type, ChangeKind.UNKNOWN)
+        filename = getattr(file, "filename", None)
+        old_filename = getattr(file, "old_filename", None)
+        if kind is ChangeKind.DELETED:
+            old_path, new_path = filename, None
+        elif kind is ChangeKind.RENAMED:
+            old_path, new_path = old_filename, filename
+        else:
+            old_path, new_path = None, filename
+
+        def line_count(name: str) -> int | None:
+            value = getattr(file, name, None)
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+        return ChangedFile(
+            new_path=new_path,
+            old_path=old_path,
+            kind=kind,
+            additions=line_count("num_plus_lines"),
+            deletions=line_count("num_minus_lines"),
+            generated=None,
+        )
+
+    def _labels_for_routing(self) -> tuple[str, ...] | None:
+        try:
+            if not self.git_provider.is_supported("get_labels"):
+                return None
+            labels = self.git_provider.get_pr_labels()
+        except Exception as exc:
+            get_logger().warning(
+                "Review-depth routing could not read pull-request labels",
+                artifact={"error_class": type(exc).__name__},
+            )
+            return None
+        if labels is None:
+            return None
+        if not isinstance(labels, (list, tuple)):
+            return (labels,)
+        return tuple(labels)
+
+    def _apply_review_route(self, decision: ReviewRouteDecision) -> None:
+        self.review_route_decision = decision
+        budget = decision.applied_budget
+        self._review_context_tokens = budget.context_tokens if decision.routing_enabled else None
+        self._review_max_findings = budget.max_findings if decision.routing_enabled else None
+        self._review_max_verification_candidates = (
+            budget.max_verification_candidates if decision.routing_enabled else None
+        )
+        self._review_max_published_findings = (
+            budget.max_published_findings if decision.routing_enabled else None
+        )
+        self._review_shadow_only = bool(decision.routing_enabled and budget.shadow_only is True)
+        if hasattr(self, "vars"):
+            self.vars["num_max_findings"] = (
+                budget.max_findings
+                if decision.routing_enabled and budget.max_findings is not None
+                else get_settings().pr_reviewer.num_max_findings
+            )
+            self.vars["publication_threshold"] = (
+                budget.publication_threshold
+                if decision.routing_enabled and budget.publication_threshold is not None
+                else "none"
+            )
+            self.vars["max_verification_candidates"] = self._review_max_verification_candidates
+        serialized = review_route_decision_to_dict(decision)
+        record_review_route(serialized)
+        get_logger().info(
+            "Review depth selected",
+            artifact={
+                "requested_depth": decision.requested_depth,
+                "applied_depth": decision.applied_depth.value,
+                "reason_codes": [reason.code for reason in decision.reasons],
+                "policy_version": decision.policy_version,
+            },
+        )
+
+    def _specialist_escalation_consumption_enabled(self) -> bool:
+        configuration = self._routing_configuration()
+        return bool(configuration.enabled and configuration.consume_specialist_escalation)
+
+    async def _run_guarded_specialist_escalation(self) -> None:
+        """Consume only a validated upward-only risk record behind an explicit gate."""
+
+        if specialists_enabled():
+            await self._run_shadow_specialists_once()
+            escalation = self._validated_specialist_escalation()
+        else:
+            escalation = ReviewDepthEscalation(
+                source="specialist:risk_recommendation",
+                minimum_depth=None,
+                reasons=(),
+                available=False,
+            )
+        if escalation is None:
+            return
+        request = replace(self.review_route_request, escalation=escalation)
+        self.review_route_request = request
+        self._apply_review_route(route_review(request, self._routing_configuration().policy))
+
+    def _validated_specialist_escalation(self) -> ReviewDepthEscalation | None:
+        result = getattr(self, "specialist_shadow_result", None)
+        pipeline = getattr(self, "_specialist_pipeline", None)
+        specialist_input = getattr(self, "_specialist_input", None)
+        source = "specialist:risk_recommendation"
+        unavailable = ReviewDepthEscalation(
+            source=source,
+            minimum_depth=None,
+            reasons=(),
+            available=False,
+        )
+        invalid = ReviewDepthEscalation(
+            source=source,
+            minimum_depth=None,
+            reasons=("validated_contract_invalid",),
+            available=True,
+        )
+        if result is None:
+            return unavailable
+        if not isinstance(result, SpecialistBatchResult) or pipeline is None or specialist_input is None:
+            return invalid
+        if (
+            result.schema_version != SPECIALIST_BATCH_SCHEMA_VERSION
+            or result.stale
+            or result.snapshot_id != specialist_input.snapshot_id
+            or result.head_sha != specialist_input.head_sha
+            or result.input_hash != specialist_input.input_hash
+            or result.configuration_hash != pipeline.configuration_hash
+        ):
+            return invalid
+
+        if not isinstance(result.records, tuple) or any(
+            not isinstance(record, RoleExecution) for record in result.records
+        ):
+            return invalid
+        records = [record for record in result.records if record.role is SpecialistRole.RISK_RECOMMENDATION]
+        if len(records) != 1:
+            return invalid
+        record = records[0]
+        if record.state not in {SpecialistState.SUCCESS, SpecialistState.CACHED}:
+            return unavailable
+        output = record.output
+        if not isinstance(output, Mapping):
+            return invalid
+        try:
+            # Re-run #12's versioned validator at the consumer boundary. This keeps
+            # raw, rejected, or hand-constructed model output from becoming a route
+            # input even if a malformed batch object reaches this method.
+            validated_output = validate_specialist_output(
+                SpecialistRole.RISK_RECOMMENDATION,
+                json.dumps(dict(output)),
+                specialist_input,
+                pipeline,
+            )
+        except Exception:
+            return invalid
+        confidence = validated_output.get("confidence")
+        if record.confidence != confidence:
+            return invalid
+        recommendation = validated_output.get("recommendation")
+        if recommendation == "none":
+            return None
+        evidence = self._canonical_specialist_evidence(validated_output.get("reasons"))
+        if not evidence:
+            return invalid
+        return ReviewDepthEscalation(
+            source=source,
+            minimum_depth=self._routing_configuration().specialist_escalation_depth,
+            reasons=("validated_recommendation:escalate", *evidence),
+        )
+
+    @staticmethod
+    def _canonical_specialist_evidence(reasons: Any) -> tuple[str, ...]:
+        """Keep validated anchors only; never feed model prose back into routing."""
+
+        if not isinstance(reasons, list):
+            return ()
+        anchors = []
+        for reason in reasons:
+            if not isinstance(reason, Mapping) or set(reason) != {"reason", "evidence"}:
+                return ()
+            evidence_items = reason.get("evidence")
+            if not isinstance(evidence_items, list) or not evidence_items:
+                return ()
+            for evidence in evidence_items:
+                if not isinstance(evidence, Mapping):
+                    return ()
+                source = evidence.get("source")
+                if source == "diff_hunk" and set(evidence) == {"source", "path", "hunk_id", "line"}:
+                    anchors.append(
+                        f"diff_hunk:{evidence['path']}:{evidence['hunk_id']}:{evidence['line']}"
+                    )
+                elif source == "pull_request" and set(evidence) == {"source", "field"}:
+                    anchors.append(f"pull_request:{evidence['field']}")
+                elif source == "deterministic_result" and set(evidence) == {"source", "rule_id"}:
+                    anchors.append(f"deterministic_result:{evidence['rule_id']}")
+                else:
+                    return ()
+        return tuple(dict.fromkeys(anchors))
+
+    def _review_model_route(self) -> AIModelRoute | None:
+        decision = getattr(self, "review_route_decision", None)
+        if decision is None or not decision.routing_enabled:
+            return None
+        budget = decision.applied_budget
+        route_name = (budget.model_route or "inherit").casefold()
+        has_request_controls = any(
+            value is not None
+            for value in (budget.timeout_seconds, budget.max_retries, budget.max_output_tokens)
+        )
+        if route_name == "inherit" and not has_request_controls:
+            return None
+        if route_name == "weak":
+            primary = get_model("model_weak")
+        elif route_name == "reasoning":
+            primary = get_model("model_reasoning")
+        else:
+            primary = get_settings().config.model
+        fallback_models = get_settings().config.fallback_models
+        if isinstance(fallback_models, str):
+            fallback_models = [model.strip() for model in fallback_models.split(",") if model.strip()]
+        models = (primary, *tuple(fallback_models or ()))
+        deployment = get_settings().get("openai.deployment_id", None)
+        fallback_deployments = get_settings().get("openai.fallback_deployments", [])
+        if isinstance(fallback_deployments, str):
+            fallback_deployments = [item.strip() or None for item in fallback_deployments.split(",")]
+        if fallback_deployments:
+            deployments = (deployment, *tuple(fallback_deployments))
+            if len(deployments) < len(models):
+                raise ValueError("review depth model route has fewer deployments than models")
+            deployments = deployments[:len(models)]
+        else:
+            deployments = (deployment,) * len(models)
+        return AIModelRoute(
+            models=models,
+            deployments=deployments,
+            timeout_seconds=budget.timeout_seconds,
+            model_retries=(budget.max_retries + 1 if budget.max_retries is not None else None),
+            max_output_tokens=budget.max_output_tokens,
+        )
 
     def _clear_stale_persistent_bugs_only_review(self) -> None:
         """Remove a prior persistent defect summary after a clean bugs-only rerun."""
@@ -334,13 +673,33 @@ class PRReviewer:
         )
 
     async def _prepare_prediction(self, model: str) -> None:
-        output = get_pr_diff(self.git_provider,
-                             self.token_handler,
-                             model,
-                             add_line_numbers_to_hunks=True,
-                             disable_extra_lines=False,
-                             return_remaining_files=True,
-                             return_deleted_files=True,)
+        decision = getattr(self, "review_route_decision", None)
+        if decision is not None and decision.routing_enabled:
+            # Model-specific tokenization matters when the selected profile uses a
+            # weak or reasoning route, and the rebuilt prompt includes its finding
+            # and publication budgets.
+            self.token_handler = TokenHandler(
+                self.git_provider.pr,
+                self.vars,
+                get_settings().pr_review_prompt.system,
+                get_settings().pr_review_prompt.user,
+                model=model,
+            )
+        diff_kwargs = {
+            "add_line_numbers_to_hunks": True,
+            "disable_extra_lines": False,
+            "return_remaining_files": True,
+            "return_deleted_files": True,
+        }
+        context_tokens = getattr(self, "_review_context_tokens", None)
+        if context_tokens is not None:
+            diff_kwargs["max_context_tokens"] = context_tokens
+        output = get_pr_diff(
+            self.git_provider,
+            self.token_handler,
+            model,
+            **diff_kwargs,
+        )
         if isinstance(output, PRDiffCoverage):
             self.patches_diff = output.diff
             self.remaining_files_list = output.remaining_files
@@ -366,6 +725,7 @@ class PRReviewer:
         self._specialists_started = True
         try:
             pipeline = load_specialist_pipeline_config()
+            self._specialist_pipeline = pipeline
             snapshot_context = get_specialist_snapshot_context()
             if snapshot_context is not None:
                 snapshot = snapshot_context.snapshot
@@ -398,7 +758,9 @@ class PRReviewer:
                 diff_files=self.git_provider.get_diff_files() or [],
                 head_sha=head_sha,
                 snapshot=snapshot,
+                additional_deterministic_results=self._specialist_deterministic_results(),
             )
+            self._specialist_input = specialist_input
             self.specialist_shadow_result = await run_shadow_specialists(
                 specialist_input,
                 pipeline,
@@ -412,6 +774,21 @@ class PRReviewer:
                 "Specialist shadow batch failed; continuing the ordinary review",
                 artifact={"error_class": type(exc).__name__},
             )
+
+    def _specialist_deterministic_results(self) -> tuple[dict[str, Any], ...]:
+        decision = getattr(self, "review_route_decision", None)
+        if decision is None or not decision.routing_enabled:
+            return ()
+        return tuple(
+            {
+                "id": reason.code,
+                "result": {
+                    "minimum_depth": reason.minimum_depth.value,
+                    "evidence": list(reason.evidence),
+                },
+            }
+            for reason in decision.reasons
+        )
 
     def _reject_unparsable_prediction(self, model: str) -> None:
         """Treat a prediction that will not parse as a failure of this model.
@@ -580,7 +957,7 @@ class PRReviewer:
                 "start_line": start_line,
                 "end_line": end_line,
             })
-            if len(normalized_issues) >= get_settings().pr_reviewer.num_max_findings:
+            if len(normalized_issues) >= self._maximum_generated_findings():
                 break
         return {"review": {"key_issues_to_review": normalized_issues}}
 
@@ -600,6 +977,8 @@ class PRReviewer:
             get_logger().exception("Failed to parse review data", artifact={"data": data})
             return ""
         data = self._normalize_bugs_only_review(data)
+        data = self._apply_finding_budget(data)
+        data = self._apply_publication_budget(data)
         github_action_output(data, 'review')
 
         structured_publisher = getattr(self.git_provider, "publish_structured_review", None)
@@ -623,10 +1002,18 @@ class PRReviewer:
                 "omitted_files": sorted(set(self.remaining_files_list)),
                 "deleted_files": sorted(set(getattr(self, "deleted_files_list", []))),
             }
+            review_route_decision = getattr(self, "review_route_decision", None)
+            if review_route_decision is not None:
+                structured_data["metadata"]["review_route"] = review_route_decision_to_dict(
+                    review_route_decision
+                )
             specialist_shadow_result = getattr(self, "specialist_shadow_result", None)
             if specialist_shadow_result is not None:
                 structured_data["metadata"]["specialist_shadow"] = specialist_shadow_result.to_dict()
             structured_publisher(structured_data)
+
+        if getattr(self, "_review_shadow_only", False):
+            return ""
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
         if 'key_issues_to_review' in data['review']:
@@ -691,6 +1078,29 @@ class PRReviewer:
             markdown_text = ""
 
         return markdown_text
+
+    def _maximum_generated_findings(self) -> int:
+        limit = getattr(self, "_review_max_findings", None)
+        if isinstance(limit, int) and not isinstance(limit, bool):
+            return limit
+        return get_settings().pr_reviewer.num_max_findings
+
+    def _apply_finding_budget(self, data: dict) -> dict:
+        return self._limit_findings(data, getattr(self, "_review_max_findings", None))
+
+    def _apply_publication_budget(self, data: dict) -> dict:
+        return self._limit_findings(data, getattr(self, "_review_max_published_findings", None))
+
+    @staticmethod
+    def _limit_findings(data: dict, limit: int | None) -> dict:
+        if limit is None:
+            return data
+        issues = (data.get("review") or {}).get("key_issues_to_review")
+        if not isinstance(issues, list) or len(issues) <= limit:
+            return data
+        limited = copy.deepcopy(data)
+        limited["review"]["key_issues_to_review"] = issues[:limit]
+        return limited
 
     def _build_key_issue_comment(self, issue, diff_files: dict) -> Optional[dict]:
         if not isinstance(issue, dict):

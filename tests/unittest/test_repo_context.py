@@ -593,6 +593,7 @@ def test_github_provider_reads_from_default_branch_when_requested():
                 "require_todo_scan": False,
                 "require_estimate_effort_to_review": True,
                 "num_max_findings": 3,
+                "publication_threshold": "none",
                 "num_pr_files": 1,
                 "is_ai_metadata": False,
             },
@@ -667,6 +668,7 @@ def test_bugs_only_review_prompt_renders_ci_failure_evidence_contract():
         "require_todo_scan": False,
         "require_estimate_effort_to_review": False,
         "num_max_findings": 3,
+        "publication_threshold": "none",
         "num_pr_files": 1,
         "is_ai_metadata": False,
     }

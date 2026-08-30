@@ -1623,6 +1623,10 @@ def show_run_details(gfm_supported: bool) -> str:
     lines = [f"- Model: {details.model_used}{' (fallback)' if details.fallback_used else ''}"]
     if details.review_profile:
         lines.append(f"- Review profile: {details.review_profile}")
+    if details.review_route:
+        applied_depth = details.review_route.get("applied_depth")
+        if applied_depth:
+            lines.append(f"- Review depth: {applied_depth}")
     if details.has_token_usage:
         # A counter still at zero after a successful call means the provider never
         # reported that component, so drop it instead of claiming it was zero.

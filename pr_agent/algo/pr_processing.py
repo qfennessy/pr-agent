@@ -55,13 +55,24 @@ def cap_and_log_extra_lines(value, direction) -> int:
     return value
 
 
+def _effective_max_tokens(model: str, max_context_tokens: int | None) -> int:
+    model_limit = get_max_tokens(model)
+    if max_context_tokens is None:
+        return model_limit
+    if isinstance(max_context_tokens, bool) or not isinstance(max_context_tokens, int) or max_context_tokens <= 0:
+        raise ValueError("max_context_tokens must be a positive integer or None")
+    return min(model_limit, max_context_tokens)
+
+
 def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
                 model: str,
                 add_line_numbers_to_hunks: bool = False,
                 disable_extra_lines: bool = False,
                 large_pr_handling=False,
                 return_remaining_files=False,
-                return_deleted_files=False):
+                return_deleted_files=False,
+                max_context_tokens: int | None = None):
+    max_tokens_model = _effective_max_tokens(model, max_context_tokens)
     if disable_extra_lines:
         PATCH_EXTRA_LINES_BEFORE = 0
         PATCH_EXTRA_LINES_AFTER = 0
@@ -91,8 +102,8 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
         patch_extra_lines_before=PATCH_EXTRA_LINES_BEFORE, patch_extra_lines_after=PATCH_EXTRA_LINES_AFTER)
 
     # if we are under the limit, return the full diff
-    if total_tokens + OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD < get_max_tokens(model):
-        get_logger().info(f"Tokens: {total_tokens}, total tokens under limit: {get_max_tokens(model)}, "
+    if total_tokens + OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD < max_tokens_model:
+        get_logger().info(f"Tokens: {total_tokens}, total tokens under limit: {max_tokens_model}, "
                           f"returning full diff.")
         full_diff = "\n".join(patches_extended)
         if return_remaining_files and return_deleted_files:
@@ -105,10 +116,17 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
         return full_diff
 
     # if we are over the limit, start pruning (If we got here, we will not extend the patches with extra lines)
-    get_logger().info(f"Tokens: {total_tokens}, total tokens over limit: {get_max_tokens(model)}, "
+    get_logger().info(f"Tokens: {total_tokens}, total tokens over limit: {max_tokens_model}, "
                       f"pruning diff.")
     patches_compressed_list, total_tokens_list, deleted_files_list, remaining_files_list, file_dict, files_in_patches_list = \
-        pr_generate_compressed_diff(pr_languages, token_handler, model, add_line_numbers_to_hunks, large_pr_handling)
+        pr_generate_compressed_diff(
+            pr_languages,
+            token_handler,
+            model,
+            add_line_numbers_to_hunks,
+            large_pr_handling,
+            max_context_tokens=max_context_tokens,
+        )
 
     if large_pr_handling and len(patches_compressed_list) > 1:
         get_logger().info(f"Large PR handling mode, and found {len(patches_compressed_list)} patches with original diff.")
@@ -120,7 +138,7 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
     files_in_patch = files_in_patches_list[0]
 
     # Insert additional information about added, modified, and deleted files if there is enough space
-    max_tokens = get_max_tokens(model) - OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD
+    max_tokens = max_tokens_model - OUTPUT_BUFFER_TOKENS_HARD_THRESHOLD
     curr_token = total_tokens_new  # == token_handler.count_tokens(final_diff)+token_handler.prompt_tokens
     final_diff = "\n".join(patches_compressed)
     delta_tokens = 10
@@ -239,7 +257,8 @@ def pr_generate_extended_diff(pr_languages: list,
 
 def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, model: str,
                                 convert_hunks_to_line_numbers: bool,
-                                large_pr_handling: bool) -> Tuple[list, list, list, list, dict, list]:
+                                large_pr_handling: bool,
+                                max_context_tokens: int | None = None) -> Tuple[list, list, list, list, dict, list]:
     deleted_files_list = []
 
     for lang in top_langs:
@@ -290,7 +309,7 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler, mo
                 'tokens': new_patch_tokens,
                 'edit_type': file.edit_type,
             }
-    max_tokens_model = get_max_tokens(model)
+    max_tokens_model = _effective_max_tokens(model, max_context_tokens)
 
     # first iteration
     files_in_patches_list = []

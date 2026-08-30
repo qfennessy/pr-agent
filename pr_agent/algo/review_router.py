@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -152,6 +153,7 @@ class ReviewRouterPolicy:
     test_patterns: tuple[str, ...] = DEFAULT_TEST_PATTERNS
     generated_patterns: tuple[str, ...] = DEFAULT_GENERATED_PATTERNS
     dependency_patterns: tuple[str, ...] = DEFAULT_DEPENDENCY_PATTERNS
+    configuration_errors: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sensitive_categories", _freeze_tuple(self.sensitive_categories))
@@ -159,6 +161,18 @@ class ReviewRouterPolicy:
         object.__setattr__(self, "test_patterns", _freeze_tuple(self.test_patterns))
         object.__setattr__(self, "generated_patterns", _freeze_tuple(self.generated_patterns))
         object.__setattr__(self, "dependency_patterns", _freeze_tuple(self.dependency_patterns))
+        object.__setattr__(self, "configuration_errors", _freeze_tuple(self.configuration_errors))
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewRoutingConfiguration:
+    """Validated runtime selection around one immutable routing policy."""
+
+    enabled: bool = False
+    requested_depth: RequestedReviewDepth | str = RequestedReviewDepth.AUTO
+    consume_specialist_escalation: bool = False
+    specialist_escalation_depth: ReviewDepth | str = ReviewDepth.DEEP
+    policy: ReviewRouterPolicy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +248,196 @@ _DEPTH_RANK = {
 }
 
 _DEFAULT_INHERITED_BUDGET = ReviewBudgetPolicy()
+_FAIL_SAFE_DEEP_BUDGET = ReviewBudgetPolicy(
+    context_tokens=32_000,
+    max_findings=6,
+    max_verification_candidates=6,
+    model_route="reasoning",
+    timeout_seconds=240,
+    max_retries=2,
+    max_output_tokens=8_192,
+    max_published_findings=6,
+    publication_threshold="low",
+    shadow_only=False,
+)
+
+_CONFIGURATION_KEYS = {
+    "enabled",
+    "requested_depth",
+    "consume_specialist_escalation",
+    "specialist_escalation_depth",
+    "version",
+    "large_change_files",
+    "large_change_lines",
+    "docs_patterns",
+    "test_patterns",
+    "generated_patterns",
+    "dependency_patterns",
+    "sensitive_categories",
+    "profiles",
+}
+_BUDGET_KEYS = (
+    "context_tokens",
+    "max_findings",
+    "max_verification_candidates",
+    "model_route",
+    "timeout_seconds",
+    "max_retries",
+    "max_output_tokens",
+    "max_published_findings",
+    "publication_threshold",
+    "shadow_only",
+)
+
+
+def load_review_routing_configuration(section: Any) -> ReviewRoutingConfiguration:
+    """Parse one settings section without reading or mutating global configuration.
+
+    Missing or explicitly disabled configuration preserves the legacy standard review.
+    Once enabled, malformed values are retained as policy errors so ``route_review``
+    selects deep before any model call instead of silently falling back.
+    """
+
+    if section is None or section == {}:
+        return ReviewRoutingConfiguration()
+    if not isinstance(section, Mapping):
+        policy = ReviewRouterPolicy(configuration_errors=("review_depth must be a mapping",))
+        return ReviewRoutingConfiguration(enabled=True, policy=policy)
+
+    errors: list[str] = []
+    unknown_keys = sorted(str(key) for key in section if str(key) not in _CONFIGURATION_KEYS)
+    errors.extend(f"unknown review_depth key: {key}" for key in unknown_keys)
+
+    enabled = section.get("enabled", False)
+    if not isinstance(enabled, bool):
+        errors.append("enabled must be a boolean")
+        enabled = True
+    if not enabled:
+        return ReviewRoutingConfiguration()
+
+    requested_depth = section.get("requested_depth", RequestedReviewDepth.AUTO.value)
+    consume_specialist = section.get("consume_specialist_escalation", False)
+    if not isinstance(consume_specialist, bool):
+        errors.append("consume_specialist_escalation must be a boolean")
+        consume_specialist = False
+    specialist_depth = section.get("specialist_escalation_depth", ReviewDepth.DEEP.value)
+    if _review_depth(specialist_depth) not in {ReviewDepth.STANDARD, ReviewDepth.DEEP}:
+        errors.append("specialist_escalation_depth must be standard or deep")
+
+    profiles = section.get("profiles", {})
+    budgets: dict[str, ReviewBudgetPolicy] = {}
+    if not isinstance(profiles, Mapping):
+        errors.append("profiles must be a mapping")
+        profiles = {}
+    else:
+        for name in profiles:
+            if str(name) not in {depth.value for depth in ReviewDepth}:
+                errors.append(f"unknown review depth profile: {name}")
+    for depth in ReviewDepth:
+        raw_budget = profiles.get(depth.value)
+        if raw_budget is None:
+            errors.append(f"profiles.{depth.value} is required")
+            raw_budget = {}
+        budgets[depth.value] = _budget_from_mapping(raw_budget, depth.value, errors)
+        configured_route = budgets[depth.value].model_route
+        if configured_route is not None and (
+            not isinstance(configured_route, str)
+            or configured_route.casefold() not in {"inherit", "regular", "weak", "reasoning"}
+        ):
+            errors.append(
+                f"profiles.{depth.value}.model_route must be inherit, regular, weak, or reasoning"
+            )
+
+    raw_categories = section.get("sensitive_categories", [])
+    categories: list[SensitiveCategory] = []
+    if not isinstance(raw_categories, (list, tuple)):
+        errors.append("sensitive_categories must be a list")
+    else:
+        for index, raw_category in enumerate(raw_categories):
+            prefix = f"sensitive_categories[{index}]"
+            if not isinstance(raw_category, Mapping):
+                errors.append(f"{prefix} must be a mapping")
+                continue
+            unknown = sorted(
+                str(key) for key in raw_category if str(key) not in {"name", "path_patterns", "labels"}
+            )
+            errors.extend(f"unknown {prefix} key: {key}" for key in unknown)
+            categories.append(SensitiveCategory(
+                name=raw_category.get("name", ""),
+                path_patterns=_configuration_tuple(raw_category.get("path_patterns", [])),
+                labels=_configuration_tuple(raw_category.get("labels", [])),
+            ))
+
+    policy = ReviewRouterPolicy(
+        version=section.get("version", "review-router-v1"),
+        quick=budgets[ReviewDepth.QUICK.value],
+        standard=budgets[ReviewDepth.STANDARD.value],
+        deep=budgets[ReviewDepth.DEEP.value],
+        sensitive_categories=tuple(categories),
+        large_change_files=section.get("large_change_files", 25),
+        large_change_lines=section.get("large_change_lines", 1_000),
+        docs_patterns=_configuration_tuple(section.get("docs_patterns", DEFAULT_DOC_PATTERNS)),
+        test_patterns=_configuration_tuple(section.get("test_patterns", DEFAULT_TEST_PATTERNS)),
+        generated_patterns=_configuration_tuple(section.get("generated_patterns", DEFAULT_GENERATED_PATTERNS)),
+        dependency_patterns=_configuration_tuple(section.get("dependency_patterns", DEFAULT_DEPENDENCY_PATTERNS)),
+        configuration_errors=tuple(errors),
+    )
+    return ReviewRoutingConfiguration(
+        enabled=True,
+        requested_depth=requested_depth,
+        consume_specialist_escalation=consume_specialist,
+        specialist_escalation_depth=specialist_depth,
+        policy=policy,
+    )
+
+
+def review_route_decision_to_dict(decision: ReviewRouteDecision) -> dict[str, Any]:
+    """Serialize a decision without aliases or provider-specific values."""
+
+    return {
+        "requested_depth": decision.requested_depth,
+        "applied_depth": decision.applied_depth.value,
+        "review_profile": decision.review_profile,
+        "requested_budget": _budget_to_dict(decision.requested_budget),
+        "applied_budget": _budget_to_dict(decision.applied_budget),
+        "reasons": [
+            {
+                "code": reason.code,
+                "message": reason.message,
+                "minimum_depth": reason.minimum_depth.value,
+                "evidence": list(reason.evidence),
+            }
+            for reason in decision.reasons
+        ],
+        "matched_sensitive_categories": list(decision.matched_sensitive_categories),
+        "missing_inputs": list(decision.missing_inputs),
+        "policy_version": decision.policy_version,
+        "policy_valid": decision.policy_valid,
+        "policy_errors": list(decision.policy_errors),
+        "routing_enabled": decision.routing_enabled,
+        "escalation_applied": decision.escalation_applied,
+    }
+
+
+def _budget_from_mapping(raw: Any, name: str, errors: list[str]) -> ReviewBudgetPolicy:
+    if not isinstance(raw, Mapping):
+        errors.append(f"profiles.{name} must be a mapping")
+        return ReviewBudgetPolicy()
+    unknown = sorted(str(key) for key in raw if str(key) not in _BUDGET_KEYS)
+    errors.extend(f"unknown profiles.{name} key: {key}" for key in unknown)
+    return ReviewBudgetPolicy(**{key: raw.get(key) for key in _BUDGET_KEYS if key in raw})
+
+
+def _configuration_tuple(value: Any) -> Any:
+    if isinstance(value, list):
+        return tuple(value)
+    return value
+
+
+def _budget_to_dict(budget: ReviewBudgetPolicy | None) -> dict[str, Any] | None:
+    if budget is None:
+        return None
+    return {key: getattr(budget, key) for key in _BUDGET_KEYS}
 
 
 def route_review(request: ReviewRouteRequest, policy: ReviewRouterPolicy | None) -> ReviewRouteDecision:
@@ -272,7 +476,7 @@ def route_review(request: ReviewRouteRequest, policy: ReviewRouterPolicy | None)
             applied_depth=ReviewDepth.DEEP,
             review_profile=review_profile,
             requested_budget=None,
-            applied_budget=_DEFAULT_INHERITED_BUDGET,
+            applied_budget=_FAIL_SAFE_DEEP_BUDGET,
             reasons=tuple(reasons),
             matched_sensitive_categories=(),
             missing_inputs=(),
@@ -462,10 +666,10 @@ def _invalid_request_decision(request: Any, policy: Any) -> ReviewRouteDecision:
             if isinstance(policy, ReviewRouterPolicy) and isinstance(policy.version, str)
             else "invalid"
         )
-        applied_budget = _DEFAULT_INHERITED_BUDGET
+        applied_budget = _FAIL_SAFE_DEEP_BUDGET
         reasons.append(RoutingReason(
             code="policy_invalid",
-            message="Routing policy is also invalid; inherited review budgets were preserved.",
+            message="Routing policy is also invalid; the built-in fail-safe deep budget was applied.",
             minimum_depth=ReviewDepth.DEEP,
             evidence=policy_errors,
         ))
@@ -767,6 +971,14 @@ def _validate_policy(policy: Any) -> tuple[str, ...]:
         return ("policy must be a ReviewRouterPolicy",)
 
     errors = []
+    if not isinstance(policy.configuration_errors, tuple):
+        errors.append("configuration_errors must be a sequence")
+    else:
+        for index, error in enumerate(policy.configuration_errors):
+            if not isinstance(error, str) or not error.strip():
+                errors.append(f"configuration_errors[{index}] must be a non-empty string")
+            else:
+                errors.append(error.strip())
     if not isinstance(policy.version, str) or not policy.version.strip():
         errors.append("version must be a non-empty string")
 

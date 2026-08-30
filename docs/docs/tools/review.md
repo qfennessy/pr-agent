@@ -57,6 +57,126 @@ If you want to edit [configurations](#configuration-options), add the relevant o
 /review --pr_reviewer.some_config1=... --pr_reviewer.some_config2=...
 ```
 
+#### Risk-based review depth
+
+Review depth is separate from the `full` or `bugs_only` output profile. When `[review_depth]` is absent or disabled,
+PR-Agent keeps today's standard review and inherited model, diff, timeout, retry, finding, and publication settings.
+When enabled, `quick`, `standard`, and `deep` are immutable budget profiles. Select one explicitly with
+`requested_depth`, or use `auto` to route from changed paths, old and new rename paths, diff size, dependency files,
+generated/docs/tests-only evidence, labels, and repository-defined sensitive categories.
+
+This is a complete repository example:
+
+```toml
+[review_depth]
+enabled = true
+requested_depth = "auto"
+version = "acme-review-router-v1"
+large_change_files = 25
+large_change_lines = 1000
+consume_specialist_escalation = false
+specialist_escalation_depth = "deep"
+
+[review_depth.profiles.quick]
+context_tokens = 8000
+max_findings = 2
+max_verification_candidates = 1
+model_route = "weak"
+timeout_seconds = 30
+max_retries = 0
+max_output_tokens = 2048
+max_published_findings = 2
+publication_threshold = "high"
+shadow_only = false
+
+[review_depth.profiles.standard]
+context_tokens = 24000
+max_findings = 3
+max_verification_candidates = 3
+model_route = "regular"
+timeout_seconds = 120
+max_retries = 1
+max_output_tokens = 4096
+max_published_findings = 3
+publication_threshold = "medium"
+shadow_only = false
+
+[review_depth.profiles.deep]
+context_tokens = 32000
+max_findings = 6
+max_verification_candidates = 6
+model_route = "reasoning"
+timeout_seconds = 240
+max_retries = 2
+max_output_tokens = 8192
+max_published_findings = 6
+publication_threshold = "low"
+shadow_only = false
+
+[[review_depth.sensitive_categories]]
+name = "security"
+path_patterns = ["**/security/**", "**/crypto/**", "**/secrets/**"]
+labels = ["security"]
+
+[[review_depth.sensitive_categories]]
+name = "authorization"
+path_patterns = ["**/auth/**", "**/authorization/**", "**/permissions/**"]
+labels = ["authorization"]
+
+[[review_depth.sensitive_categories]]
+name = "tenant_isolation"
+path_patterns = ["**/tenant/**", "**/tenancy/**"]
+labels = ["tenant-isolation"]
+
+[[review_depth.sensitive_categories]]
+name = "billing"
+path_patterns = ["**/billing/**", "**/payments/**"]
+labels = ["billing"]
+
+[[review_depth.sensitive_categories]]
+name = "migration"
+path_patterns = ["**/migrations/**", "**/schema/**"]
+labels = ["migration"]
+
+[[review_depth.sensitive_categories]]
+name = "concurrency"
+path_patterns = ["**/concurrency/**", "**/locks/**", "**/queues/**"]
+labels = ["concurrency"]
+
+[[review_depth.sensitive_categories]]
+name = "destructive_operation"
+path_patterns = ["**/delete/**", "**/cleanup/**", "**/purge/**"]
+labels = ["destructive-operation"]
+
+[[review_depth.sensitive_categories]]
+name = "deployment_credentials"
+path_patterns = ["**/.github/workflows/**", "**/deploy/**", "**/credentials/**"]
+labels = ["deployment-credentials"]
+```
+
+`model_route` is provider-neutral: `inherit` keeps the ordinary configured model route, while `regular`, `weak`, and
+`reasoning` select the existing `config.model`, `config.model_weak`, or `config.model_reasoning` settings and the normal
+fallback/deployment configuration. `max_retries` counts retries after the first attempt, so `0` means one attempt.
+`max_findings` bounds generated candidates, and `max_published_findings` is enforced before structured or Markdown
+publication. `max_verification_candidates` is a request-local budget for guarded verifier stages and is recorded even
+when no verifier is enabled; it does not launch an independent model by itself. `publication_threshold` is supplied to
+the reviewer prompt and recorded in structured metadata; it does not invent a severity score after the model answers.
+`shadow_only = true` keeps the bounded result in structured output without publishing review Markdown, inline findings,
+or review labels.
+
+Forced-deep rules always win, including when a sensitive file is renamed or deleted. A dependency change requires at
+least `standard`; a large or malformed change selects `deep`. Missing paths, line counts, labels, or optional escalation
+evidence prevent `quick` and select at least `standard`. Unknown profiles, model-route names, budgets, thresholds, and
+rule shapes fail closed to `deep` before the main review model runs. Profile inheritance is deliberately unsupported, so
+there are no inheritance cycles to resolve.
+
+The small risk specialist is not the final correctness judge. Its validated output can say only `escalate` or `none`;
+`none` never lowers deterministic depth, and model prose is never fed back into the router. Guarded consumption has its
+own default-off `consume_specialist_escalation` switch and should remain off until the benchmark and rollout gate in
+issue #27 approves it. Disabled, unavailable, timed-out, or low-confidence specialist evidence raises a would-be quick
+route to `standard`; stale, malformed, or identity-mismatched evidence fails closed to `deep`. Neither outcome can
+lower a deterministic forced-deep route.
+
 #### Shadow review specialists
 
 PR-Agent includes a disabled-by-default shadow stage for three narrow tasks: change classification, an upward-only

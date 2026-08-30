@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -7,6 +8,18 @@ from pr_agent.algo.inline_comment_dedup import (body_with_markers,
                                                 get_inline_comment_store,
                                                 key_issue_fingerprint)
 from pr_agent.algo.pr_processing import PRDiffCoverage
+from pr_agent.algo.review_router import (
+    ReviewDepth,
+    load_review_routing_configuration,
+    review_route_decision_to_dict,
+)
+from pr_agent.algo.review_specialists import (
+    RoleExecution,
+    SpecialistBatchResult,
+    SpecialistRole,
+    SpecialistState,
+)
+from pr_agent.algo.run_details import get_run_details, init_run_details
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity
 from pr_agent.config_loader import get_settings
@@ -33,6 +46,61 @@ def _make_prediction_reviewer(git_provider=None):
     reviewer.incremental = SimpleNamespace(is_incremental=False)
     reviewer.prediction = None
     return reviewer
+
+
+def _routing_configuration(*, consume=False, requested_depth="auto", sensitive_categories=()):
+    return load_review_routing_configuration({
+        "enabled": True,
+        "requested_depth": requested_depth,
+        "consume_specialist_escalation": consume,
+        "specialist_escalation_depth": "deep",
+        "profiles": {
+            "quick": {
+                "context_tokens": 8_000,
+                "max_findings": 2,
+                "max_verification_candidates": 1,
+                "model_route": "weak",
+                "timeout_seconds": 30,
+                "max_retries": 0,
+                "max_output_tokens": 2_048,
+                "max_published_findings": 2,
+                "publication_threshold": "high",
+            },
+            "standard": {
+                "context_tokens": 24_000,
+                "max_findings": 3,
+                "model_route": "regular",
+            },
+            "deep": {
+                "context_tokens": 32_000,
+                "max_findings": 6,
+                "model_route": "reasoning",
+            },
+        },
+        "sensitive_categories": list(sensitive_categories),
+    })
+
+
+def _route_file(
+    filename="docs/guide.md",
+    *,
+    edit_type=None,
+    old_filename=None,
+    additions=2,
+    deletions=1,
+):
+    from pr_agent.algo.types import EDIT_TYPE
+
+    return FilePatchInfo(
+        base_file="old\n",
+        head_file="new\n",
+        patch="@@ -1 +1 @@\n-old\n+new",
+        filename=filename,
+        edit_type=edit_type or EDIT_TYPE.MODIFIED,
+        old_filename=old_filename,
+        num_plus_lines=additions,
+        num_minus_lines=deletions,
+    )
 
 
 @pytest.mark.asyncio
@@ -73,6 +141,108 @@ async def test_prepare_prediction_accepts_full_diff_string_when_token_budget_is_
     assert reviewer.remaining_files_list == []
     assert reviewer.deleted_files_list == []
     assert reviewer.prediction == VALID_PREDICTION
+
+
+@pytest.mark.asyncio
+async def test_routed_prediction_applies_context_budget_and_model_specific_token_handler():
+    provider = MagicMock()
+    provider.pr = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+    reviewer._prepare_review_route()
+    reviewer._specialists_started = True
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
+    routed_token_handler = MagicMock()
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.TokenHandler", return_value=routed_token_handler) as token_handler,
+        patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value="diff") as get_pr_diff,
+    ):
+        await reviewer._prepare_prediction("weak-model")
+
+    assert token_handler.call_args.kwargs["model"] == "weak-model"
+    get_pr_diff.assert_called_once_with(
+        provider,
+        routed_token_handler,
+        "weak-model",
+        add_line_numbers_to_hunks=True,
+        disable_extra_lines=False,
+        return_remaining_files=True,
+        return_deleted_files=True,
+        max_context_tokens=8_000,
+    )
+
+
+def test_profile_model_route_uses_request_local_controls_and_retry_semantics():
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+    reviewer._prepare_review_route()
+
+    with patch("pr_agent.tools.pr_reviewer.get_model", return_value="weak-model"):
+        route = reviewer._review_model_route()
+
+    assert route.models[0] == "weak-model"
+    assert route.timeout_seconds == 30
+    assert route.model_retries == 1
+    assert route.max_output_tokens == 2_048
+    assert route.attribution is None
+
+
+def test_publication_budget_clamps_findings_and_shadow_profile_never_publishes_markdown():
+    reviewer = _make_prediction_reviewer()
+    reviewer._review_max_published_findings = 1
+    reviewer._review_shadow_only = True
+    data = {
+        "review": {
+            "key_issues_to_review": [
+                {"issue_header": "one"},
+                {"issue_header": "two"},
+            ]
+        }
+    }
+
+    limited = reviewer._apply_publication_budget(data)
+
+    assert [issue["issue_header"] for issue in limited["review"]["key_issues_to_review"]] == ["one"]
+    assert len(data["review"]["key_issues_to_review"]) == 2
+    assert reviewer._should_publish_review_no_suggestions("review") is False
+
+
+def test_generated_and_publication_finding_budgets_are_independent_and_immutable():
+    reviewer = _make_prediction_reviewer()
+    reviewer._review_max_findings = 2
+    reviewer._review_max_published_findings = 1
+    data = {
+        "review": {
+            "key_issues_to_review": [
+                {"issue_header": "one"},
+                {"issue_header": "two"},
+                {"issue_header": "three"},
+            ]
+        }
+    }
+
+    generated = reviewer._apply_finding_budget(data)
+    published = reviewer._apply_publication_budget(generated)
+
+    assert [issue["issue_header"] for issue in generated["review"]["key_issues_to_review"]] == [
+        "one", "two",
+    ]
+    assert [issue["issue_header"] for issue in published["review"]["key_issues_to_review"]] == ["one"]
+    assert len(data["review"]["key_issues_to_review"]) == 3
 
 
 @pytest.mark.asyncio
@@ -126,6 +296,327 @@ async def test_enabled_shadow_specialists_run_at_most_once_across_main_fallback_
         (("primary",), {}),
         (("fallback",), {}),
     ]
+
+
+@pytest.mark.parametrize(
+    ("edit_type", "filename", "old_filename", "expected_kind", "old_path", "new_path"),
+    [
+        ("ADDED", "new.py", None, "added", None, "new.py"),
+        ("DELETED", "old.py", None, "deleted", "old.py", None),
+        ("MODIFIED", "same.py", None, "modified", None, "same.py"),
+        ("RENAMED", "new.py", "old.py", "renamed", "old.py", "new.py"),
+        ("UNKNOWN", "maybe.py", None, "unknown", None, "maybe.py"),
+    ],
+)
+def test_file_patch_info_conversion_preserves_edit_identity(
+    edit_type, filename, old_filename, expected_kind, old_path, new_path
+):
+    from pr_agent.algo.types import EDIT_TYPE
+
+    changed = PRReviewer._changed_file_for_routing(_route_file(
+        filename,
+        edit_type=getattr(EDIT_TYPE, edit_type),
+        old_filename=old_filename,
+        additions=-1,
+        deletions=-1,
+    ))
+
+    assert changed.kind.value == expected_kind
+    assert changed.old_path == old_path
+    assert changed.new_path == new_path
+    assert changed.additions is None
+    assert changed.deletions is None
+
+
+def test_deterministic_route_runs_from_provider_metadata_and_records_structured_decision():
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.QUICK
+    assert reviewer.vars["num_max_findings"] == 2
+    assert reviewer.vars["publication_threshold"] == "high"
+    assert reviewer.vars["max_verification_candidates"] == 1
+    assert reviewer._review_context_tokens == 8_000
+    assert get_run_details().review_route == review_route_decision_to_dict(decision)
+
+
+def test_changed_file_metadata_failure_is_recorded_and_prevents_quick():
+    provider = MagicMock()
+    provider.get_diff_files.side_effect = RuntimeError("metadata unavailable")
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert "changed_files" in decision.missing_inputs
+    assert "inputs_missing" in [reason.code for reason in decision.reasons]
+
+
+@pytest.mark.parametrize("labels_supported", [False, True])
+def test_unavailable_label_metadata_is_recorded_and_prevents_quick(labels_supported):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = labels_supported
+    if labels_supported:
+        provider.get_pr_labels.side_effect = RuntimeError("labels unavailable")
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert "labels" in decision.missing_inputs
+
+
+def test_sensitive_old_rename_path_forces_deep_over_docs_only_signal():
+    from pr_agent.algo.types import EDIT_TYPE
+
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file(
+        "docs/guide.md",
+        edit_type=EDIT_TYPE.RENAMED,
+        old_filename="services/auth/guard.py",
+    )]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+
+
+def _install_specialist_result(reviewer, *, state, recommendation="escalate", identity="head"):
+    specialist_input = SimpleNamespace(
+        snapshot_id="snapshot",
+        head_sha="head",
+        input_hash="input-hash",
+    )
+    prompt = SimpleNamespace(schema_version="risk-recommendation-output-v1")
+    pipeline = SimpleNamespace(
+        configuration_hash="configuration-hash",
+        prompt=lambda role: prompt,
+    )
+    output = {
+        "schema_version": prompt.schema_version,
+        "confidence": 0.9,
+        "recommendation": recommendation,
+        "reasons": [{
+            "reason": "untrusted specialist prose must not reach routing",
+            "evidence": [{"source": "pull_request", "field": "title"}],
+        }],
+    }
+    reviewer._specialist_input = specialist_input
+    reviewer._specialist_pipeline = pipeline
+    reviewer.specialist_shadow_result = SpecialistBatchResult(
+        snapshot_id="snapshot",
+        head_sha=identity,
+        input_hash="input-hash",
+        configuration_hash="configuration-hash",
+        records=(RoleExecution(
+            role=SpecialistRole.RISK_RECOMMENDATION,
+            state=state,
+            output=output,
+            confidence=0.9,
+        ),),
+        role_records={},
+        changed_path_count=1,
+        hunk_count=1,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "recommendation", "expected_depth"),
+    [
+        (SpecialistState.SUCCESS, "escalate", ReviewDepth.DEEP),
+        (SpecialistState.CACHED, "none", ReviewDepth.QUICK),
+        (SpecialistState.LOW_CONFIDENCE, "escalate", ReviewDepth.STANDARD),
+        (SpecialistState.TIMEOUT, "escalate", ReviewDepth.STANDARD),
+    ],
+)
+async def test_guarded_specialist_consumer_only_escalates_validated_success(
+    monkeypatch, state, recommendation, expected_depth
+):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(reviewer, state=state, recommendation=recommendation)
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is expected_depth
+    serialized_reasons = review_route_decision_to_dict(reviewer.review_route_decision)["reasons"]
+    assert "untrusted specialist prose" not in str(serialized_reasons)
+    if recommendation == "escalate" and state in {SpecialistState.SUCCESS, SpecialistState.CACHED}:
+        assert "pull_request:title" in str(serialized_reasons)
+
+
+@pytest.mark.asyncio
+async def test_specialist_identity_mismatch_fails_closed_to_deep(monkeypatch):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(
+        reviewer,
+        state=SpecialistState.SUCCESS,
+        identity="different-head",
+    )
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert "escalation_invalid" in [reason.code for reason in reviewer.review_route_decision.reasons]
+
+
+@pytest.mark.asyncio
+async def test_specialist_none_cannot_lower_a_deterministic_forced_deep_route(monkeypatch):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("services/auth/guard.py")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "bugs_only"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(
+        consume=True,
+        sensitive_categories=({
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },),
+    )
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(
+        reviewer,
+        state=SpecialistState.SUCCESS,
+        recommendation="none",
+    )
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert reviewer.review_route_decision.review_profile == "bugs_only"
+    assert reviewer.review_route_decision.matched_sensitive_categories == ("authorization",)
+
+
+@pytest.mark.asyncio
+async def test_malformed_specialist_record_fails_closed_without_reading_raw_output(monkeypatch):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(reviewer, state=SpecialistState.SUCCESS)
+    reviewer.specialist_shadow_result = replace(
+        reviewer.specialist_shadow_result,
+        records=(object(),),
+    )
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert "escalation_invalid" in [reason.code for reason in reviewer.review_route_decision.reasons]
+
+
+@pytest.mark.asyncio
+async def test_run_orders_routing_and_guarded_escalation_before_ticket_and_main_model():
+    events = []
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.git_provider.get_files.return_value = [object()]
+    reviewer._prepare_review_route = MagicMock(side_effect=lambda: events.append("route"))
+    reviewer._specialist_escalation_consumption_enabled = MagicMock(return_value=True)
+    reviewer._run_guarded_specialist_escalation = AsyncMock(
+        side_effect=lambda: events.append("specialist")
+    )
+    reviewer._review_model_route = MagicMock(return_value=None)
+    reviewer._prepare_pr_review = MagicMock(return_value="review")
+    reviewer._should_publish_review_no_suggestions = MagicMock(return_value=False)
+    reviewer._clear_stale_persistent_bugs_only_review = MagicMock()
+
+    async def extract_tickets(*args, **kwargs):
+        events.append("ticket")
+
+    async def run_main_model(*args, **kwargs):
+        events.append("main")
+        reviewer.prediction = VALID_PREDICTION
+
+    settings = get_settings()
+    original_publish_output = settings.config.publish_output
+    settings.set("config.publish_output", False)
+    try:
+        with (
+            patch(
+                "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+                side_effect=extract_tickets,
+            ),
+            patch(
+                "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+                side_effect=run_main_model,
+            ),
+        ):
+            await reviewer.run()
+    finally:
+        settings.set("config.publish_output", original_publish_output)
+
+    assert events == ["route", "specialist", "ticket", "main"]
 
 
 @pytest.mark.asyncio
@@ -1168,6 +1659,36 @@ def test_prepare_review_publishes_provider_neutral_structured_data(monkeypatch):
     # (assert_called_once_with cannot catch this: dict equality ignores key order.)
     published = git_provider.publish_structured_review.call_args[0][0]
     assert list(published["review"].keys()) == ["key_issues_to_review", "security_concerns"]
+
+
+def test_structured_review_includes_applied_route_without_aliasing_decision(monkeypatch):
+    git_provider = MagicMock()
+    git_provider.is_supported.return_value = True
+    git_provider.get_pr_labels.return_value = []
+    git_provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.set_review_labels = MagicMock()
+    init_run_details()
+    decision = reviewer._prepare_review_route()
+    reviewer.prediction = """review:
+  key_issues_to_review: []
+  security_concerns: no
+"""
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+        lambda *args, **kwargs: "## Review",
+    )
+
+    reviewer._prepare_pr_review()
+
+    metadata = git_provider.publish_structured_review.call_args[0][0]["metadata"]
+    assert metadata["review_route"] == review_route_decision_to_dict(decision)
+    metadata["review_route"]["reasons"].append({"code": "mutated"})
+    assert "mutated" not in str(review_route_decision_to_dict(decision))
 
 
 def test_bugs_only_publishes_structured_empty_list_but_no_markdown():
