@@ -22,6 +22,7 @@ from pr_agent.algo.review_specialists import (
     SpecialistBatchResult,
     SpecialistRole,
     SpecialistState,
+    unavailable_specialist_batch,
 )
 from pr_agent.algo.run_details import (get_run_details, init_run_details,
                                        record_model_used)
@@ -34,6 +35,7 @@ from pr_agent.git_providers.bitbucket_provider import BitbucketProvider
 from pr_agent.git_providers.bitbucket_server_provider import BitbucketServerProvider
 from pr_agent.git_providers.gerrit_provider import GerritProvider
 from pr_agent.git_providers.gitea_provider import GiteaProvider
+from pr_agent.git_providers.git_provider import IncrementalPR
 from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.git_providers.gitlab_provider import GitLabProvider
 from pr_agent.tools.pr_reviewer import PRReviewer
@@ -1113,6 +1115,87 @@ def test_azure_ignored_sensitive_net_path_remains_visible_to_router():
     }
 
 
+@pytest.mark.parametrize(
+    "sensitive_file",
+    [
+        FilePatchInfo(
+            base_file="",
+            head_file="",
+            patch="",
+            filename="/generated/guard.md",
+            edit_type=EDIT_TYPE.RENAMED,
+            old_filename="/services/auth/guard.py",
+        ),
+        FilePatchInfo(
+            base_file="",
+            head_file="",
+            patch="",
+            filename="/services/auth/key.pem",
+            edit_type=EDIT_TYPE.MODIFIED,
+        ),
+    ],
+    ids=["ignored-rename-source", "invalid-extension-path"],
+)
+def test_azure_incremental_unfiltered_inventory_forces_deep_when_detail_is_filtered(
+    sensitive_file,
+):
+    provider = _azure_routing_provider(
+        [],
+        [_route_file("/docs/guide.md")],
+    )
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {"/docs/guide.md": "@@ patch"}
+    provider._routing_incremental_files = (
+        FilePatchInfo(
+            base_file="",
+            head_file="",
+            patch="",
+            filename="/docs/guide.md",
+            edit_type=EDIT_TYPE.MODIFIED,
+        ),
+        sensitive_file,
+    )
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.DEEP
+    assert decision.matched_sensitive_categories == ("authorization",)
+    assert any(
+        path and "services/auth/" in path
+        for file in reviewer.review_route_request.files
+        for path in (file.old_path, file.new_path)
+    )
+
+
+def test_azure_incremental_uninitialized_routing_inventory_fails_safe():
+    provider = _azure_routing_provider(
+        [],
+        [_route_file("/docs/guide.md")],
+    )
+    provider.incremental = IncrementalPR(True)
+    provider.unreviewed_files_map = {"/docs/guide.md": "@@ patch"}
+    provider._routing_incremental_files = None
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert decision.applied_depth is ReviewDepth.STANDARD
+    assert any(file.kind is ChangeKind.UNKNOWN for file in reviewer.review_route_request.files)
+
+
 def test_azure_malformed_non_tree_net_entry_prevents_quick():
     provider = _azure_routing_provider(
         [
@@ -1863,6 +1946,23 @@ def _install_specialist_result(
     )
 
 
+def _unavailable_specialist_fixture():
+    role = SpecialistRole.RISK_RECOMMENDATION
+    reason = "stable_head_identity_unavailable"
+    prompt = SimpleNamespace(
+        prompt_version="risk-v1",
+        input_schema_version="specialist-input-v1",
+        schema_version="specialist-output-v1",
+    )
+    pipeline = SimpleNamespace(
+        configuration_hash="configuration-hash",
+        roles=(SimpleNamespace(role=role, enabled=True),),
+        prompt=lambda requested_role: prompt if requested_role is role else None,
+    )
+    batch = unavailable_specialist_batch(pipeline, failure_reason=reason)
+    return pipeline, batch
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("state", "recommendation", "expected_depth"),
@@ -1927,6 +2027,156 @@ async def test_guarded_specialist_consumer_treats_disabled_omission_as_unavailab
     reason_codes = [reason.code for reason in reviewer.review_route_decision.reasons]
     assert "escalation_unavailable" in reason_codes
     assert "escalation_invalid" not in reason_codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "expected_depth"),
+    [
+        ("docs/guide.md", ReviewDepth.STANDARD),
+        ("services/auth/guard.py", ReviewDepth.DEEP),
+    ],
+)
+async def test_no_stable_head_specialist_batch_is_unavailable_not_malformed(
+    monkeypatch, filename, expected_depth
+):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file(filename)]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    provider.get_pr_head_sha.return_value = None
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {"title": "Change behavior"}
+    reviewer.pr_description = "Description"
+    reviewer.ai_handler = MagicMock()
+    reviewer.review_routing_configuration = _routing_configuration(
+        consume=True,
+        sensitive_categories=({
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },),
+    )
+    init_run_details()
+    reviewer._prepare_review_route()
+    pipeline, batch = _unavailable_specialist_fixture()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.load_specialist_pipeline_config", return_value=pipeline),
+        patch("pr_agent.tools.pr_reviewer.get_specialist_snapshot_context", return_value=None),
+        patch("pr_agent.tools.pr_reviewer.unavailable_specialist_batch", return_value=batch),
+    ):
+        await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is expected_depth
+    reason_codes = [reason.code for reason in reviewer.review_route_decision.reasons]
+    assert "escalation_unavailable" in reason_codes
+    assert "escalation_invalid" not in reason_codes
+    assert not hasattr(reviewer, "_specialist_input")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "configuration",
+        "failure_reason",
+        "record_cached",
+        "record_model",
+        "record_tokens",
+        "role_records",
+        "role_record_cached",
+        "role_record_output",
+        "stale",
+    ],
+)
+async def test_tampered_unavailable_specialist_batch_still_fails_closed(
+    monkeypatch, corruption
+):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    pipeline, batch = _unavailable_specialist_fixture()
+    if corruption == "configuration":
+        batch = replace(batch, configuration_hash="other")
+    elif corruption == "failure_reason":
+        batch = replace(
+            batch,
+            records=(replace(batch.records[0], failure_reason="provider_failure"),),
+        )
+    elif corruption == "record_cached":
+        batch = replace(batch, records=(replace(batch.records[0], cached=True),))
+    elif corruption == "record_model":
+        batch = replace(batch, records=(replace(batch.records[0], model="tampered"),))
+    elif corruption == "record_tokens":
+        batch = replace(batch, records=(replace(batch.records[0], input_tokens=99),))
+    elif corruption == "role_records":
+        batch = replace(batch, role_records={})
+    elif corruption == "role_record_cached":
+        role_records = {key: dict(value) for key, value in batch.role_records.items()}
+        role_records[SpecialistRole.RISK_RECOMMENDATION.value]["cached"] = True
+        batch = replace(batch, role_records=role_records)
+    elif corruption == "role_record_output":
+        role_records = {key: dict(value) for key, value in batch.role_records.items()}
+        role_records[SpecialistRole.RISK_RECOMMENDATION.value]["output"] = {
+            "recommendation": "deep"
+        }
+        batch = replace(batch, role_records=role_records)
+    elif corruption == "stale":
+        batch = replace(batch, stale=True)
+    reviewer._specialist_pipeline = pipeline
+    reviewer.specialist_shadow_result = batch
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert "escalation_invalid" in [
+        reason.code for reason in reviewer.review_route_decision.reasons
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completed_specialist_batch_without_input_still_fails_closed(monkeypatch):
+    provider = MagicMock()
+    provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    provider.is_supported.return_value = True
+    provider.get_pr_labels.return_value = []
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(consume=True)
+    init_run_details()
+    reviewer._prepare_review_route()
+    _install_specialist_result(reviewer, state=SpecialistState.SUCCESS)
+    del reviewer._specialist_input
+    reviewer._run_shadow_specialists_once = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.specialists_enabled", lambda: True)
+
+    await reviewer._run_guarded_specialist_escalation()
+
+    assert reviewer.review_route_decision.applied_depth is ReviewDepth.DEEP
+    assert "escalation_invalid" in [
+        reason.code for reason in reviewer.review_route_decision.reasons
+    ]
+
+
+def test_non_consuming_routing_does_not_validate_specialist_evidence():
+    reviewer = _make_prediction_reviewer()
+    reviewer.review_routing_configuration = _routing_configuration(consume=False)
+    reviewer.specialist_shadow_result = object()
+
+    assert reviewer._specialist_escalation_consumption_enabled() is False
 
 
 @pytest.mark.asyncio

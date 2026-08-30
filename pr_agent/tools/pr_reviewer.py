@@ -719,6 +719,102 @@ class PRReviewer:
         self.review_route_request = request
         self._apply_review_route(route_review(request, self._routing_configuration().policy))
 
+    @staticmethod
+    def _is_expected_unavailable_specialist_batch(
+        result: SpecialistBatchResult,
+        pipeline: Any,
+    ) -> bool:
+        """Recognize the batch emitted when no stable provider identity exists."""
+        if (
+            result.schema_version != SPECIALIST_BATCH_SCHEMA_VERSION
+            or result.stale
+            or result.snapshot_id != "unavailable"
+            or result.head_sha != ""
+            or result.input_hash != ""
+            or result.configuration_hash != getattr(pipeline, "configuration_hash", None)
+            or result.changed_path_count != 0
+            or result.hunk_count != 0
+            or not isinstance(result.records, tuple)
+            or not isinstance(result.role_records, Mapping)
+        ):
+            return False
+
+        role_configs = getattr(pipeline, "roles", None)
+        if not isinstance(role_configs, tuple):
+            return False
+        enabled_roles = []
+        for config in role_configs:
+            role = getattr(config, "role", None)
+            enabled = getattr(config, "enabled", None)
+            if (
+                not isinstance(role, SpecialistRole)
+                or not isinstance(enabled, bool)
+                or role in enabled_roles
+            ):
+                return False
+            if enabled:
+                enabled_roles.append(role)
+        if len(result.records) != len(enabled_roles):
+            return False
+
+        record_roles = []
+        for record in result.records:
+            expected_record = RoleExecution(
+                role=record.role,
+                state=SpecialistState.UNAVAILABLE,
+                failure_reason="stable_head_identity_unavailable",
+            ) if isinstance(record, RoleExecution) else None
+            if (
+                not isinstance(record, RoleExecution)
+                or record.role not in enabled_roles
+                or record.role in record_roles
+                or record != expected_record
+            ):
+                return False
+            record_roles.append(record.role)
+        if set(record_roles) != set(enabled_roles):
+            return False
+
+        expected_role_names = {role.value for role in enabled_roles}
+        if set(result.role_records) != expected_role_names:
+            return False
+        for role in enabled_roles:
+            try:
+                prompt = pipeline.prompt(role)
+            except Exception:
+                return False
+            expected_role_record = {
+                "role": role.value,
+                "model": None,
+                "deployment": None,
+                "fallback_used": False,
+                "prompt_version": prompt.prompt_version,
+                "input_schema_version": prompt.input_schema_version,
+                "schema_version": prompt.schema_version,
+                "state": SpecialistState.UNAVAILABLE.value,
+                "latency_seconds": 0.0,
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "ai_calls": 0,
+                },
+                "cost": {
+                    "status": "unavailable",
+                    "total_usd": None,
+                    "by_model_usd": {},
+                },
+                "confidence": None,
+                "failure_reason": "stable_head_identity_unavailable",
+                "cached": False,
+                "reservation": {"input_tokens": 0, "output_tokens": 0},
+                "output": None,
+            }
+            role_record = result.role_records[role.value]
+            if not isinstance(role_record, Mapping) or dict(role_record) != expected_role_record:
+                return False
+        return True
+
     def _validated_specialist_escalation(self) -> ReviewDepthEscalation | None:
         result = getattr(self, "specialist_shadow_result", None)
         pipeline = getattr(self, "_specialist_pipeline", None)
@@ -738,8 +834,14 @@ class PRReviewer:
         )
         if result is None:
             return unavailable
-        if not isinstance(result, SpecialistBatchResult) or pipeline is None or specialist_input is None:
+        if not isinstance(result, SpecialistBatchResult) or pipeline is None:
             return invalid
+        if specialist_input is None:
+            return (
+                unavailable
+                if self._is_expected_unavailable_specialist_batch(result, pipeline)
+                else invalid
+            )
         if (
             result.schema_version != SPECIALIST_BATCH_SCHEMA_VERSION
             or result.stale

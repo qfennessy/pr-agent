@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as _dt
 import os
 import re
+from collections.abc import Mapping
 from typing import Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
@@ -148,6 +149,29 @@ def _azure_change_old_path(change) -> str | None:
     )
 
 
+def _azure_change_for_routing(change) -> FilePatchInfo | None:
+    """Adapt one unfiltered Azure change into provider-neutral routing evidence."""
+    path = _get_azure_change_path(change)
+    if not path:
+        if _is_azure_tree_change(change):
+            return None
+        return FilePatchInfo(
+            base_file="",
+            head_file="",
+            patch="",
+            filename="",
+            edit_type=EDIT_TYPE.UNKNOWN,
+        )
+    return FilePatchInfo(
+        base_file="",
+        head_file="",
+        patch="",
+        filename=path,
+        edit_type=_azure_change_edit_type(change),
+        old_filename=_azure_change_old_path(change),
+    )
+
+
 class AzureDevopsProvider(GitProvider):
 
     def __init__(
@@ -162,6 +186,7 @@ class AzureDevopsProvider(GitProvider):
         self.diff_files = None
         self._diff_path_map = None
         self._latest_pr_iteration_changes = None
+        self._routing_incremental_files = None
         self.workspace_slug = None
         self.repo_slug = None
         self.repo = None
@@ -408,6 +433,7 @@ class AzureDevopsProvider(GitProvider):
         self.diff_files = None
         self._diff_path_map = None
         self._latest_pr_iteration_changes = None
+        self._routing_incremental_files = None
         self._published_inline_comment_bodies = []
         self._inline_comment_store = None
         self.pr_url = pr_url
@@ -425,10 +451,12 @@ class AzureDevopsProvider(GitProvider):
             self.diff_files = None
             self._diff_path_map = None
             self._latest_pr_iteration_changes = None
+            self._routing_incremental_files = None
             self.unreviewed_files_map = {}
             self._get_incremental_commits()
 
     def _get_incremental_commits(self):
+        self._routing_incremental_files = ()
         if not self.pr_commits:
             raw = list(self.azure_devops_client.get_pull_request_commits(
                 project=self.workspace_slug,
@@ -453,6 +481,8 @@ class AzureDevopsProvider(GitProvider):
         if self.incremental.commits_range is None:
             return
         candidate_paths = []
+        routing_files = []
+        routing_file_keys = set()
         had_errors = False
         non_merge_seen = False
         for commit in self.incremental.commits_range:
@@ -461,19 +491,38 @@ class AzureDevopsProvider(GitProvider):
                 continue
             non_merge_seen = True
             try:
-                changes_obj = self.azure_devops_client.get_changes(
-                    project=self.workspace_slug,
-                    repository_id=self.repo_slug,
-                    commit_id=commit.commit_id,
+                commit_changes, incomplete = self._get_incremental_commit_changes(
+                    commit.commit_id
                 )
             except Exception as e:
                 had_errors = True
                 get_logger().warning(f"Failed to fetch changes for {commit.commit_id}: {e}")
                 continue
-            for change in (getattr(changes_obj, "changes", None) or []):
+            had_errors = had_errors or incomplete
+            for change in commit_changes:
+                routing_file = _azure_change_for_routing(change)
+                if routing_file is not None:
+                    key = (
+                        routing_file.filename,
+                        routing_file.old_filename,
+                        routing_file.edit_type,
+                    )
+                    if key not in routing_file_keys:
+                        routing_file_keys.add(key)
+                        routing_files.append(routing_file)
                 path = _get_azure_change_path(change)
                 if path:
                     candidate_paths.append(path)
+
+        if had_errors:
+            routing_files.append(FilePatchInfo(
+                base_file="",
+                head_file="",
+                patch="",
+                filename="",
+                edit_type=EDIT_TYPE.UNKNOWN,
+            ))
+        self._routing_incremental_files = tuple(routing_files)
 
         if candidate_paths:
             deduped = list(dict.fromkeys(candidate_paths))
@@ -491,6 +540,40 @@ class AzureDevopsProvider(GitProvider):
                 "Incremental range only contains merge commits; falling back to full review."
             )
             self.incremental.is_incremental = False
+
+    def _get_incremental_commit_changes(self, commit_id: str) -> tuple[list, bool]:
+        """Fetch Azure change pages, retaining evidence before a later failure."""
+        page_size = 2000
+        skip = 0
+        changes = []
+        while True:
+            try:
+                response = self.azure_devops_client.get_changes(
+                    project=self.workspace_slug,
+                    repository_id=self.repo_slug,
+                    commit_id=commit_id,
+                    top=page_size,
+                    skip=skip,
+                )
+                page = (
+                    response.get("changes")
+                    if isinstance(response, Mapping)
+                    else getattr(response, "changes", None)
+                ) or []
+                page = list(page)
+            except Exception:
+                if not changes:
+                    raise
+                get_logger().warning(
+                    f"Failed to fetch all change pages for {commit_id}; "
+                    "preserving fetched paths and marking routing evidence incomplete."
+                )
+                return changes, True
+            changes.extend(page)
+            if len(page) < page_size:
+                break
+            skip += len(page)
+        return changes, False
 
     def _get_commit_range(self):
         last_review_time = _to_naive_utc(getattr(self.previous_review, "created_at", None))
@@ -658,34 +741,23 @@ class AzureDevopsProvider(GitProvider):
     def get_files_for_routing(self):
         """Return current, unfiltered net paths instead of per-commit history."""
         if (isinstance(getattr(self, "incremental", None), IncrementalPR)
-                and self.incremental.is_incremental
-                and self.unreviewed_files_map):
-            return list(self.unreviewed_files_map.keys())
+                and self.incremental.is_incremental):
+            routing_files = getattr(self, "_routing_incremental_files", None)
+            if routing_files is None:
+                return [FilePatchInfo(
+                    base_file="",
+                    head_file="",
+                    patch="",
+                    filename="",
+                    edit_type=EDIT_TYPE.UNKNOWN,
+                )]
+            return list(routing_files)
 
         files = []
         for change in self._get_latest_pr_iteration_changes():
-            path = _get_azure_change_path(change)
-            if not path:
-                if not _is_azure_tree_change(change):
-                    # A malformed blob/change entry means the net inventory is not
-                    # complete. Retain an unknown record so routing cannot mistake
-                    # the remaining docs-only paths for safe complete evidence.
-                    files.append(FilePatchInfo(
-                        base_file="",
-                        head_file="",
-                        patch="",
-                        filename="",
-                        edit_type=EDIT_TYPE.UNKNOWN,
-                    ))
-                continue
-            files.append(FilePatchInfo(
-                base_file="",
-                head_file="",
-                patch="",
-                filename=path,
-                edit_type=_azure_change_edit_type(change),
-                old_filename=_azure_change_old_path(change),
-            ))
+            routing_file = _azure_change_for_routing(change)
+            if routing_file is not None:
+                files.append(routing_file)
         return files
 
     def _get_files_full(self):
