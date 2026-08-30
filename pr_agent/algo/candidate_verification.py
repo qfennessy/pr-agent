@@ -60,8 +60,12 @@ class _RepositoryFetchCapacityExhausted(RuntimeError):
     """Raised when timed-out provider work already occupies every bounded fetch slot."""
 
 
+class _ChangedContextCollectionStopped(RuntimeError):
+    """Raised when a retrieval budget stops lazy changed-context collection."""
+
+
 async def _bounded_repo_file_fetch(git_provider, path: str, timeout_seconds: float,
-                                  from_pr_head: bool = False):
+                                   from_pr_head: bool = False):
     """Run a synchronous provider fetch without allowing abandoned work to grow unboundedly."""
     if timeout_seconds <= 0:
         raise asyncio.TimeoutError
@@ -639,6 +643,10 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             "_changed_anchor_ordinal": anchor_ordinal,
             "_trusted_lineage_key": _trusted_file_lineage(diff_file),
             "_trusted_side_line_count": trusted_side_line_count,
+            "_display_file": (
+                safe_repo_path(getattr(diff_file, "old_filename", None))
+                if side == "old" else relevant_file
+            ) or relevant_file,
         })
     sensitive_omitted_count = sensitive_total_count - len(sensitive_specs)
     if sensitive_omitted_count:
@@ -979,18 +987,113 @@ def _candidate_changed_patch_evidence(diff_file, candidate: dict) -> Optional[di
     )
 
 
-def _changed_context_patch_evidence(diff_file) -> list[dict]:
-    """Return bounded-unit evidence for every visible changed range in a requested changed file."""
-    patch = getattr(diff_file, "patch", "") or ""
-    evidence = []
-    for side, ranges in (("new", _added_line_ranges(patch)), ("old", _deleted_line_ranges(patch))):
-        for start_line, end_line in ranges:
-            item = _changed_patch_range_evidence(
-                diff_file, side, start_line, end_line, "changed_context_patch"
-            )
+def _changed_context_patch_evidence(
+    diff_file,
+    stop_requested: Optional[Callable[[], bool]] = None,
+    remaining_line_budget: Optional[Callable[[], int]] = None,
+    remaining_token_budget: Optional[Callable[[], int]] = None,
+    token_counter: Optional[Callable[[str], int]] = None,
+) -> Iterable[dict]:
+    """Yield changed ranges from one patch traversal so retrieval budgets can stop work early."""
+    if diff_file is None:
+        return
+
+    old_line = None
+    new_line = None
+    pending = {"new": None, "old": None}
+
+    def completed(side: str) -> Optional[dict]:
+        current = pending[side]
+        if current is None:
+            return None
+        pending[side] = None
+        return {
+            "source": "changed_context_patch",
+            "side": side,
+            "content": "\n".join(current["content"]),
+            "start_line": current["start_line"],
+            "end_line": current["end_line"],
+            "anchor_start_line": current["start_line"],
+            "anchor_end_line": current["end_line"],
+        }
+
+    def append_changed(side: str, line_number: int, content: str) -> Optional[dict]:
+        current = pending[side]
+        finished = None
+        if current is not None and line_number != current["end_line"] + 1:
+            finished = completed(side)
+            current = None
+        line_budget = remaining_line_budget() if remaining_line_budget is not None else None
+        token_budget = remaining_token_budget() if remaining_token_budget is not None else None
+        added_tokens = 0
+        if token_counter is not None:
+            added_tokens = max(1, int(token_counter(content)))
+            if current is not None:
+                added_tokens += max(1, int(token_counter("\n")))
+        if line_budget is not None and (
+            line_budget < 1
+            or (current is not None and len(current["content"]) >= line_budget)
+        ):
+            raise _ChangedContextCollectionStopped
+        if token_budget is not None and (
+            token_budget < 1
+            or (current["token_count"] if current is not None else 0) + added_tokens > token_budget
+        ):
+            raise _ChangedContextCollectionStopped
+        if current is None:
+            pending[side] = {
+                "start_line": line_number,
+                "end_line": line_number,
+                "content": [content],
+                "token_count": added_tokens,
+            }
+        else:
+            current["end_line"] = line_number
+            current["content"].append(content)
+            current["token_count"] += added_tokens
+        return finished
+
+    for record in iter_git_patch_lines(getattr(diff_file, "patch", "") or ""):
+        if stop_requested is not None and stop_requested():
+            raise _ChangedContextCollectionStopped
+        line = strip_git_line_ending(record)
+        header = RE_HUNK_HEADER.match(line)
+        if header:
+            next_old_line = int(header.group(1))
+            next_new_line = int(header.group(3))
+            for side, next_line in (("new", next_new_line), ("old", next_old_line)):
+                current = pending[side]
+                if current is not None and next_line != current["end_line"] + 1:
+                    item = completed(side)
+                    if item is not None:
+                        yield item
+            old_line = next_old_line
+            new_line = next_new_line
+            continue
+        if old_line is None or new_line is None or line.startswith("\\ No newline at end of file"):
+            continue
+        if line.startswith("+"):
+            item = append_changed("new", new_line, line[1:])
             if item is not None:
-                evidence.append(item)
-    return evidence
+                yield item
+        elif line.startswith("-"):
+            item = append_changed("old", old_line, line[1:])
+            if item is not None:
+                yield item
+        else:
+            for side in ("new", "old"):
+                item = completed(side)
+                if item is not None:
+                    yield item
+        if not line.startswith("+"):
+            old_line += 1
+        if not line.startswith("-"):
+            new_line += 1
+
+    for side in ("new", "old"):
+        item = completed(side)
+        if item is not None:
+            yield item
 
 
 def _retrieval_evidence_id(candidate_id: str, path: str, source: str) -> str:
@@ -1020,7 +1123,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
     budget_exhausted = False
     time_budget_exhausted = False
     changed_evidence_count = 0
-    added_context_head_available = {}
+    changed_context_head_available = {}
     incomplete_changed_context = set()
     shared_repo_evidence = {}
     diff_by_file = {
@@ -1112,6 +1215,27 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             changed_evidence_count += 1
         return True
 
+    def append_complete_context_head(candidate: dict, candidate_id: str, context_path: str,
+                                     request_spec: dict, context_diff) -> bool:
+        head_file = getattr(context_diff, "head_file", "")
+        if not head_file or not getattr(context_diff, "head_file_is_complete", True):
+            return False
+        source = "changed_context_head"
+        evidence_id = _retrieval_evidence_id(candidate_id, context_path, source)
+        anchor_line = _excerpt_anchor_line(str(head_file), candidate, context_path)
+        if not append_evidence({
+            "candidate_id": candidate_id,
+            "source": source,
+            "content": str(head_file),
+            "evidence_id": evidence_id,
+            "required_evidence": bool(request_spec.get("required")),
+            "anchor_start_line": anchor_line,
+            "anchor_end_line": anchor_line,
+        }, candidate, context_path):
+            return False
+        changed_context_head_available[(candidate_id, context_path)] = evidence_id
+        return True
+
     # Reserve each exact candidate anchor before any larger same-file or
     # repository excerpt can consume its path budget. This keeps one candidate
     # from starving another candidate in the same file of changed-code proof.
@@ -1139,38 +1263,50 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 continue
             context_diff = diff_by_file.get(context_path)
             context_key = (candidate_id, context_path)
+            if context_diff is None:
+                continue
             if (
                 getattr(context_diff, "edit_type", None) == EDIT_TYPE.ADDED
                 and getattr(context_diff, "head_file", "")
                 and getattr(context_diff, "head_file_is_complete", True)
             ):
-                source = "changed_context_head"
-                evidence_id = _retrieval_evidence_id(candidate_id, context_path, source)
-                anchor_line = _excerpt_anchor_line(str(context_diff.head_file), candidate, context_path)
-                if append_evidence({
-                    "candidate_id": candidate_id,
-                    "source": source,
-                    "content": str(context_diff.head_file),
-                    "evidence_id": evidence_id,
-                    "required_evidence": bool(request_spec.get("required")),
-                    "anchor_start_line": anchor_line,
-                    "anchor_end_line": anchor_line,
-                }, candidate, context_path):
-                    added_context_head_available[context_key] = evidence_id
-                else:
+                if not append_complete_context_head(
+                    candidate, candidate_id, context_path, request_spec, context_diff
+                ):
                     incomplete_changed_context.add(context_key)
                 continue
-            context_items = _changed_context_patch_evidence(context_diff)
-            if not context_items:
-                continue
-            appended_all = all(
-                append_evidence(
-                    {"candidate_id": candidate_id, **context_item},
-                    candidate,
-                    context_path,
+            context_item_count = 0
+            try:
+                context_items = _changed_context_patch_evidence(
+                    context_diff,
+                    stop_requested=lambda path=context_path: (
+                        time.monotonic() >= deadline
+                        or remaining_lines(path) < 1
+                        or total_tokens >= budgets.max_context_tokens
+                    ),
+                    remaining_line_budget=lambda path=context_path: remaining_lines(path),
+                    remaining_token_budget=lambda: budgets.max_context_tokens - total_tokens,
+                    token_counter=count_tokens,
                 )
-                for context_item in context_items
-            )
+                appended_all = True
+                for context_item in context_items:
+                    context_item_count += 1
+                    if not append_evidence(
+                        {"candidate_id": candidate_id, **context_item},
+                        candidate,
+                        context_path,
+                    ):
+                        appended_all = False
+                        break
+            except _ChangedContextCollectionStopped:
+                budget_exhausted = True
+                if time.monotonic() >= deadline:
+                    time_budget_exhausted = True
+                appended_all = False
+            if context_item_count == 0 and appended_all:
+                appended_all = append_complete_context_head(
+                    candidate, candidate_id, context_path, request_spec, context_diff
+                )
             if not appended_all:
                 incomplete_changed_context.add(context_key)
 
@@ -1209,10 +1345,10 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 request["evidence_id"] = changed_head_evidence_id
                 continue
             context_key = (candidate_id, path)
-            if context_key in added_context_head_available:
+            if context_key in changed_context_head_available:
                 request["status"] = "satisfied_by_changed_head"
                 request["source"] = "changed_context_head"
-                request["evidence_id"] = added_context_head_available[context_key]
+                request["evidence_id"] = changed_context_head_available[context_key]
                 continue
             if context_key in incomplete_changed_context:
                 request["status"] = "context_budget_exhausted"
@@ -1581,9 +1717,10 @@ def apply_verification_decisions(
             record["reason"] = "location_not_in_changed_lines"
             result_records.append(record)
             continue
+        display_file = safe_repo_path(candidate.get("_display_file")) or relevant_file
         finding = {
             "_candidate_id": candidate_id,
-            "relevant_file": relevant_file,
+            "relevant_file": display_file,
             "issue_header": str(decision.get("issue_header") or candidate.get("issue_header") or "Issue").strip(),
             "issue_content": (
                 f"{explanation}\n\n**Trigger:** {trigger}\n\n**Impact:** {impact}\n\n"

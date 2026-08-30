@@ -34,6 +34,7 @@ from pr_agent.algo.review_specialists import (
 )
 from pr_agent.algo.token_handler import TokenEncoder
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
+from pr_agent.algo.utils import convert_to_markdown_v2
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
 from pr_agent.tools.pr_reviewer import PRReviewer
 
@@ -507,6 +508,7 @@ async def test_sensitive_rename_to_safe_path_audits_both_sides_with_old_lineage(
         ("old", "src/policy.py"),
         ("new", "src/policy.py"),
     ]
+    assert old_candidate["_display_file"] == "auth/policy.py"
     assert all(candidate["_trusted_lineage_key"] == "file:auth/policy.py" for candidate in candidates)
     assert any(
         item["candidate_id"] == old_candidate["candidate_id"]
@@ -517,7 +519,71 @@ async def test_sensitive_rename_to_safe_path_audits_both_sides_with_old_lineage(
     )
     provider.get_repo_file_content.assert_called_once_with("auth/policy.py", False)
     assert findings[0]["side"] == "old"
+    assert findings[0]["relevant_file"] == "auth/policy.py"
+    assert findings[0]["verification_evidence"] == ["src/policy.py"]
     assert decisions[0]["verdict"] == "verified"
+
+
+@pytest.mark.asyncio
+async def test_renamed_old_side_display_path_is_escaped_without_changing_evidence_identity():
+    old_path = "auth/legacy & <policy>.py"
+    current_path = "lib/policy.py"
+    diff_file = _diff_file(
+        current_path,
+        edit_type=EDIT_TYPE.RENAMED,
+        old_filename=old_path,
+    )
+    diff_file.patch = (
+        "@@ -10,1 +10,1 @@\n"
+        "-auth_check(request)\n"
+        "+log_request(request)"
+    )
+    candidates, rejected = prepare_candidates(
+        _review_data(), [diff_file], ["auth/**"], 1
+    )
+    old_candidate = next(candidate for candidate in candidates if candidate["side"] == "old")
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = diff_file.base_file
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(max_lines_per_file=60, max_total_lines=120),
+        [],
+        diff_files=[diff_file],
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": old_candidate["candidate_id"],
+        "verdict": "verified",
+        "relevant_file": current_path,
+        "start_line": 10,
+        "end_line": 10,
+        "evidence_paths": [current_path],
+    }]}}
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    rendered = convert_to_markdown_v2(
+        {"review": {"key_issues_to_review": findings}},
+        gfm_supported=True,
+        git_provider=provider,
+        files=[diff_file],
+        review_profile="bugs_only",
+    )
+    safe_artifact = telemetry_safe_artifact({"retrieval": artifact})
+
+    assert rejected == []
+    assert decisions[0]["verdict"] == "verified"
+    assert findings[0]["relevant_file"] == old_path
+    assert findings[0]["verification_evidence"] == [current_path]
+    assert "Deleted location: <code>auth/legacy &amp; &lt;policy&gt;.py</code>, line 10" in rendered
+    assert "auth/legacy & <policy>.py" not in rendered
+    provider.get_line_link.assert_not_called()
+    assert old_path not in json.dumps(safe_artifact)
 
 
 def test_sensitive_path_creates_a_candidate_for_each_changed_hunk():
@@ -1925,6 +1991,268 @@ async def test_all_candidate_anchors_are_reserved_before_changed_context_patches
 
 
 @pytest.mark.asyncio
+async def test_changed_context_patch_uses_one_pass_and_stops_when_the_budget_is_full(monkeypatch):
+    service_diff = _diff_file("src/service.py")
+    dependency_diff = _diff_file("src/generated_dependency.py")
+    dependency_diff.patch = "\n".join(
+        f"@@ -{line},0 +{line},1 @@\n+generated_change_{line}"
+        for line in range(2, 10_002, 2)
+    )
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(context_files=["src/generated_dependency.py"])),
+        [service_diff, dependency_diff],
+        [],
+        3,
+    )
+    original_iter_git_patch_lines = candidate_verification.iter_git_patch_lines
+    dependency_traversals = 0
+    dependency_records_consumed = 0
+
+    def counted_iter_git_patch_lines(patch_text):
+        nonlocal dependency_traversals, dependency_records_consumed
+        records = original_iter_git_patch_lines(patch_text)
+        if patch_text != dependency_diff.patch:
+            yield from records
+            return
+        dependency_traversals += 1
+        for record in records:
+            dependency_records_consumed += 1
+            yield record
+
+    monkeypatch.setattr(
+        candidate_verification,
+        "iter_git_patch_lines",
+        counted_iter_git_patch_lines,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        MagicMock(),
+        candidates,
+        VerificationBudgets(
+            max_lines_per_file=1,
+            max_total_lines=2,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[service_diff, dependency_diff],
+    )
+
+    context_evidence = [
+        item for item in evidence if item["source"] == "changed_context_patch"
+    ]
+    dependency_request = next(
+        request for request in artifact["requests"]
+        if request.get("path") == "src/generated_dependency.py"
+    )
+    assert dependency_traversals == 1
+    assert dependency_records_consumed < 20
+    assert len(context_evidence) == 1
+    assert context_evidence[0]["content"] == "generated_change_2"
+    assert context_evidence[0]["start_line"] == 2
+    assert context_evidence[0]["end_line"] == 2
+    assert dependency_request["status"] == "context_budget_exhausted"
+    assert artifact["budget_exhausted"] is True
+
+
+@pytest.mark.asyncio
+async def test_changed_context_patch_stops_a_contiguous_hunk_at_the_pending_token_budget(monkeypatch):
+    service_diff = _diff_file("src/service.py")
+    dependency_diff = _diff_file("src/generated_dependency.py")
+    dependency_diff.patch = "@@ -0,0 +1,5000 @@\n" + "\n".join("+x" for _ in range(5_000))
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(context_files=["src/generated_dependency.py"])),
+        [service_diff, dependency_diff],
+        [],
+        3,
+    )
+    original_iter_git_patch_lines = candidate_verification.iter_git_patch_lines
+    dependency_traversals = 0
+    dependency_records_consumed = 0
+
+    def counted_iter_git_patch_lines(patch_text):
+        nonlocal dependency_traversals, dependency_records_consumed
+        records = original_iter_git_patch_lines(patch_text)
+        if patch_text != dependency_diff.patch:
+            yield from records
+            return
+        dependency_traversals += 1
+        for record in records:
+            dependency_records_consumed += 1
+            yield record
+
+    monkeypatch.setattr(
+        candidate_verification,
+        "iter_git_patch_lines",
+        counted_iter_git_patch_lines,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        MagicMock(),
+        candidates,
+        VerificationBudgets(
+            max_lines_per_file=6_000,
+            max_total_lines=6_001,
+            max_context_tokens=4,
+        ),
+        [],
+        diff_files=[service_diff, dependency_diff],
+        token_counter=len,
+    )
+
+    dependency_request = next(
+        request for request in artifact["requests"]
+        if request.get("path") == "src/generated_dependency.py"
+    )
+    assert dependency_traversals == 1
+    assert dependency_records_consumed < 10
+    assert not any(item["source"] == "changed_context_patch" for item in evidence)
+    assert dependency_request["status"] == "context_budget_exhausted"
+    assert artifact["budget_exhausted"] is True
+
+
+def test_changed_context_patch_preserves_side_specific_replacement_and_deletion_ranges():
+    diff_file = _diff_file(
+        "lib/policy.py",
+        edit_type=EDIT_TYPE.RENAMED,
+        old_filename="auth/policy.py",
+    )
+    diff_file.patch = (
+        "@@ -10,3 +10,3 @@\n"
+        "-old_guard_one\n"
+        "-old_guard_two\n"
+        "+new_guard_one\n"
+        "+new_guard_two\n"
+        " unchanged\n"
+        "@@ -30,1 +30,0 @@\n"
+        "-deleted_guard"
+    )
+
+    evidence = list(candidate_verification._changed_context_patch_evidence(diff_file))
+
+    assert [
+        (item["side"], item["start_line"], item["end_line"], item["content"])
+        for item in evidence
+    ] == [
+        ("new", 10, 11, "new_guard_one\nnew_guard_two"),
+        ("old", 10, 11, "old_guard_one\nold_guard_two"),
+        ("old", 30, 30, "deleted_guard"),
+    ]
+    assert all(item["source"] == "changed_context_patch" for item in evidence)
+
+
+@pytest.mark.asyncio
+async def test_modified_context_without_patch_uses_trusted_complete_current_head():
+    service_diff = _diff_file("src/service.py")
+    helper_diff = _diff_file(
+        "src/helper.py",
+        base_file="def required_contract(): return 'SAFE'",
+        head_file="def required_contract(): return 'UNSAFE'",
+        edit_type=EDIT_TYPE.MODIFIED,
+    )
+    helper_diff.patch = ""
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/helper.py"],
+            context_symbols=["required_contract"],
+        )),
+        [service_diff, helper_diff],
+        [],
+        3,
+    )
+    provider = MagicMock()
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(),
+        [],
+        diff_files=[service_diff, helper_diff],
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py", "src/helper.py"],
+    }]}}
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    helper_evidence = next(item for item in evidence if item.get("path") == "src/helper.py")
+    helper_request = next(
+        request for request in artifact["requests"] if request.get("path") == "src/helper.py"
+    )
+    assert helper_evidence["source"] == "changed_context_head"
+    assert "UNSAFE" in helper_evidence["content"]
+    assert "return 'SAFE'" not in helper_evidence["content"]
+    assert helper_request["status"] == "satisfied_by_changed_head"
+    assert decisions[0]["verdict"] == "verified"
+    assert len(findings) == 1
+    provider.get_repo_file_content.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("patch_text", ["", "@@ -1,1 +1,1 @@"])
+async def test_incomplete_modified_context_without_visible_ranges_rejects_base_only_proof(patch_text):
+    service_diff = _diff_file("src/service.py")
+    helper_diff = _diff_file(
+        "src/helper.py",
+        base_file="def required_contract(): return 'SAFE'",
+        head_file="def required_contract(): return 'UNSAFE'",
+        edit_type=EDIT_TYPE.MODIFIED,
+    )
+    helper_diff.head_file_is_complete = False
+    helper_diff.patch = patch_text
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/helper.py"],
+            context_symbols=["required_contract"],
+        )),
+        [service_diff, helper_diff],
+        [],
+        3,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = helper_diff.base_file
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(),
+        [],
+        diff_files=[service_diff, helper_diff],
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py", "src/helper.py"],
+    }]}}
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    helper_request = next(
+        request for request in artifact["requests"] if request.get("path") == "src/helper.py"
+    )
+    assert helper_request["status"] == "context_budget_exhausted"
+    assert not any(item.get("path") == "src/helper.py" for item in evidence)
+    assert findings == []
+    assert decisions[0]["reason"] == "required_context_unavailable"
+    provider.get_repo_file_content.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_added_required_context_uses_complete_head_and_can_publish():
     service_diff = _diff_file()
     dependency_diff = _diff_file(
@@ -2947,6 +3275,7 @@ async def test_verifier_exception_log_uses_the_source_free_telemetry_whitelist()
     provider.get_diff_files.return_value = [_diff_file()]
     provider.get_repo_file_content.return_value = "def call_service(): return service().value"
     reviewer = _reviewer_for_orchestration(provider)
+    reviewer.ai_handler.chat_completion = AsyncMock(side_effect=RuntimeError(secret))
     settings = _verification_settings()
     settings.get = lambda key, default=None: ({
         "static_analysis_evidence": [{
@@ -2967,10 +3296,12 @@ async def test_verifier_exception_log_uses_the_source_free_telemetry_whitelist()
     ):
         await reviewer._run_candidate_verification()
 
-    exception_artifact = logger.exception.call_args.kwargs["artifact"]
+    error_artifact = logger.error.call_args.kwargs["artifact"]
     info_artifact = logger.info.call_args.kwargs["artifact"]
-    assert secret not in json.dumps(exception_artifact)
+    assert secret not in str(logger.error.call_args)
+    assert secret not in json.dumps(error_artifact)
     assert secret not in json.dumps(info_artifact)
+    logger.exception.assert_not_called()
 
 
 @pytest.mark.asyncio

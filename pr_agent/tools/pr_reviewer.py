@@ -1218,7 +1218,7 @@ class PRReviewer:
                 "failure": type(failure).__name__,
                 "verified_count": 0,
             })
-            get_logger().exception(
+            get_logger().error(
                 "Candidate verification failed", artifact=telemetry_safe_artifact(artifact)
             )
         finally:
