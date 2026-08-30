@@ -193,6 +193,46 @@ def test_captured_filenames_are_literal_git_pathspecs(tmp_path):
     assert "excluded.py" not in snapshot.diff
 
 
+def test_operational_ignores_are_literal_paths(tmp_path):
+    repo = _repo(tmp_path)
+    (repo / "[ab].md").write_text("artifact\n", encoding="utf-8")
+    (repo / "a.md").write_text("review me\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo), ignored_paths=["[ab].md"]).capture(event="worktree-idle")
+
+    assert "[ab].md" not in snapshot.changed_paths
+    assert "a.md" in snapshot.changed_paths
+
+
+def test_capture_revalidates_before_accepting_diff_bytes(tmp_path):
+    repo = _repo(tmp_path)
+    path = repo / "tracked.py"
+    path.write_text("small\n", encoding="utf-8")
+
+    class RacingReview(LocalPairReview):
+        def _capture_diff(self, event, base_revision, paths):
+            path.write_text("x" * 100, encoding="utf-8")
+            return super()._capture_diff(event, base_revision, paths)
+
+    snapshot = RacingReview(str(repo), max_file_bytes=20).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert CoverageIssue(path="tracked.py", reason="file_too_large") in snapshot.coverage_issues
+
+
+def test_skipped_content_fingerprint_invalidates_snapshot_identity(tmp_path):
+    repo = _repo(tmp_path)
+    path = repo / "excluded.txt"
+    path.write_text("first\n", encoding="utf-8")
+    reviewer = LocalPairReview(str(repo), excluded_paths=["excluded.txt"])
+    first = reviewer.capture(event="worktree-idle")
+    path.write_text("second\n", encoding="utf-8")
+    second = reviewer.capture(event="worktree-idle")
+
+    assert first.coverage_issues[0].fingerprint != second.coverage_issues[0].fingerprint
+    assert first.snapshot_id != second.snapshot_id
+
+
 def test_file_save_requires_a_safe_focused_path_and_captures_untracked_addition(tmp_path):
     repo = _repo(tmp_path)
     (repo / "new.py").write_text("added = True\n", encoding="utf-8")

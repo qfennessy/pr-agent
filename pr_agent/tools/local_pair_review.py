@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import subprocess
@@ -92,7 +93,43 @@ class LocalPairReview:
         return any(fnmatch.fnmatch(path, pattern) for pattern in self.excluded_paths)
 
     def _is_ignored(self, path: str) -> bool:
-        return any(fnmatch.fnmatch(path, pattern) for pattern in self.ignored_paths)
+        return path in self.ignored_paths
+
+    def _git_object_identity(self, revision: str, path: str) -> tuple[Optional[str], Optional[str]]:
+        if revision == ":":
+            output = _run_git(
+                self.repository_root, "--literal-pathspecs", "ls-files", "--stage", "--", path
+            )
+            fields = output.decode("utf-8", errors="replace").strip().split(maxsplit=3)
+            return (fields[0], fields[1]) if len(fields) >= 2 else (None, None)
+        output = _run_git(
+            self.repository_root, "--literal-pathspecs", "ls-tree", revision, "--", path
+        )
+        fields = output.decode("utf-8", errors="replace").strip().split(maxsplit=3)
+        return (fields[0], fields[2]) if len(fields) >= 3 else (None, None)
+
+    def _path_fingerprint(self, event: ReviewEvent, path: str, base_revision: str) -> Optional[str]:
+        if event is ReviewEvent.PRE_COMMIT:
+            _, object_id = self._git_object_identity(":", path)
+            if object_id is None:
+                _, object_id = self._git_object_identity(base_revision, path)
+            return f"git:{object_id}" if object_id else None
+
+        candidate = self.repository_root / path
+        try:
+            digest = hashlib.sha256()
+            if candidate.is_symlink():
+                digest.update(os.readlink(candidate).encode("utf-8", errors="surrogateescape"))
+                return "sha256:" + digest.hexdigest()
+            if candidate.is_file():
+                with candidate.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                return "sha256:" + digest.hexdigest()
+        except OSError:
+            return None
+        _, object_id = self._git_object_identity(base_revision, path)
+        return f"git:{object_id}" if object_id else None
 
     def _inspect_content(self, content: bytes) -> Optional[str]:
         if len(content) > self.max_file_bytes:
@@ -106,16 +143,8 @@ class LocalPairReview:
         return None
 
     def _git_object_mode(self, revision: str, path: str) -> Optional[str]:
-        if revision == ":":
-            output = _run_git(
-                self.repository_root, "--literal-pathspecs", "ls-files", "--stage", "--", path
-            )
-        else:
-            output = _run_git(
-                self.repository_root, "--literal-pathspecs", "ls-tree", revision, "--", path
-            )
-        line = output.decode("utf-8", errors="replace").strip()
-        return line.split(maxsplit=1)[0] if line else None
+        mode, _ = self._git_object_identity(revision, path)
+        return mode
 
     def _inspect_revision_file(self, revision: str, path: str) -> Optional[str]:
         mode = self._git_object_mode(revision, path)
@@ -242,16 +271,22 @@ class LocalPairReview:
         selected_untracked: list[str] = []
         coverage: list[CoverageIssue] = []
 
+        def add_coverage(path: Optional[str], reason: str) -> None:
+            fingerprint = None
+            if path and reason != "outside_repository_root":
+                fingerprint = self._path_fingerprint(event, path, base_revision)
+            coverage.append(CoverageIssue(path=path, reason=reason, fingerprint=fingerprint))
+
         def validate_path(path: str) -> Optional[str]:
             try:
                 normalized = self._relative_path(path)
             except SnapshotCaptureError:
-                coverage.append(CoverageIssue(path=path, reason="outside_repository_root"))
+                add_coverage(path, "outside_repository_root")
                 return None
             if self._is_ignored(normalized):
                 return None
             if self._is_excluded(normalized):
-                coverage.append(CoverageIssue(path=normalized, reason="excluded"))
+                add_coverage(normalized, "excluded")
                 return None
             file_issue = (
                 self._inspect_index_file(normalized, base_revision)
@@ -259,7 +294,7 @@ class LocalPairReview:
                 else self._inspect_current_file(normalized, base_revision)
             )
             if file_issue:
-                coverage.append(CoverageIssue(path=normalized, reason=file_issue))
+                add_coverage(normalized, file_issue)
                 return None
             return normalized
 
@@ -274,12 +309,33 @@ class LocalPairReview:
             if normalized is not None:
                 selected_untracked.append(normalized)
 
-        diff_parts = []
-        if selected_tracked:
-            diff_parts.append(self._capture_diff(event, base_revision, selected_tracked))
-        for path in selected_untracked:
-            diff_parts.append(self._capture_untracked_addition(path))
-        captured_diff = "".join(diff_parts)
+        def capture_selected() -> str:
+            diff_parts = []
+            if selected_tracked:
+                diff_parts.append(self._capture_diff(event, base_revision, selected_tracked))
+            for selected_path in selected_untracked:
+                diff_parts.append(self._capture_untracked_addition(selected_path))
+            return "".join(diff_parts)
+
+        try:
+            captured_diff = capture_selected()
+            revalidated = all(
+                validate_path(selected_path) is not None
+                for selected_path in (*selected_tracked, *selected_untracked)
+            )
+            verified_diff = capture_selected() if revalidated else ""
+        except UnicodeDecodeError:
+            add_coverage(None, "content_changed_during_capture")
+            captured_diff = verified_diff = ""
+            revalidated = False
+        if not revalidated or verified_diff != captured_diff:
+            if revalidated:
+                add_coverage(None, "content_changed_during_capture")
+            captured_diff = ""
+            selected_tracked.clear()
+            selected_untracked.clear()
+        else:
+            captured_diff = verified_diff
 
         parsed_files = parse_plain_diff(captured_diff) if captured_diff.strip() else []
         parsed_paths = {
@@ -290,7 +346,7 @@ class LocalPairReview:
         }
         expected_paths = set(selected_tracked) | set(selected_untracked)
         for missing_path in sorted(expected_paths - parsed_paths):
-            coverage.append(CoverageIssue(path=missing_path, reason="binary_or_unparseable_diff"))
+            add_coverage(missing_path, "binary_or_unparseable_diff")
 
         # Serializing the already parsed objects is the narrow reuse seam: the
         # snapshot and PlainDiffGitProvider validate through the same parser.

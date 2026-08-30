@@ -35,6 +35,7 @@ class CoverageIssue:
 
     reason: str
     path: Optional[str] = None
+    fingerprint: Optional[str] = field(default=None, compare=False)
 
 
 def _canonical_json(value: Any) -> str:
