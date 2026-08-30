@@ -12,7 +12,8 @@ _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path", "plain_diff.js
                   "config.propagate_tool_errors", "pr_reviewer.extra_instructions",
                   "local_pair_review.policy_version", "local_pair_review.excluded_paths",
                   "local_pair_review.max_file_bytes", "local_pair_review.cache_enabled",
-                  "local_pair_review.cache_max_entries"]
+                  "local_pair_review.cache_max_entries", "config.use_repo_settings_file",
+                  "config.reasoning_effort"]
 
 
 @pytest.fixture(autouse=True)
@@ -199,6 +200,53 @@ def test_review_snapshot_loads_repo_policy_before_capture(cfg, monkeypatch, tmp_
         (issue.path, issue.reason) for issue in result.coverage_issues
     }
     assert json.loads(capsys.readouterr().out)["state"] == "coverage_unavailable"
+
+
+def test_review_snapshot_honors_disabled_repo_settings(cfg, monkeypatch, tmp_path, capsys):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo-policy-disabled"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "review.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "review.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    (repo / ".pr_agent.toml").write_text(
+        '[local_pair_review]\nexcluded_paths = ["review.py"]\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(repo)
+    cfg("config.use_repo_settings_file", False)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    result = run(inargs=[
+        "review-snapshot", "--event", "file-save", "--path", "review.py", "--no-cache",
+    ])
+
+    assert result.state.value == "no_findings"
+    assert json.loads(capsys.readouterr().out)["state"] == "no_findings"
+
+
+def test_snapshot_configuration_hash_covers_review_settings(cfg):
+    from pr_agent.cli import _snapshot_review_configuration_hash
+
+    cfg("config.reasoning_effort", "low")
+    first = _snapshot_review_configuration_hash()
+    cfg("config.reasoning_effort", "high")
+
+    assert _snapshot_review_configuration_hash() != first
 
 
 def test_review_snapshot_applies_external_policy_before_capture(cfg, monkeypatch, tmp_path, capsys):

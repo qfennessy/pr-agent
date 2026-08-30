@@ -107,14 +107,21 @@ class LocalPairReview:
 
     def _git_object_mode(self, revision: str, path: str) -> Optional[str]:
         if revision == ":":
-            output = _run_git(self.repository_root, "ls-files", "--stage", "--", path)
+            output = _run_git(
+                self.repository_root, "--literal-pathspecs", "ls-files", "--stage", "--", path
+            )
         else:
-            output = _run_git(self.repository_root, "ls-tree", revision, "--", path)
+            output = _run_git(
+                self.repository_root, "--literal-pathspecs", "ls-tree", revision, "--", path
+            )
         line = output.decode("utf-8", errors="replace").strip()
         return line.split(maxsplit=1)[0] if line else None
 
     def _inspect_revision_file(self, revision: str, path: str) -> Optional[str]:
-        if self._git_object_mode(revision, path) == "120000":
+        mode = self._git_object_mode(revision, path)
+        if mode is None:
+            return None
+        if mode == "120000":
             return "symlink"
         process = subprocess.run(
             ["git", "-C", str(self.repository_root), "show", f"{revision}:./{path}"],
@@ -127,6 +134,9 @@ class LocalPairReview:
         return self._inspect_content(process.stdout)
 
     def _inspect_current_file(self, path: str, base_revision: str) -> Optional[str]:
+        base_issue = self._inspect_revision_file(base_revision, path)
+        if base_issue:
+            return base_issue
         candidate = self.repository_root / path
         if candidate.is_symlink():
             return "symlink"
@@ -142,6 +152,9 @@ class LocalPairReview:
 
     def _inspect_index_file(self, path: str, base_revision: str) -> Optional[str]:
         """Inspect the exact staged blob used by a pre-commit snapshot."""
+        base_issue = self._inspect_revision_file(base_revision, path)
+        if base_issue:
+            return base_issue
         if self._git_object_mode(":", path) == "120000":
             return "symlink"
         process = subprocess.run(
@@ -182,7 +195,7 @@ class LocalPairReview:
     def _capture_diff(self, event: ReviewEvent, base_revision: str, paths: Sequence[str]) -> str:
         if not paths:
             return ""
-        args = ["diff", "--no-ext-diff", "--find-renames"]
+        args = ["--literal-pathspecs", "diff", "--no-ext-diff", "--find-renames"]
         if event is ReviewEvent.PRE_COMMIT:
             args.append("--cached")
         args.extend([base_revision, "--", *paths])

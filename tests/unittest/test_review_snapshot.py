@@ -126,6 +126,20 @@ def test_deleted_blob_is_validated_before_its_diff_is_captured(tmp_path):
     assert CoverageIssue(path="large.py", reason="file_too_large") in snapshot.coverage_issues
 
 
+def test_modified_file_validates_both_base_and_current_blobs(tmp_path):
+    repo = _repo(tmp_path)
+    path = repo / "large.py"
+    path.write_text("x" * 100, encoding="utf-8")
+    _git(repo, "add", "large.py")
+    _git(repo, "commit", "-m", "add large base")
+    path.write_text("small\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo), max_file_bytes=20).capture(event="worktree-idle")
+
+    assert "large.py" not in snapshot.changed_paths
+    assert CoverageIssue(path="large.py", reason="file_too_large") in snapshot.coverage_issues
+
+
 def test_symlink_paths_are_preserved_and_reported_as_unsupported(tmp_path):
     repo = _repo(tmp_path)
     target = repo / "target.py"
@@ -153,6 +167,24 @@ def test_excluding_either_side_rejects_an_entire_rename(tmp_path):
     assert snapshot.diff == ""
     assert snapshot.changed_paths == ()
     assert CoverageIssue(path="ignored.py", reason="excluded") in snapshot.coverage_issues
+
+
+def test_captured_filenames_are_literal_git_pathspecs(tmp_path):
+    repo = _repo(tmp_path)
+    magic = ":(glob)*.py"
+    (repo / magic).write_text("magic = 1\n", encoding="utf-8")
+    (repo / "excluded.py").write_text("secret = 1\n", encoding="utf-8")
+    _git(repo, "--literal-pathspecs", "add", "--", magic, "excluded.py")
+    _git(repo, "commit", "-m", "add pathspec fixture")
+    (repo / magic).write_text("magic = 2\n", encoding="utf-8")
+    (repo / "excluded.py").write_text("secret = 2\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo), excluded_paths=["excluded.py"]).capture(
+        event="file-save", focus_path=magic
+    )
+
+    assert snapshot.changed_paths == (magic,)
+    assert "excluded.py" not in snapshot.diff
 
 
 def test_file_save_requires_a_safe_focused_path_and_captures_untracked_addition(tmp_path):

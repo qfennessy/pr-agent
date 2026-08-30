@@ -328,7 +328,7 @@ def apply_local_repo_settings(repository_root):
     """Apply shared then worktree settings through the normal security gates."""
     apply_extra_config_settings()
     settings_path = os.path.join(str(repository_root), ".pr_agent.toml")
-    if os.path.isfile(settings_path):
+    if get_settings().config.use_repo_settings_file and os.path.isfile(settings_path):
         _apply_repo_settings_file(settings_path)
     # The local and shared layers are now fully materialized. Prevent the later
     # plain-diff provider setup from reapplying shared settings after local ones.

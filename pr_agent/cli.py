@@ -171,16 +171,35 @@ def _snapshot_review_instructions(snapshot) -> str:
 
 def _snapshot_review_configuration_hash() -> str:
     settings = get_settings()
+
+    sensitive_fragments = ("key", "token", "secret", "password", "auth", "credential", "private")
+    transient_config_keys = {"cli_mode", "git_provider", "publish_output", "propagate_tool_errors"}
+
+    def sanitized(value, *, section: str = ""):
+        if isinstance(value, dict):
+            cleaned = {}
+            for key, child in value.items():
+                normalized = str(key).lower()
+                if any(fragment in normalized for fragment in sensitive_fragments):
+                    continue
+                if section == "config" and normalized in transient_config_keys:
+                    continue
+                cleaned[str(key)] = sanitized(child, section=section)
+            return cleaned
+        if isinstance(value, (list, tuple)):
+            return [sanitized(item, section=section) for item in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    all_settings = settings.as_dict()
+    all_settings.pop("PLAIN_DIFF", None)
     effective = {
         "runtime_version": get_version(),
-        "config": {
-            key: settings.get(f"config.{key}", None)
-            for key in ("model", "fallback_models", "temperature", "model_token_count_estimate")
+        "settings": {
+            str(section): sanitized(contents, section=str(section).lower())
+            for section, contents in all_settings.items()
         },
-        "openai_deployment_id": settings.get("openai.deployment_id", None),
-        "pr_reviewer": settings.get("pr_reviewer", {}) or {},
-        "pr_review_prompt": settings.get("pr_review_prompt", {}) or {},
-        "skills": settings.get("skills", {}) or {},
     }
     payload = json.dumps(effective, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
