@@ -406,6 +406,11 @@ class GithubProvider(GitProvider):
     def get_latest_commit_url(self) -> str:
         return self.last_commit_id.html_url
 
+    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
+        if refresh:
+            return self._get_repo().get_pull(self.pr_num).head.sha
+        return self.last_commit_id.sha if getattr(self, "last_commit_id", None) else None
+
     def get_comment_url(self, comment) -> str:
         return comment.html_url
 

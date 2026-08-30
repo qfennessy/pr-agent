@@ -391,6 +391,63 @@ worktree_idle_seconds = 15
 max_concurrency = 2
 cancel_stale_snapshots = true
 
+[specialist_pipeline]
+# Disabled shadow infrastructure. Enabled roles record validated evidence but never
+# change review depth, diff selection, findings, labels, publication, or approval.
+enabled = false
+mode = "shadow"
+aggregate_timeout_seconds = 8
+# Conservatively reserves each role's input + output for every fallback, model attempt, and provider retry.
+aggregate_token_budget = 12000
+max_concurrency = 3
+cache_enabled = true
+cache_max_entries = 128
+cancel_stale_inputs = true
+allowed_change_labels = [
+    "ui", "tests", "refactor", "dependency", "documentation", "schema",
+    "authentication", "authorization", "tenant_isolation", "privacy", "billing",
+    "concurrency", "destructive_operation", "deployment", "other",
+]
+
+[specialist_pipeline.change_classification]
+enabled = true
+model = "" # empty inherits config.model; set a provider-prefixed or compatible tuned model
+deployment = ""
+fallback_models = []
+fallback_deployments = []
+timeout_seconds = 5
+model_retries = 1
+provider_retries = 0
+input_token_budget = 4000
+output_token_budget = 600
+minimum_confidence = 0.6
+
+[specialist_pipeline.risk_recommendation]
+enabled = true
+model = ""
+deployment = ""
+fallback_models = []
+fallback_deployments = []
+timeout_seconds = 5
+model_retries = 1
+provider_retries = 0
+input_token_budget = 4000
+output_token_budget = 600
+minimum_confidence = 0.6
+
+[specialist_pipeline.diff_prioritization]
+enabled = true
+model = ""
+deployment = ""
+fallback_models = []
+fallback_deployments = []
+timeout_seconds = 5
+model_retries = 1
+provider_retries = 0
+input_token_budget = 4000
+output_token_budget = 800
+minimum_confidence = 0.6
+
 [gerrit]
 # endpoint to the gerrit service
 # url = "ssh://gerrit.example.com:29418"

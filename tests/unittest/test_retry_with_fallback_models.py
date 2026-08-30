@@ -2,6 +2,14 @@ import asyncio
 
 import pytest
 
+from pr_agent.algo.ai_handlers.langchain_ai_handler import LangChainOpenAIHandler
+from pr_agent.algo.ai_handlers.openai_ai_handler import OpenAIHandler
+from pr_agent.algo.ai_request_context import (
+    AIModelRoute,
+    AIRequestOptions,
+    get_ai_request_options,
+    use_ai_request_options,
+)
 from pr_agent.algo.pr_processing import retry_with_fallback_models
 from pr_agent.algo.run_details import get_run_details, init_run_details
 from pr_agent.algo.utils import ModelType
@@ -46,6 +54,35 @@ def test_primary_model_success_invoked_once_and_returns_value():
 
         assert result == "primary-result"
         assert calls == ["primary-model"]
+    finally:
+        _restore_settings(snapshot)
+
+
+def test_empty_explicit_route_raises_instead_of_returning_implicitly():
+    class EmptyRoute:
+        models = ()
+        deployments = ()
+
+    async def fake_f(_model):
+        raise AssertionError("an empty route must not invoke the model callback")
+
+    with pytest.raises(RuntimeError, match="Model route exhausted"):
+        asyncio.run(retry_with_fallback_models(fake_f, model_route=EmptyRoute()))
+
+
+def test_request_local_deployment_is_visible_to_all_legacy_handler_properties():
+    snapshot = _snapshot_settings()
+    try:
+        get_settings().set("openai.deployment_id", "global-deployment")
+        handlers = (
+            OpenAIHandler.__new__(OpenAIHandler),
+            LangChainOpenAIHandler.__new__(LangChainOpenAIHandler),
+        )
+
+        with use_ai_request_options(AIRequestOptions(deployment_id="role-deployment")):
+            assert all(handler.deployment_id == "role-deployment" for handler in handlers)
+
+        assert all(handler.deployment_id == "global-deployment" for handler in handlers)
     finally:
         _restore_settings(snapshot)
 
@@ -130,6 +167,59 @@ def test_deployment_id_updated_per_attempt():
             ("primary-model", "deployment-primary"),
             ("fallback-1", "deployment-fb1"),
         ]
+        assert get_settings().get("openai.deployment_id", None) == "deployment-fb1"
+    finally:
+        _restore_settings(snapshot)
+
+
+def test_concurrent_explicit_routes_do_not_leak_deployments_or_controls():
+    snapshot = _snapshot_settings()
+    try:
+        get_settings().set("openai.deployment_id", "shared-deployment")
+        observed = []
+
+        async def run(role, deployment, delay):
+            route = AIModelRoute(
+                models=(f"model-{role}",),
+                deployments=(deployment,),
+                timeout_seconds=delay + 1,
+                model_retries=1,
+                provider_retries=0,
+                max_output_tokens=100 + len(role),
+                attribution=role,
+            )
+
+            async def fake_f(model):
+                await asyncio.sleep(delay)
+                options = get_ai_request_options()
+                observed.append(
+                    (
+                        role,
+                        model,
+                        options.deployment_id,
+                        options.timeout_seconds,
+                        options.max_output_tokens,
+                        get_settings().get("openai.deployment_id", None),
+                    )
+                )
+                return role
+
+            return await retry_with_fallback_models(fake_f, model_route=route)
+
+        async def run_both():
+            return await asyncio.gather(
+                run("classification", "deployment-a", 0.02),
+                run("risk", "deployment-b", 0.01),
+            )
+
+        results = asyncio.run(run_both())
+
+        assert results == ["classification", "risk"]
+        assert set(observed) == {
+            ("classification", "model-classification", "deployment-a", 1.02, 114, "shared-deployment"),
+            ("risk", "model-risk", "deployment-b", 1.01, 104, "shared-deployment"),
+        }
+        assert get_settings().get("openai.deployment_id", None) == "shared-deployment"
     finally:
         _restore_settings(snapshot)
 

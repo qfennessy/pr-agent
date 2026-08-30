@@ -1383,6 +1383,10 @@ class GitLabProvider(GitProvider):
     def get_pr_branch(self):
         return self.mr.source_branch
 
+    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
+        merge_request = self._get_merge_request() if refresh else self.mr
+        return (getattr(merge_request, "diff_refs", None) or {}).get("head_sha")
+
     def get_pr_owner_id(self) -> str | None:
         if not self.gitlab_url or 'gitlab.com' in self.gitlab_url:
             if not self.id_project:

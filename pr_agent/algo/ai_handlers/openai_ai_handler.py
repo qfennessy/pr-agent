@@ -1,10 +1,12 @@
 from os import environ
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
+
 import openai
 from openai import AsyncOpenAI
 from tenacity import retry, retry_if_exception_type, retry_if_not_exception_type, stop_after_attempt
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
+from pr_agent.algo.ai_request_context import get_ai_request_options
 from pr_agent.algo.run_details import record_ai_call
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
@@ -37,6 +39,9 @@ class OpenAIHandler(BaseAiHandler):
         """
         Returns the deployment ID for the OpenAI API.
         """
+        request_options = get_ai_request_options()
+        if request_options is not None:
+            return request_options.deployment_id
         return get_settings().get("OPENAI.DEPLOYMENT_ID", None)
 
     @retry(
