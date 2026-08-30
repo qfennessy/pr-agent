@@ -1144,6 +1144,49 @@ def test_review_snapshot_applies_external_policy_before_capture(cfg, monkeypatch
     assert json.loads(capsys.readouterr().out)["state"] == "coverage_unavailable"
 
 
+@pytest.mark.parametrize("source_kind", ["path", "file_url"])
+def test_review_snapshot_ignores_local_external_config_input(
+    cfg, monkeypatch, tmp_path, capsys, source_kind
+):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / f"repo-local-extra-{source_kind}"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    extra = repo / "local secrets.toml"
+    extra.write_text('[openai]\nkey = "must-not-reach-model"\n', encoding="utf-8")
+    source = str(extra) if source_kind == "path" else extra.as_uri()
+    monkeypatch.chdir(repo)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            review_input = get_settings().plain_diff.content
+            assert "must-not-reach-model" not in review_input
+            assert "local secrets.toml" not in review_input
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    result = run(inargs=[
+        "--extra_config_url", source, "review-snapshot", "--event", "worktree-idle",
+        "--no-cache",
+    ])
+
+    assert result.state.value == "no_findings"
+    assert json.loads(capsys.readouterr().out)["state"] == "no_findings"
+
+
 def test_review_snapshot_forwards_context_and_publishes_only_fresh_markdown(
     cfg, monkeypatch, tmp_path, capsys
 ):

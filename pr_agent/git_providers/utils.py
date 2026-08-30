@@ -54,6 +54,28 @@ def _safe_url_for_log(url: str) -> str:
         return "<extra config URL redacted>"
 
 
+def get_local_extra_config_path(source) -> str | None:
+    """Return the local path represented by a bare path or file URL."""
+    if not isinstance(source, str):
+        return None
+    source = source.strip()
+    if not source:
+        return None
+    if _WINDOWS_DRIVE_PATH_RE.match(source):
+        return source
+    parsed = urlparse(source)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("", "file"):
+        return None
+    if scheme == "":
+        return source
+    netloc = parsed.netloc or ""
+    raw = parsed.path
+    if netloc and netloc.lower() != "localhost":
+        raw = f"//{netloc}{raw}"
+    return url2pathname(raw)
+
+
 def _resolve_extra_config_to_file(source):
     """
     Resolve --extra_config_url to a local readable .toml file.
@@ -80,34 +102,15 @@ def _resolve_extra_config_to_file(source):
     if not source:
         return None, False
 
-    # Bare Windows drive-letter paths must be handled before urlparse() — it
-    # would otherwise treat the drive letter as a URL scheme.
-    if _WINDOWS_DRIVE_PATH_RE.match(source):
-        if os.path.isfile(source):
-            return source, False
-        get_logger().warning(f"Extra config not found at local path: {source}")
-        return None, False
-
-    parsed = urlparse(source)
-    scheme = (parsed.scheme or "").lower()
-
-    # Local path (bare or file://)
-    if scheme in ("", "file"):
-        if scheme == "file":
-            # Preserve any non-localhost netloc (UNC-style file://host/share/...)
-            # and URL-decode percent-encoded path components via url2pathname.
-            netloc = parsed.netloc or ""
-            raw = parsed.path
-            if netloc and netloc.lower() != "localhost":
-                raw = f"//{netloc}{raw}"
-            local_path = url2pathname(raw)
-        else:
-            local_path = source
+    local_path = get_local_extra_config_path(source)
+    if local_path is not None:
         if os.path.isfile(local_path):
             return local_path, False
         get_logger().warning(f"Extra config not found at local path: {local_path}")
         return None, False
 
+    parsed = urlparse(source)
+    scheme = (parsed.scheme or "").lower()
     if scheme not in ("http", "https"):
         get_logger().warning(f"Unsupported scheme for extra config: {scheme}")
         return None, False

@@ -24,7 +24,10 @@ from pr_agent.algo.run_details import get_run_details
 from pr_agent.algo.skills_loader import get_skills_context, pin_skills_context
 from pr_agent.algo.utils import get_version
 from pr_agent.config_loader import get_settings
-from pr_agent.git_providers.utils import apply_local_repo_settings
+from pr_agent.git_providers.utils import (
+    apply_local_repo_settings,
+    get_local_extra_config_path,
+)
 from pr_agent.log import get_logger, setup_logger
 from pr_agent.tools.local_pair_review import (
     LocalPairReview,
@@ -544,6 +547,11 @@ def _output_artifact_exclusions(repository_root: Path, *paths: str | None) -> li
     return exclusions
 
 
+def _extra_config_exclusions(repository_root: Path, source) -> list[str]:
+    local_path = get_local_extra_config_path(source)
+    return _output_artifact_exclusions(repository_root, local_path)
+
+
 def _snapshot_settings(keys: tuple[str, ...]) -> dict[str, object]:
     settings = get_settings()
     snapshot = {}
@@ -782,6 +790,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             parser.error("--output and --json-output must reference different paths")
     checks = _parse_deterministic_checks(snapshot_args.deterministic_check, parser)
     event = ReviewEvent.parse(snapshot_args.event)
+    invocation_extra_config = get_settings().get("CONFIG.EXTRA_CONFIG_URL", None)
     try:
         repository_root = find_repository_root()
         apply_local_repo_settings(repository_root)
@@ -805,7 +814,12 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         ]
     else:
         configured_exclusions = []
-    artifact_exclusions = _output_artifact_exclusions(repository_root, markdown_output, json_output)
+    artifact_exclusions = _output_artifact_exclusions(
+        repository_root, markdown_output, json_output
+    )
+    artifact_exclusions.extend(
+        _extra_config_exclusions(repository_root, invocation_extra_config)
+    )
     skills_context = get_skills_context()
     repo_context_files = {}
 
