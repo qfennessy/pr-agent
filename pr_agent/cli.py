@@ -175,6 +175,30 @@ def _parse_deterministic_checks(values: list[str], parser: argparse.ArgumentPars
     return checks
 
 
+def _validate_configured_snapshot_event(
+    event: ReviewEvent,
+    settings,
+    parser: argparse.ArgumentParser,
+) -> None:
+    configured = settings.get(
+        "events", ["file_save", "worktree_idle", "pre_commit"]
+    ) if hasattr(settings, "get") else ["file_save", "worktree_idle", "pre_commit"]
+    if isinstance(configured, str):
+        configured = [configured]
+    if not isinstance(configured, (list, tuple, set)):
+        parser.error("local_pair_review.events must be a list of review events")
+    allowed_events = set()
+    for value in configured:
+        if not isinstance(value, str):
+            parser.error("local_pair_review.events must contain only review event names")
+        try:
+            allowed_events.add(ReviewEvent.parse(value))
+        except ValueError:
+            parser.error(f"local_pair_review.events contains unsupported event: {value}")
+    if event not in allowed_events:
+        parser.error(f"local snapshot event is disabled by configuration: {event.value}")
+
+
 def _prepare_output_parent(output_path: str) -> tuple[int, int]:
     parent = Path(output_path).parent
     parent.mkdir(parents=True, exist_ok=True)
@@ -686,6 +710,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         validated_limits = validate_local_pair_review_limits(settings)
     except SnapshotCaptureError as exc:
         outer_parser.error(str(exc))
+    _validate_configured_snapshot_event(event, settings, parser)
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
     raw_exclusions = settings.get("excluded_paths", []) or []
     if isinstance(raw_exclusions, str):

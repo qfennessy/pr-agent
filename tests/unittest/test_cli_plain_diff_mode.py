@@ -15,6 +15,7 @@ _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path", "plain_diff.js
                   "local_pair_review.policy_version", "local_pair_review.excluded_paths",
                   "local_pair_review.max_file_bytes", "local_pair_review.max_snapshot_bytes",
                   "local_pair_review.max_path_discovery_bytes",
+                  "local_pair_review.events",
                   "local_pair_review.cache_enabled",
                   "local_pair_review.cache_max_entries", "config.use_repo_settings_file",
                   "config.model", "config.reasoning_effort", "config.max_model_tokens", "skills.enabled",
@@ -467,6 +468,35 @@ def test_review_snapshot_validates_base_before_removing_output(monkeypatch, tmp_
     error = capsys.readouterr().err
     assert "Needed a single revision" in error
     assert "Traceback" not in error
+    assert output.read_text(encoding="utf-8") == previous
+
+
+def test_review_snapshot_rejects_an_event_disabled_by_repository_settings(
+    monkeypatch, tmp_path, capsys
+):
+    import subprocess
+
+    repo = tmp_path / "repo-disabled-event"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    (repo / ".pr_agent.toml").write_text(
+        '[local_pair_review]\nevents = ["pre_commit"]\n',
+        encoding="utf-8",
+    )
+    (repo / "saved.py").write_text("value = 1\n", encoding="utf-8")
+    output = tmp_path / "previous-review.md"
+    previous = "<!-- pr-agent-review-snapshot -->\nPrevious review\n"
+    output.write_text(previous, encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "saved.py",
+            "--output", str(output),
+        ])
+
+    error = capsys.readouterr().err
+    assert "event is disabled by configuration: file_save" in error
     assert output.read_text(encoding="utf-8") == previous
 
 
