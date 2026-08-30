@@ -170,6 +170,31 @@ def test_review_snapshot_rejects_nonexistent_output_through_repo_symlink(monkeyp
     assert not (repo / "new.json").exists()
 
 
+def test_review_snapshot_rejects_nonexistent_output_through_internal_symlink(
+    monkeypatch, tmp_path, capsys
+):
+    import subprocess
+
+    repo = tmp_path / "repo-internal-parent-alias"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    source = repo / "changed.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    real_parent = repo / "real-output"
+    real_parent.mkdir()
+    (repo / "output-link").symlink_to(real_parent, target_is_directory=True)
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--json-output", "output-link/result.json", "--no-cache",
+        ])
+
+    assert "aliases an existing repository path" in capsys.readouterr().err
+    assert not (real_parent / "result.json").exists()
+
+
 def test_review_snapshot_rejects_external_symlink_into_git_metadata(monkeypatch, tmp_path, capsys):
     import subprocess
 

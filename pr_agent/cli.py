@@ -482,6 +482,7 @@ def _reject_existing_repository_outputs(
         resolved_artifact = resolved.is_relative_to(git_artifact_root)
         if (
             (resolved_worktree and not lexical_worktree)
+            or (lexical_worktree and resolved_worktree and lexical != resolved)
             or (resolved_metadata and not lexical_metadata)
             or (lexical_metadata and not resolved_metadata)
             or (lexical_metadata and not lexical_artifact)
