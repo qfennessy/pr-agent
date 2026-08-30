@@ -399,6 +399,49 @@ def test_review_snapshot_cli_emits_snapshot_bound_json(cfg, monkeypatch, tmp_pat
     assert result.state.value == "no_findings"
 
 
+def test_review_snapshot_atomically_replaces_json_symlink_swapped_during_review(
+    cfg, monkeypatch, tmp_path, capsys
+):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo-json-output-race"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    protected = repo / ".git" / "config"
+    original = protected.read_bytes()
+    output = repo / ".git" / "pr-agent" / "result.json"
+    monkeypatch.chdir(repo)
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.symlink_to(protected)
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    result = run(inargs=[
+        "review-snapshot", "--event", "file-save", "--path", "changed.py",
+        "--no-cache", "--json-output", str(output),
+    ])
+
+    assert protected.read_bytes() == original
+    assert not output.is_symlink()
+    assert json.loads(output.read_text(encoding="utf-8"))["snapshot_id"] == result.snapshot_id
+    capsys.readouterr()
+
+
 def test_review_snapshot_restores_provider_settings_for_later_hosted_run(
     cfg, monkeypatch, tmp_path, capsys
 ):

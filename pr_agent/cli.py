@@ -168,11 +168,19 @@ def _emit_snapshot_result(result, output_path: str | None) -> None:
     payload = json.dumps(result.to_dict(), ensure_ascii=True, sort_keys=True, indent=2) + "\n"
     print(payload, end="")
     if output_path:
+        temporary_path = None
         try:
             destination = Path(output_path)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(payload, encoding="utf-8")
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=destination.parent, delete=False
+            ) as handle:
+                handle.write(payload)
+                temporary_path = Path(handle.name)
+            os.replace(temporary_path, destination)
         except OSError as exc:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
             raise SnapshotCaptureError(f"could not write --json-output '{output_path}': {exc}") from exc
 
 

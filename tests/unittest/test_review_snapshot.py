@@ -616,3 +616,28 @@ def test_cache_eviction_tolerates_entry_removed_before_stat(tmp_path, monkeypatc
 
     cache.write(result)
     assert cache.read(snapshot.snapshot_id) is not None
+
+
+def test_cache_treats_structurally_invalid_json_as_a_miss(tmp_path):
+    repo = _repo(tmp_path, "invalid-cache")
+    cache = SnapshotCache(repo)
+    snapshot = _snapshot(str(repo))
+    cache.cache_dir.mkdir(parents=True, exist_ok=True)
+    invalid_payloads = [
+        {"snapshot_id": snapshot.snapshot_id},
+        {"snapshot_id": snapshot.snapshot_id, "state": "unknown"},
+        {
+            "snapshot_id": snapshot.snapshot_id,
+            "state": "no_findings",
+            "latency_seconds": "not-a-number",
+        },
+        {
+            "snapshot_id": snapshot.snapshot_id,
+            "state": "no_findings",
+            "coverage_issues": [{"path": "missing-reason.py"}],
+        },
+    ]
+
+    for payload in invalid_payloads:
+        cache._path(snapshot.snapshot_id).write_text(json.dumps(payload), encoding="utf-8")
+        assert cache.read(snapshot.snapshot_id) is None

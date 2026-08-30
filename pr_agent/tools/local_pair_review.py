@@ -475,23 +475,23 @@ class SnapshotCache:
         path = self._path(snapshot_id)
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
+            if not isinstance(data, dict) or data.get("snapshot_id") != snapshot_id:
+                return None
+            return ReviewSnapshotResult(
+                snapshot_id=data["snapshot_id"],
+                state=ReviewResultState(data["state"]),
+                current_snapshot_id=data.get("current_snapshot_id"),
+                review=data.get("review"),
+                coverage_issues=tuple(CoverageIssue(**issue) for issue in data.get("coverage_issues", [])),
+                latency_seconds=float(data.get("latency_seconds", 0)),
+                usage=data.get("usage", {}),
+                cost=data.get("cost", {}),
+                cached=True,
+                advisory=True,
+                shadow_capable=True,
+            )
+        except (OSError, KeyError, ValueError, TypeError, AttributeError):
             return None
-        if data.get("snapshot_id") != snapshot_id:
-            return None
-        return ReviewSnapshotResult(
-            snapshot_id=data["snapshot_id"],
-            state=ReviewResultState(data["state"]),
-            current_snapshot_id=data.get("current_snapshot_id"),
-            review=data.get("review"),
-            coverage_issues=tuple(CoverageIssue(**issue) for issue in data.get("coverage_issues", [])),
-            latency_seconds=float(data.get("latency_seconds", 0)),
-            usage=data.get("usage", {}),
-            cost=data.get("cost", {}),
-            cached=True,
-            advisory=True,
-            shadow_capable=True,
-        )
 
     def write(self, result: ReviewSnapshotResult) -> None:
         unavailable_states = {
