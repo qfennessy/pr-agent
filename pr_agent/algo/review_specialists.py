@@ -7,7 +7,6 @@ import copy
 import hashlib
 import inspect
 import json
-import re
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -21,6 +20,11 @@ from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_request_context import AIModelRoute
+from pr_agent.algo.git_patch_processing import (
+    RE_HUNK_HEADER,
+    iter_git_patch_lines,
+    strip_git_line_ending,
+)
 from pr_agent.algo.pr_processing import retry_with_fallback_models
 from pr_agent.algo.review_snapshot import ReviewSnapshot
 from pr_agent.algo.run_details import get_run_details, record_specialist_result, specialist_runs_to_dict
@@ -29,10 +33,9 @@ from pr_agent.algo.types import FilePatchInfo
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 
-SPECIALIST_INPUT_SCHEMA_VERSION = "review-specialist-input-v1"
+SPECIALIST_INPUT_SCHEMA_VERSION = "review-specialist-input-v2"
 SPECIALIST_BATCH_SCHEMA_VERSION = "review-specialist-shadow-batch-v1"
 
-_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _ROLE_ORDER: tuple["SpecialistRole", ...]
 
 
@@ -118,6 +121,7 @@ class SpecialistHunk:
     start_line: int
     end_line: int
     added_lines: tuple[int, ...]
+    deleted_lines: tuple[int, ...]
     patch_hash: str
 
 
@@ -132,6 +136,7 @@ class SpecialistInput:
     changed_paths: tuple[str, ...]
     diff: str
     hunks: tuple[SpecialistHunk, ...]
+    allowed_change_labels: tuple[str, ...] = field(default_factory=tuple)
     deterministic_results: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
     event: str = "pull_request"
     policy_version: str = "specialist-shadow-v1"
@@ -141,6 +146,10 @@ class SpecialistInput:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "changed_paths", tuple(sorted(set(self.changed_paths))))
+        labels = tuple(sorted({str(label).strip() for label in self.allowed_change_labels}))
+        if any(not label for label in labels):
+            raise ValueError("allowed_change_labels cannot contain blank entries")
+        object.__setattr__(self, "allowed_change_labels", labels)
         object.__setattr__(
             self,
             "hunks",
@@ -164,6 +173,7 @@ class SpecialistInput:
             "changed_paths": list(self.changed_paths),
             "diff": self.diff,
             "hunks": [asdict(hunk) for hunk in self.hunks],
+            "allowed_change_labels": list(self.allowed_change_labels),
             "deterministic_results": [_thaw_json(result) for result in self.deterministic_results],
             "event": self.event,
             "policy_version": self.policy_version,
@@ -281,6 +291,10 @@ class SpecialistPipelineConfig:
     def __post_init__(self) -> None:
         if self.enabled and self.mode != "shadow":
             raise SpecialistConfigurationError("specialist_pipeline.mode must remain 'shadow'")
+        labels = tuple(sorted({str(label).strip() for label in self.allowed_change_labels}))
+        if not labels or any(not label for label in labels):
+            raise SpecialistConfigurationError("allowed_change_labels cannot contain blank entries")
+        object.__setattr__(self, "allowed_change_labels", labels)
         identity = {
             "mode": self.mode,
             "aggregate_timeout_seconds": self.aggregate_timeout_seconds,
@@ -626,42 +640,70 @@ def _parse_hunks(path: str, patch: str) -> tuple[SpecialistHunk, ...]:
     hunks: list[SpecialistHunk] = []
     current_header: Optional[str] = None
     current_lines: list[str] = []
-    start_line = 0
-    target_count = 0
+    old_start_line = 0
+    old_count = 0
+    new_start_line = 0
+    new_count = 0
 
     def finish() -> None:
         if current_header is None:
             return
         patch_text = "".join(current_lines)
-        new_line = start_line
+        old_line = old_start_line
+        new_line = new_start_line
+        consumed_old = 0
+        consumed_new = 0
         added_lines: list[int] = []
+        deleted_lines: list[int] = []
+        valid = True
         for line in current_lines[1:]:
-            if line.startswith("+") and not line.startswith("+++"):
+            if line.startswith("+"):
                 added_lines.append(new_line)
                 new_line += 1
+                consumed_new += 1
+            elif line.startswith("-"):
+                deleted_lines.append(old_line)
+                old_line += 1
+                consumed_old += 1
             elif line.startswith(" "):
+                old_line += 1
                 new_line += 1
-        end_line = max(start_line, start_line + max(0, target_count) - 1)
+                consumed_old += 1
+                consumed_new += 1
+            elif line.startswith("\\ No newline at end of file"):
+                continue
+            else:
+                valid = False
+        if not valid or consumed_old != old_count or consumed_new != new_count:
+            return
+        end_line = max(new_start_line, new_start_line + new_count - 1)
         hunk_hash = _sha256(f"{path}\n{current_header}\n{patch_text}")
         hunks.append(
             SpecialistHunk(
                 hunk_id=hunk_hash,
                 path=path,
-                start_line=start_line,
+                start_line=new_start_line,
                 end_line=end_line,
                 added_lines=tuple(added_lines),
+                deleted_lines=tuple(deleted_lines),
                 patch_hash=_sha256(patch_text),
             )
         )
 
-    for line in patch.splitlines(keepends=True):
-        match = _HUNK_HEADER_RE.match(line)
-        if match:
+    for line in iter_git_patch_lines(patch):
+        if line.startswith("@@"):
             finish()
-            current_header = line.rstrip("\r\n")
+            current_header = None
+            current_lines = []
+            match = RE_HUNK_HEADER.match(strip_git_line_ending(line))
+            if match is None:
+                continue
+            current_header = strip_git_line_ending(line)
             current_lines = [line]
-            start_line = int(match.group(3))
-            target_count = int(match.group(4) or "1")
+            old_start_line = int(match.group(1))
+            old_count = int(match.group(2) or "1")
+            new_start_line = int(match.group(3))
+            new_count = int(match.group(4) or "1")
         elif current_header is not None:
             current_lines.append(line)
     finish()
@@ -674,6 +716,7 @@ def build_specialist_input(
     description: str,
     diff_files: Sequence[FilePatchInfo],
     head_sha: str,
+    allowed_change_labels: Sequence[str],
     snapshot: Optional[ReviewSnapshot] = None,
     additional_deterministic_results: Sequence[Mapping[str, Any]] = (),
 ) -> SpecialistInput:
@@ -727,6 +770,7 @@ def build_specialist_input(
         changed_paths=tuple(changed_paths),
         diff=diff,
         hunks=tuple(hunks),
+        allowed_change_labels=tuple(allowed_change_labels),
         deterministic_results=tuple(deterministic_results),
         event=event,
         policy_version=policy_version,
@@ -780,7 +824,11 @@ def _validate_evidence(value: Any, specialist_input: SpecialistInput) -> dict[st
         raise SpecialistOutputError("evidence must be an object")
     source = value.get("source")
     if source == "diff_hunk":
-        _require_exact_keys(value, {"source", "path", "hunk_id", "line"}, "diff_hunk evidence")
+        _require_exact_keys(
+            value,
+            {"source", "path", "hunk_id", "side", "line"},
+            "diff_hunk evidence",
+        )
         try:
             path = _normalized_path(str(value["path"]))
         except (TypeError, ValueError) as exc:
@@ -788,6 +836,9 @@ def _validate_evidence(value: Any, specialist_input: SpecialistInput) -> dict[st
         line = value["line"]
         if isinstance(line, bool) or not isinstance(line, int):
             raise SpecialistOutputError("diff_hunk evidence line must be an integer")
+        side = value["side"]
+        if not isinstance(side, str) or side not in {"old", "new"}:
+            raise SpecialistOutputError("diff_hunk evidence side must be 'old' or 'new'")
         hunk = next(
             (
                 item
@@ -796,9 +847,20 @@ def _validate_evidence(value: Any, specialist_input: SpecialistInput) -> dict[st
             ),
             None,
         )
-        if hunk is None or line not in hunk.added_lines:
-            raise SpecialistOutputError("diff_hunk evidence does not identify an added line")
-        return {"source": source, "path": path, "hunk_id": hunk.hunk_id, "line": line}
+        changed_lines = () if hunk is None else (
+            hunk.deleted_lines if side == "old" else hunk.added_lines
+        )
+        if hunk is None or line not in changed_lines:
+            raise SpecialistOutputError(
+                f"diff_hunk evidence does not identify a changed {side}-side line"
+            )
+        return {
+            "source": source,
+            "path": path,
+            "hunk_id": hunk.hunk_id,
+            "side": side,
+            "line": line,
+        }
     if source == "pull_request":
         _require_exact_keys(value, {"source", "field"}, "pull_request evidence")
         if value["field"] not in {"title", "description"}:
@@ -823,6 +885,10 @@ def _validate_change_classification(
     specialist_input: SpecialistInput,
     pipeline: SpecialistPipelineConfig,
 ) -> dict[str, Any]:
+    if specialist_input.allowed_change_labels != pipeline.allowed_change_labels:
+        raise SpecialistOutputError(
+            "classifier input policy does not match the pipeline configuration"
+        )
     _require_exact_keys(data, {"schema_version", "confidence", "labels"}, "classification output")
     labels = data["labels"]
     if not isinstance(labels, list):

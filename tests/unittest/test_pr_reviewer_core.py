@@ -931,6 +931,26 @@ def _bugs_only_reviewer(*issues):
     return reviewer, data
 
 
+@pytest.mark.parametrize("record_separator", ["\r", "\u0085", "\u2028", "\u2029"])
+def test_bugs_only_changed_lines_advance_only_on_lf_records(record_separator):
+    git_provider = MagicMock()
+    git_provider.get_diff_files.return_value = [
+        FilePatchInfo(
+            base_file="",
+            head_file="",
+            patch=(
+                "@@ -0,0 +1,2 @@\n"
+                f"+new{record_separator}+fake\n"
+                "+real_second\n"
+            ),
+            filename="app.py",
+        )
+    ]
+    reviewer = _make_prediction_reviewer(git_provider)
+
+    assert reviewer._changed_lines_by_file()["app.py"] == {1, 2}
+
+
 def test_bugs_only_keeps_a_complete_defect_and_exposes_only_the_public_finding_shape():
     reviewer, data = _bugs_only_reviewer(_bugs_only_issue())
 

@@ -5,9 +5,14 @@ from typing import List, Optional
 
 from unidiff.errors import UnidiffParseError
 
+from pr_agent.algo.git_patch_processing import iter_git_patch_lines
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.config_loader import _find_repository_root, get_settings
-from pr_agent.git_providers.diff_parsing import parse_unified_diff, reconstruct_base_file, to_hunk_only_patch
+from pr_agent.git_providers.diff_parsing import (
+    parse_unified_diff,
+    reconstruct_base_file,
+    to_hunk_only_patch,
+)
 from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.log import get_logger
 
@@ -55,7 +60,7 @@ def _decode_git_c_quoted_path(path: str, *, c_quoted_header: bool) -> str:
 
 
 def _header_is_c_quoted(patch: str, prefix: str) -> bool:
-    for line in patch.splitlines():
+    for line in iter_git_patch_lines(patch):
         if line.startswith(prefix):
             return line[len(prefix):].startswith('"')
     return False

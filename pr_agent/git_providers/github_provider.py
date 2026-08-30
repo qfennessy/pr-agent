@@ -17,7 +17,9 @@ from retry.api import retry_call
 from starlette_context import context
 
 from ..algo.file_filter import filter_ignored
-from ..algo.git_patch_processing import extract_hunk_headers
+from ..algo.git_patch_processing import (extract_hunk_headers,
+                                         iter_git_patch_lines,
+                                         strip_git_line_ending)
 from ..algo.inline_comment_dedup import (body_fingerprint, body_with_markers,
                                          code_fingerprint,
                                          get_inline_comment_store, has_marker)
@@ -369,7 +371,7 @@ class GithubProvider(GitProvider):
                     num_plus_lines = file.additions
                     num_minus_lines = file.deletions
                 else:
-                    patch_lines = patch.splitlines(keepends=True)
+                    patch_lines = list(iter_git_patch_lines(patch))
                     num_plus_lines = len([line for line in patch_lines if line.startswith('+')])
                     num_minus_lines = len([line for line in patch_lines if line.startswith('-')])
 
@@ -1608,7 +1610,10 @@ class GithubProvider(GitProvider):
                         patch_str = file.patch
                         if not hasattr(file, 'patches_range'):
                             file.patches_range = []
-                            patch_lines = patch_str.splitlines()
+                            patch_lines = [
+                                strip_git_line_ending(line)
+                                for line in iter_git_patch_lines(patch_str)
+                            ]
                             for i, line in enumerate(patch_lines):
                                 if line.startswith('@@'):
                                     match = RE_HUNK_HEADER.match(line)
@@ -1657,7 +1662,10 @@ class GithubProvider(GitProvider):
                                 diff = difflib.unified_diff(existing_code.split('\n'),
                                                             improved_code.split('\n'), n=999)
                                 patch_orig = "\n".join(diff)
-                                patch = "\n".join(patch_orig.splitlines()[5:]).strip('\n')
+                                patch = "\n".join(
+                                    strip_git_line_ending(line)
+                                    for line in list(iter_git_patch_lines(patch_orig))[5:]
+                                ).strip('\n')
                                 diff_code = f"\n\n<details><summary>New proposed code:</summary>\n\n```diff\n{patch.rstrip()}\n```"
                                 # replace ```suggestion ... ``` with diff_code, using regex:
                                 body = re.sub(r'```suggestion.*?```', diff_code, body, flags=re.DOTALL)

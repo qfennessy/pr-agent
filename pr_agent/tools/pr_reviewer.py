@@ -11,6 +11,7 @@ from jinja2 import Environment, StrictUndefined
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.ai_request_context import AIModelRoute
+from pr_agent.algo.git_patch_processing import iter_git_patch_lines, split_git_file_lines
 from pr_agent.algo.inline_comment_dedup import (
     InlineCommentStore, can_verify_inline_comment_publication,
     get_inline_comment_store, key_issue_body_with_markers,
@@ -778,6 +779,10 @@ class PRReviewer:
                         pipeline,
                         failure_reason="stable_head_identity_unavailable",
                     )
+                    get_logger().info(
+                        "Specialist shadow telemetry",
+                        artifact=self.specialist_shadow_result.to_dict(),
+                    )
                     get_logger().warning(
                         "Specialist shadow batch is unavailable because the provider has no stable head identity"
                     )
@@ -791,6 +796,7 @@ class PRReviewer:
                 head_sha=head_sha,
                 snapshot=snapshot,
                 additional_deterministic_results=self._specialist_deterministic_results(),
+                allowed_change_labels=pipeline.allowed_change_labels,
             )
             self._specialist_input = specialist_input
             self.specialist_shadow_result = await run_shadow_specialists(
@@ -798,6 +804,10 @@ class PRReviewer:
                 pipeline,
                 self.ai_handler,
                 current_identity=current_identity,
+            )
+            get_logger().info(
+                "Specialist shadow telemetry",
+                artifact=self.specialist_shadow_result.to_dict(),
             )
         except Exception as exc:
             # Shadow infrastructure is observational. Configuration/provider failures
@@ -888,7 +898,7 @@ class PRReviewer:
                 continue
             file_lines = set()
             new_line = None
-            for patch_line in patch.splitlines():
+            for patch_line in iter_git_patch_lines(patch):
                 header = _HUNK_HEADER_RE.match(patch_line)
                 if header:
                     new_line = int(header.group(1))
@@ -1159,7 +1169,7 @@ class PRReviewer:
             get_logger().warning("Review finding points at a file that is not in the diff, "
                                  "keeping it in the summary", artifact={"relevant_file": relevant_file})
             return None
-        if not file.head_file or end_line > len(file.head_file.splitlines()):
+        if not file.head_file or end_line > len(split_git_file_lines(file.head_file)):
             get_logger().warning("Review finding points past the end of the file, keeping it in the summary",
                                  artifact={"relevant_file": relevant_file, "start_line": start_line,
                                            "end_line": end_line})
