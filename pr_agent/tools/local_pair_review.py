@@ -285,14 +285,9 @@ def _patch_model_visible_regions(patch: str) -> tuple[bytes, ...]:
     return tuple(dict.fromkeys(regions))
 
 
-def _status_has_content_patch(status: str) -> bool:
-    """Return whether a status has a hunk distinct from a full copy addition."""
-    if status.startswith(("M", "R")):
-        return True
-    if not status.startswith("C"):
-        return False
-    similarity = status[1:]
-    return not similarity.isdigit() or int(similarity) < 100
+def _status_uses_grouped_patch(status: str) -> bool:
+    """Return whether provenance must use the captured path group's patch."""
+    return status.startswith(("M", "R", "C"))
 
 
 def find_repository_root(start: Optional[str] = None) -> Path:
@@ -1437,7 +1432,7 @@ class LocalPairReview:
         index_patch_groups = {
             group[-1]: group
             for stage, status, group in tracked_groups
-            if stage == "index" and _status_has_content_patch(status)
+            if stage == "index" and _status_uses_grouped_patch(status)
         }
         current_copy_candidates = tuple(
             dict.fromkeys(
@@ -1456,7 +1451,7 @@ class LocalPairReview:
             group[-1]: group
             for stage, status, group in tracked_groups
             if stage in {"combined", "worktree"}
-            and _status_has_content_patch(status)
+            and _status_uses_grouped_patch(status)
         }
         unsafe_copy_sources = self._unsafe_copy_sources(
             event,
@@ -1566,7 +1561,7 @@ class LocalPairReview:
             current_index_patch_groups = {
                 group[-1]: group
                 for stage, status, group in current_groups
-                if stage == "index" and _status_has_content_patch(status)
+                if stage == "index" and _status_uses_grouped_patch(status)
             }
             current_candidates = tuple(
                 dict.fromkeys(
@@ -1585,7 +1580,7 @@ class LocalPairReview:
                 group[-1]: group
                 for stage, status, group in current_groups
                 if stage in {"combined", "worktree"}
-                and _status_has_content_patch(status)
+                and _status_uses_grouped_patch(status)
             }
             current_unsafe_sources = self._unsafe_copy_sources(
                 event,
@@ -1664,7 +1659,7 @@ class LocalPairReview:
 
         # A rename/copy is one security unit. If either side is unavailable or
         # excluded, selecting the other side alone can expose the full source.
-        for stage, status, group in tracked_groups:
+        for stage, _status, group in tracked_groups:
             if any(path in filtered_paths for path in group):
                 covered_paths = {issue.path for issue in coverage}
                 for raw_path in group:
@@ -1679,12 +1674,7 @@ class LocalPairReview:
                     path for path in normalized_group if path is not None
                 )
                 validation_tracked.extend(selected_group)
-                captured_group = (
-                    selected_group[-1:]
-                    if status.startswith("C")
-                    and not _status_has_content_patch(status)
-                    else selected_group
-                )
+                captured_group = selected_group
                 selected_tracked_groups.append((stage, captured_group))
                 selected_tracked.extend(captured_group)
             else:

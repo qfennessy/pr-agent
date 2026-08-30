@@ -943,8 +943,11 @@ def test_rename_copy_edits_scope_provenance_to_captured_group_patch(
     )
 
 
-def test_metadata_only_staged_rename_does_not_suppress_safe_worktree_edit(tmp_path):
-    repo = _repo(tmp_path, "metadata-rename-safe-worktree-edit")
+@pytest.mark.parametrize("change_kind", ["rename", "copy"])
+def test_metadata_only_staged_group_does_not_suppress_safe_worktree_edit(
+    change_kind, tmp_path
+):
+    repo = _repo(tmp_path, f"metadata-{change_kind}-safe-worktree-edit")
     secret_line = "API_TOKEN=distant-metadata-rename-secret"
     (repo / ".env").write_text(f"{secret_line}\n", encoding="utf-8")
     source = repo / "feature.py"
@@ -955,8 +958,16 @@ def test_metadata_only_staged_rename_does_not_suppress_safe_worktree_edit(tmp_pa
     )
     _git(repo, "add", "-f", ".env", "feature.py")
     _git(repo, "commit", "-m", "add metadata rename fixture")
-    destination = repo / "renamed.py"
-    _git(repo, "mv", "feature.py", "renamed.py")
+    destination_name = "renamed.py" if change_kind == "rename" else "copied.py"
+    destination = repo / destination_name
+    if change_kind == "rename":
+        _git(repo, "mv", "feature.py", destination_name)
+    else:
+        destination.write_text(
+            source.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        _git(repo, "add", destination_name)
     destination.write_text(
         destination.read_text(encoding="utf-8").replace(
             "FEATURE_FLAG=disabled", "FEATURE_FLAG=enabled"
@@ -970,16 +981,17 @@ def test_metadata_only_staged_rename_does_not_suppress_safe_worktree_edit(tmp_pa
     )
 
     assert groups is not None
-    assert ("index", "R100", ("feature.py", "renamed.py")) in groups
-    assert ("worktree", "M", ("renamed.py",)) in groups
+    expected_status = "R100" if change_kind == "rename" else "C100"
+    assert ("index", expected_status, ("feature.py", destination_name)) in groups
+    assert ("worktree", "M", (destination_name,)) in groups
 
     snapshot = reviewer.capture(event="worktree-idle")
 
-    assert "renamed.py" in snapshot.changed_paths
+    assert destination_name in snapshot.changed_paths
     assert "+FEATURE_FLAG=enabled" in snapshot.diff
     assert secret_line not in snapshot.diff
     assert not any(
-        issue.path == "renamed.py" and issue.reason == "rename_group_omitted"
+        issue.path == destination_name and issue.reason == "rename_group_omitted"
         for issue in snapshot.coverage_issues
     )
 
@@ -1507,7 +1519,7 @@ def test_file_save_rejects_a_focused_rename_with_an_excluded_source(tmp_path):
     assert CoverageIssue(path="allowed.py", reason="rename_group_omitted") in snapshot.coverage_issues
 
 
-def test_file_save_does_not_select_a_copy_by_its_unchanged_source(tmp_path):
+def test_file_save_treats_an_identical_copy_as_metadata_only(tmp_path):
     repo = _repo(tmp_path, "file-save-copy-source")
     source = repo / "source.txt"
     source.write_text("shared content\n", encoding="utf-8")
@@ -1526,9 +1538,14 @@ def test_file_save_does_not_select_a_copy_by_its_unchanged_source(tmp_path):
 
     assert source_snapshot.changed_paths == ()
     assert source_snapshot.diff == ""
-    assert destination_snapshot.changed_paths == ("other.txt",)
-    assert "+shared content" in destination_snapshot.diff
-    assert destination_snapshot.coverage_issues == ()
+    assert destination_snapshot.changed_paths == ()
+    assert destination_snapshot.diff == ""
+    assert CoverageIssue(
+        path="source.txt", reason="metadata_only_diff"
+    ) in destination_snapshot.coverage_issues
+    assert CoverageIssue(
+        path="other.txt", reason="metadata_only_diff"
+    ) in destination_snapshot.coverage_issues
 
 
 def test_file_save_checks_copy_source_filter_from_base(tmp_path):
