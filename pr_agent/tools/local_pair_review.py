@@ -108,6 +108,27 @@ class LocalPairReview:
             return "binary"
         return None
 
+    def _inspect_index_file(self, path: str) -> Optional[str]:
+        """Inspect the exact staged blob used by a pre-commit snapshot."""
+        process = subprocess.run(
+            ["git", "-C", str(self.repository_root), "show", f":./{path}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if process.returncode != 0:
+            return None  # a staged deletion has no index blob and is valid input
+        content = process.stdout
+        if len(content) > self.max_file_bytes:
+            return "file_too_large"
+        if b"\0" in content:
+            return "binary"
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError:
+            return "binary"
+        return None
+
     def _resolve_base(self, base: str) -> str:
         resolved = _run_git(self.repository_root, "rev-parse", "--verify", f"{base}^{{commit}}")
         return resolved.decode("ascii").strip()
@@ -196,7 +217,11 @@ class LocalPairReview:
             if self._is_excluded(normalized):
                 coverage.append(CoverageIssue(path=normalized, reason="excluded"))
                 continue
-            file_issue = self._inspect_current_file(normalized)
+            file_issue = (
+                self._inspect_index_file(normalized)
+                if event is ReviewEvent.PRE_COMMIT
+                else self._inspect_current_file(normalized)
+            )
             if file_issue:
                 coverage.append(CoverageIssue(path=normalized, reason=file_issue))
                 continue

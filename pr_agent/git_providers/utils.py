@@ -322,6 +322,13 @@ def apply_repo_settings(pr_url):
         set_claude_model()
 
 
+def apply_local_repo_settings(repository_root):
+    """Apply a worktree's .pr_agent.toml through the shared security gate."""
+    settings_path = os.path.join(str(repository_root), ".pr_agent.toml")
+    if os.path.isfile(settings_path):
+        _apply_repo_settings_file(settings_path)
+
+
 def _apply_repo_settings_file(repo_settings_file):
     """Load a single repo settings file and merge its allowed keys into the global settings.
 

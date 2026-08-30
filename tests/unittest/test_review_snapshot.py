@@ -97,6 +97,19 @@ def test_pre_commit_snapshot_uses_only_the_index(tmp_path):
     assert "untracked.py" not in snapshot.diff
 
 
+def test_pre_commit_coverage_inspects_the_staged_blob(tmp_path):
+    repo = _repo(tmp_path)
+    path = repo / "tracked.py"
+    path.write_text("x" * 100, encoding="utf-8")
+    _git(repo, "add", "tracked.py")
+    path.write_text("small\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo), max_file_bytes=20).capture(event="pre-commit")
+
+    assert snapshot.diff == ""
+    assert CoverageIssue(path="tracked.py", reason="file_too_large") in snapshot.coverage_issues
+
+
 def test_file_save_requires_a_safe_focused_path_and_captures_untracked_addition(tmp_path):
     repo = _repo(tmp_path)
     (repo / "new.py").write_text("added = True\n", encoding="utf-8")
