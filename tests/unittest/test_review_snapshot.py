@@ -1365,6 +1365,51 @@ def test_non_regular_source_discovery_stops_before_materializing_over_budget(
     assert iterator.produced == 1
 
 
+@pytest.mark.parametrize("target_kind", ["external", "cycle"])
+def test_non_regular_source_discovery_rejects_junction_target_before_descending(
+    target_kind, tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path, f"junction-{target_kind}-source-discovery")
+    junction = repo / "junction"
+    junction.mkdir()
+    if target_kind == "external":
+        junction_target = tmp_path / "outside-target"
+        junction_target.mkdir()
+        (junction_target / "outside-secret.txt").write_text(
+            "must-not-be-scanned\n",
+            encoding="utf-8",
+        )
+    else:
+        junction_target = repo
+    (junction / "target").symlink_to(junction_target, target_is_directory=True)
+    (repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
+    original_scandir = local_pair_review_module.os.scandir
+    scanned_directories = []
+
+    def track_scandir(path):
+        scanned_directories.append(Path(path))
+        if Path(path) == junction:
+            raise AssertionError(f"followed {target_kind} junction target")
+        return original_scandir(path)
+
+    monkeypatch.setattr(local_pair_review_module.os, "scandir", track_scandir)
+    monkeypatch.setattr(
+        local_pair_review_module.os.path,
+        "isjunction",
+        lambda path: Path(path) == junction,
+    )
+
+    snapshot = LocalPairReview(str(repo)).capture(event="worktree-idle")
+
+    assert junction not in scanned_directories
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "must-not-be-scanned" not in snapshot.diff
+    assert CoverageIssue(
+        reason="untracked_source_discovery_budget"
+    ) in snapshot.coverage_issues
+
+
 def test_modified_destination_copy_scan_budget_fails_closed(tmp_path):
     repo = _repo(tmp_path, "modified-destination-copy-budget")
     secret_line = "API_TOKEN=copy-budget-secret"

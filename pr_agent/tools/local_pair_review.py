@@ -849,6 +849,13 @@ class LocalPairReview:
                 if entry.name == ".git":
                     continue
                 try:
+                    is_junction = getattr(os.path, "isjunction", None)
+                    if is_junction is not None and is_junction(lexical_path):
+                        # NTFS junctions can report as directories even without
+                        # symlink following. Their targets may escape or cycle
+                        # back into the repository, so an inventory containing
+                        # one is incomplete unless junctions are supported.
+                        return None
                     entry_stat = entry.stat(follow_symlinks=False)
                 except OSError:
                     return None
