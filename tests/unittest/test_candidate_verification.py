@@ -1,4 +1,6 @@
 import json
+import tomllib
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,7 +12,7 @@ from pr_agent.algo.candidate_verification import (VerificationBudgets,
                                                   render_verification_payload,
                                                   retrieve_evidence,
                                                   safe_repo_path)
-from pr_agent.algo.types import FilePatchInfo
+from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.tools.pr_reviewer import PRReviewer
 
 
@@ -35,8 +37,16 @@ def _review_data(*candidates):
     return {"review": {"key_issues_to_review": list(candidates)}}
 
 
-def _diff_file(filename="src/service.py"):
-    return FilePatchInfo("old", "new", "@@ -10,1 +12,4 @@\n+one\n+two\n+three\n+four", filename)
+def _diff_file(filename="src/service.py", base_file="old", head_file="new",
+               edit_type=EDIT_TYPE.UNKNOWN, old_filename=None):
+    return FilePatchInfo(
+        base_file,
+        head_file,
+        "@@ -10,1 +12,4 @@\n+one\n+two\n+three\n+four",
+        filename,
+        edit_type=edit_type,
+        old_filename=old_filename,
+    )
 
 
 def test_prepare_candidates_deduplicates_by_root_cause_and_keeps_sensitive_audits():
@@ -108,6 +118,37 @@ def test_apply_verification_decisions_rejects_disproved_and_missing_candidates()
     ]
 
 
+def test_apply_verification_decisions_rejects_repeated_candidate_ids():
+    candidates, _ = prepare_candidates(_review_data(_candidate()), [_diff_file()], [], 3, 3)
+    evidence = [{
+        "candidate_id": "candidate-1",
+        "source": "changed_head",
+        "path": "src/service.py",
+        "content": "changed service",
+    }]
+    repeated_decision = {
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py"],
+    }
+
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        {"verification": {"decisions": [repeated_decision, dict(repeated_decision)]}},
+    )
+
+    assert findings == []
+    assert decisions == [{
+        "candidate_id": "candidate-1",
+        "verdict": "rejected",
+        "reason": "duplicate_decision",
+    }]
+
+
 @pytest.mark.asyncio
 async def test_retrieve_evidence_reports_missing_files_and_budget_exhaustion():
     provider = MagicMock()
@@ -143,6 +184,41 @@ async def test_retrieve_evidence_preserves_attached_static_policy_evidence():
     assert evidence[0]["policy_id"] == "AUTH-7"
     assert evidence[0]["severity"] == "high"
     assert evidence[0]["source"] == "policy_engine"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edit_type", [EDIT_TYPE.ADDED, EDIT_TYPE.RENAMED])
+async def test_changed_head_is_citable_when_base_file_is_missing(edit_type):
+    head_file = "\n".join(f"line {line}" for line in range(1, 30))
+    diff_file = _diff_file(
+        base_file="",
+        head_file=head_file,
+        edit_type=edit_type,
+        old_filename="src/old_service.py" if edit_type == EDIT_TYPE.RENAMED else None,
+    )
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(context_files=[])), [diff_file], [], 3, 3
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = ""
+
+    evidence, artifact = await retrieve_evidence(
+        provider, candidates, VerificationBudgets(), [], diff_files=[diff_file]
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py"],
+    }]}}
+    findings, _ = apply_verification_decisions(candidates, evidence, verification)
+
+    assert artifact["changed_evidence_count"] == 1
+    assert evidence[0]["source"] == "changed_head"
+    assert evidence[0]["path"] == "src/service.py"
+    assert findings[0]["verification_evidence"] == ["src/service.py"]
 
 
 def test_paths_and_prompt_injection_text_are_handled_as_untrusted_data():
@@ -185,6 +261,7 @@ def _verification_settings():
             candidate_verification_sensitive_path_globs=[],
             candidate_verification_max_model_calls=1,
             candidate_verification_model="",
+            num_max_findings=3,
         ),
         config=_SettingsDict(model="model", temperature=0),
         pr_review_verification_prompt=SimpleNamespace(system="verify", user="{{ verification_payload }}"),
@@ -199,7 +276,10 @@ async def test_orchestration_exposes_unsupported_provider_without_calling_verifi
     provider.supports_repo_file_fetching.return_value = False
     reviewer = _reviewer_for_orchestration(provider)
 
-    with patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()):
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
         await reviewer._run_candidate_verification()
 
     assert reviewer.candidate_verification_artifact["status"] == "unsupported_provider"
@@ -214,9 +294,94 @@ async def test_orchestration_exposes_verifier_failure_and_does_not_publish_candi
     provider.get_repo_file_content.return_value = "def call_service(): return service().value"
     reviewer = _reviewer_for_orchestration(provider)
 
-    with patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()):
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
         await reviewer._run_candidate_verification()
 
     assert reviewer.candidate_verification_artifact["status"] == "verifier_failed"
     assert reviewer.candidate_verification_artifact["model_calls"] == 1
     assert reviewer.verified_review_data["review"]["key_issues_to_review"] == []
+
+
+class _CharacterEncoder:
+    @staticmethod
+    def encode(value, disallowed_special=()):
+        return list(value)
+
+
+@pytest.mark.asyncio
+async def test_orchestration_clips_complete_prompt_to_selected_model_budget():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer.patches_diff = "+changed line\n" * 2_000
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        "verification:\n  decisions:\n    - candidate_id: candidate-1\n"
+        "      verdict: rejected\n      reason: not proven\n",
+        "stop",
+    ))
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()),
+        patch("pr_agent.tools.pr_reviewer.TokenEncoder.get_token_encoder", return_value=_CharacterEncoder()),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=5_500),
+    ):
+        await reviewer._run_candidate_verification()
+
+    call = reviewer.ai_handler.chat_completion.await_args.kwargs
+    assert len(call["system"]) + len(call["user"]) <= 4_000
+    assert reviewer.candidate_verification_artifact["prompt_budget"]["truncated"] is True
+    assert reviewer.candidate_verification_artifact["prompt_budget"]["prompt_tokens"] <= 4_000
+
+
+@pytest.mark.asyncio
+async def test_orchestration_applies_global_finding_limit_after_verification():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._parse_review_prediction = MagicMock(return_value=_review_data(
+        _candidate(),
+        _candidate(root_cause="second root cause", issue_content="A second distinct defect."),
+    ))
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        "verification:\n  decisions:\n"
+        "    - candidate_id: candidate-1\n      verdict: verified\n"
+        "      relevant_file: src/service.py\n      start_line: 12\n      end_line: 12\n"
+        "      issue_content: First verified defect.\n      evidence_paths: [src/service.py]\n"
+        "    - candidate_id: candidate-2\n      verdict: verified\n"
+        "      relevant_file: src/service.py\n      start_line: 12\n      end_line: 12\n"
+        "      issue_content: Second verified defect.\n      evidence_paths: [src/service.py]\n",
+        "stop",
+    ))
+    settings = _verification_settings()
+    settings.pr_reviewer["num_max_findings"] = 1
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch("pr_agent.tools.pr_reviewer.TokenEncoder.get_token_encoder", return_value=_CharacterEncoder()),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    assert len(reviewer.verified_review_data["review"]["key_issues_to_review"]) == 1
+    assert reviewer.candidate_verification_artifact["verifier_verified_count"] == 2
+    assert reviewer.candidate_verification_artifact["finding_limit_dropped"] == 1
+
+
+def test_repository_override_mirrors_candidate_verification_defaults():
+    repository_config = tomllib.loads(Path(".pr_agent.toml").read_text())["pr_reviewer"]
+    default_config = tomllib.loads(Path("pr_agent/settings/configuration.toml").read_text())["pr_reviewer"]
+    candidate_keys = {"enable_candidate_verification"} | {
+        key for key in default_config if key.startswith("candidate_verification_")
+    }
+
+    assert candidate_keys
+    assert {key: repository_config[key] for key in candidate_keys} == {
+        key: default_config[key] for key in candidate_keys
+    }

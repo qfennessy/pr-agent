@@ -20,18 +20,19 @@ from pr_agent.algo.inline_comment_dedup import (
     InlineCommentStore, can_verify_inline_comment_publication,
     get_inline_comment_store, key_issue_body_with_markers,
     key_issue_fingerprint, key_issue_location_fingerprint)
-from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
+from pr_agent.algo.pr_processing import (OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+                                         add_ai_metadata_to_diff_files,
                                          get_pr_diff,
                                          retry_with_fallback_models)
 from pr_agent.algo.repo_context import build_repo_context
 from pr_agent.algo.run_details import (get_run_details, init_run_details,
                                        record_review_profile)
 from pr_agent.algo.skills_loader import get_skills_context
-from pr_agent.algo.token_handler import TokenHandler
+from pr_agent.algo.token_handler import TokenEncoder, TokenHandler
 from pr_agent.algo.utils import (ModelType, PRReviewHeader, PRReviewIdentity,
                                  add_pr_review_identity,
                                  convert_to_markdown_v2, github_action_output,
-                                 load_yaml, show_relevant_configurations,
+                                 get_max_tokens, load_yaml, show_relevant_configurations,
                                  show_run_details)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider_with_context
@@ -499,9 +500,10 @@ class PRReviewer:
             sensitive_globs = config.get("candidate_verification_sensitive_path_globs", []) or []
             if isinstance(sensitive_globs, str):
                 sensitive_globs = [sensitive_globs]
+            diff_files = self.git_provider.get_diff_files()
             candidates, candidate_rejections = prepare_candidates(
                 review_data,
-                self.git_provider.get_diff_files(),
+                diff_files,
                 sensitive_globs,
                 budgets.max_candidates,
                 budgets.max_files,
@@ -518,25 +520,90 @@ class PRReviewer:
             runtime_data = get_settings().get("data", {}) or {}
             static_evidence = runtime_data.get("static_analysis_evidence", []) if isinstance(runtime_data, dict) else []
             evidence, retrieval_artifact = await retrieve_evidence(
-                self.git_provider, candidates, budgets, static_evidence
+                self.git_provider, candidates, budgets, static_evidence, diff_files=diff_files
             )
             artifact["retrieval"] = retrieval_artifact
             if int(config.get("candidate_verification_max_model_calls", 1)) < 1:
                 artifact["status"] = "model_call_budget_exhausted"
                 return
 
-            variables = {
-                "verification_payload": render_verification_payload(candidates, self.patches_diff or "", evidence),
-            }
             environment = Environment(
                 autoescape=select_autoescape(default_for_string=False),
                 undefined=StrictUndefined,
             )
             verification_prompt = get_settings().pr_review_verification_prompt
-            system_prompt = environment.from_string(verification_prompt.system).render(variables)
-            user_prompt = environment.from_string(verification_prompt.user).render(variables)
             model = str(config.get("candidate_verification_model", "") or get_settings().config.model).strip()
-            artifact.update({"model": model, "model_calls": 1})
+            artifact["model"] = model
+            encoder = TokenEncoder.get_token_encoder(model)
+            model_max_tokens = get_max_tokens(model)
+            max_prompt_tokens = max(0, model_max_tokens - OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD)
+
+            def render_prompts(evidence_fraction: float, changed_diff_fraction: float) -> tuple[str, str, int]:
+                variables = {
+                    "verification_payload": render_verification_payload(
+                        candidates,
+                        self.patches_diff or "",
+                        evidence,
+                        content_fraction=evidence_fraction,
+                        changed_diff_fraction=changed_diff_fraction,
+                    ),
+                }
+                rendered_system = environment.from_string(verification_prompt.system).render(variables)
+                rendered_user = environment.from_string(verification_prompt.user).render(variables)
+                prompt_tokens = (
+                    len(encoder.encode(rendered_system, disallowed_special=())) +
+                    len(encoder.encode(rendered_user, disallowed_special=()))
+                )
+                return rendered_system, rendered_user, prompt_tokens
+
+            full_system_prompt, full_user_prompt, full_prompt_tokens = render_prompts(1.0, 1.0)
+            evidence_fraction = 1.0
+            changed_diff_fraction = 1.0
+            system_prompt = full_system_prompt
+            user_prompt = full_user_prompt
+            prompt_tokens = full_prompt_tokens
+            if full_prompt_tokens > max_prompt_tokens:
+                system_prompt, user_prompt, prompt_tokens = render_prompts(1.0, 0.0)
+                changed_diff_fraction = 0.0
+                if prompt_tokens > max_prompt_tokens:
+                    system_prompt, user_prompt, prompt_tokens = render_prompts(0.0, 0.0)
+                    evidence_fraction = 0.0
+                if prompt_tokens > max_prompt_tokens:
+                    artifact.update({
+                        "status": "prompt_budget_exhausted",
+                        "prompt_budget": {
+                            "model_max_tokens": model_max_tokens,
+                            "reserved_completion_tokens": OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+                            "max_prompt_tokens": max_prompt_tokens,
+                            "prompt_tokens": prompt_tokens,
+                            "truncated": True,
+                        },
+                    })
+                    return
+                lower = 0.0
+                upper = 1.0
+                if evidence_fraction < 1.0:
+                    for _ in range(18):
+                        midpoint = (lower + upper) / 2
+                        candidate_system, candidate_user, candidate_tokens = render_prompts(midpoint, 0.0)
+                        if candidate_tokens <= max_prompt_tokens:
+                            lower = midpoint
+                            evidence_fraction = midpoint
+                            system_prompt = candidate_system
+                            user_prompt = candidate_user
+                            prompt_tokens = candidate_tokens
+                        else:
+                            upper = midpoint
+            artifact["prompt_budget"] = {
+                "model_max_tokens": model_max_tokens,
+                "reserved_completion_tokens": OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+                "max_prompt_tokens": max_prompt_tokens,
+                "prompt_tokens": prompt_tokens,
+                "truncated": evidence_fraction < 1.0 or changed_diff_fraction < 1.0,
+                "evidence_content_fraction": round(evidence_fraction, 4),
+                "changed_diff_fraction": round(changed_diff_fraction, 4),
+            }
+            artifact["model_calls"] = 1
             verifier_started = time.monotonic()
             details = get_run_details()
             if details is not None:
@@ -561,14 +628,18 @@ class PRReviewer:
                 last_key="decisions",
             )
             verified_findings, decisions = apply_verification_decisions(candidates, evidence, verification_data)
-            self.verified_review_data["review"]["key_issues_to_review"] = verified_findings
+            max_findings = max(0, int(config.get("num_max_findings", 3)))
+            published_findings = verified_findings[:max_findings]
+            self.verified_review_data["review"]["key_issues_to_review"] = published_findings
             artifact.update({
                 "status": "partial" if retrieval_artifact["budget_exhausted"] or any(
                     request["status"] != "retrieved" for request in retrieval_artifact["requests"]
                 ) else "complete",
                 "decisions": decisions,
-                "verified_count": len(verified_findings),
-                "rejected_count": len(candidates) - len(verified_findings),
+                "verified_count": len(published_findings),
+                "verifier_verified_count": len(verified_findings),
+                "finding_limit_dropped": len(verified_findings) - len(published_findings),
+                "rejected_count": len(candidates) - len(published_findings),
             })
         except Exception as exc:
             artifact.update({"status": "verifier_failed", "failure": type(exc).__name__, "verified_count": 0})

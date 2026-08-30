@@ -6,6 +6,17 @@
 [pr_reviewer]
 enable_review_labels_effort = true
 enable_auto_approval = true
+# Keep candidate verification opt-in while benchmark evidence is gathered.
+enable_candidate_verification = false
+candidate_verification_model = ""
+candidate_verification_max_model_calls = 1
+candidate_verification_max_candidates = 3
+candidate_verification_max_files = 6
+candidate_verification_max_lines_per_file = 160
+candidate_verification_max_total_lines = 600
+candidate_verification_max_context_tokens = 6000
+candidate_verification_timeout_seconds = 10
+candidate_verification_sensitive_path_globs = []
 
 [github_app]
 pr_commands = [

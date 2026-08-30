@@ -235,7 +235,7 @@ def _matching_static_evidence(candidate: dict, static_evidence: list) -> list[di
 
 
 async def retrieve_evidence(git_provider, candidates: list[dict], budgets: VerificationBudgets,
-                            static_evidence: list) -> tuple[list[dict], dict]:
+                            static_evidence: list, diff_files: Optional[list] = None) -> tuple[list[dict], dict]:
     """Fetch bounded base-branch excerpts and return them with an auditable retrieval record."""
     started = time.monotonic()
     deadline = started + max(0.0, budgets.timeout_seconds)
@@ -247,8 +247,38 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
     total_chars = 0
     max_chars = max(0, budgets.max_context_tokens) * 4
     budget_exhausted = False
+    changed_evidence_count = 0
+    diff_by_file = {
+        path: diff_file
+        for diff_file in (diff_files or [])
+        if (path := safe_repo_path(getattr(diff_file, "filename", "")))
+    }
 
     for candidate in candidates:
+        diff_file = diff_by_file.get(candidate.get("relevant_file"))
+        head_file = getattr(diff_file, "head_file", "") if diff_file is not None else ""
+        if head_file and getattr(diff_file, "head_file_is_complete", True):
+            available_lines = min(budgets.max_lines_per_file, budgets.max_total_lines - total_lines)
+            excerpt, start_line, end_line = _select_excerpt(
+                str(head_file), candidate, candidate.get("relevant_file"), available_lines
+            )
+            available_chars = max_chars - total_chars
+            if len(excerpt) > available_chars:
+                excerpt = excerpt[:available_chars]
+                budget_exhausted = True
+            if excerpt:
+                evidence.append({
+                    "candidate_id": candidate["candidate_id"],
+                    "source": "changed_head",
+                    "path": candidate["relevant_file"],
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "content": excerpt,
+                })
+                line_count = excerpt.count("\n") + 1
+                total_lines += line_count
+                total_chars += len(excerpt)
+                changed_evidence_count += 1
         for static_item in _matching_static_evidence(candidate, static_evidence):
             if total_chars + len(static_item["content"]) > max_chars:
                 budget_exhausted = True
@@ -322,6 +352,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         "retrieved_evidence": evidence,
         "budget_exhausted": budget_exhausted,
         "files_read": len(unique_files),
+        "changed_evidence_count": changed_evidence_count,
         "lines_retrieved": total_lines,
         "estimated_context_tokens": (total_chars + 3) // 4,
         "duration_seconds": round(time.monotonic() - started, 3),
@@ -329,9 +360,35 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
     return evidence, artifact
 
 
-def render_verification_payload(candidates: list[dict], changed_diff: str, evidence: list[dict]) -> str:
+def render_verification_payload(candidates: list[dict], changed_diff: str, evidence: list[dict],
+                                content_fraction: float = 1.0,
+                                changed_diff_fraction: Optional[float] = None) -> str:
     """Serialize all model-controlled material as JSON data for the verifier prompt."""
-    return json.dumps({"candidates": candidates, "changed_diff": changed_diff, "evidence": evidence},
+    content_fraction = min(1.0, max(0.0, float(content_fraction)))
+    if changed_diff_fraction is None:
+        changed_diff_fraction = content_fraction
+    changed_diff_fraction = min(1.0, max(0.0, float(changed_diff_fraction)))
+
+    def bounded_content(value, fraction: float) -> str:
+        value = str(value or "")
+        if fraction >= 1.0 or not value:
+            return value
+        kept_characters = int(len(value) * fraction)
+        if kept_characters < 1:
+            return ""
+        if kept_characters >= len(value):
+            return value
+        return f"{value[:kept_characters]}\n...(truncated)"
+
+    bounded_evidence = []
+    for item in evidence:
+        bounded_item = dict(item)
+        if "content" in bounded_item:
+            bounded_item["content"] = bounded_content(bounded_item["content"], content_fraction)
+        bounded_evidence.append(bounded_item)
+    return json.dumps({"candidates": candidates,
+                       "changed_diff": bounded_content(changed_diff, changed_diff_fraction),
+                       "evidence": bounded_evidence},
                       ensure_ascii=False, indent=2)
 
 
@@ -346,10 +403,27 @@ def apply_verification_decisions(candidates: list[dict], evidence: list[dict], v
     verified_findings = []
     result_records = []
     seen_findings = set()
+    decision_ids = [
+        str(decision.get("candidate_id") or "").strip()
+        for decision in decisions if isinstance(decision, dict)
+    ] if isinstance(decisions, list) else []
+    duplicate_decision_ids = {
+        candidate_id for candidate_id in decision_ids if candidate_id and decision_ids.count(candidate_id) > 1
+    }
+    recorded_duplicate_ids = set()
     for decision in decisions if isinstance(decisions, list) else []:
         if not isinstance(decision, dict):
             continue
         candidate_id = str(decision.get("candidate_id") or "").strip()
+        if candidate_id in duplicate_decision_ids:
+            if candidate_id not in recorded_duplicate_ids:
+                result_records.append({
+                    "candidate_id": candidate_id,
+                    "verdict": "rejected",
+                    "reason": "duplicate_decision",
+                })
+                recorded_duplicate_ids.add(candidate_id)
+            continue
         candidate = candidates_by_id.get(candidate_id)
         verdict = str(decision.get("verdict") or "").strip().lower()
         record = {"candidate_id": candidate_id, "verdict": verdict or "invalid"}
