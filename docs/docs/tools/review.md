@@ -241,6 +241,7 @@ unverified candidate is never promoted to a finding.
 ```toml
 [pr_reviewer]
 enable_candidate_verification = true
+candidate_verification_consume_specialist_prioritization = false
 candidate_verification_model = "" # Empty uses config.model
 candidate_verification_max_model_calls = 1
 candidate_verification_max_candidates = 3
@@ -256,6 +257,11 @@ Configured sensitive paths create independent audit candidates, so the first mod
 static-analysis text is passed to the verifier as untrusted data. Structured review publishers receive a
 `candidate_verification` artifact containing candidate and decision counts, the verifier model and call count, retrieval
 statuses, budget usage, latency, and concise rejection or failure reasons.
+
+The specialist-prioritization consumer remains disabled separately. When enabled, it accepts only a successful or cached,
+validated `diff_prioritization` result whose immutable input identity matches the review. Ranked hunks can reorder
+verification work, and context requests anchored to the candidate's exact hunk can add bounded file or symbol lookups.
+They never remove a candidate, bypass sensitive-path audits, select a review depth, or act as verification evidence.
 
 Keep this feature disabled by default until a representative frozen benchmark shows an acceptable precision/recall
 tradeoff. Compare the same PR corpus with the feature off and on, and record verified true positives, rejected false

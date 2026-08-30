@@ -8,6 +8,7 @@ enable_review_labels_effort = true
 enable_auto_approval = true
 # Keep candidate verification opt-in while benchmark evidence is gathered.
 enable_candidate_verification = false
+candidate_verification_consume_specialist_prioritization = false
 candidate_verification_model = ""
 candidate_verification_max_model_calls = 1
 candidate_verification_max_candidates = 3

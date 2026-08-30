@@ -12,10 +12,12 @@ from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.candidate_verification import (
     VerificationBudgets,
+    apply_specialist_prioritization,
     apply_verification_decisions,
     prepare_candidates,
     render_verification_payload,
     retrieve_evidence,
+    validated_specialist_prioritization,
 )
 from pr_agent.algo.inline_comment_dedup import (
     InlineCommentStore, can_verify_inline_comment_publication,
@@ -116,6 +118,7 @@ class PRReviewer:
         self.prediction = None
         self.candidate_verification_artifact = None
         self.verified_review_data = None
+        self.specialist_shadow_input = None
         self.specialist_shadow_result = None
         self._specialists_started = False
         question_str, answer_str = self._get_user_answers()
@@ -413,6 +416,7 @@ class PRReviewer:
                 head_sha=head_sha,
                 snapshot=snapshot,
             )
+            self.specialist_shadow_input = specialist_input
             self.specialist_shadow_result = await run_shadow_specialists(
                 specialist_input,
                 pipeline,
@@ -610,6 +614,15 @@ class PRReviewer:
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
 
+    @staticmethod
+    def _candidate_specialist_prioritization_enabled() -> bool:
+        value = get_settings().pr_reviewer.get(
+            "candidate_verification_consume_specialist_prioritization", False
+        )
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
     def _parse_review_prediction(self) -> dict:
         return load_yaml(
             self.prediction.strip(),
@@ -623,7 +636,15 @@ class PRReviewer:
     async def _run_candidate_verification(self) -> None:
         """Verify review candidates against bounded base-branch repository evidence."""
         config = get_settings().pr_reviewer
-        artifact = {"enabled": True, "status": "initializing", "model_calls": 0}
+        consume_specialist_prioritization = self._candidate_specialist_prioritization_enabled()
+        artifact = {
+            "enabled": True,
+            "status": "initializing",
+            "model_calls": 0,
+            "specialist_prioritization": {
+                "status": "pending" if consume_specialist_prioritization else "disabled"
+            },
+        }
         verifier_started = None
         details_before = None
         self.candidate_verification_artifact = artifact
@@ -659,6 +680,18 @@ class PRReviewer:
                 budgets.max_candidates,
                 budgets.max_files,
             )
+            if consume_specialist_prioritization:
+                specialist_input = getattr(self, "specialist_shadow_input", None)
+                prioritization = validated_specialist_prioritization(
+                    getattr(self, "specialist_shadow_result", None), specialist_input
+                )
+                if prioritization is None:
+                    artifact["specialist_prioritization"] = {"status": "validated_output_unavailable"}
+                else:
+                    candidates, prioritization_artifact = apply_specialist_prioritization(
+                        candidates, prioritization, specialist_input
+                    )
+                    artifact["specialist_prioritization"] = prioritization_artifact
             artifact.update({
                 "candidate_count": len(candidates),
                 "candidate_rejections": candidate_rejections,

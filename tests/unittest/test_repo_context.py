@@ -651,6 +651,7 @@ def test_prompt_templates_render_configured_repo_context(prompt_name, variables)
 def test_bugs_only_review_prompt_renders_ci_failure_evidence_contract():
     variables = {
         "bugs_only": True,
+        "enable_candidate_verification": False,
         "ci_failure_context": (
             '{"status": "available", "failures": [{"name": "Unit tests", '
             '"title": "Cache isolation failed", "summary": "Tenant key omitted"}]}'

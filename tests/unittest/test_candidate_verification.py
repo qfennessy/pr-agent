@@ -7,11 +7,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pr_agent.algo.candidate_verification import (VerificationBudgets,
+                                                  apply_specialist_prioritization,
                                                   apply_verification_decisions,
                                                   prepare_candidates,
                                                   render_verification_payload,
                                                   retrieve_evidence,
-                                                  safe_repo_path)
+                                                  safe_repo_path,
+                                                  validated_specialist_prioritization)
+from pr_agent.algo.review_specialists import (RoleExecution,
+                                              SpecialistBatchResult,
+                                              SpecialistHunk,
+                                              SpecialistInput,
+                                              SpecialistRole,
+                                              SpecialistState)
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.tools.pr_reviewer import PRReviewer
 
@@ -69,6 +77,140 @@ def test_prepare_candidates_rejects_locations_outside_the_changed_diff():
 
     assert candidates == []
     assert rejected == [{"candidate_id": "candidate-1", "reason": "invalid_candidate"}]
+
+
+def _specialist_input():
+    return SpecialistInput(
+        snapshot_id="head-1",
+        head_sha="head-1",
+        title="Candidate verification",
+        description="",
+        changed_paths=("src/service.py",),
+        diff="@@ -10,1 +12,4 @@\n+one\n+two\n+three\n+four\n@@ -28,1 +30,2 @@\n+five\n+six",
+        hunks=(
+            SpecialistHunk("hunk-1", "src/service.py", 12, 15, (12, 13, 14, 15), "hash-1"),
+            SpecialistHunk("hunk-2", "src/service.py", 30, 31, (30, 31), "hash-2"),
+        ),
+    )
+
+
+def _specialist_batch(specialist_input, state, output, *, stale=False):
+    record = RoleExecution(
+        role=SpecialistRole.DIFF_PRIORITIZATION,
+        state=state,
+        output=output,
+    )
+    return SpecialistBatchResult(
+        snapshot_id=specialist_input.snapshot_id,
+        head_sha=specialist_input.head_sha,
+        input_hash=specialist_input.input_hash,
+        configuration_hash="config-1",
+        records=(record,),
+        role_records={},
+        changed_path_count=1,
+        hunk_count=2,
+        stale=stale,
+    )
+
+
+@pytest.mark.parametrize("state", [SpecialistState.SUCCESS, SpecialistState.CACHED])
+def test_specialist_prioritization_uses_only_validated_exact_input_records(state):
+    specialist_input = _specialist_input()
+    output = {"ranked_hunks": [], "context_requests": []}
+    batch = _specialist_batch(specialist_input, state, output)
+
+    assert validated_specialist_prioritization(batch, specialist_input) is output
+
+
+@pytest.mark.parametrize("state", [SpecialistState.LOW_CONFIDENCE, SpecialistState.MALFORMED_OUTPUT])
+def test_specialist_prioritization_rejects_nonvalidated_role_states(state):
+    specialist_input = _specialist_input()
+    batch = _specialist_batch(
+        specialist_input,
+        state,
+        {"ranked_hunks": [], "context_requests": []},
+    )
+
+    assert validated_specialist_prioritization(batch, specialist_input) is None
+
+
+def test_specialist_prioritization_rejects_stale_or_different_input_identity():
+    specialist_input = _specialist_input()
+    output = {"ranked_hunks": [], "context_requests": []}
+    stale_batch = _specialist_batch(specialist_input, SpecialistState.SUCCESS, output, stale=True)
+    other_input = SpecialistInput(
+        snapshot_id="head-2",
+        head_sha="head-2",
+        title="Candidate verification",
+        description="",
+        changed_paths=("src/service.py",),
+        diff="different",
+        hunks=specialist_input.hunks,
+    )
+
+    assert validated_specialist_prioritization(stale_batch, specialist_input) is None
+    assert validated_specialist_prioritization(
+        _specialist_batch(specialist_input, SpecialistState.SUCCESS, output), other_input
+    ) is None
+
+
+def test_apply_specialist_prioritization_ranks_exact_hunks_without_suppressing_sensitive_audits():
+    specialist_input = _specialist_input()
+    candidates = [
+        {
+            "candidate_id": "sensitive-1",
+            "relevant_file": "src/service.py",
+            "start_line": 12,
+            "sensitive_path": True,
+            "context_files": ["src/service.py"],
+            "context_symbols": [],
+        },
+        {
+            "candidate_id": "candidate-1",
+            "relevant_file": "src/service.py",
+            "start_line": 12,
+            "sensitive_path": False,
+            "context_files": [],
+            "context_symbols": [],
+        },
+        {
+            "candidate_id": "candidate-2",
+            "relevant_file": "src/service.py",
+            "start_line": 30,
+            "sensitive_path": False,
+            "context_files": [],
+            "context_symbols": [],
+        },
+    ]
+    prioritization = {
+        "ranked_hunks": [
+            {"rank": 1, "path": "src/service.py", "hunk_id": "hunk-2"},
+            {"rank": 2, "path": "src/service.py", "hunk_id": "hunk-1"},
+        ],
+        "context_requests": [{
+            "kind": "caller",
+            "target": "src/specialist_caller.py",
+            "anchor_path": "src/service.py",
+            "anchor_hunk_id": "hunk-2",
+        }],
+    }
+
+    prioritized, artifact = apply_specialist_prioritization(
+        candidates, prioritization, specialist_input
+    )
+
+    assert [candidate["candidate_id"] for candidate in prioritized] == [
+        "sensitive-1", "candidate-2", "candidate-1"
+    ]
+    assert prioritized[1]["context_files"] == ["src/specialist_caller.py"]
+    assert prioritized[0]["context_files"] == ["src/service.py"]
+    assert artifact == {
+        "status": "applied",
+        "ranked_candidate_count": 3,
+        "context_request_count": 1,
+        "matched_context_request_count": 1,
+        "context_hints_added": 1,
+    }
 
 
 def test_apply_verification_decisions_publishes_only_evidence_backed_findings():
@@ -303,6 +445,51 @@ async def test_orchestration_exposes_verifier_failure_and_does_not_publish_candi
     assert reviewer.candidate_verification_artifact["status"] == "verifier_failed"
     assert reviewer.candidate_verification_artifact["model_calls"] == 1
     assert reviewer.verified_review_data["review"]["key_issues_to_review"] == []
+
+
+@pytest.mark.asyncio
+async def test_orchestration_consumes_validated_specialist_context_only_when_enabled():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def helper(): return True"
+    reviewer = _reviewer_for_orchestration(provider)
+    specialist_input = _specialist_input()
+    prioritization = {
+        "ranked_hunks": [{"rank": 1, "path": "src/service.py", "hunk_id": "hunk-1"}],
+        "context_requests": [{
+            "kind": "caller",
+            "target": "src/specialist_caller.py",
+            "anchor_path": "src/service.py",
+            "anchor_hunk_id": "hunk-1",
+        }],
+    }
+    reviewer.specialist_shadow_input = specialist_input
+    reviewer.specialist_shadow_result = _specialist_batch(
+        specialist_input, SpecialistState.SUCCESS, prioritization
+    )
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        "verification:\n  decisions:\n    - candidate_id: candidate-1\n"
+        "      verdict: rejected\n      reason: not proven\n",
+        "stop",
+    ))
+    settings = _verification_settings()
+    settings.pr_reviewer["candidate_verification_consume_specialist_prioritization"] = True
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    assert reviewer.candidate_verification_artifact["specialist_prioritization"] == {
+        "status": "applied",
+        "ranked_candidate_count": 1,
+        "context_request_count": 1,
+        "matched_context_request_count": 1,
+        "context_hints_added": 1,
+    }
+    assert "src/specialist_caller.py" in reviewer.ai_handler.chat_completion.await_args.kwargs["user"]
 
 
 class _CharacterEncoder:

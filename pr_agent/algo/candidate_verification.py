@@ -7,8 +7,12 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Optional
+from typing import Mapping, Optional
 
+from pr_agent.algo.review_specialists import (SpecialistBatchResult,
+                                              SpecialistInput,
+                                              SpecialistRole,
+                                              SpecialistState)
 from pr_agent.log import get_logger
 
 _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -169,6 +173,130 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
         candidates.append(candidate)
         model_candidate_count += 1
     return candidates, rejected
+
+
+def validated_specialist_prioritization(
+    batch_result: Optional[SpecialistBatchResult],
+    specialist_input: Optional[SpecialistInput],
+) -> Optional[Mapping]:
+    """Return only the validated diff-prioritization output for the exact shared input.
+
+    Successful and cached role records have already crossed the specialist output
+    validator. Other states can contain rejected or incomplete output and must not
+    influence candidate verification.
+    """
+    if (
+        batch_result is None
+        or specialist_input is None
+        or batch_result.stale
+        or batch_result.input_hash != specialist_input.input_hash
+        or batch_result.snapshot_id != specialist_input.snapshot_id
+        or batch_result.head_sha != specialist_input.head_sha
+    ):
+        return None
+    for record in batch_result.records:
+        if (
+            record.role is SpecialistRole.DIFF_PRIORITIZATION
+            and record.state in (SpecialistState.SUCCESS, SpecialistState.CACHED)
+            and isinstance(record.output, Mapping)
+            and isinstance(record.output.get("ranked_hunks"), (list, tuple))
+            and isinstance(record.output.get("context_requests"), (list, tuple))
+        ):
+            return record.output
+    return None
+
+
+def _candidate_hunk_id(candidate: dict, specialist_input: SpecialistInput) -> Optional[str]:
+    try:
+        line = int(candidate.get("start_line"))
+    except (TypeError, ValueError):
+        return None
+    path = candidate.get("relevant_file")
+    for hunk in specialist_input.hunks:
+        if hunk.path == path and hunk.start_line <= line <= hunk.end_line:
+            return hunk.hunk_id
+    return None
+
+
+def _append_context_hint(candidate: dict, kind: str, target: str) -> bool:
+    target = str(target or "").strip()
+    if not target or len(target) > 256 or "\x00" in target or "\n" in target or "\r" in target:
+        return False
+    path = safe_repo_path(target)
+    path_name = PurePosixPath(path).name if path else ""
+    if kind != "symbol" and path and not any(character.isspace() for character in path) and (
+        "/" in path or "." in path_name
+    ):
+        key = "context_files"
+        value = path
+    else:
+        key = "context_symbols"
+        value = target
+    current = candidate.get(key) or []
+    if isinstance(current, str):
+        current = [current]
+    elif not isinstance(current, list):
+        current = []
+    if value in current:
+        return False
+    candidate[key] = [*current, value]
+    return True
+
+
+def apply_specialist_prioritization(
+    candidates: list[dict],
+    prioritization: Mapping,
+    specialist_input: SpecialistInput,
+) -> tuple[list[dict], dict]:
+    """Apply validated hunk ranks and anchored context requests without dropping candidates."""
+    prepared = [dict(candidate) for candidate in candidates]
+    candidate_hunks = {
+        candidate["candidate_id"]: _candidate_hunk_id(candidate, specialist_input)
+        for candidate in prepared
+    }
+    ranks = {
+        str(item.get("hunk_id")): int(item["rank"])
+        for item in prioritization.get("ranked_hunks", ())
+        if isinstance(item, Mapping)
+        and isinstance(item.get("rank"), int)
+        and not isinstance(item.get("rank"), bool)
+    }
+    original_order = {candidate["candidate_id"]: index for index, candidate in enumerate(prepared)}
+    prepared.sort(key=lambda candidate: (
+        0 if candidate.get("sensitive_path") else 1,
+        ranks.get(candidate_hunks.get(candidate["candidate_id"]), float("inf")),
+        original_order[candidate["candidate_id"]],
+    ))
+
+    context_hints_added = 0
+    matched_requests = 0
+    for request in prioritization.get("context_requests", ()):
+        if not isinstance(request, Mapping):
+            continue
+        anchor_hunk_id = str(request.get("anchor_hunk_id") or "")
+        anchor_path = request.get("anchor_path")
+        matched = False
+        for candidate in prepared:
+            if (
+                candidate.get("relevant_file") != anchor_path
+                or candidate_hunks.get(candidate["candidate_id"]) != anchor_hunk_id
+            ):
+                continue
+            matched = True
+            if _append_context_hint(candidate, str(request.get("kind") or ""), request.get("target")):
+                context_hints_added += 1
+        if matched:
+            matched_requests += 1
+
+    return prepared, {
+        "status": "applied",
+        "ranked_candidate_count": sum(
+            1 for hunk_id in candidate_hunks.values() if hunk_id in ranks
+        ),
+        "context_request_count": len(prioritization.get("context_requests", ())),
+        "matched_context_request_count": matched_requests,
+        "context_hints_added": context_hints_added,
+    }
 
 
 def _requested_paths(candidate: dict) -> list[str]:

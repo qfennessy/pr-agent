@@ -112,6 +112,8 @@ branch_issue_regex = ""
 review_profile="full" # "full" preserves the standard review; "bugs_only" emits only qualifying defects.
 # Opt in to a bounded second pass that verifies review candidates against repository evidence.
 enable_candidate_verification=false
+# Consume only validated diff-prioritization output for the exact specialist input; keep off until rollout gates pass.
+candidate_verification_consume_specialist_prioritization=false
 candidate_verification_model="" # Empty uses config.model.
 candidate_verification_max_model_calls=1 # The implementation performs at most one verifier call per review.
 candidate_verification_max_candidates=3
