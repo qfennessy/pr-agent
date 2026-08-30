@@ -237,14 +237,8 @@ def _apply_settings_from_file(path: str, label: str):
         get_logger().warning(f"Failed to apply {label} settings from {path}: {e}")
 
 
-def apply_repo_settings(pr_url):
-    os.environ["AUTO_CAST_FOR_DYNACONF"] = "false"
-
-    # Apply external/shared config FIRST, before constructing the git provider:
-    # provider initialisers (e.g. GitLabProvider reads GITLAB.PERSONAL_ACCESS_TOKEN
-    # at __init__) need to see any provider-critical settings that come from the
-    # extra file. Repo-local .pr_agent.toml is still applied later and overrides
-    # the extra file on conflicting keys.
+def apply_extra_config_settings():
+    """Apply the configured shared settings layer before repository settings."""
     extra_source = get_settings().get("CONFIG.EXTRA_CONFIG_URL", None)
     if isinstance(extra_source, str) and extra_source.strip():
         extra_path, extra_is_temp = _resolve_extra_config_to_file(extra_source)
@@ -267,6 +261,14 @@ def apply_repo_settings(pr_url):
             "Ignoring CONFIG.EXTRA_CONFIG_URL: expected str, got "
             f"{type(extra_source).__name__}"
         )
+
+
+def apply_repo_settings(pr_url):
+    os.environ["AUTO_CAST_FOR_DYNACONF"] = "false"
+
+    # Provider initialisers need external provider settings before construction.
+    # Hosted repository settings are applied afterwards and retain precedence.
+    apply_extra_config_settings()
 
     git_provider = get_git_provider_with_context(pr_url)
 
@@ -323,10 +325,14 @@ def apply_repo_settings(pr_url):
 
 
 def apply_local_repo_settings(repository_root):
-    """Apply a worktree's .pr_agent.toml through the shared security gate."""
+    """Apply shared then worktree settings through the normal security gates."""
+    apply_extra_config_settings()
     settings_path = os.path.join(str(repository_root), ".pr_agent.toml")
     if os.path.isfile(settings_path):
         _apply_repo_settings_file(settings_path)
+    # The local and shared layers are now fully materialized. Prevent the later
+    # plain-diff provider setup from reapplying shared settings after local ones.
+    get_settings().set("CONFIG.EXTRA_CONFIG_URL", None)
 
 
 def _apply_repo_settings_file(repo_settings_file):

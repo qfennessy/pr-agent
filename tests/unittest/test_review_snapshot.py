@@ -140,6 +140,21 @@ def test_symlink_paths_are_preserved_and_reported_as_unsupported(tmp_path):
     assert CoverageIssue(path="link.py", reason="symlink") in snapshot.coverage_issues
 
 
+def test_excluding_either_side_rejects_an_entire_rename(tmp_path):
+    repo = _repo(tmp_path)
+    source = repo / "ignored.py"
+    source.write_text("secret = True\n", encoding="utf-8")
+    _git(repo, "add", "ignored.py")
+    _git(repo, "commit", "-m", "add ignored source")
+    _git(repo, "mv", "ignored.py", "allowed.py")
+
+    snapshot = LocalPairReview(str(repo), excluded_paths=["ignored.py"]).capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(path="ignored.py", reason="excluded") in snapshot.coverage_issues
+
+
 def test_file_save_requires_a_safe_focused_path_and_captures_untracked_addition(tmp_path):
     repo = _repo(tmp_path)
     (repo / "new.py").write_text("added = True\n", encoding="utf-8")
@@ -217,6 +232,24 @@ def test_result_states_distinguish_findings_clean_and_unavailable():
     assert clean.state is ReviewResultState.NO_FINDINGS
     assert unavailable.state is ReviewResultState.COVERAGE_UNAVAILABLE
     assert CoverageIssue(reason="review_failed:AuthenticationError") in unavailable.coverage_issues
+
+
+def test_partial_coverage_cannot_be_reported_as_clean():
+    snapshot = _snapshot("/repo/one")
+    snapshot = ReviewSnapshot(**{
+        key: value
+        for key, value in snapshot.__dict__.items()
+        if key not in {"snapshot_id", "coverage_issues"}
+    }, coverage_issues=(CoverageIssue(path="large.bin", reason="binary"),))
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={"review": {"key_issues_to_review": []}},
+        started_at=monotonic(),
+    )
+
+    assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert result.review is None
 
 
 def test_cache_is_repository_local_and_does_not_store_unavailable_results(tmp_path):

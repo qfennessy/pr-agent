@@ -61,12 +61,14 @@ class LocalPairReview:
         repository_root: Optional[str] = None,
         *,
         excluded_paths: Optional[Sequence[str]] = None,
+        ignored_paths: Optional[Sequence[str]] = None,
         max_file_bytes: Optional[int] = None,
     ) -> None:
         self.repository_root = find_repository_root(repository_root)
         settings = get_settings().get("local_pair_review", {}) or {}
         configured_exclusions = settings.get("excluded_paths", []) if hasattr(settings, "get") else []
         self.excluded_paths = tuple(excluded_paths if excluded_paths is not None else configured_exclusions)
+        self.ignored_paths = tuple(ignored_paths or ())
         configured_limit = settings.get("max_file_bytes", 1_000_000) if hasattr(settings, "get") else 1_000_000
         self.max_file_bytes = int(max_file_bytes if max_file_bytes is not None else configured_limit)
 
@@ -88,6 +90,9 @@ class LocalPairReview:
 
     def _is_excluded(self, path: str) -> bool:
         return any(fnmatch.fnmatch(path, pattern) for pattern in self.excluded_paths)
+
+    def _is_ignored(self, path: str) -> bool:
+        return any(fnmatch.fnmatch(path, pattern) for pattern in self.ignored_paths)
 
     def _inspect_content(self, content: bytes) -> Optional[str]:
         if len(content) > self.max_file_bytes:
@@ -220,24 +225,21 @@ class LocalPairReview:
         if normalized_focus:
             tracked_groups = [group for group in tracked_groups if normalized_focus in group]
             untracked = [path for path in untracked if path == normalized_focus]
-        tracked = [path for group in tracked_groups for path in group]
-
         selected_tracked: list[str] = []
         selected_untracked: list[str] = []
         coverage: list[CoverageIssue] = []
-        candidate_paths = (
-            [(path, selected_tracked) for path in tracked]
-            + [(path, selected_untracked) for path in untracked]
-        )
-        for path, destination in candidate_paths:
+
+        def validate_path(path: str) -> Optional[str]:
             try:
                 normalized = self._relative_path(path)
             except SnapshotCaptureError:
                 coverage.append(CoverageIssue(path=path, reason="outside_repository_root"))
-                continue
+                return None
+            if self._is_ignored(normalized):
+                return None
             if self._is_excluded(normalized):
                 coverage.append(CoverageIssue(path=normalized, reason="excluded"))
-                continue
+                return None
             file_issue = (
                 self._inspect_index_file(normalized, base_revision)
                 if event is ReviewEvent.PRE_COMMIT
@@ -245,8 +247,19 @@ class LocalPairReview:
             )
             if file_issue:
                 coverage.append(CoverageIssue(path=normalized, reason=file_issue))
-                continue
-            destination.append(normalized)
+                return None
+            return normalized
+
+        # A rename/copy is one security unit. If either side is unavailable or
+        # excluded, selecting the other side alone can expose the full source.
+        for group in tracked_groups:
+            normalized_group = [validate_path(path) for path in group]
+            if all(normalized_group):
+                selected_tracked.extend(path for path in normalized_group if path is not None)
+        for path in untracked:
+            normalized = validate_path(path)
+            if normalized is not None:
+                selected_untracked.append(normalized)
 
         diff_parts = []
         if selected_tracked:
@@ -395,13 +408,18 @@ def build_snapshot_result(
             latency_seconds=monotonic() - started_at,
         )
 
-    state = ReviewResultState.FINDINGS if finding_count(structured_review) else ReviewResultState.NO_FINDINGS
+    findings = finding_count(structured_review)
+    state = ReviewResultState.FINDINGS if findings else ReviewResultState.NO_FINDINGS
+    review = structured_review.get("review") if isinstance(structured_review, Mapping) else None
+    if not findings and coverage:
+        state = ReviewResultState.COVERAGE_UNAVAILABLE
+        review = None
     metadata = structured_review.get("metadata", {}) if isinstance(structured_review, Mapping) else {}
     return ReviewSnapshotResult(
         snapshot_id=snapshot.snapshot_id,
         state=state,
         current_snapshot_id=current_snapshot.snapshot_id,
-        review=structured_review.get("review") if isinstance(structured_review, Mapping) else None,
+        review=review,
         coverage_issues=tuple(coverage),
         latency_seconds=monotonic() - started_at,
         usage=structured_review.get("usage", {}) if isinstance(structured_review, Mapping) else {},

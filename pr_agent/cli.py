@@ -186,6 +186,19 @@ def _snapshot_review_configuration_hash() -> str:
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _output_artifact_exclusions(repository_root: Path, *paths: str | None) -> list[str]:
+    exclusions = []
+    for supplied_path in paths:
+        if not supplied_path:
+            continue
+        candidate = Path(os.path.abspath(supplied_path))
+        try:
+            exclusions.append(candidate.relative_to(repository_root).as_posix())
+        except ValueError:
+            continue
+    return exclusions
+
+
 def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
     parser = _snapshot_parser()
     snapshot_args = parser.parse_args(args.rest)
@@ -204,9 +217,15 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
         outer_parser.error(str(exc))
     settings = get_settings().get("local_pair_review", {}) or {}
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
+    configured_exclusions = list(settings.get("excluded_paths", []) or [])
+    artifact_exclusions = _output_artifact_exclusions(repository_root, markdown_output, json_output)
 
     try:
-        reviewer = LocalPairReview(str(repository_root))
+        reviewer = LocalPairReview(
+            str(repository_root),
+            excluded_paths=configured_exclusions,
+            ignored_paths=artifact_exclusions,
+        )
         snapshot = reviewer.capture(
             event=event,
             base=snapshot_args.base,
