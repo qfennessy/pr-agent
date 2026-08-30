@@ -464,8 +464,15 @@ class SnapshotCache:
             handle.write(payload)
             temporary_path = Path(handle.name)
         os.replace(temporary_path, self._path(result.snapshot_id))
-        cached_paths = sorted(self.cache_dir.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
-        for old_path in cached_paths[self.max_entries:]:
+        cached_paths = []
+        for cached_path in self.cache_dir.glob("*.json"):
+            try:
+                cached_paths.append((cached_path.stat().st_mtime, cached_path))
+            except OSError:
+                # Another hook may evict the entry between glob and stat.
+                continue
+        cached_paths.sort(key=lambda item: item[0], reverse=True)
+        for _, old_path in cached_paths[self.max_entries:]:
             try:
                 old_path.unlink()
             except OSError:

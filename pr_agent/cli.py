@@ -229,6 +229,26 @@ def _output_artifact_exclusions(repository_root: Path, *paths: str | None) -> li
     return exclusions
 
 
+def _reject_existing_repository_outputs(
+    repository_root: Path,
+    git_metadata_root: Path,
+    *paths: str | None,
+) -> None:
+    for supplied_path in paths:
+        if not supplied_path:
+            continue
+        lexical = Path(os.path.abspath(supplied_path))
+        if not lexical.exists() and not lexical.is_symlink():
+            continue
+        resolved = lexical.resolve(strict=False)
+        if resolved.is_relative_to(git_metadata_root):
+            continue
+        if lexical.is_relative_to(repository_root) or resolved.is_relative_to(repository_root):
+            raise SnapshotCaptureError(
+                f"output destination aliases an existing repository path: {supplied_path}"
+            )
+
+
 def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
     parser = _snapshot_parser()
     snapshot_args = parser.parse_args(args.rest)
@@ -254,6 +274,13 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
     settings = get_settings().get("local_pair_review", {}) or {}
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
     configured_exclusions = list(settings.get("excluded_paths", []) or [])
+    git_metadata_root = SnapshotCache(repository_root).cache_dir.parents[1]
+    try:
+        _reject_existing_repository_outputs(
+            repository_root, git_metadata_root, markdown_output, json_output
+        )
+    except SnapshotCaptureError as exc:
+        outer_parser.error(str(exc))
     artifact_exclusions = _output_artifact_exclusions(repository_root, markdown_output, json_output)
     skills_context = get_skills_context()
 
@@ -306,6 +333,7 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
         with tempfile.TemporaryDirectory(prefix="pr-agent-snapshot-") as temp_dir:
             structured_path = Path(temp_dir) / "review.json"
             markdown_path = Path(temp_dir) / "review.md" if markdown_output else None
+            original_extra_instructions = get_settings().get("pr_reviewer.extra_instructions", "")
             get_settings().set("config.git_provider", "plain-diff")
             get_settings().set("plain_diff.content", snapshot.diff)
             get_settings().set("plain_diff.output_path", str(markdown_path) if markdown_path else None)
@@ -329,12 +357,15 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
                 return get_run_details()
 
             try:
-                with pin_skills_context(skills_context):
-                    details = asyncio.run(inner())
-            except Exception as exc:
-                # The result exposes the error class, not provider text that may
-                # contain credential-shaped values or source excerpts.
-                review_error = type(exc).__name__
+                try:
+                    with pin_skills_context(skills_context):
+                        details = asyncio.run(inner())
+                except Exception as exc:
+                    # The result exposes the error class, not provider text that may
+                    # contain credential-shaped values or source excerpts.
+                    review_error = type(exc).__name__
+            finally:
+                get_settings().set("pr_reviewer.extra_instructions", original_extra_instructions)
             if structured_path.exists():
                 try:
                     structured_review = json.loads(structured_path.read_text(encoding="utf-8"))

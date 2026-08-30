@@ -471,3 +471,30 @@ def test_cache_is_repository_local_and_does_not_store_unavailable_results(tmp_pa
     first_cache.write(unavailable)
     cached = first_cache.read(unavailable.snapshot_id)
     assert cached is None or cached.state is not ReviewResultState.COVERAGE_UNAVAILABLE
+
+
+def test_cache_eviction_tolerates_entry_removed_before_stat(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, "cache-race")
+    cache = SnapshotCache(repo, max_entries=1)
+    snapshot = _snapshot(str(repo))
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={"review": {"key_issues_to_review": []}},
+        started_at=monotonic(),
+    )
+    cache.cache_dir.mkdir(parents=True, exist_ok=True)
+    vanished = cache.cache_dir / "vanished.json"
+    vanished.write_text("{}", encoding="utf-8")
+    original_stat = Path.stat
+
+    def racing_stat(path, *args, **kwargs):
+        if path == vanished:
+            vanished.unlink(missing_ok=True)
+            raise FileNotFoundError(path)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", racing_stat)
+
+    cache.write(result)
+    assert cache.read(snapshot.snapshot_id) is not None

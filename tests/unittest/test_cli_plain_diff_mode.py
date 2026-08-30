@@ -79,6 +79,26 @@ def test_review_snapshot_rejects_colliding_output_paths(capsys):
     assert "must reference different paths" in capsys.readouterr().err
 
 
+def test_review_snapshot_rejects_output_that_aliases_review_input(monkeypatch, tmp_path, capsys):
+    import subprocess
+
+    repo = tmp_path / "repo-output-alias"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    source = repo / "notes.txt"
+    source.write_text("keep this source\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "notes.txt",
+            "--output", "notes.txt", "--no-cache",
+        ])
+
+    assert "aliases an existing repository path" in capsys.readouterr().err
+    assert source.read_text(encoding="utf-8") == "keep this source\n"
+
+
 _DIFF = (
     "diff --git a/foo.py b/foo.py\n"
     "index 1111111..2222222 100644\n"
@@ -364,7 +384,7 @@ def test_review_snapshot_forwards_context_and_publishes_only_fresh_markdown(
     subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
     changed.write_text("value = 2\n", encoding="utf-8")
-    output = repo / "review.md"
+    output = tmp_path / "stale-review.md"
     output.write_text("old output\n", encoding="utf-8")
     monkeypatch.chdir(repo)
 
@@ -391,6 +411,47 @@ def test_review_snapshot_forwards_context_and_publishes_only_fresh_markdown(
     assert result.state.value == "stale"
     assert not output.exists()
     assert json.loads(capsys.readouterr().out)["state"] == "stale"
+
+
+def test_review_snapshot_restores_snapshot_only_instructions(cfg, monkeypatch, tmp_path, capsys):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    repo = tmp_path / "repo-instruction-reset"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Snapshot Test"], check=True)
+    changed = repo / "changed.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    changed.write_text("value = 2\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+    cfg("pr_reviewer.extra_instructions", "Persistent repository rule")
+    observed = []
+
+    class FakeAgent:
+        async def _handle_request(self, target, request, notify=None):
+            observed.append(str(get_settings().pr_reviewer.extra_instructions))
+            Path(get_settings().plain_diff.json_output_path).write_text(
+                json.dumps({"review": {"key_issues_to_review": []}}), encoding="utf-8"
+            )
+            return True
+
+    monkeypatch.setattr("pr_agent.cli.PRAgent", FakeAgent)
+    for intent in ("First snapshot", "Second snapshot"):
+        run(inargs=[
+            "review-snapshot", "--event", "file-save", "--path", "changed.py",
+            "--intent", intent, "--no-cache",
+        ])
+        capsys.readouterr()
+        assert get_settings().pr_reviewer.extra_instructions == "Persistent repository rule"
+
+    assert "First snapshot" in observed[0]
+    assert "First snapshot" not in observed[1]
+    assert "Second snapshot" in observed[1]
 
 
 def test_review_snapshot_bypasses_structured_cache_when_markdown_is_requested(
@@ -486,8 +547,8 @@ def test_worktree_snapshot_excludes_requested_output_artifacts(cfg, monkeypatch,
     subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
     changed.write_text("value = 2\n", encoding="utf-8")
-    output = repo / "review.md"
-    result_path = repo / "result.json"
+    output = tmp_path / "repeat-review.md"
+    result_path = tmp_path / "repeat-result.json"
     monkeypatch.chdir(repo)
     calls = []
 
