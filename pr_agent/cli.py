@@ -215,6 +215,7 @@ def _unlink_output(destination: Path, parent_identity: tuple[int, int]) -> None:
         try:
             os.unlink(destination.name, dir_fd=parent_fd)
         except FileNotFoundError:
+            # A stale Markdown artifact is optional; there is nothing to remove.
             pass
     finally:
         os.close(parent_fd)
