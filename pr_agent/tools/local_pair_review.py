@@ -83,6 +83,7 @@ class LocalPairReview:
         excluded_paths: Optional[Sequence[str]] = None,
         ignored_paths: Optional[Sequence[str]] = None,
         max_file_bytes: Optional[int] = None,
+        max_snapshot_bytes: Optional[int] = None,
     ) -> None:
         self.repository_root = find_repository_root(repository_root)
         settings = get_settings().get("local_pair_review", {}) or {}
@@ -94,6 +95,19 @@ class LocalPairReview:
         configured_limit = settings.get("max_file_bytes", 1_000_000) if hasattr(settings, "get") else 1_000_000
         self.max_file_bytes = max(
             0, int(max_file_bytes if max_file_bytes is not None else configured_limit)
+        )
+        configured_snapshot_limit = (
+            settings.get("max_snapshot_bytes", 5_000_000)
+            if hasattr(settings, "get")
+            else 5_000_000
+        )
+        self.max_snapshot_bytes = max(
+            0,
+            int(
+                max_snapshot_bytes
+                if max_snapshot_bytes is not None
+                else configured_snapshot_limit
+            ),
         )
 
     def _relative_path(self, supplied_path: str) -> str:
@@ -342,6 +356,7 @@ class LocalPairReview:
             tracked_groups = [group for group in tracked_groups if normalized_focus in group]
             untracked = [path for path in untracked if path == normalized_focus]
         selected_tracked: list[str] = []
+        selected_tracked_groups: list[tuple[str, ...]] = []
         selected_untracked: list[str] = []
         coverage: list[CoverageIssue] = []
 
@@ -375,7 +390,11 @@ class LocalPairReview:
         for group in tracked_groups:
             normalized_group = [validate_path(path) for path in group]
             if all(normalized_group):
-                selected_tracked.extend(path for path in normalized_group if path is not None)
+                selected_group = tuple(
+                    path for path in normalized_group if path is not None
+                )
+                selected_tracked_groups.append(selected_group)
+                selected_tracked.extend(selected_group)
             else:
                 covered_paths = {issue.path for issue in coverage}
                 for raw_path in group:
@@ -391,33 +410,66 @@ class LocalPairReview:
             if normalized is not None:
                 selected_untracked.append(normalized)
 
-        def capture_selected() -> str:
+        def capture_selected() -> tuple[str, set[str]]:
             diff_parts = []
-            if selected_tracked:
-                diff_parts.append(self._capture_diff(event, base_revision, selected_tracked))
+            omitted_paths: set[str] = set()
+            remaining_bytes = self.max_snapshot_bytes
+            for selected_group in selected_tracked_groups:
+                if remaining_bytes <= 0:
+                    omitted_paths.update(selected_group)
+                    continue
+                part = self._capture_diff(event, base_revision, selected_group)
+                part_size = len(part.encode("utf-8", errors="surrogateescape"))
+                if part_size > remaining_bytes:
+                    omitted_paths.update(selected_group)
+                    continue
+                diff_parts.append(part)
+                remaining_bytes -= part_size
             for selected_path in selected_untracked:
-                diff_parts.append(self._capture_untracked_addition(selected_path))
-            return "".join(diff_parts)
+                if remaining_bytes <= 0:
+                    omitted_paths.add(selected_path)
+                    continue
+                part = self._capture_untracked_addition(selected_path)
+                part_size = len(part.encode("utf-8", errors="surrogateescape"))
+                if part_size > remaining_bytes:
+                    omitted_paths.add(selected_path)
+                    continue
+                diff_parts.append(part)
+                remaining_bytes -= part_size
+            return "".join(diff_parts), omitted_paths
 
         try:
-            captured_diff = capture_selected()
+            captured_diff, captured_omissions = capture_selected()
             revalidated = all(
                 validate_path(selected_path) is not None
                 for selected_path in (*selected_tracked, *selected_untracked)
             )
-            verified_diff = capture_selected() if revalidated else ""
+            if revalidated:
+                verified_diff, verified_omissions = capture_selected()
+            else:
+                verified_diff, verified_omissions = "", set()
         except UnicodeDecodeError:
             add_coverage(None, "content_changed_during_capture")
             captured_diff = verified_diff = ""
+            captured_omissions = verified_omissions = set()
             revalidated = False
-        if not revalidated or verified_diff != captured_diff:
+        if (
+            not revalidated
+            or verified_diff != captured_diff
+            or verified_omissions != captured_omissions
+        ):
             if revalidated:
                 add_coverage(None, "content_changed_during_capture")
             captured_diff = ""
             selected_tracked.clear()
+            selected_tracked_groups.clear()
             selected_untracked.clear()
+            budget_omitted_paths: set[str] = set()
         else:
             captured_diff = verified_diff
+            budget_omitted_paths = verified_omissions
+            for omitted_path in sorted(budget_omitted_paths):
+                add_coverage(omitted_path, "snapshot_byte_budget")
 
         parsed_files = parse_plain_diff(captured_diff) if captured_diff.strip() else []
         reviewable_files = []
@@ -437,7 +489,9 @@ class LocalPairReview:
             for path in (getattr(item, "filename", None), getattr(item, "old_filename", None))
             if path
         }
-        expected_paths = set(selected_tracked) | set(selected_untracked)
+        expected_paths = (
+            set(selected_tracked) | set(selected_untracked)
+        ) - budget_omitted_paths
         for missing_path in sorted(expected_paths - parsed_paths - metadata_only_paths):
             add_coverage(missing_path, "binary_or_unparseable_diff")
 

@@ -13,7 +13,8 @@ _SETTINGS_KEYS = ["plain_diff.content", "plain_diff.output_path", "plain_diff.js
                   "config.git_provider", "config.publish_output",
                   "config.propagate_tool_errors", "pr_reviewer.extra_instructions",
                   "local_pair_review.policy_version", "local_pair_review.excluded_paths",
-                  "local_pair_review.max_file_bytes", "local_pair_review.cache_enabled",
+                  "local_pair_review.max_file_bytes", "local_pair_review.max_snapshot_bytes",
+                  "local_pair_review.cache_enabled",
                   "local_pair_review.cache_max_entries", "config.use_repo_settings_file",
                   "config.model", "config.reasoning_effort", "config.max_model_tokens", "skills.enabled",
                   "config.repo_context_files", "config.repo_context_max_lines",
@@ -648,6 +649,35 @@ def test_portable_snapshot_preparation_does_not_delete_existing_markdown(
     _unlink_output(output, identity)
 
     assert output.read_text(encoding="utf-8") == "previous review\n"
+
+
+def test_repeatable_json_validation_rejects_large_file_without_reading_it(
+    monkeypatch, tmp_path
+):
+    import subprocess
+    from pathlib import Path
+
+    from pr_agent.cli import (
+        _MAX_REPEATABLE_SNAPSHOT_ARTIFACT_BYTES,
+        _is_repeatable_snapshot_artifact,
+    )
+
+    repo = tmp_path / "repo-large-artifact"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    output = repo / "result.json"
+    with output.open("wb") as handle:
+        handle.truncate(_MAX_REPEATABLE_SNAPSHOT_ARTIFACT_BYTES + 1)
+    original_read_text = Path.read_text
+
+    def guarded_read_text(path, *args, **kwargs):
+        if path == output:
+            raise AssertionError("oversized artifact must not be materialized")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+    assert _is_repeatable_snapshot_artifact(output, repo, "json") is False
 
 
 def test_review_snapshot_restores_provider_settings_for_later_hosted_run(

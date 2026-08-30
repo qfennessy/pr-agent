@@ -519,6 +519,22 @@ def test_negative_file_size_limit_is_clamped_before_reads(tmp_path):
     assert CoverageIssue(path="large.py", reason="file_too_large") in snapshot.coverage_issues
 
 
+def test_snapshot_diff_budget_reports_all_uncaptured_paths(tmp_path):
+    repo = _repo(tmp_path, "snapshot-budget")
+    (repo / "first.py").write_text("first = 1\n", encoding="utf-8")
+    (repo / "second.py").write_text("second = 2\n", encoding="utf-8")
+    reviewer = LocalPairReview(str(repo), max_snapshot_bytes=0)
+
+    snapshot = reviewer.capture(event="worktree-idle")
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert {
+        issue.path for issue in snapshot.coverage_issues
+        if issue.reason == "snapshot_byte_budget"
+    } == {"first.py", "second.py"}
+
+
 def test_superseded_snapshot_is_stale_and_suppresses_review(tmp_path):
     repo = _repo(tmp_path)
     path = repo / "tracked.py"

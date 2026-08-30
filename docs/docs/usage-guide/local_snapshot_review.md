@@ -48,7 +48,9 @@ issues, latency, available token and cost data, and exactly one state:
 Skipped binary, unreadable, oversized, excluded, or unsafe paths appear in
 `coverage_issues`. They never turn into a false clean result. Default logs and the result
 envelope do not contain the full diff; the immutable input envelope retains the exact diff
-in memory only for the review path.
+in memory only for the review path. `local_pair_review.max_snapshot_bytes` bounds the
+cumulative captured diff; paths beyond that budget are reported with
+`snapshot_byte_budget` coverage.
 
 Successful identical snapshots can use a bounded cache under the repository's Git common
 directory. The key includes repository identity, exact diff content, event, base revision,

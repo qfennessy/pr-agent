@@ -41,6 +41,7 @@ _MISSING_SETTING = object()
 _SNAPSHOT_ARTIFACT_TYPE = "pr-agent-review-snapshot"
 _SNAPSHOT_MARKDOWN_MARKER = b"<!-- pr-agent-review-snapshot -->\n"
 _MAX_SNAPSHOT_REPO_CONTEXT_BYTES = 1_000_000
+_MAX_REPEATABLE_SNAPSHOT_ARTIFACT_BYTES = 1_000_000
 _SNAPSHOT_PROVIDER_SETTINGS = (
     "config.git_provider",
     "config.publish_output",
@@ -541,6 +542,7 @@ def _is_repeatable_snapshot_artifact(
         stat.S_ISLNK(candidate_stat.st_mode)
         or not stat.S_ISREG(candidate_stat.st_mode)
         or candidate_stat.st_nlink != 1
+        or candidate_stat.st_size > _MAX_REPEATABLE_SNAPSHOT_ARTIFACT_BYTES
         or _is_tracked_repository_path(candidate, repository_root)
     ):
         return False
