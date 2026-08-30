@@ -80,6 +80,7 @@ _DEFAULT_SECRET_EXCLUSIONS = (
 )
 
 _UNSAFE_COPY_SIMILARITY_THRESHOLD = 0.5
+_UNSAFE_COPY_SMALL_SIMILARITY_THRESHOLD = 0.8
 _UNSAFE_COPY_PROBE_WINDOW = 16
 _UNSAFE_COPY_MAX_PROBES = 128
 _UNSAFE_COPY_MAX_TOTAL_PROBES = 65_536
@@ -1045,7 +1046,7 @@ class LocalPairReview:
                     len(content) <= 2 * len(source_content)
                     and SequenceMatcher(
                         None, source_content, content, autojunk=False
-                    ).ratio() >= _UNSAFE_COPY_SIMILARITY_THRESHOLD
+                    ).ratio() >= _UNSAFE_COPY_SMALL_SIMILARITY_THRESHOLD
                 ):
                     sources.add((source, reason))
             if sources:
@@ -1172,11 +1173,11 @@ class LocalPairReview:
             add_coverage(None, "untracked_path_discovery_budget")
             untracked = []
             discovery_overflow = True
-        tracked_additions = tuple(
+        index_copy_candidates = tuple(
             dict.fromkeys(
                 group[-1]
-                for _, status, group in tracked_groups
-                if status.startswith("A")
+                for stage, status, group in tracked_groups
+                if stage == "index" and not status.startswith("D")
             )
         )
         current_copy_candidates = tuple(
@@ -1184,9 +1185,10 @@ class LocalPairReview:
                 (
                     *untracked,
                     *(
-                        tracked_additions
-                        if event is not ReviewEvent.PRE_COMMIT
-                        else ()
+                        group[-1]
+                        for stage, status, group in tracked_groups
+                        if stage in {"combined", "worktree"}
+                        and not status.startswith("D")
                     ),
                 )
             )
@@ -1195,11 +1197,7 @@ class LocalPairReview:
             event,
             base_revision,
             current_candidate_paths=current_copy_candidates,
-            index_candidate_paths=(
-                tracked_additions
-                if event in {ReviewEvent.PRE_COMMIT, ReviewEvent.WORKTREE_IDLE}
-                else ()
-            ),
+            index_candidate_paths=index_copy_candidates,
         )
         if unsafe_copy_sources is None:
             add_coverage(None, "copy_source_discovery_budget")
@@ -1286,11 +1284,11 @@ class LocalPairReview:
             )
             if current_untracked is None:
                 return None
-            current_additions = tuple(
+            current_index_candidates = tuple(
                 dict.fromkeys(
                     group[-1]
-                    for _, status, group in current_groups
-                    if status.startswith("A")
+                    for stage, status, group in current_groups
+                    if stage == "index" and not status.startswith("D")
                 )
             )
             current_candidates = tuple(
@@ -1298,9 +1296,10 @@ class LocalPairReview:
                     (
                         *current_untracked,
                         *(
-                            current_additions
-                            if event is not ReviewEvent.PRE_COMMIT
-                            else ()
+                            group[-1]
+                            for stage, status, group in current_groups
+                            if stage in {"combined", "worktree"}
+                            and not status.startswith("D")
                         ),
                     )
                 )
@@ -1309,11 +1308,7 @@ class LocalPairReview:
                 event,
                 base_revision,
                 current_candidate_paths=current_candidates,
-                index_candidate_paths=(
-                    current_additions
-                    if event in {ReviewEvent.PRE_COMMIT, ReviewEvent.WORKTREE_IDLE}
-                    else ()
-                ),
+                index_candidate_paths=current_index_candidates,
             )
             if current_unsafe_sources is None:
                 return None

@@ -636,6 +636,34 @@ def test_worktree_idle_scans_index_variant_of_staged_addition(tmp_path):
 
 
 @pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
+def test_modified_tracked_file_embedding_excluded_source_is_omitted(event, tmp_path):
+    repo = _repo(tmp_path, f"modified-embedded-excluded-copy-{event}")
+    source = repo / ".env"
+    source.write_text("API_TOKEN=production-secret\n", encoding="utf-8")
+    destination = repo / "feature.py"
+    destination.write_text("FEATURE_FLAG=disabled\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".env", "feature.py")
+    _git(repo, "commit", "-m", "add source and destination")
+    destination.write_text(
+        "API_TOKEN=production-secret\nFEATURE_FLAG=enabled\n",
+        encoding="utf-8",
+    )
+    if event == "pre-commit":
+        _git(repo, "add", "feature.py")
+
+    snapshot = LocalPairReview(str(repo)).capture(
+        event=event,
+        focus_path="feature.py" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert "production-secret" not in snapshot.diff
+    assert CoverageIssue(path=".env", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="feature.py", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle", "pre-commit"])
 def test_deletion_only_modified_file_is_unsupported_coverage(event, tmp_path):
     repo = _repo(tmp_path, f"deletion-only-modified-{event}")
     path = repo / "tracked.py"
