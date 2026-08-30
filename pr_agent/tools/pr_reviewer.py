@@ -387,6 +387,10 @@ class PRReviewer:
                         pipeline,
                         failure_reason="stable_head_identity_unavailable",
                     )
+                    get_logger().info(
+                        "Specialist shadow telemetry",
+                        artifact=self.specialist_shadow_result.to_dict(),
+                    )
                     get_logger().warning(
                         "Specialist shadow batch is unavailable because the provider has no stable head identity"
                     )
@@ -399,12 +403,17 @@ class PRReviewer:
                 diff_files=self.git_provider.get_diff_files() or [],
                 head_sha=head_sha,
                 snapshot=snapshot,
+                allowed_change_labels=pipeline.allowed_change_labels,
             )
             self.specialist_shadow_result = await run_shadow_specialists(
                 specialist_input,
                 pipeline,
                 self.ai_handler,
                 current_identity=current_identity,
+            )
+            get_logger().info(
+                "Specialist shadow telemetry",
+                artifact=self.specialist_shadow_result.to_dict(),
             )
         except Exception as exc:
             # Shadow infrastructure is observational. Configuration/provider failures
