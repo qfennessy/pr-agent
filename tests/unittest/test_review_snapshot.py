@@ -1109,3 +1109,33 @@ def test_cache_refuses_symlinked_directories(tmp_path, symlink_component):
 
     assert cache.read(snapshot.snapshot_id) is None
     assert list(external.iterdir()) == []
+
+
+def test_cache_write_stays_bound_when_validated_path_is_swapped(tmp_path, monkeypatch):
+    repo = _repo(tmp_path, "cache-path-swap")
+    cache = SnapshotCache(repo)
+    snapshot = _snapshot(str(repo))
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={"review": {"key_issues_to_review": []}},
+        started_at=monotonic(),
+    )
+    cache.cache_dir.mkdir(parents=True)
+    original_open_cache_dir = cache._open_cache_dir
+    original_cache_parent = cache.cache_dir.parent.with_name("pr-agent-original")
+    external = tmp_path / "external-cache-swap"
+    external.mkdir()
+
+    def open_then_swap(*, create):
+        cache_fd = original_open_cache_dir(create=create)
+        cache.cache_dir.parent.rename(original_cache_parent)
+        cache.cache_dir.parent.symlink_to(external, target_is_directory=True)
+        return cache_fd
+
+    monkeypatch.setattr(cache, "_open_cache_dir", open_then_swap)
+
+    cache.write(result)
+
+    assert list(external.iterdir()) == []
+    assert (original_cache_parent / "snapshot-cache" / cache._path(snapshot.snapshot_id).name).is_file()

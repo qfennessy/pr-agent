@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import secrets
 import stat
 import subprocess
 import tempfile
@@ -829,33 +830,55 @@ class SnapshotCache:
         digest = snapshot_id.removeprefix("sha256:")
         return self.cache_dir / f"{digest}.json"
 
-    def _validated_cache_dir(self, *, create: bool) -> Optional[Path]:
-        current = self.git_dir
-        for name in ("pr-agent", "snapshot-cache"):
-            current = current / name
+    def _open_cache_dir(self, *, create: bool) -> Optional[int]:
+        required_dir_fd_functions = (os.open, os.mkdir, os.stat, os.unlink)
+        if any(function not in os.supports_dir_fd for function in required_dir_fd_functions):
+            raise OSError("descriptor-relative snapshot cache access is unavailable")
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        current_fd = os.open(self.git_dir, flags)
+        try:
+            for name in ("pr-agent", "snapshot-cache"):
+                try:
+                    next_fd = os.open(name, flags, dir_fd=current_fd)
+                except FileNotFoundError:
+                    if not create:
+                        os.close(current_fd)
+                        return None
+                    try:
+                        os.mkdir(name, mode=0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        # A concurrent hook may have created the directory. The
+                        # no-follow open below decides whether it is safe.
+                        pass
+                    next_fd = os.open(name, flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            return current_fd
+        except Exception:
             try:
-                current_stat = current.lstat()
-            except FileNotFoundError:
-                if not create:
-                    return None
-                current.mkdir()
-                current_stat = current.lstat()
-            if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISDIR(current_stat.st_mode):
-                raise OSError("snapshot cache path contains a non-directory or symlink")
-            if not current.resolve(strict=True).is_relative_to(self.git_dir):
-                raise OSError("snapshot cache path escapes the Git metadata directory")
-        return current
+                os.close(current_fd)
+            except OSError:
+                pass
+            raise
 
     def read(self, snapshot_id: str) -> Optional[ReviewSnapshotResult]:
+        cache_fd = None
         try:
-            cache_dir = self._validated_cache_dir(create=False)
-            if cache_dir is None:
+            cache_fd = self._open_cache_dir(create=False)
+            if cache_fd is None:
                 return None
-            path = cache_dir / self._path(snapshot_id).name
-            path_stat = path.lstat()
+            path_name = self._path(snapshot_id).name
+            path_fd = os.open(
+                path_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=cache_fd,
+            )
+            path_stat = os.fstat(path_fd)
             if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
+                os.close(path_fd)
                 return None
-            data = json.loads(path.read_text(encoding="utf-8"))
+            with os.fdopen(path_fd, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
             if not isinstance(data, dict) or data.get("snapshot_id") != snapshot_id:
                 return None
             state = ReviewResultState(data["state"])
@@ -899,6 +922,9 @@ class SnapshotCache:
             )
         except (OSError, KeyError, ValueError, TypeError, AttributeError):
             return None
+        finally:
+            if cache_fd is not None:
+                os.close(cache_fd)
 
     def write(self, result: ReviewSnapshotResult) -> None:
         unavailable_states = {
@@ -917,31 +943,60 @@ class SnapshotCache:
             )
 
     def _write(self, result: ReviewSnapshotResult) -> None:
-        cache_dir = self._validated_cache_dir(create=True)
-        if cache_dir is None:
+        cache_fd = self._open_cache_dir(create=True)
+        if cache_fd is None:
             raise OSError("could not create snapshot cache directory")
         payload = json.dumps(result.to_dict(), ensure_ascii=True, sort_keys=True, indent=2) + "\n"
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=cache_dir, delete=False) as handle:
-            handle.write(payload)
-            temporary_path = Path(handle.name)
-        os.replace(temporary_path, cache_dir / self._path(result.snapshot_id).name)
-        cached_paths = []
-        for cached_path in cache_dir.glob("*.json"):
+        temporary_name = f".pr-agent-{secrets.token_hex(16)}.tmp"
+        try:
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=cache_fd,
+            )
+            with os.fdopen(temporary_fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
             try:
-                cached_stat = cached_path.lstat()
-                if stat.S_ISREG(cached_stat.st_mode):
-                    cached_paths.append((cached_stat.st_mtime, cached_path))
-            except OSError:
-                # Another hook may evict the entry between glob and stat.
-                continue
-        cached_paths.sort(key=lambda item: item[0], reverse=True)
-        for _, old_path in cached_paths[self.max_entries:]:
-            try:
-                old_path.unlink()
-            except OSError:
-                # Eviction is best effort; an in-use or concurrently removed cache
-                # entry must not turn a completed review into unavailable coverage.
-                pass
+                os.replace(
+                    temporary_name,
+                    self._path(result.snapshot_id).name,
+                    src_dir_fd=cache_fd,
+                    dst_dir_fd=cache_fd,
+                )
+            except (NotImplementedError, TypeError) as exc:
+                raise OSError("descriptor-relative snapshot cache replacement is unavailable") from exc
+            temporary_name = ""
+            cached_paths = []
+            for cached_name in os.listdir(cache_fd):
+                if not cached_name.endswith(".json"):
+                    continue
+                try:
+                    cached_stat = os.stat(
+                        cached_name,
+                        dir_fd=cache_fd,
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISREG(cached_stat.st_mode):
+                        cached_paths.append((cached_stat.st_mtime, cached_name))
+                except OSError:
+                    # Another hook may evict the entry between listing and stat.
+                    continue
+            cached_paths.sort(key=lambda item: item[0], reverse=True)
+            for _, old_name in cached_paths[self.max_entries:]:
+                try:
+                    os.unlink(old_name, dir_fd=cache_fd)
+                except OSError:
+                    # Eviction is best effort; an in-use or concurrently removed cache
+                    # entry must not turn a completed review into unavailable coverage.
+                    pass
+        finally:
+            if temporary_name:
+                try:
+                    os.unlink(temporary_name, dir_fd=cache_fd)
+                except OSError:
+                    pass
+            os.close(cache_fd)
 
 
 def build_snapshot_result(
