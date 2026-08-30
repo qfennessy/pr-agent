@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import time
 from abc import ABC, abstractmethod
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Mapping, Optional, Tuple
 
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.algo.utils import (Range, add_pr_review_identity,
@@ -403,6 +403,18 @@ class GitProvider(ABC):
         provider-owned adapter for that representation.
         """
         return self.get_files()
+
+    def is_incremental_scope_empty(self) -> Optional[bool]:
+        """Return whether the provider has a complete, known-empty incremental scope.
+
+        ``None`` means the provider cannot prove completeness, so callers must not
+        turn the run into a no-op. Providers with richer incremental evidence can
+        override this to distinguish a legitimate empty scope from a partial fetch.
+        """
+        inventory = getattr(self, "unreviewed_files_map", None)
+        if not isinstance(inventory, Mapping):
+            return None
+        return not inventory
 
     def normalize_file_path_for_routing(self, path: str | None) -> str | None:
         """Adapt a provider-native changed path to a repository-relative path.

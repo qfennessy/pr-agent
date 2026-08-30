@@ -219,6 +219,40 @@ class TestAzureDevopsProviderFiles:
             ("/docs/deleted.md", None, EDIT_TYPE.DELETED),
         ]
 
+    @pytest.mark.parametrize("filtered_by", ["ignore", "extension"])
+    def test_filtered_only_incremental_scope_is_known_empty(self, filtered_by):
+        provider = self._provider()
+        commit = SimpleNamespace(commit_id="head", sha="head", parents=[SimpleNamespace()])
+        provider.pr_commits = [commit]
+        provider.get_previous_review = MagicMock(return_value=SimpleNamespace())
+        provider._get_commit_range = MagicMock(return_value=[commit])
+        provider.incremental = IncrementalPR(True)
+        provider.unreviewed_files_map = {}
+        provider._routing_incremental_files = None
+        provider.azure_devops_client.get_changes.return_value = SimpleNamespace(changes=[{
+            "item": {"path": "/services/auth/key.pem"},
+            "changeType": "edit",
+        }])
+        filtered = [] if filtered_by == "ignore" else ["/services/auth/key.pem"]
+
+        with (
+            patch(
+                "pr_agent.git_providers.azuredevops_provider.filter_ignored",
+                return_value=filtered,
+            ),
+            patch(
+                "pr_agent.git_providers.azuredevops_provider.is_valid_file",
+                return_value=False,
+            ),
+        ):
+            provider._get_incremental_commits()
+
+        assert provider.unreviewed_files_map == {}
+        assert provider.is_incremental_scope_empty() is True
+        assert [file.filename for file in provider.get_files_for_routing()] == [
+            "/services/auth/key.pem"
+        ]
+
     def test_incremental_routing_inventory_marks_partial_change_fetch_as_unknown(self):
         provider = self._provider()
         commits = [

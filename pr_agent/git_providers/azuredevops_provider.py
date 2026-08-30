@@ -760,6 +760,17 @@ class AzureDevopsProvider(GitProvider):
                 files.append(routing_file)
         return files
 
+    def is_incremental_scope_empty(self) -> bool | None:
+        empty = super().is_incremental_scope_empty()
+        if empty is not True:
+            return empty
+        routing_files = getattr(self, "_routing_incremental_files", None)
+        if routing_files is None or any(
+            file.edit_type is EDIT_TYPE.UNKNOWN for file in routing_files
+        ):
+            return None
+        return True
+
     def _get_files_full(self):
         files = []
         for i in self.azure_devops_client.get_pull_request_commits(

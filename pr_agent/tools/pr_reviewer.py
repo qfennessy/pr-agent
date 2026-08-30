@@ -229,15 +229,36 @@ class PRReviewer:
         progress_response = None
         review_failed = False
         try:
-            if not self.git_provider.get_files():
-                get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
-                return None
-
             if self.incremental.is_incremental:
                 can_run = self._can_run_incremental_review()
                 # If the gate disabled incremental (e.g., commits_range is None), fall through to full review.
                 if not can_run and self.incremental.is_incremental:
                     return None
+                if (
+                    self.incremental.is_incremental
+                    and self.git_provider.is_incremental_scope_empty() is True
+                ):
+                    get_logger().info(
+                        f"Incremental review is enabled for {self.pr_url} but there are no new files"
+                    )
+                    previous_review_url = ""
+                    if (
+                        hasattr(self.git_provider, "previous_review")
+                        and self.git_provider.previous_review is not None
+                    ):
+                        previous_review_url = (
+                            getattr(self.git_provider.previous_review, "html_url", "") or ""
+                        )
+                    if get_settings().config.publish_output and self._provider_mutations_allowed():
+                        self.git_provider.publish_comment(
+                            "Incremental Review Skipped\n"
+                            f"No files were changed since the [previous PR Review]({previous_review_url})"
+                        )
+                    return None
+
+            if not self.git_provider.get_files():
+                get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
+                return None
 
             self._prepare_review_route()
             if self._specialist_escalation_consumption_enabled():
@@ -262,20 +283,6 @@ class PRReviewer:
             # ticket extraction if exists
             if self._review_profile() != "bugs_only":
                 await extract_and_cache_pr_tickets(self.git_provider, self.vars)
-
-            if (
-                self.incremental.is_incremental
-                and hasattr(self.git_provider, "unreviewed_files_map")
-                and not self.git_provider.unreviewed_files_map
-            ):
-                get_logger().info(f"Incremental review is enabled for {self.pr_url} but there are no new files")
-                previous_review_url = ""
-                if hasattr(self.git_provider, "previous_review") and self.git_provider.previous_review is not None:
-                    previous_review_url = getattr(self.git_provider.previous_review, "html_url", "") or ""
-                if get_settings().config.publish_output and self._provider_mutations_allowed():
-                    self.git_provider.publish_comment(f"Incremental Review Skipped\n"
-                                    f"No files were changed since the [previous PR Review]({previous_review_url})")
-                return None
 
             if (get_settings().config.publish_output and self._provider_mutations_allowed() and
                     not get_settings().config.get('is_auto_command', False)):
