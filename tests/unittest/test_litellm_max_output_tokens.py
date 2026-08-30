@@ -129,6 +129,34 @@ class TestMaxOutputTokens:
         assert "thinking" not in kwargs
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("request_cap", "thinking_enabled"),
+        [(2047, False), (2048, False), (2049, True)],
+    )
+    async def test_request_local_cap_matches_thinking_headroom_boundary(
+        self,
+        monkeypatch,
+        request_cap,
+        thinking_enabled,
+    ):
+        config_values = {
+            "enable_claude_extended_thinking": True,
+            "extended_thinking_budget_tokens": 2048,
+            "extended_thinking_max_output_tokens": 4096,
+        }
+        with use_ai_request_options(AIRequestOptions(max_output_tokens=request_cap)):
+            kwargs = await _run(
+                monkeypatch,
+                "claude-3-7-sonnet-20250219",
+                config_values,
+            )
+
+        assert kwargs["max_tokens"] == request_cap
+        assert ("thinking" in kwargs) is thinking_enabled
+        if thinking_enabled:
+            assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+
+    @pytest.mark.asyncio
     async def test_string_override_is_coerced(self, monkeypatch):
         # Dynaconf/env overrides can arrive as strings.
         kwargs = await _run(monkeypatch, "gpt-4o", {"max_output_tokens": "16000"})

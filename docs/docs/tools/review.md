@@ -255,6 +255,10 @@ unverified candidate is never promoted to a finding.
 enable_candidate_verification = true
 candidate_verification_consume_specialist_prioritization = false
 candidate_verification_model = "" # Empty uses config.model
+candidate_verification_deployment = "" # Required for a different Azure verifier model
+candidate_verification_fallback_models = []
+candidate_verification_fallback_deployments = []
+candidate_verification_max_output_tokens = 0 # 0 inherits the effective provider/config cap
 candidate_verification_max_model_calls = 1
 candidate_verification_max_candidates = 3
 candidate_verification_max_sensitive_candidates = 6
@@ -273,6 +277,11 @@ overflow priority, and removed ranges are selected before added ranges within th
 text is passed to the verifier as untrusted data. Structured review publishers receive a
 `candidate_verification` artifact containing candidate and decision counts, the verifier model and call count, retrieval
 statuses, budget usage, latency, and concise rejection or failure reasons.
+
+Verifier model/deployment pairs use an immutable request-local route. Azure deployments must be explicit when the verifier
+or any fallback differs from the primary reviewer model; missing or mismatched routes fail closed. Prompt clipping reserves
+the effective completion allowance actually sent for every primary/fallback attempt, including configured output caps and
+Claude extended thinking, so prompt plus requested completion stays within each model context window.
 
 The specialist-prioritization consumer remains disabled separately. When enabled, it accepts only a successful or cached,
 validated `diff_prioritization` result whose immutable input identity matches the review. Ranked hunks can reorder

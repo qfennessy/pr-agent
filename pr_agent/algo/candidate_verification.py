@@ -123,7 +123,8 @@ def telemetry_safe_artifact(artifact: dict) -> dict:
     """Return provider-neutral telemetry without repository or model-generated text."""
     safe = {}
     scalar_keys = {
-        "enabled", "status", "model_calls", "candidate_count", "verified_count", "model",
+        "enabled", "status", "model_calls", "verifier_attempts", "candidate_count",
+        "verified_count", "model",
         "verifier_verified_count", "finding_limit_dropped", "rejected_count", "failure",
         "verifier_latency_seconds", "publication_safe",
     }
@@ -379,43 +380,116 @@ def _normalized_evidence_shape(content: str) -> str:
     return "".join(shaped.split())
 
 
-def _changed_anchor_shape(patch: str, start_line: int, end_line: int, side: str = "new") -> str:
+def _changed_anchor_identity(
+    patch: str,
+    start_line: int,
+    end_line: int,
+    side: str = "new",
+) -> tuple[str, int]:
+    """Derive the range shape and equal-shape start ordinal in one patch traversal."""
     old_line = None
     new_line = None
-    changed = []
+    segment = 0
+    last_changed_line = None
+    changed_records = []
     for record in iter_git_patch_lines(patch or ""):
         line = strip_git_line_ending(record)
         header = RE_HUNK_HEADER.match(line)
         if header:
             old_line = int(header.group(1))
             new_line = int(header.group(3))
+            segment += 1
+            last_changed_line = None
             continue
         if old_line is None or new_line is None or line.startswith("\\ No newline at end of file"):
             continue
-        if (side == "new" and line.startswith("+") and not line.startswith("+++")
-                and start_line <= new_line <= end_line):
-            changed.append(line[1:])
-        if (side == "old" and line.startswith("-") and not line.startswith("---")
-                and start_line <= old_line <= end_line):
-            changed.append(line[1:])
+        is_changed = (
+            side == "new" and line.startswith("+") and not line.startswith("+++")
+        ) or (
+            side == "old" and line.startswith("-") and not line.startswith("---")
+        )
+        changed_line = new_line if side == "new" else old_line
+        if is_changed:
+            content = line[1:]
+            line_shape = _normalized_evidence_shape(content)
+            if last_changed_line is not None and changed_line != last_changed_line + 1:
+                segment += 1
+            changed_records.append((changed_line, segment, line_shape))
+            last_changed_line = changed_line
         if not line.startswith("+"):
             old_line += 1
         if not line.startswith("-"):
             new_line += 1
-    return _normalized_evidence_shape("\n".join(changed))
+
+    target_record_indexes = [
+        index
+        for index, (line_number, _, _) in enumerate(changed_records)
+        if start_line <= line_number <= end_line
+    ]
+    if not target_record_indexes:
+        return "", 0
+
+    def tokenized(records: list[tuple[int, int, str]]) -> list[Optional[str]]:
+        tokens = []
+        previous_segment = None
+        for _, record_segment, line_shape in records:
+            if previous_segment is not None and record_segment != previous_segment:
+                tokens.append(None)
+            tokens.append(line_shape)
+            previous_segment = record_segment
+        return tokens
+
+    changed_tokens = tokenized(changed_records)
+    target_records = [changed_records[index] for index in target_record_indexes]
+    target_shapes = tokenized(target_records)
+    if not any(isinstance(token, str) and token for token in target_shapes):
+        return "", 0
+    anchor_shape = json.dumps(target_shapes, separators=(",", ":"))
+    if target_records[0][0] != start_line:
+        return anchor_shape, 0
+
+    target_record_index = target_record_indexes[0]
+    target_start_index = target_record_index
+    for index in range(1, target_record_index + 1):
+        if changed_records[index][1] != changed_records[index - 1][1]:
+            target_start_index += 1
+
+    # Count exact normalized range-shape occurrences using KMP so a multi-line
+    # candidate is not renumbered by an earlier range that only shares its first
+    # line or crosses a hunk/context boundary. This stays linear even for
+    # generated patches with repeated anchors.
+    prefix = [0] * len(target_shapes)
+    matched = 0
+    for index in range(1, len(target_shapes)):
+        while matched and target_shapes[index] != target_shapes[matched]:
+            matched = prefix[matched - 1]
+        if target_shapes[index] == target_shapes[matched]:
+            matched += 1
+            prefix[index] = matched
+
+    anchor_ordinal = 0
+    matched = 0
+    scan_limit = target_start_index + len(target_shapes)
+    for index, line_shape in enumerate(changed_tokens[:scan_limit]):
+        while matched and line_shape != target_shapes[matched]:
+            matched = prefix[matched - 1]
+        if line_shape == target_shapes[matched]:
+            matched += 1
+        if matched == len(target_shapes):
+            occurrence_start = index - len(target_shapes) + 1
+            if occurrence_start <= target_start_index:
+                anchor_ordinal += 1
+            matched = prefix[matched - 1]
+    return anchor_shape, anchor_ordinal
+
+
+def _changed_anchor_shape(patch: str, start_line: int, end_line: int, side: str = "new") -> str:
+    return _changed_anchor_identity(patch, start_line, end_line, side)[0]
 
 
 def _changed_anchor_ordinal(patch: str, start_line: int, side: str = "new") -> int:
     """Return the ordinal among equal-shaped anchors within one file lineage."""
-    ranges = _added_line_ranges(patch) if side == "new" else _deleted_line_ranges(patch)
-    changed_lines = [line for range_start, range_end in ranges for line in range(range_start, range_end + 1)]
-    target_shape = _changed_anchor_shape(patch, start_line, start_line, side)
-    if not target_shape or start_line not in changed_lines:
-        return 0
-    return sum(
-        1 for line in changed_lines
-        if line <= start_line and _changed_anchor_shape(patch, line, line, side) == target_shape
-    )
+    return _changed_anchor_identity(patch, start_line, start_line, side)[1]
 
 
 def _trusted_file_lineage(diff_file) -> Optional[str]:
@@ -542,6 +616,9 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
                 "sensitive_path": True,
             })
             continue
+        anchor_shape, anchor_ordinal = _changed_anchor_identity(
+            patch, start_line, end_line, side
+        )
         candidates.append({
             "candidate_id": f"sensitive-{sensitive_count}",
             "candidate_type": "sensitive_path_audit",
@@ -558,8 +635,8 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             "context_symbols": [],
             "sensitive_path": True,
             "_changed_line_ranges": changed_line_ranges,
-            "_changed_anchor_shape": _changed_anchor_shape(patch, start_line, end_line, side),
-            "_changed_anchor_ordinal": _changed_anchor_ordinal(patch, start_line, side),
+            "_changed_anchor_shape": anchor_shape,
+            "_changed_anchor_ordinal": anchor_ordinal,
             "_trusted_lineage_key": _trusted_file_lineage(diff_file),
             "_trusted_side_line_count": trusted_side_line_count,
         })
@@ -615,11 +692,12 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             continue
         seen.add(key)
         candidate["_changed_line_ranges"] = changed_line_ranges
-        candidate["_changed_anchor_shape"] = _changed_anchor_shape(
-            getattr(diff_file, "patch", ""), candidate["start_line"], candidate["end_line"]
-        )
-        candidate["_changed_anchor_ordinal"] = _changed_anchor_ordinal(
-            getattr(diff_file, "patch", ""), candidate["start_line"]
+        candidate["_changed_anchor_shape"], candidate["_changed_anchor_ordinal"] = (
+            _changed_anchor_identity(
+                getattr(diff_file, "patch", ""),
+                candidate["start_line"],
+                candidate["end_line"],
+            )
         )
         candidate["_trusted_lineage_key"] = _trusted_file_lineage(diff_file)
         candidate["_trusted_side_line_count"] = trusted_side_line_count

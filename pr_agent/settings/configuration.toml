@@ -115,6 +115,10 @@ enable_candidate_verification=false
 # Consume only validated diff-prioritization output for the exact specialist input; keep off until rollout gates pass.
 candidate_verification_consume_specialist_prioritization=false
 candidate_verification_model="" # Empty uses config.model.
+candidate_verification_deployment="" # Required when an Azure verifier model differs from config.model.
+candidate_verification_fallback_models=[]
+candidate_verification_fallback_deployments=[] # Must match fallback models for Azure routes.
+candidate_verification_max_output_tokens=0 # 0 inherits config.max_output_tokens/provider-specific caps.
 candidate_verification_max_model_calls=1 # The implementation performs at most one verifier call per review.
 candidate_verification_max_candidates=3
 # Sensitive audits bypass the coordinator candidate cap but remain bounded independently.

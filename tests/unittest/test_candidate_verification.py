@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import pr_agent.algo.candidate_verification as candidate_verification
+from pr_agent.algo.ai_request_context import get_ai_request_options
 from pr_agent.algo.candidate_verification import (
     _REPO_FETCH_MAX_WORKERS,
     VerificationBudgets,
@@ -285,9 +286,9 @@ def test_sensitive_audit_budget_bounds_expensive_shape_work_for_generated_diffs(
     max_sensitive_candidates = 6
 
     with patch(
-        "pr_agent.algo.candidate_verification._changed_anchor_shape",
-        wraps=candidate_verification._changed_anchor_shape,
-    ) as changed_anchor_shape:
+        "pr_agent.algo.candidate_verification._changed_anchor_identity",
+        wraps=candidate_verification._changed_anchor_identity,
+    ) as changed_anchor_identity:
         candidates, rejected = prepare_candidates(
             _review_data(),
             [diff_file],
@@ -299,7 +300,132 @@ def test_sensitive_audit_budget_bounds_expensive_shape_work_for_generated_diffs(
     assert len(candidates) == max_sensitive_candidates
     assert rejected[-1]["total_count"] == 2_000
     assert rejected[-1]["omitted_count"] == 1_994
-    assert changed_anchor_shape.call_count <= max_sensitive_candidates ** 2 + 2 * max_sensitive_candidates
+    assert changed_anchor_identity.call_count == max_sensitive_candidates
+
+
+def test_late_model_candidate_computes_anchor_identity_in_one_patch_pass():
+    diff_file = _diff_file("src/generated.py")
+    diff_file.head_file_is_complete = False
+    diff_file.patch = "@@ -0,0 +1,5000 @@\n" + "\n".join(
+        f"+generated_value_{line}" for line in range(1, 5_001)
+    )
+    review_data = _review_data(_candidate(
+        relevant_file="src/generated.py",
+        start_line=5_000,
+        end_line=5_000,
+        context_files=[],
+    ))
+
+    with patch(
+        "pr_agent.algo.candidate_verification.iter_git_patch_lines",
+        wraps=candidate_verification.iter_git_patch_lines,
+    ) as patch_lines:
+        candidates, rejected = prepare_candidates(review_data, [diff_file], [], 1)
+
+    assert len(candidates) == 1
+    assert rejected == []
+    assert candidates[0]["_changed_anchor_ordinal"] == 5_000
+    assert patch_lines.call_count == 2
+
+
+@pytest.mark.parametrize("side", ["new", "old"])
+def test_late_replacement_anchor_ordinal_is_linear_and_exact_on_both_sides(side):
+    patch_text = "@@ -1,5000 +1,5000 @@\n" + "\n".join(
+        line
+        for index in range(1, 5_001)
+        for line in (f"-old_value_{index}", f"+new_value_{index}")
+    )
+
+    with patch(
+        "pr_agent.algo.candidate_verification.iter_git_patch_lines",
+        wraps=candidate_verification.iter_git_patch_lines,
+    ) as patch_lines:
+        shape, ordinal = candidate_verification._changed_anchor_identity(
+            patch_text, 5_000, 5_000, side
+        )
+
+    assert shape
+    assert ordinal == 5_000
+    assert patch_lines.call_count == 1
+
+
+def test_multiline_anchor_ordinal_ignores_same_first_line_with_different_range_shape():
+    target_only = "@@ -0,0 +1,2 @@\n+if ready:\n+    return result"
+    unrelated_before = (
+        "@@ -0,0 +1,4 @@\n"
+        "+if unrelated:\n"
+        "+    raise DifferentError\n"
+        "+if ready:\n"
+        "+    return result"
+    )
+    exact_duplicate_before = (
+        "@@ -0,0 +1,4 @@\n"
+        "+if prior:\n"
+        "+    return other\n"
+        "+if ready:\n"
+        "+    return result"
+    )
+
+    original_shape, original_ordinal = candidate_verification._changed_anchor_identity(
+        target_only, 1, 2
+    )
+    unrelated_shape, unrelated_ordinal = candidate_verification._changed_anchor_identity(
+        unrelated_before, 3, 4
+    )
+    duplicate_shape, duplicate_ordinal = candidate_verification._changed_anchor_identity(
+        exact_duplicate_before, 3, 4
+    )
+
+    assert original_shape == unrelated_shape == duplicate_shape
+    assert original_ordinal == unrelated_ordinal == 1
+    assert duplicate_ordinal == 2
+
+
+def test_multiline_anchor_ordinal_does_not_match_across_hunk_boundaries():
+    target_only = "@@ -0,0 +3,2 @@\n+if target:\n+    return result"
+    split_prior = (
+        "@@ -0,0 +1,1 @@\n"
+        "+if prior:\n"
+        "@@ -0,0 +2,1 @@\n"
+        "+    return earlier\n"
+        "@@ -0,0 +3,2 @@\n"
+        "+if target:\n"
+        "+    return result"
+    )
+
+    original = candidate_verification._changed_anchor_identity(target_only, 3, 4)
+    after_split_prior = candidate_verification._changed_anchor_identity(split_prior, 3, 4)
+
+    assert after_split_prior == original
+    assert original[1] == 1
+
+
+def test_anchor_shape_preserves_line_partitions_to_avoid_root_identity_collisions():
+    patch_text = (
+        "@@ -0,0 +1,3 @@\n"
+        "+if first: return result\n"
+        "+if second:\n"
+        "+    return value"
+    )
+    one_line_shape, one_line_ordinal = candidate_verification._changed_anchor_identity(
+        patch_text, 1, 1
+    )
+    two_line_shape, two_line_ordinal = candidate_verification._changed_anchor_identity(
+        patch_text, 2, 3
+    )
+    one_line_identity = candidate_verification._verified_finding_identity({
+        "_changed_anchor_shape": one_line_shape,
+        "_changed_anchor_ordinal": one_line_ordinal,
+        "_trusted_lineage_key": "file:src/service.py",
+    })
+    two_line_identity = candidate_verification._verified_finding_identity({
+        "_changed_anchor_shape": two_line_shape,
+        "_changed_anchor_ordinal": two_line_ordinal,
+        "_trusted_lineage_key": "file:src/service.py",
+    })
+
+    assert one_line_shape != two_line_shape
+    assert one_line_identity != two_line_identity
 
 
 def test_sensitive_deletion_uses_a_trusted_old_side_anchor():
@@ -2224,6 +2350,10 @@ def _verification_settings():
         pr_reviewer=_SettingsDict(
             candidate_verification_max_candidates=3,
             candidate_verification_max_sensitive_candidates=6,
+            candidate_verification_deployment="",
+            candidate_verification_fallback_models=[],
+            candidate_verification_fallback_deployments=[],
+            candidate_verification_max_output_tokens=0,
             candidate_verification_max_files=3,
             candidate_verification_max_lines_per_file=30,
             candidate_verification_max_total_lines=60,
@@ -2239,6 +2369,329 @@ def _verification_settings():
     )
     settings.get = lambda key, default=None: default
     return settings
+
+
+def _rejected_verification_response(*candidate_ids):
+    decisions = "\n".join(
+        f"    - candidate_id: {candidate_id}\n"
+        "      verdict: rejected\n"
+        "      reason: disproved by repository evidence"
+        for candidate_id in candidate_ids
+    )
+    return f"verification:\n  decisions:\n{decisions}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_cap", [1_499, 1_500, 1_501, 16_000])
+async def test_verifier_prompt_reserves_the_effective_configured_output_cap(output_cap):
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    observed_options = []
+
+    async def complete(**kwargs):
+        observed_options.append(get_ai_request_options())
+        return _rejected_verification_response("candidate-1"), None
+
+    reviewer.ai_handler.chat_completion = complete
+    settings = _verification_settings()
+    settings.config["max_output_tokens"] = output_cap
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.get_settings",
+            return_value=settings,
+        ),
+        patch(
+            "pr_agent.tools.pr_reviewer.TokenEncoder.get_token_encoder",
+            return_value=_CharacterEncoder(),
+        ),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    prompt_budget = reviewer.candidate_verification_artifact["prompt_budget"]
+    assert prompt_budget["reserved_completion_tokens"] == output_cap
+    assert prompt_budget["prompt_tokens"] + output_cap <= 20_000
+    assert observed_options[0].max_output_tokens == output_cap
+    assert reviewer.candidate_verification_artifact["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_verifier_uncapped_default_enforces_the_reserved_completion_budget():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    observed_options = []
+
+    async def complete(**kwargs):
+        observed_options.append(get_ai_request_options())
+        return _rejected_verification_response("candidate-1"), None
+
+    reviewer.ai_handler.chat_completion = complete
+    settings = _verification_settings()
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.get_settings",
+            return_value=settings,
+        ),
+        patch(
+            "pr_agent.tools.pr_reviewer.TokenEncoder.get_token_encoder",
+            return_value=_CharacterEncoder(),
+        ),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    prompt_budget = reviewer.candidate_verification_artifact["prompt_budget"]
+    assert prompt_budget["reserved_completion_tokens"] == 1_500
+    assert prompt_budget["prompt_tokens"] + 1_500 <= 20_000
+    assert observed_options[0].max_output_tokens == 1_500
+    assert reviewer.candidate_verification_artifact["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_reasoning_only_verifier_route_fails_closed_before_model_call():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    chat_completion = AsyncMock()
+    reviewer.ai_handler.chat_completion = chat_completion
+    settings = _verification_settings()
+    settings.config["model"] = "openrouter/anthropic/claude-sonnet-4"
+    settings.get = lambda key, default=None: (
+        {"reasoning_max_tokens": 16_000}
+        if key.casefold() == "openrouter"
+        else default
+    )
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.get_settings",
+            return_value=settings,
+        ),
+    ):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "verifier_route_invalid"
+    assert artifact["failure"] == "invalid_output_budget"
+    assert artifact["publication_safe"] is False
+    chat_completion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_verifier_prompt_reserves_claude_extended_thinking_output_cap():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    observed_options = []
+
+    async def complete(**kwargs):
+        observed_options.append(get_ai_request_options())
+        return _rejected_verification_response("candidate-1"), None
+
+    reviewer.ai_handler.chat_completion = complete
+    settings = _verification_settings()
+    settings.config.update({
+        "model": "claude-3-7-sonnet-20250219",
+        "max_output_tokens": 16_000,
+        "enable_claude_extended_thinking": True,
+        "extended_thinking_budget_tokens": 2_048,
+        "extended_thinking_max_output_tokens": 4_096,
+        "claude_extended_thinking_models_override": [],
+    })
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.get_settings",
+            return_value=settings,
+        ),
+        patch(
+            "pr_agent.tools.pr_reviewer.TokenEncoder.get_token_encoder",
+            return_value=_CharacterEncoder(),
+        ),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    prompt_budget = reviewer.candidate_verification_artifact["prompt_budget"]
+    assert prompt_budget["reserved_completion_tokens"] == 4_096
+    assert prompt_budget["prompt_tokens"] + 4_096 <= 20_000
+    assert observed_options[0].max_output_tokens == 16_000
+
+
+@pytest.mark.asyncio
+async def test_verifier_fallback_route_uses_each_models_budget_and_request_context():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    attempts = []
+
+    async def complete(model, **kwargs):
+        options = get_ai_request_options()
+        attempts.append((model, options.deployment_id, options.max_output_tokens))
+        if model == "primary-verifier":
+            raise RuntimeError("primary unavailable")
+        return _rejected_verification_response("candidate-1"), None
+
+    reviewer.ai_handler.chat_completion = complete
+    settings = _verification_settings()
+    settings.config["model"] = "primary-verifier"
+    settings.config["max_output_tokens"] = 4_000
+    settings.pr_reviewer["candidate_verification_fallback_models"] = ["fallback-verifier"]
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.get_settings",
+            return_value=settings,
+        ),
+        patch(
+            "pr_agent.tools.pr_reviewer.TokenEncoder.get_token_encoder",
+            return_value=_CharacterEncoder(),
+        ),
+        patch(
+            "pr_agent.tools.pr_reviewer.get_max_tokens",
+            side_effect=lambda model: {"primary-verifier": 20_000, "fallback-verifier": 10_000}[model],
+        ),
+    ):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert attempts == [
+        ("primary-verifier", None, 4_000),
+        ("fallback-verifier", None, 4_000),
+    ]
+    assert artifact["status"] == "complete"
+    assert artifact["model"] == "fallback-verifier"
+    assert artifact["verifier_attempts"] == 2
+    assert artifact["prompt_budget"]["max_prompt_tokens"] == 6_000
+    assert artifact["prompt_budget"]["prompt_tokens"] + 4_000 <= 10_000
+
+
+@pytest.mark.asyncio
+async def test_azure_verifier_route_uses_model_specific_deployments_across_fallback():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    attempts = []
+
+    async def complete(model, **kwargs):
+        attempts.append((model, get_ai_request_options().deployment_id))
+        if model == "verifier-model":
+            raise RuntimeError("deployment unavailable")
+        return _rejected_verification_response("candidate-1"), None
+
+    reviewer.ai_handler = SimpleNamespace(azure=True, chat_completion=complete)
+    settings = _verification_settings()
+    settings.config["model"] = "primary-model"
+    settings.pr_reviewer.update({
+        "candidate_verification_model": "verifier-model",
+        "candidate_verification_deployment": "verifier-deployment",
+        "candidate_verification_fallback_models": ["fallback-model"],
+        "candidate_verification_fallback_deployments": ["fallback-deployment"],
+    })
+    settings.get = lambda key, default=None: (
+        "primary-deployment" if key.casefold() == "openai.deployment_id" else default
+    )
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.get_settings",
+            return_value=settings,
+        ),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    assert attempts == [
+        ("verifier-model", "verifier-deployment"),
+        ("fallback-model", "fallback-deployment"),
+    ]
+    assert reviewer.candidate_verification_artifact["status"] == "complete"
+    assert reviewer.candidate_verification_artifact["model"] == "fallback-model"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["missing_primary", "mismatched_fallbacks"])
+async def test_invalid_azure_verifier_routes_fail_closed_before_model_call(failure_mode):
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    reviewer = _reviewer_for_orchestration(provider)
+    chat_completion = AsyncMock()
+    reviewer.ai_handler = SimpleNamespace(azure=True, chat_completion=chat_completion)
+    settings = _verification_settings()
+    settings.config["model"] = "primary-model"
+    settings.pr_reviewer["candidate_verification_model"] = "verifier-model"
+    if failure_mode == "mismatched_fallbacks":
+        settings.pr_reviewer.update({
+            "candidate_verification_deployment": "verifier-deployment",
+            "candidate_verification_fallback_models": ["fallback-one", "fallback-two"],
+            "candidate_verification_fallback_deployments": ["fallback-deployment"],
+        })
+    settings.get = lambda key, default=None: (
+        "primary-deployment" if key.casefold() == "openai.deployment_id" else default
+    )
+
+    with patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "verifier_route_invalid"
+    assert artifact["failure"] == "invalid_model_route"
+    assert artifact["publication_safe"] is False
+    chat_completion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_non_azure_verifier_model_override_keeps_deployment_optional():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    observed = []
+
+    async def complete(model, **kwargs):
+        observed.append((model, get_ai_request_options().deployment_id))
+        return _rejected_verification_response("candidate-1"), None
+
+    reviewer.ai_handler = SimpleNamespace(azure=False, chat_completion=complete)
+    settings = _verification_settings()
+    settings.pr_reviewer["candidate_verification_model"] = "non-azure-verifier"
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.get_settings",
+            return_value=settings,
+        ),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    assert observed == [("non-azure-verifier", None)]
+    assert reviewer.candidate_verification_artifact["status"] == "complete"
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,11 @@ from typing import List, Optional, Tuple
 from jinja2 import Environment, StrictUndefined, select_autoescape
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
-from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
+from pr_agent.algo.ai_handlers.litellm_ai_handler import (
+    LiteLLMAIHandler,
+    get_effective_litellm_output_token_cap,
+)
+from pr_agent.algo.ai_request_context import AIModelRoute
 from pr_agent.algo.candidate_verification import (
     VerificationBudgets,
     apply_specialist_prioritization,
@@ -724,6 +728,105 @@ class PRReviewer:
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
 
+    def _candidate_verifier_model_route(self, config) -> AIModelRoute:
+        """Build an immutable verifier route without inheriting an incompatible Azure deployment."""
+
+        def string_tuple(value, key: str) -> tuple[str, ...]:
+            if value in (None, "", []):
+                return ()
+            if isinstance(value, str):
+                values = [part.strip() for part in value.split(",")]
+            elif isinstance(value, (list, tuple)):
+                values = [str(part).strip() for part in value]
+            else:
+                raise ValueError(f"{key} must be a string list")
+            if any(not part for part in values):
+                raise ValueError(f"{key} cannot contain blank entries")
+            return tuple(values)
+
+        def deployment_tuple(value, key: str) -> tuple[Optional[str], ...]:
+            if value in (None, "", []):
+                return ()
+            if isinstance(value, str):
+                values = value.split(",")
+            elif isinstance(value, (list, tuple)):
+                values = value
+            else:
+                raise ValueError(f"{key} must be a string list")
+            return tuple(str(part).strip() or None for part in values)
+
+        settings = get_settings()
+        primary_model = str(settings.config.model).strip()
+        configured_model = str(config.get("candidate_verification_model", "") or "").strip()
+        model = configured_model or primary_model
+        if not model:
+            raise ValueError("candidate verifier model cannot be blank")
+        fallback_models = string_tuple(
+            config.get("candidate_verification_fallback_models", []),
+            "candidate_verification_fallback_models",
+        )
+
+        global_deployment = str(
+            settings.get("openai.deployment_id", "") or ""
+        ).strip() or None
+        explicit_deployment = str(
+            config.get("candidate_verification_deployment", "") or ""
+        ).strip() or None
+        azure_route = getattr(self.ai_handler, "azure", False) is True or global_deployment is not None
+        if explicit_deployment is not None:
+            deployment = explicit_deployment
+        elif not configured_model or model == primary_model:
+            deployment = global_deployment
+        elif azure_route:
+            raise ValueError(
+                "candidate_verification_deployment is required when the Azure verifier model differs"
+            )
+        else:
+            deployment = None
+
+        fallback_deployments = deployment_tuple(
+            config.get("candidate_verification_fallback_deployments", []),
+            "candidate_verification_fallback_deployments",
+        )
+        if fallback_deployments and len(fallback_deployments) != len(fallback_models):
+            raise ValueError(
+                "candidate_verification_fallback_deployments must match fallback models"
+            )
+        if not fallback_deployments:
+            if azure_route and fallback_models:
+                raise ValueError(
+                    "Azure verifier fallback models require matching fallback deployments"
+                )
+            fallback_deployments = (None,) * len(fallback_models)
+        deployments = (deployment, *fallback_deployments)
+        if azure_route and any(item is None for item in deployments):
+            raise ValueError("every Azure verifier model requires a deployment")
+
+        configured_output_cap = config.get("candidate_verification_max_output_tokens", 0)
+        try:
+            output_cap = int(configured_output_cap)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("candidate_verification_max_output_tokens must be an integer") from exc
+        if output_cap < 0:
+            raise ValueError("candidate_verification_max_output_tokens cannot be negative")
+        if output_cap == 0:
+            try:
+                output_cap = int(settings.config.get("max_output_tokens", 0))
+            except (TypeError, ValueError):
+                output_cap = 0
+
+        return AIModelRoute(
+            models=(model, *fallback_models),
+            deployments=deployments,
+            timeout_seconds=max(
+                0.001, float(config.get("candidate_verification_timeout_seconds", 10))
+            ),
+            model_retries=1,
+            provider_retries=0,
+            max_output_tokens=output_cap or None,
+            attribution="candidate_verification",
+        )
+
     def _parse_review_prediction(self) -> dict:
         return load_yaml(
             self.prediction.strip(),
@@ -849,9 +952,16 @@ class PRReviewer:
                     artifact.update({"status": "no_candidates", "publication_safe": True})
                 return
 
-            model = str(
-                config.get("candidate_verification_model", "") or get_settings().config.model
-            ).strip()
+            try:
+                verifier_route = self._candidate_verifier_model_route(config)
+            except (TypeError, ValueError):
+                artifact.update({
+                    "status": "verifier_route_invalid",
+                    "failure": "invalid_model_route",
+                    "verified_count": 0,
+                })
+                return
+            model = verifier_route.models[0]
             artifact["model"] = model
             encoder = TokenEncoder.get_token_encoder(model)
             runtime_data = get_settings().get("data", {}) or {}
@@ -877,8 +987,59 @@ class PRReviewer:
                 undefined=StrictUndefined,
             )
             verification_prompt = get_settings().pr_review_verification_prompt
-            model_max_tokens = get_max_tokens(model)
-            max_prompt_tokens = max(0, model_max_tokens - OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD)
+            route_encoders = {
+                route_model: TokenEncoder.get_token_encoder(route_model)
+                for route_model in verifier_route.models
+            }
+            try:
+                route_completion_reserves = {
+                    route_model: get_effective_litellm_output_token_cap(
+                        route_model,
+                        verifier_route.max_output_tokens,
+                        require_bounded_reasoning=True,
+                    )
+                    for route_model in verifier_route.models
+                }
+                if any(cap is None for cap in route_completion_reserves.values()):
+                    verifier_route = AIModelRoute(
+                        models=verifier_route.models,
+                        deployments=verifier_route.deployments,
+                        timeout_seconds=verifier_route.timeout_seconds,
+                        model_retries=verifier_route.model_retries,
+                        provider_retries=verifier_route.provider_retries,
+                        max_output_tokens=OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+                        attribution=verifier_route.attribution,
+                    )
+                    route_completion_reserves = {
+                        route_model: get_effective_litellm_output_token_cap(
+                            route_model,
+                            verifier_route.max_output_tokens,
+                            require_bounded_reasoning=True,
+                        )
+                        for route_model in verifier_route.models
+                    }
+            except ValueError:
+                artifact.update({
+                    "status": "verifier_route_invalid",
+                    "failure": "invalid_output_budget",
+                    "verified_count": 0,
+                })
+                return
+            route_model_max_tokens = {
+                route_model: get_max_tokens(route_model)
+                for route_model in verifier_route.models
+            }
+            route_prompt_limits = {
+                route_model: max(
+                    0,
+                    route_model_max_tokens[route_model]
+                    - route_completion_reserves[route_model],
+                )
+                for route_model in verifier_route.models
+            }
+            model_max_tokens = min(route_model_max_tokens.values())
+            reserved_completion_tokens = max(route_completion_reserves.values())
+            max_prompt_tokens = min(route_prompt_limits.values())
 
             def render_prompts(evidence_fraction: float, changed_diff_fraction: float) -> tuple[str, str, int]:
                 variables = {
@@ -892,9 +1053,10 @@ class PRReviewer:
                 }
                 rendered_system = environment.from_string(verification_prompt.system).render(variables)
                 rendered_user = environment.from_string(verification_prompt.user).render(variables)
-                prompt_tokens = (
-                    len(encoder.encode(rendered_system, disallowed_special=())) +
-                    len(encoder.encode(rendered_user, disallowed_special=()))
+                prompt_tokens = max(
+                    len(route_encoder.encode(rendered_system, disallowed_special=()))
+                    + len(route_encoder.encode(rendered_user, disallowed_special=()))
+                    for route_encoder in route_encoders.values()
                 )
                 return rendered_system, rendered_user, prompt_tokens
 
@@ -933,7 +1095,7 @@ class PRReviewer:
                             "status": "prompt_budget_exhausted",
                             "prompt_budget": {
                                 "model_max_tokens": model_max_tokens,
-                                "reserved_completion_tokens": OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+                                "reserved_completion_tokens": reserved_completion_tokens,
                                 "max_prompt_tokens": max_prompt_tokens,
                                 "prompt_tokens": prompt_tokens,
                                 "truncated": True,
@@ -955,9 +1117,10 @@ class PRReviewer:
                             upper = midpoint
             artifact["prompt_budget"] = {
                 "model_max_tokens": model_max_tokens,
-                "reserved_completion_tokens": OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+                "reserved_completion_tokens": reserved_completion_tokens,
                 "max_prompt_tokens": max_prompt_tokens,
                 "prompt_tokens": prompt_tokens,
+                "route_count": len(verifier_route.models),
                 "truncated": evidence_fraction < 1.0 or changed_diff_fraction < 1.0,
                 "evidence_content_fraction": round(evidence_fraction, 4),
                 "changed_diff_fraction": round(changed_diff_fraction, 4),
@@ -973,11 +1136,22 @@ class PRReviewer:
                     "total_cost_usd": details.total_cost_usd,
                     "known_cost_call_count": details.known_cost_call_count,
                 }
-            prediction, _ = await self.ai_handler.chat_completion(
-                model=model,
-                temperature=get_settings().config.temperature,
-                system=system_prompt,
-                user=user_prompt,
+            artifact["verifier_attempts"] = 0
+
+            async def call_verifier(attempt_model: str):
+                artifact["verifier_attempts"] += 1
+                prediction_result = await self.ai_handler.chat_completion(
+                    model=attempt_model,
+                    temperature=get_settings().config.temperature,
+                    system=system_prompt,
+                    user=user_prompt,
+                )
+                artifact["model"] = attempt_model
+                return prediction_result
+
+            prediction, _ = await retry_with_fallback_models(
+                call_verifier,
+                model_route=verifier_route,
             )
             verification_data = load_yaml(
                 prediction.strip(),
@@ -1038,7 +1212,12 @@ class PRReviewer:
                 "rejected_count": len(candidates) - len(published_findings),
             })
         except Exception as exc:
-            artifact.update({"status": "verifier_failed", "failure": type(exc).__name__, "verified_count": 0})
+            failure = exc.__cause__ if exc.__cause__ is not None else exc
+            artifact.update({
+                "status": "verifier_failed",
+                "failure": type(failure).__name__,
+                "verified_count": 0,
+            })
             get_logger().exception(
                 "Candidate verification failed", artifact=telemetry_safe_artifact(artifact)
             )
