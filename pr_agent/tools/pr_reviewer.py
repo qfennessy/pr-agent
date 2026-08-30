@@ -736,6 +736,9 @@ class PRReviewer:
                 static_evidence,
                 diff_files=diff_files,
                 token_counter=lambda value: len(encoder.encode(value, disallowed_special=())),
+                prefer_pr_head=bool(
+                    getattr(getattr(self, "incremental", None), "is_incremental", False)
+                ),
             )
             artifact["retrieval"] = retrieval_artifact
             if int(config.get("candidate_verification_max_model_calls", 1)) < 1:
@@ -935,7 +938,9 @@ class PRReviewer:
                 "deleted_files": sorted(set(getattr(self, "deleted_files_list", []))),
             }
             if getattr(self, "candidate_verification_artifact", None) is not None:
-                structured_data["candidate_verification"] = copy.deepcopy(self.candidate_verification_artifact)
+                structured_data["candidate_verification"] = telemetry_safe_artifact(
+                    self.candidate_verification_artifact
+                )
             specialist_shadow_result = getattr(self, "specialist_shadow_result", None)
             if specialist_shadow_result is not None:
                 structured_data["metadata"]["specialist_shadow"] = specialist_shadow_result.to_dict()

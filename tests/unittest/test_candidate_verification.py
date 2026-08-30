@@ -1012,6 +1012,86 @@ async def test_retrieve_evidence_reports_missing_files_and_budget_exhaustion():
 
 
 @pytest.mark.asyncio
+async def test_incremental_retrieval_reads_earlier_changed_context_from_current_pr_head():
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = "stale helper from target branch"
+    provider.get_pr_head_file_content.return_value = "def helper(): return 'current PR behavior'"
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            relevant_file="src/caller.py",
+            context_files=["src/helper.py"],
+            context_symbols=["helper"],
+        )),
+        [_diff_file("src/caller.py")],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(),
+        [],
+        diff_files=[_diff_file("src/caller.py")],
+        prefer_pr_head=True,
+    )
+
+    provider.get_pr_head_file_content.assert_called_once_with("src/helper.py")
+    provider.get_repo_file_content.assert_not_called()
+    helper = next(item for item in evidence if item["path"] == "src/helper.py")
+    assert helper["content"] == "def helper(): return 'current PR behavior'"
+    assert helper["source"] == "pr_head_file"
+    assert artifact["requests"][1]["status"] == "retrieved"
+    assert artifact["requests"][1]["source"] == "pr_head_file"
+
+
+@pytest.mark.asyncio
+async def test_incremental_retrieval_fails_closed_when_pr_head_context_is_unsupported():
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = "stale helper from target branch"
+    provider.get_pr_head_file_content.return_value = ""
+    diff_file = _diff_file("src/caller.py")
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            relevant_file="src/caller.py",
+            context_files=["src/helper.py"],
+            context_symbols=["helper"],
+        )),
+        [diff_file],
+        [],
+        3,
+    )
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(),
+        [],
+        diff_files=[diff_file],
+        prefer_pr_head=True,
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": candidates[0]["candidate_id"],
+        "verdict": "verified",
+        "relevant_file": "src/caller.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/helper.py"],
+    }]}}
+
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    provider.get_repo_file_content.assert_not_called()
+    assert artifact["requests"][1]["status"] == "missing"
+    assert findings == []
+    assert decisions[0]["reason"] == "required_context_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_context_token_budget_uses_the_selected_verifier_tokenizer_exactly():
     candidates, _ = prepare_candidates(
         _review_data(_candidate(context_files=[])), [_diff_file()], [], 3

@@ -545,6 +545,21 @@ class GitProvider(ABC):
     def get_repo_file_content(self, file_path: str, from_default_branch: bool = False):
         return ""
 
+    def get_pr_head_file_content(self, file_path: str):
+        """Return file content from the current PR head when the provider supports it.
+
+        Candidate verification uses this separate capability for incremental
+        reviews. Repository-instruction loading intentionally continues to use
+        ``get_repo_file_content`` and its trusted target-branch boundary.
+        """
+        get_file = getattr(self, "get_pr_file_content", None)
+        if not callable(get_file):
+            return ""
+        ref = self.get_pr_head_sha() or self.get_pr_branch()
+        if not ref:
+            return ""
+        return get_file(file_path, ref)
+
     def get_workspace_name(self):
         return ""
 

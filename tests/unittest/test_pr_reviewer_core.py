@@ -1242,6 +1242,51 @@ def test_prepare_review_publishes_provider_neutral_structured_data(monkeypatch):
     assert list(published["review"].keys()) == ["key_issues_to_review", "security_concerns"]
 
 
+def test_prepare_review_sanitizes_candidate_verification_structured_data(monkeypatch):
+    git_provider = MagicMock()
+    git_provider.is_supported.return_value = False
+    git_provider.get_diff_files.return_value = []
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.prediction = "review:\n  key_issues_to_review: []\n"
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.set_review_labels = MagicMock()
+    reviewer.candidate_verification_artifact = {
+        "status": "complete",
+        "decisions": [{
+            "candidate_id": "candidate-1",
+            "verdict": "rejected",
+            "reason": "model reason containing private source details",
+            "evidence_paths": ["src/private.py"],
+        }],
+        "retrieval": {
+            "retrieved_evidence": [{
+                "candidate_id": "candidate-1",
+                "source": "repository_file",
+                "path": "src/private.py",
+                "start_line": 1,
+                "end_line": 1,
+                "content": "PRIVATE_SOURCE_TEXT",
+            }],
+        },
+        "verified_findings": [{"issue_content": "model-generated private explanation"}],
+    }
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+        lambda *args, **kwargs: "## Review",
+    )
+
+    reviewer._prepare_pr_review()
+
+    published = git_provider.publish_structured_review.call_args.args[0]
+    verification = published["candidate_verification"]
+    assert verification["decisions"][0]["reason"] == "rejected_by_verifier"
+    assert verification["retrieval"]["retrieved_evidence"][0]["content_characters"] == 19
+    assert "content" not in verification["retrieval"]["retrieved_evidence"][0]
+    assert "verified_findings" not in verification
+    assert "PRIVATE_SOURCE_TEXT" not in repr(published)
+    assert "private explanation" not in repr(published)
+
+
 def test_bugs_only_publishes_structured_empty_list_but_no_markdown():
     reviewer, _ = _bugs_only_reviewer()
     reviewer.prediction = "review:\n  key_issues_to_review: []\n"

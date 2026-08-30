@@ -60,7 +60,8 @@ class _RepositoryFetchCapacityExhausted(RuntimeError):
     """Raised when timed-out provider work already occupies every bounded fetch slot."""
 
 
-async def _bounded_repo_file_fetch(git_provider, path: str, timeout_seconds: float):
+async def _bounded_repo_file_fetch(git_provider, path: str, timeout_seconds: float,
+                                  from_pr_head: bool = False):
     """Run a synchronous provider fetch without allowing abandoned work to grow unboundedly."""
     if timeout_seconds <= 0:
         raise asyncio.TimeoutError
@@ -80,7 +81,10 @@ async def _bounded_repo_file_fetch(git_provider, path: str, timeout_seconds: flo
 
     def fetch():
         try:
-            value = git_provider.get_repo_file_content(path, False)
+            if from_pr_head:
+                value = git_provider.get_pr_head_file_content(path)
+            else:
+                value = git_provider.get_repo_file_content(path, False)
             outcome = (value, None)
         except Exception as exc:
             outcome = (None, exc)
@@ -830,8 +834,9 @@ def _retrieval_evidence_id(candidate_id: str, path: str, source: str) -> str:
 
 async def retrieve_evidence(git_provider, candidates: list[dict], budgets: VerificationBudgets,
                             static_evidence: list, diff_files: Optional[list] = None,
-                            token_counter: Optional[Callable[[str], int]] = None) -> tuple[list[dict], dict]:
-    """Fetch bounded base-branch excerpts and return them with an auditable retrieval record."""
+                            token_counter: Optional[Callable[[str], int]] = None,
+                            prefer_pr_head: bool = False) -> tuple[list[dict], dict]:
+    """Fetch bounded repository excerpts and return them with an auditable retrieval record."""
     started = time.monotonic()
     deadline = started + max(0.0, budgets.timeout_seconds)
     evidence = []
@@ -1056,11 +1061,12 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 budget_exhausted = True
                 continue
             unique_files.add(path)
-            fetch_path = _base_fetch_path(path, diff_by_file.get(path))
-            if fetch_path not in cache:
+            fetch_path = path if prefer_pr_head else _base_fetch_path(path, diff_by_file.get(path))
+            cache_key = ("pr_head" if prefer_pr_head else "base", fetch_path)
+            if cache_key not in cache:
                 try:
-                    cache[fetch_path] = await _bounded_repo_file_fetch(
-                        git_provider, fetch_path, remaining_time
+                    cache[cache_key] = await _bounded_repo_file_fetch(
+                        git_provider, fetch_path, remaining_time, from_pr_head=prefer_pr_head
                     )
                 except asyncio.TimeoutError:
                     request["status"] = "time_budget_exhausted"
@@ -1071,17 +1077,17 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                     budget_exhausted = True
                     continue
                 except Exception as exc:
-                    cache[fetch_path] = None
+                    cache[cache_key] = None
                     request["status"] = "fetch_failed"
                     request["error"] = type(exc).__name__
                     continue
-            content = cache[fetch_path]
+            content = cache[cache_key]
             if not content:
                 request["status"] = "missing"
                 continue
             if isinstance(content, bytes):
                 content = content.decode("utf-8", errors="replace")
-            source = "repository_file"
+            source = "pr_head_file" if prefer_pr_head else "repository_file"
             evidence_id = _retrieval_evidence_id(candidate_id, path, source)
             anchor_line = _excerpt_anchor_line(str(content), candidate, path)
             evidence_item = {
@@ -1103,6 +1109,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             appended = evidence[before]
             request.update({
                 "status": "retrieved",
+                "source": source,
                 "start_line": appended["start_line"],
                 "end_line": appended["end_line"],
                 "evidence_id": evidence_id,
