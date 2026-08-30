@@ -487,7 +487,12 @@ def _reject_existing_repository_outputs(
         if not supplied_path:
             continue
         lexical = Path(os.path.abspath(supplied_path))
-        resolved = lexical.resolve(strict=False)
+        try:
+            resolved = lexical.resolve(strict=False)
+        except RuntimeError as exc:
+            raise SnapshotCaptureError(
+                f"output destination aliases an existing repository path: {supplied_path}"
+            ) from exc
         exists = lexical.exists() or lexical.is_symlink()
         lexical_worktree = (
             lexical.is_relative_to(repository_root)

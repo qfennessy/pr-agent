@@ -636,6 +636,29 @@ def test_token_budget_omissions_cannot_be_reported_as_clean():
     assert CoverageIssue(path="large.py", reason="token_budget_omitted") in result.coverage_issues
 
 
+@pytest.mark.parametrize(
+    "review",
+    [
+        {},
+        {"key_issues_to_review": {}},
+        {"key_issues_to_review": "none"},
+    ],
+)
+def test_malformed_finding_collection_cannot_be_reported_as_clean(review):
+    snapshot = _snapshot("/repo/one")
+
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={"review": review},
+        started_at=monotonic(),
+    )
+
+    assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert result.review is None
+    assert CoverageIssue(reason="review_failed:InvalidStructuredReview") in result.coverage_issues
+
+
 def test_cache_is_repository_local_and_does_not_store_unavailable_results(tmp_path):
     first_repo = _repo(tmp_path, "one")
     second_repo = _repo(tmp_path, "two")
@@ -738,6 +761,8 @@ def test_cache_treats_semantically_inconsistent_results_as_misses(tmp_path):
         },
         {**valid, "state": "stale"},
         {**valid, "advisory": False},
+        {**valid, "review": {}},
+        {**valid, "review": {"key_issues_to_review": "none"}},
     ]
     cache.cache_dir.mkdir(parents=True, exist_ok=True)
 

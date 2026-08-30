@@ -571,6 +571,7 @@ class SnapshotCache:
                 or current_snapshot_id != snapshot_id
                 or state not in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
                 or not isinstance(review, Mapping)
+                or findings is None
                 or not isinstance(usage, Mapping)
                 or not isinstance(cost, Mapping)
                 or not math.isfinite(latency_seconds)
@@ -654,6 +655,9 @@ def build_snapshot_result(
             for path in omitted_files
             if isinstance(path, str) and path
         )
+    findings = finding_count(structured_review)
+    if structured_review is not None and findings is None:
+        error = error or "InvalidStructuredReview"
     if current_snapshot is None:
         coverage.append(CoverageIssue(reason="current_snapshot_unavailable"))
         return ReviewSnapshotResult(
@@ -687,7 +691,7 @@ def build_snapshot_result(
             latency_seconds=monotonic() - started_at,
         )
 
-    findings = finding_count(structured_review)
+    assert findings is not None
     state = ReviewResultState.FINDINGS if findings else ReviewResultState.NO_FINDINGS
     review = structured_review.get("review") if isinstance(structured_review, Mapping) else None
     if not findings and coverage:

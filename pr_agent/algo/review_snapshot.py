@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional
 
 SNAPSHOT_SCHEMA_VERSION = "review-snapshot-v1"
 
@@ -141,11 +141,11 @@ class ReviewSnapshotResult:
         return data
 
 
-def finding_count(structured_review: Optional[Mapping[str, Any]]) -> int:
+def finding_count(structured_review: Optional[Mapping[str, Any]]) -> Optional[int]:
     if not structured_review:
-        return 0
+        return None
     review = structured_review.get("review")
     if not isinstance(review, Mapping):
-        return 0
-    findings = review.get("key_issues_to_review", [])
-    return len(findings) if isinstance(findings, Sequence) and not isinstance(findings, (str, bytes)) else 0
+        return None
+    findings = review.get("key_issues_to_review")
+    return len(findings) if isinstance(findings, list) else None
