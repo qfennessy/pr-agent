@@ -84,6 +84,7 @@ _UNSAFE_COPY_SMALL_SIMILARITY_THRESHOLD = 0.8
 _UNSAFE_COPY_PROBE_WINDOW = 16
 _UNSAFE_COPY_MAX_PROBES = 128
 _UNSAFE_COPY_MAX_TOTAL_PROBES = 65_536
+_UNSAFE_COPY_MAX_TOTAL_EXACT_LINES = 65_536
 _UNSAFE_COPY_MAX_SMALL_COMPARISONS = 10_000
 _MAX_FINDING_LINE = 2_147_483_647
 
@@ -250,31 +251,48 @@ def _patch_has_only_deletions(patch: str) -> bool:
     return has_deletion and not has_addition
 
 
-def _patch_reviewable_regions(patch: str) -> tuple[bytes, ...]:
-    """Return each hunk's added and context bytes without joining distinct hunks."""
+def _patch_model_visible_regions(patch: str) -> tuple[bytes, ...]:
+    """Return each hunk's old and new payload bytes as separate regions."""
     regions: list[bytes] = []
-    current_region: list[str] = []
+    old_region: list[str] = []
+    new_region: list[str] = []
     inside_hunk = False
+
+    def flush_hunk() -> None:
+        for region in (old_region, new_region):
+            if region:
+                regions.append(
+                    "".join(region).encode("utf-8", errors="surrogateescape")
+                )
+
     for line in patch.splitlines(keepends=True):
         if RE_HUNK_HEADER.match(line):
-            if current_region:
-                regions.append(
-                    "".join(current_region).encode(
-                        "utf-8", errors="surrogateescape"
-                    )
-                )
-            current_region = []
+            flush_hunk()
+            old_region = []
+            new_region = []
             inside_hunk = True
             continue
         if not inside_hunk or line.startswith("\\"):
             continue
-        if line.startswith((" ", "+")):
-            current_region.append(line[1:])
-    if current_region:
-        regions.append(
-            "".join(current_region).encode("utf-8", errors="surrogateescape")
-        )
-    return tuple(region for region in regions if region)
+        if line.startswith(" "):
+            old_region.append(line[1:])
+            new_region.append(line[1:])
+        elif line.startswith("-"):
+            old_region.append(line[1:])
+        elif line.startswith("+"):
+            new_region.append(line[1:])
+    flush_hunk()
+    return tuple(dict.fromkeys(regions))
+
+
+def _status_has_content_patch(status: str) -> bool:
+    """Return whether a status has a hunk distinct from a full copy addition."""
+    if status.startswith("M"):
+        return True
+    if not status.startswith(("R", "C")):
+        return False
+    similarity = status[1:]
+    return not similarity.isdigit() or int(similarity) < 100
 
 
 def find_repository_root(start: Optional[str] = None) -> Path:
@@ -810,22 +828,26 @@ class LocalPairReview:
         return None if output is None else _decode_z_paths(output)
 
     def _non_regular_source_paths(self, max_output_bytes: int) -> Optional[list[str]]:
-        """Discover non-regular worktree entries without following symlinks."""
+        """Discover non-regular entries within separate entry and byte budgets."""
         pending = [self.repository_root]
         paths = []
         output_bytes = 0
         visited_entries = 0
+        max_entries = self.max_path_discovery_bytes
         while pending:
             directory = pending.pop()
             try:
                 with os.scandir(directory) as iterator:
-                    entries = sorted(iterator, key=lambda entry: entry.name)
+                    entries = []
+                    for entry in iterator:
+                        visited_entries += 1
+                        if visited_entries > max_entries:
+                            return None
+                        entries.append(entry)
+                    entries.sort(key=lambda entry: entry.name)
             except OSError:
                 return None
             for entry in entries:
-                visited_entries += 1
-                if visited_entries > self.max_path_discovery_bytes:
-                    return None
                 lexical_path = Path(entry.path)
                 try:
                     relative = lexical_path.relative_to(self.repository_root).as_posix()
@@ -889,8 +911,8 @@ class LocalPairReview:
         *,
         current_candidate_paths: Sequence[str] = (),
         index_candidate_paths: Sequence[str] = (),
-        current_modified_paths: Sequence[str] = (),
-        index_modified_paths: Sequence[str] = (),
+        current_patch_groups: Optional[Mapping[str, Sequence[str]]] = None,
+        index_patch_groups: Optional[Mapping[str, Sequence[str]]] = None,
         current_source_paths: Sequence[str] = (),
     ) -> Optional[dict[str, tuple[tuple[str, str], ...]]]:
         """Find candidate changes copied from unsafe tracked or untracked files."""
@@ -956,15 +978,15 @@ class LocalPairReview:
 
         candidate_variants: list[tuple[str, tuple[bytes, ...], str, bool]] = []
         candidate_keys: set[tuple[str, str]] = set()
-        current_modified = set(current_modified_paths)
-        index_modified = set(index_modified_paths)
+        current_patch_groups = current_patch_groups or {}
+        index_patch_groups = index_patch_groups or {}
         remaining_similarity_bytes = self.max_snapshot_bytes
 
         def add_candidate(
             path: str,
             *,
             current: bool,
-            patch_scoped: bool,
+            patch_paths: Optional[Sequence[str]],
             diff_stage: str,
         ) -> bool:
             nonlocal remaining_similarity_bytes
@@ -987,17 +1009,18 @@ class LocalPairReview:
                 mode, candidate_oid = self._git_object_identity(":", path)
                 if mode not in {"100644", "100755"} or candidate_oid is None:
                     return True
+            patch_scoped = patch_paths is not None
             if patch_scoped:
                 patch = self._capture_diff(
                     event,
                     base_revision,
-                    (path,),
+                    patch_paths,
                     max_output_bytes=remaining_similarity_bytes,
                     diff_stage=diff_stage,
                 )
                 if patch is None:
                     return False
-                regions = _patch_reviewable_regions(patch)
+                regions = _patch_model_visible_regions(patch)
                 candidate_size = sum(len(region) for region in regions)
                 candidate_digest = hashlib.sha256()
                 for region in regions:
@@ -1064,7 +1087,7 @@ class LocalPairReview:
             if not add_candidate(
                 path,
                 current=False,
-                patch_scoped=path in index_modified,
+                patch_paths=index_patch_groups.get(path),
                 diff_stage="index",
             ):
                 return None
@@ -1073,7 +1096,7 @@ class LocalPairReview:
             if not add_candidate(
                 path,
                 current=True,
-                patch_scoped=path in current_modified,
+                patch_paths=current_patch_groups.get(path),
                 diff_stage=(
                     "worktree"
                     if event is ReviewEvent.WORKTREE_IDLE
@@ -1203,15 +1226,21 @@ class LocalPairReview:
         large_signatures: list[tuple[str, str, frozenset[int]]] = []
         small_sources: list[tuple[str, str, bytes]] = []
         unsafe_lines: dict[bytes, set[tuple[str, str]]] = {}
+        total_exact_lines = 0
         for source, variants in source_contents.items():
             reason = unsafe_reasons[source]
             for content in variants.values():
                 for line in content.splitlines():
                     normalized_line = line.strip()
-                    if len(normalized_line) >= _UNSAFE_COPY_PROBE_WINDOW:
-                        unsafe_lines.setdefault(normalized_line, set()).add(
-                            (source, reason)
-                        )
+                    if not normalized_line:
+                        continue
+                    line_sources = unsafe_lines.setdefault(normalized_line, set())
+                    source_identity = (source, reason)
+                    if source_identity not in line_sources:
+                        total_exact_lines += 1
+                        if total_exact_lines > _UNSAFE_COPY_MAX_TOTAL_EXACT_LINES:
+                            return None
+                        line_sources.add(source_identity)
                 if len(content) < 4 * _UNSAFE_COPY_PROBE_WINDOW:
                     small_sources.append((source, reason, content))
                 if len(content) < _UNSAFE_COPY_PROBE_WINDOW:
@@ -1244,7 +1273,7 @@ class LocalPairReview:
                 if patch_scoped:
                     for line in region.splitlines():
                         normalized_line = line.strip()
-                        if len(normalized_line) >= _UNSAFE_COPY_PROBE_WINDOW:
+                        if normalized_line:
                             sources.update(unsafe_lines.get(normalized_line, ()))
                 for probe in _rolling_copy_hashes(region):
                     for signature_index in probe_index.get(probe, ()):
@@ -1290,7 +1319,8 @@ class LocalPairReview:
             *self._diff_filter_overrides(),
             "-c", "core.quotePath=false",
             "--literal-pathspecs", "diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/",
-            "--no-ext-diff", "--no-textconv", "--find-renames",
+            "--no-ext-diff", "--no-textconv", "--find-renames", "--find-copies",
+            "--find-copies-harder", "-l0",
         ]
         if event is ReviewEvent.PRE_COMMIT or diff_stage == "index":
             args.append("--cached")
@@ -1404,11 +1434,11 @@ class LocalPairReview:
                 if stage == "index" and not status.startswith("D")
             )
         )
-        index_modified_candidates = tuple(
-            group[-1]
+        index_patch_groups = {
+            group[-1]: group
             for stage, status, group in tracked_groups
-            if stage == "index" and status.startswith("M")
-        )
+            if stage == "index" and _status_has_content_patch(status)
+        }
         current_copy_candidates = tuple(
             dict.fromkeys(
                 (
@@ -1422,18 +1452,19 @@ class LocalPairReview:
                 )
             )
         )
-        current_modified_candidates = tuple(
-            group[-1]
+        current_patch_groups = {
+            group[-1]: group
             for stage, status, group in tracked_groups
-            if stage in {"combined", "worktree"} and status.startswith("M")
-        )
+            if stage in {"combined", "worktree"}
+            and _status_has_content_patch(status)
+        }
         unsafe_copy_sources = self._unsafe_copy_sources(
             event,
             base_revision,
             current_candidate_paths=current_copy_candidates,
             index_candidate_paths=index_copy_candidates,
-            current_modified_paths=current_modified_candidates,
-            index_modified_paths=index_modified_candidates,
+            current_patch_groups=current_patch_groups,
+            index_patch_groups=index_patch_groups,
             current_source_paths=untracked_sources,
         )
         if unsafe_copy_sources is None:
@@ -1532,11 +1563,11 @@ class LocalPairReview:
                     if stage == "index" and not status.startswith("D")
                 )
             )
-            current_index_modified = tuple(
-                group[-1]
+            current_index_patch_groups = {
+                group[-1]: group
                 for stage, status, group in current_groups
-                if stage == "index" and status.startswith("M")
-            )
+                if stage == "index" and _status_has_content_patch(status)
+            }
             current_candidates = tuple(
                 dict.fromkeys(
                     (
@@ -1550,18 +1581,19 @@ class LocalPairReview:
                     )
                 )
             )
-            current_modified = tuple(
-                group[-1]
+            current_patch_groups = {
+                group[-1]: group
                 for stage, status, group in current_groups
-                if stage in {"combined", "worktree"} and status.startswith("M")
-            )
+                if stage in {"combined", "worktree"}
+                and _status_has_content_patch(status)
+            }
             current_unsafe_sources = self._unsafe_copy_sources(
                 event,
                 base_revision,
                 current_candidate_paths=current_candidates,
                 index_candidate_paths=current_index_candidates,
-                current_modified_paths=current_modified,
-                index_modified_paths=current_index_modified,
+                current_patch_groups=current_patch_groups,
+                index_patch_groups=current_index_patch_groups,
                 current_source_paths=current_untracked_sources,
             )
             if current_unsafe_sources is None:
@@ -1650,6 +1682,7 @@ class LocalPairReview:
                 captured_group = (
                     selected_group[-1:]
                     if status.startswith("C")
+                    and not _status_has_content_patch(status)
                     else selected_group
                 )
                 selected_tracked_groups.append((stage, captured_group))
