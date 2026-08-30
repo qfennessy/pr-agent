@@ -497,6 +497,27 @@ def test_edited_untracked_copy_from_excluded_tracked_source_is_omitted(event, tm
 
 
 @pytest.mark.parametrize("event", ["file-save", "worktree-idle"])
+def test_short_edited_untracked_copy_from_excluded_source_is_omitted(event, tmp_path):
+    repo = _repo(tmp_path, f"untracked-short-edited-excluded-copy-{event}")
+    source = repo / "secrets.txt"
+    source.write_text("token=short-secret\n", encoding="utf-8")
+    _git(repo, "add", "secrets.txt")
+    _git(repo, "commit", "-m", "add excluded source")
+    destination = repo / "public.txt"
+    destination.write_text("token=short-secrex\n", encoding="utf-8")
+
+    snapshot = LocalPairReview(str(repo), excluded_paths=["secrets.txt"]).capture(
+        event=event,
+        focus_path="public.txt" if event == "file-save" else None,
+    )
+
+    assert snapshot.diff == ""
+    assert snapshot.changed_paths == ()
+    assert CoverageIssue(path="secrets.txt", reason="excluded") in snapshot.coverage_issues
+    assert CoverageIssue(path="public.txt", reason="rename_group_omitted") in snapshot.coverage_issues
+
+
+@pytest.mark.parametrize("event", ["file-save", "worktree-idle"])
 def test_unrelated_untracked_file_remains_reviewable_with_excluded_tracked_source(event, tmp_path):
     repo = _repo(tmp_path, f"untracked-unrelated-to-excluded-{event}")
     source = repo / "secrets.json"
@@ -1450,6 +1471,26 @@ def test_finding_range_may_include_adjacent_unchanged_context():
             "issue_content": "The changed line breaks the adjacent context.",
             "start_line": 1,
             "end_line": 2,
+        }]}},
+        started_at=monotonic(),
+    )
+
+    assert result.state is ReviewResultState.FINDINGS
+    assert result.review is not None
+
+
+def test_finding_file_alias_may_have_a_leading_slash():
+    snapshot = _snapshot("/repo/one")
+
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={"review": {"key_issues_to_review": [{
+            "relevant_file": "/x",
+            "issue_header": "Bug",
+            "issue_content": "The changed line has a defect.",
+            "start_line": 1,
+            "end_line": 1,
         }]}},
         started_at=monotonic(),
     )

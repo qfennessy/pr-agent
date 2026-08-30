@@ -947,8 +947,9 @@ class LocalPairReview:
         for source, variants in source_contents.items():
             reason = unsafe_reasons[source]
             for content in variants.values():
-                if len(content) < _UNSAFE_COPY_PROBE_WINDOW:
+                if len(content) < 4 * _UNSAFE_COPY_PROBE_WINDOW:
                     small_sources.append((source, reason, content))
+                if len(content) < _UNSAFE_COPY_PROBE_WINDOW:
                     continue
                 probes = _copy_similarity_probes(content)
                 if probes:
@@ -1499,13 +1500,15 @@ def _findings_match_snapshot(
     for finding in findings:
         if not isinstance(finding, Mapping):
             return False
-        filename = finding.get("relevant_file")
+        filename = str(finding.get("relevant_file") or "").strip()
         try:
             start_line = int(str(finding.get("start_line", "")).strip())
             end_line = int(str(finding.get("end_line", "")).strip())
         except ValueError:
             return False
-        allowed_lines = changed_lines.get(filename, set())
+        allowed_lines = changed_lines.get(filename) or changed_lines.get(
+            filename.lstrip("/"), set()
+        )
         if (
             not allowed_lines
             or start_line < 1
