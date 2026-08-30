@@ -258,19 +258,37 @@ def test_bugs_only_discards_non_defects_and_unverifiable_findings(issue):
     assert reviewer._normalize_bugs_only_review(data) == {"review": {"key_issues_to_review": []}}
 
 
-def test_bugs_only_discards_ci_duplicate_only_when_failed_check_name_is_observed():
+def test_bugs_only_discards_ci_duplicate_only_when_failed_check_evidences_same_defect():
     issue = _bugs_only_issue(duplicates_ci_failure=True, matching_ci_failure="Unit tests")
     reviewer, data = _bugs_only_reviewer(issue)
-    reviewer.ci_failure_names = {"unit tests"}
+    reviewer.ci_failure_evidence_by_name = {
+        "unit tests": ["test_cache_key: cache key omits tenant identifier"],
+    }
 
     assert reviewer._normalize_bugs_only_review(data) == {"review": {"key_issues_to_review": []}}
+
+
+@pytest.mark.parametrize("evidence", [
+    "Tests failed",
+    "test_user_login failed because the session cookie is missing",
+])
+def test_bugs_only_keeps_claimed_ci_duplicate_without_same_defect_evidence(evidence):
+    issue = _bugs_only_issue(duplicates_ci_failure=True, matching_ci_failure="Unit tests")
+    reviewer, data = _bugs_only_reviewer(issue)
+    reviewer.ci_failure_evidence_by_name = {"unit tests": [evidence]}
+
+    result = reviewer._normalize_bugs_only_review(data)
+
+    assert len(result["review"]["key_issues_to_review"]) == 1
 
 
 @pytest.mark.parametrize("matching_ci_failure", ["", "Different check"])
 def test_bugs_only_keeps_claimed_ci_duplicate_without_matching_evidence(matching_ci_failure):
     issue = _bugs_only_issue(duplicates_ci_failure=True, matching_ci_failure=matching_ci_failure)
     reviewer, data = _bugs_only_reviewer(issue)
-    reviewer.ci_failure_names = {"unit tests"}
+    reviewer.ci_failure_evidence_by_name = {
+        "unit tests": ["test_cache_key: cache key omits tenant identifier"],
+    }
 
     result = reviewer._normalize_bugs_only_review(data)
 

@@ -44,6 +44,10 @@ _BUG_FINDING_HEADERS = {
     "security": "Security vulnerability",
     "performance": "Performance regression",
 }
+_GENERIC_CI_EVIDENCE_TERMS = {
+    "assert", "assertion", "build", "check", "error", "errors", "fail", "failed", "failure", "failures",
+    "job", "test", "tests", "unit",
+}
 
 
 class PRReviewer:
@@ -113,11 +117,15 @@ class PRReviewer:
         if not isinstance(ci_failures, list):
             ci_failures = []
             self.ci_failure_context["failures"] = ci_failures
-        self.ci_failure_names = {
-            str(failure.get("name") or "").strip().casefold()
-            for failure in ci_failures
-            if isinstance(failure, dict) and str(failure.get("name") or "").strip()
-        }
+        self.ci_failure_evidence_by_name = {}
+        for failure in ci_failures:
+            if not isinstance(failure, dict):
+                continue
+            name = str(failure.get("name") or "").strip().casefold()
+            if not name:
+                continue
+            evidence = " ".join((str(failure.get("title") or ""), str(failure.get("summary") or ""))).strip()
+            self.ci_failure_evidence_by_name.setdefault(name, []).append(evidence)
         self.vars = {
             "title": self.git_provider.pr.title,
             "branch": self.git_provider.get_pr_branch(),
@@ -425,6 +433,28 @@ class PRReviewer:
                 return False
         return None
 
+    @staticmethod
+    def _specific_ci_terms(value: str) -> set[str]:
+        return {
+            term
+            for term in re.findall(r"[a-z0-9]+", value.casefold())
+            if len(term) >= 4 and term not in _GENERIC_CI_EVIDENCE_TERMS
+        }
+
+    def _ci_failure_evidences_same_defect(self, issue: dict, matching_ci_failure: str) -> bool:
+        issue_text = " ".join(
+            str(issue.get(field) or "")
+            for field in ("issue_content", "trigger", "impact", "root_cause")
+        )
+        issue_terms = self._specific_ci_terms(issue_text)
+        if len(issue_terms) < 2:
+            return False
+        evidence_by_name = getattr(self, "ci_failure_evidence_by_name", {})
+        for evidence in evidence_by_name.get(matching_ci_failure, []):
+            if len(issue_terms & self._specific_ci_terms(evidence)) >= 2:
+                return True
+        return False
+
     def _normalize_bugs_only_review(self, data: dict) -> dict:
         """Keep only complete, changed-line defect reports and collapse shared root causes."""
         if self._review_profile() != "bugs_only":
@@ -444,7 +474,7 @@ class PRReviewer:
                 continue
             matching_ci_failure = str(issue.get("matching_ci_failure") or "").strip().casefold()
             if (self._strict_bool(issue.get("duplicates_ci_failure")) is True and
-                    matching_ci_failure in getattr(self, "ci_failure_names", set())):
+                    self._ci_failure_evidences_same_defect(issue, matching_ci_failure)):
                 continue
 
             relevant_file = str(issue.get("relevant_file") or "").strip()

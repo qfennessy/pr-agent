@@ -51,7 +51,7 @@ Determining what to flag:
 - This run uses the bugs-only profile. Return only defects introduced by the PR: functional bugs, security vulnerabilities, or demonstrated material performance regressions.
 - Every finding must point to an added line, name a realistic trigger, and state the observable impact.
 - Exclude style, naming, formatting, documentation polish, generic hardening, praise, scores, effort estimates, PR-splitting advice, test-presence commentary, labels, and failures already reported by CI.
-- Set `duplicates_ci_failure` to true only when `matching_ci_failure` exactly names a failed check in the CI context below. If the context is unavailable or has no matching check, use false and an empty name.
+- Set `duplicates_ci_failure` to true only when `matching_ci_failure` exactly names a failed check and that check's title or summary specifically describes the same trigger, root cause, or impact. A generic result such as "Tests failed" is insufficient. If the context is unavailable or has no evidence of the same defect, use false and an empty name.
 - If several symptoms have the same root cause, return only the clearest finding for that root cause.
 - If there are no qualifying defects, return an empty `key_issues_to_review` list. Do not invent a finding to fill the response.
 
