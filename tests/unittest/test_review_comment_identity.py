@@ -87,15 +87,20 @@ def test_full_and_incremental_review_identities_remain_distinct():
     )
     incremental = add_pr_review_identity(
         "## Incremental Team Review 🔍\n\nbody",
-        PRReviewIdentity.INCREMENTAL.value,
+        PRReviewIdentity.FULL_INCREMENTAL.value,
     )
 
     assert PRReviewIdentity.REGULAR.value in full_identifiers
     assert PRReviewIdentity.INCREMENTAL.value not in full_identifiers
     assert PRReviewIdentity.BUGS_ONLY.value not in full_identifiers
-    assert PRReviewIdentity.INCREMENTAL.value in incremental_identifiers
+    assert PRReviewIdentity.FULL_INCREMENTAL.value in incremental_identifiers
+    assert PRReviewIdentity.INCREMENTAL.value not in incremental_identifiers
     assert PRReviewIdentity.BUGS_ONLY.value not in incremental_identifiers
     assert PRReviewIdentity.BUGS_ONLY.value in bugs_only_incremental_identifiers
+    assert PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value in bugs_only_incremental_identifiers
+    assert PRReviewIdentity.FULL_INCREMENTAL.value in bugs_only_incremental_identifiers
+    assert PRReviewIdentity.INCREMENTAL.value in bugs_only_incremental_identifiers
+    assert PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value not in incremental_identifiers
     assert not any(comment_matches_identity(incremental, item) for item in full_identifiers)
 
 
@@ -103,7 +108,7 @@ def test_full_and_incremental_review_identities_remain_distinct():
     ("body", "full", "incremental", "review_profile"),
     [
         ("## PR Reviewer Guide 🔍\n\nlegacy", True, False, "full"),
-        ("## Incremental PR Reviewer Guide 🔍\n\nlegacy", False, True, "full"),
+        ("## Incremental PR Reviewer Guide 🔍\n\nlegacy", False, True, "bugs_only"),
         (
             "## Team Review 🔍\n\n<!-- pr-agent:review:full -->\n\nmarked",
             True,
@@ -111,13 +116,13 @@ def test_full_and_incremental_review_identities_remain_distinct():
             "full",
         ),
         (
-            "## Incremental Team Review 🔍\n\n<!-- pr-agent:review:incremental -->\n\nmarked",
+            "## Incremental Team Review 🔍\n\n<!-- pr-agent:review:full:incremental -->\n\nmarked",
             False,
             True,
             "full",
         ),
         (
-            "## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\nmarked",
+            "## Incremental Team Review 🔍\n\n<!-- pr-agent:review:bugs-only:incremental -->\n\nmarked",
             True,
             True,
             "bugs_only",
@@ -145,6 +150,16 @@ def test_github_full_incremental_lookup_does_not_adopt_bugs_only_marker():
     provider.pr = MagicMock()
     provider.pr.get_issue_comments.return_value = [SimpleNamespace(
         body="## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\nmarked",
+    )]
+
+    assert provider.get_previous_review(full=True, incremental=True, review_profile="full") is None
+
+
+def test_github_full_incremental_lookup_does_not_adopt_ambiguous_legacy_marker():
+    provider = GithubProvider.__new__(GithubProvider)
+    provider.pr = MagicMock()
+    provider.pr.get_issue_comments.return_value = [SimpleNamespace(
+        body="## Incremental Team Review 🔍\n\n<!-- pr-agent:review:incremental -->\n\nmarked",
     )]
 
     assert provider.get_previous_review(full=True, incremental=True, review_profile="full") is None

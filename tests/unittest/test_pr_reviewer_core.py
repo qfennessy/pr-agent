@@ -1217,15 +1217,17 @@ async def test_run_threads_only_the_final_review_comment(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("is_incremental", "expected_identity"),
+    ("is_incremental", "review_profile", "expected_identity"),
     [
-        (False, PRReviewIdentity.REGULAR.value),
-        (True, PRReviewIdentity.INCREMENTAL.value),
+        (False, "full", PRReviewIdentity.REGULAR.value),
+        (True, "full", PRReviewIdentity.FULL_INCREMENTAL.value),
+        (True, "bugs_only", PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value),
     ],
 )
 async def test_nonpersistent_review_adds_identity_for_incremental_capable_provider(
     monkeypatch,
     is_incremental,
+    review_profile,
     expected_identity,
 ):
     from pr_agent.tools import pr_reviewer as pr_reviewer_module
@@ -1236,6 +1238,7 @@ async def test_nonpersistent_review_adds_identity_for_incremental_capable_provid
     git_provider.supports_review_comment_identity.return_value = True
     git_provider.publish_comment.return_value = progress_comment
     reviewer = _make_reviewer(git_provider)
+    reviewer.review_profile = review_profile
     reviewer.incremental = SimpleNamespace(is_incremental=is_incremental)
     if is_incremental:
         reviewer._can_run_incremental_review = lambda: True

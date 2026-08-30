@@ -270,7 +270,11 @@ class PRReviewer:
             else:
                 if self.git_provider.supports_review_comment_identity() is True:
                     identity_marker = (
-                        PRReviewIdentity.INCREMENTAL.value
+                        (
+                            PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value
+                            if self._review_profile() == "bugs_only"
+                            else PRReviewIdentity.FULL_INCREMENTAL.value
+                        )
                         if self.incremental.is_incremental
                         else (
                             PRReviewIdentity.BUGS_ONLY.value

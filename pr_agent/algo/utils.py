@@ -70,7 +70,9 @@ class PRReviewHeader(str, Enum):
 class PRReviewIdentity(str, Enum):
     REGULAR = "<!-- pr-agent:review:full -->"
     BUGS_ONLY = "<!-- pr-agent:review:bugs-only -->"
+    FULL_INCREMENTAL = "<!-- pr-agent:review:full:incremental -->"
     INCREMENTAL = "<!-- pr-agent:review:incremental -->"
+    BUGS_ONLY_INCREMENTAL = "<!-- pr-agent:review:bugs-only:incremental -->"
 
 
 class PRCodeSuggestionsHeader(str, Enum):
@@ -157,8 +159,15 @@ def get_pr_review_comment_identifiers(
         identifiers.extend((PRReviewIdentity.REGULAR.value, PRReviewHeader.REGULAR.value))
     if incremental:
         if review_profile == "bugs_only":
-            identifiers.append(PRReviewIdentity.BUGS_ONLY.value)
-        identifiers.extend((PRReviewIdentity.INCREMENTAL.value, PRReviewHeader.INCREMENTAL.value))
+            identifiers.extend((
+                PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value,
+                PRReviewIdentity.BUGS_ONLY.value,
+                PRReviewIdentity.FULL_INCREMENTAL.value,
+                PRReviewIdentity.INCREMENTAL.value,
+                PRReviewHeader.INCREMENTAL.value,
+            ))
+        else:
+            identifiers.append(PRReviewIdentity.FULL_INCREMENTAL.value)
     return tuple(identifiers)
 
 
