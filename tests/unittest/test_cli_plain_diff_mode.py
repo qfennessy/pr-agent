@@ -69,6 +69,16 @@ def test_json_output_outside_diff_mode_fails_fast(capsys):
     assert "--json-output is only supported in plain-diff mode" in err
 
 
+def test_review_snapshot_rejects_colliding_output_paths(capsys):
+    with pytest.raises(SystemExit):
+        run(inargs=[
+            "review-snapshot", "--event", "worktree-idle",
+            "--output", "result.txt", "--json-output", "./result.txt",
+        ])
+
+    assert "must reference different paths" in capsys.readouterr().err
+
+
 _DIFF = (
     "diff --git a/foo.py b/foo.py\n"
     "index 1111111..2222222 100644\n"
@@ -274,6 +284,30 @@ def test_snapshot_configuration_hash_covers_resolved_skill_content(cfg, tmp_path
     )
 
     assert _snapshot_review_configuration_hash() != first
+
+
+def test_pinned_skills_context_is_immutable_and_request_scoped(cfg, tmp_path):
+    from pr_agent.algo.skills_loader import get_skills_context, pin_skills_context
+
+    skill_dir = tmp_path / "pinned-review-skill"
+    skill_dir.mkdir()
+    skill = skill_dir / "SKILL.md"
+    skill.write_text(
+        "---\nname: pinned-review\ndescription: Review local changes.\n---\n\nFirst rule.\n",
+        encoding="utf-8",
+    )
+    cfg("skills.enabled", True)
+    cfg("skills.paths", [str(tmp_path)])
+    original = get_skills_context()
+
+    with pin_skills_context(original):
+        skill.write_text(
+            "---\nname: pinned-review\ndescription: Review local changes.\n---\n\nSecond rule.\n",
+            encoding="utf-8",
+        )
+        assert get_skills_context() == original
+
+    assert get_skills_context() != original
 
 
 def test_review_snapshot_applies_external_policy_before_capture(cfg, monkeypatch, tmp_path, capsys):

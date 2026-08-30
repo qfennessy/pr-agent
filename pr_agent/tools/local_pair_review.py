@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -135,26 +136,29 @@ class LocalPairReview:
 
     def _path_fingerprint(self, event: ReviewEvent, path: str, base_revision: str) -> Optional[str]:
         if event is ReviewEvent.PRE_COMMIT:
-            _, object_id = self._git_object_identity(":", path)
+            mode, object_id = self._git_object_identity(":", path)
             if object_id is None:
-                _, object_id = self._git_object_identity(base_revision, path)
-            return f"git:{object_id}" if object_id else None
+                mode, object_id = self._git_object_identity(base_revision, path)
+            return f"git:{mode}:{object_id}" if object_id else None
 
         candidate = self.repository_root / path
         try:
             digest = hashlib.sha256()
             if candidate.is_symlink():
+                digest.update(b"mode:120000\0")
                 digest.update(os.readlink(candidate).encode("utf-8", errors="surrogateescape"))
                 return "sha256:" + digest.hexdigest()
             if candidate.is_file():
+                worktree_mode = "100755" if candidate.stat().st_mode & stat.S_IXUSR else "100644"
+                digest.update(f"mode:{worktree_mode}\0".encode("ascii"))
                 with candidate.open("rb") as handle:
                     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                         digest.update(chunk)
                 return "sha256:" + digest.hexdigest()
         except OSError:
             return None
-        _, object_id = self._git_object_identity(base_revision, path)
-        return f"git:{object_id}" if object_id else None
+        mode, object_id = self._git_object_identity(base_revision, path)
+        return f"git:{mode}:{object_id}" if object_id else None
 
     def _inspect_content(self, content: bytes) -> Optional[str]:
         if len(content) > self.max_file_bytes:

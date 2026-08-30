@@ -14,7 +14,7 @@ from pr_agent.algo.ai_handlers.litellm_helpers import (
     litellm_callbacks_registered)
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState
 from pr_agent.algo.run_details import get_run_details
-from pr_agent.algo.skills_loader import get_skills_context
+from pr_agent.algo.skills_loader import get_skills_context, pin_skills_context
 from pr_agent.algo.utils import get_version
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.utils import apply_local_repo_settings
@@ -172,7 +172,7 @@ def _snapshot_review_instructions(snapshot) -> str:
     return f"{existing}\n\n{snapshot_context}" if existing else snapshot_context
 
 
-def _snapshot_review_configuration_hash() -> str:
+def _snapshot_review_configuration_hash(skills_context: str | None = None) -> str:
     settings = get_settings()
 
     credential_names = {"key", "token", "secret", "password", "credential", "credentials", "private"}
@@ -204,7 +204,9 @@ def _snapshot_review_configuration_hash() -> str:
     all_settings.pop("PLAIN_DIFF", None)
     effective = {
         "runtime_version": get_version(),
-        "skills_context_sha256": hashlib.sha256(get_skills_context().encode("utf-8")).hexdigest(),
+        "skills_context_sha256": hashlib.sha256(
+            (get_skills_context() if skills_context is None else skills_context).encode("utf-8")
+        ).hexdigest(),
         "settings": {
             str(section): sanitized(contents, section=str(section).lower())
             for section, contents in all_settings.items()
@@ -236,6 +238,12 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
         parser.error("--json-output may be provided before or after review-snapshot, not both")
     markdown_output = snapshot_args.output or args.output
     json_output = snapshot_args.json_output or args.json_output
+    if (
+        markdown_output
+        and json_output
+        and Path(markdown_output).resolve(strict=False) == Path(json_output).resolve(strict=False)
+    ):
+        parser.error("--output and --json-output must reference different paths")
     checks = _parse_deterministic_checks(snapshot_args.deterministic_check, parser)
     event = ReviewEvent.parse(snapshot_args.event)
     try:
@@ -247,6 +255,7 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
     policy_version = snapshot_args.policy_version or settings.get("policy_version", "local-pair-review-v1")
     configured_exclusions = list(settings.get("excluded_paths", []) or [])
     artifact_exclusions = _output_artifact_exclusions(repository_root, markdown_output, json_output)
+    skills_context = get_skills_context()
 
     try:
         reviewer = LocalPairReview(
@@ -260,7 +269,7 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
             focus_path=snapshot_args.focus_path,
             task_intent=snapshot_args.task_intent,
             deterministic_results=checks,
-            review_configuration_hash=_snapshot_review_configuration_hash(),
+            review_configuration_hash=_snapshot_review_configuration_hash(skills_context),
             policy_version=policy_version,
             parent_snapshot_id=snapshot_args.parent_snapshot_id,
         )
@@ -320,7 +329,8 @@ def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
                 return get_run_details()
 
             try:
-                details = asyncio.run(inner())
+                with pin_skills_context(skills_context):
+                    details = asyncio.run(inner())
             except Exception as exc:
                 # The result exposes the error class, not provider text that may
                 # contain credential-shaped values or source excerpts.

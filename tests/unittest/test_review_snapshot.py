@@ -1,5 +1,6 @@
-import subprocess
 import shlex
+import stat
+import subprocess
 from pathlib import Path
 from time import monotonic
 
@@ -311,6 +312,21 @@ def test_skipped_content_fingerprint_invalidates_snapshot_identity(tmp_path):
     second = reviewer.capture(event="worktree-idle")
 
     assert first.coverage_issues[0].fingerprint != second.coverage_issues[0].fingerprint
+    assert first.snapshot_id != second.snapshot_id
+
+
+def test_skipped_mode_change_invalidates_snapshot_identity(tmp_path):
+    repo = _repo(tmp_path, "skipped-mode")
+    skipped = repo / "skipped.py"
+    skipped.write_text("secret = True\n", encoding="utf-8")
+    _git(repo, "add", "skipped.py")
+    _git(repo, "commit", "-m", "add skipped file")
+    skipped.write_text("secret = False\n", encoding="utf-8")
+    reviewer = LocalPairReview(str(repo), excluded_paths=["skipped.py"])
+    first = reviewer.capture(event="worktree-idle")
+    skipped.chmod(skipped.stat().st_mode | stat.S_IXUSR)
+    second = reviewer.capture(event="worktree-idle")
+
     assert first.snapshot_id != second.snapshot_id
 
 
