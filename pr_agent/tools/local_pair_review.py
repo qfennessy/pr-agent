@@ -174,7 +174,8 @@ class LocalPairReview:
         if not candidate.is_file():
             return "not_a_regular_file"
         try:
-            content = candidate.read_bytes()
+            with candidate.open("rb") as handle:
+                content = handle.read(self.max_file_bytes + 1)
         except OSError:
             return "unreadable"
         return self._inspect_content(content)

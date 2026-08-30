@@ -131,7 +131,7 @@ def test_review_snapshot_cli_emits_snapshot_bound_json(cfg, monkeypatch, tmp_pat
     subprocess.run(["git", "-C", str(repo), "add", "changed.py"], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
     changed.write_text("value = 2\n", encoding="utf-8")
-    result_path = repo / "snapshot-result.json"
+    result_path = repo / ".git" / "pr-agent" / "snapshot-result.json"
     monkeypatch.chdir(repo)
 
     class FakeAgent:

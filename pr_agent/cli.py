@@ -150,7 +150,9 @@ def _emit_snapshot_result(result, output_path: str | None) -> None:
     print(payload, end="")
     if output_path:
         try:
-            Path(output_path).write_text(payload, encoding="utf-8")
+            destination = Path(output_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(payload, encoding="utf-8")
         except OSError as exc:
             raise SnapshotCaptureError(f"could not write --json-output '{output_path}': {exc}") from exc
 
