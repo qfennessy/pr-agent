@@ -2968,6 +2968,46 @@ async def test_openrouter_reasoning_only_verifier_route_fails_closed_before_mode
 
 
 @pytest.mark.asyncio
+async def test_disabled_openrouter_reasoning_does_not_consume_verifier_output_headroom():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        _rejected_verification_response("candidate-1"),
+        "stop",
+    ))
+    settings = _verification_settings()
+    settings.config["model"] = "openrouter/anthropic/claude-sonnet-4"
+    settings.get = lambda key, default=None: (
+        {
+            "max_tokens": 1_500,
+            "reasoning_effort": "none",
+            "reasoning_max_tokens": 16_000,
+        }
+        if key.casefold() == "openrouter"
+        else default
+    )
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch(
+            "pr_agent.algo.ai_handlers.litellm_ai_handler.get_settings",
+            return_value=settings,
+        ),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "complete"
+    assert artifact["prompt_budget"]["reserved_completion_tokens"] == 1_500
+    assert artifact["publication_safe"] is True
+    reviewer.ai_handler.chat_completion.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_verifier_prompt_reserves_claude_extended_thinking_output_cap():
     provider = MagicMock()
     provider.supports_repo_file_fetching.return_value = True

@@ -47,9 +47,10 @@ def _restore_litellm_globals():
                 os.environ[name] = value
 
 
-def _make_settings(config_values=None):
+def _make_settings(config_values=None, settings_values=None):
     """Minimal settings whose `config.get(key, ...)` serves the given dict."""
     config_values = config_values or {}
+    settings_values = settings_values or {}
 
     class Config:
         reasoning_effort = None
@@ -67,7 +68,7 @@ def _make_settings(config_values=None):
         "litellm": type("LiteLLM", (), {
             "get": lambda self, key, default=None: default,
         })(),
-        "get": lambda self, key, default=None: default,
+        "get": lambda self, key, default=None: settings_values.get(key, default),
     })()
 
 
@@ -90,6 +91,47 @@ async def _run(monkeypatch, model, config_values):
 
 
 class TestMaxOutputTokens:
+
+    def test_effective_cap_ignores_explicitly_disabled_openrouter_reasoning(
+        self,
+        monkeypatch,
+    ):
+        settings = _make_settings(settings_values={
+            "openrouter": {
+                "max_tokens": 1_500,
+                "reasoning_effort": "none",
+                "reasoning_max_tokens": 16_000,
+            },
+        })
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: settings)
+
+        cap = litellm_handler.get_effective_litellm_output_token_cap(
+            "openrouter/anthropic/claude-sonnet-4",
+            require_bounded_reasoning=True,
+        )
+
+        assert cap == 1_500
+
+    @pytest.mark.parametrize("reasoning_effort", ["", "medium", "invalid"])
+    def test_effective_cap_requires_headroom_when_openrouter_reasoning_is_not_disabled(
+        self,
+        monkeypatch,
+        reasoning_effort,
+    ):
+        settings = _make_settings(settings_values={
+            "openrouter": {
+                "max_tokens": 1_500,
+                "reasoning_effort": reasoning_effort,
+                "reasoning_max_tokens": 16_000,
+            },
+        })
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: settings)
+
+        with pytest.raises(ValueError, match="response headroom"):
+            litellm_handler.get_effective_litellm_output_token_cap(
+                "openrouter/anthropic/claude-sonnet-4",
+                require_bounded_reasoning=True,
+            )
 
     @pytest.mark.asyncio
     async def test_default_sends_no_max_tokens(self, monkeypatch):

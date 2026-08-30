@@ -116,8 +116,13 @@ def get_effective_litellm_output_token_cap(
         openrouter_cap = _positive_token_cap(openrouter_settings.get("max_tokens", 0))
         if openrouter_cap is not None:
             cap = min(cap, openrouter_cap) if cap is not None else openrouter_cap
-        reasoning_cap = _positive_token_cap(
-            openrouter_settings.get("reasoning_max_tokens", 0)
+        reasoning_effort = str(
+            openrouter_settings.get("reasoning_effort", "") or ""
+        ).strip().lower()
+        reasoning_cap = (
+            None
+            if reasoning_effort == ReasoningEffort.NONE.value
+            else _positive_token_cap(openrouter_settings.get("reasoning_max_tokens", 0))
         )
         if (
             require_bounded_reasoning
