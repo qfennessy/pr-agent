@@ -17,6 +17,7 @@ import pytest
 from litellm.utils import get_optional_params
 
 import pr_agent.algo.ai_handlers.litellm_ai_handler as litellm_handler
+from pr_agent.algo.ai_request_context import AIRequestOptions, use_ai_request_options
 
 # Environment variables that LiteLLMAIHandler.__init__ reads or mutates: the AWS
 # credential path (entered when AWS_USE_IMDS is set) writes the AWS_* variables,
@@ -297,7 +298,7 @@ class TestOpenRouterControls:
         assert disabled_params["extra_body"]["reasoning"] == {"enabled": False}
 
     @pytest.mark.asyncio
-    async def test_anthropic_reasoning_budget_warns_without_output_headroom(self, monkeypatch):
+    async def test_anthropic_reasoning_budget_is_clamped_with_output_headroom(self, monkeypatch):
         logger = MagicMock()
         monkeypatch.setattr(litellm_handler, "get_logger", lambda: logger)
         kwargs = await _run(
@@ -305,12 +306,24 @@ class TestOpenRouterControls:
             "openrouter/anthropic/claude-3.7-sonnet",
             {"reasoning_max_tokens": 2048, "max_tokens": 1024},
         )
-        assert kwargs["extra_body"]["reasoning"] == {"max_tokens": 2048}
+        assert kwargs["extra_body"]["reasoning"] == {"max_tokens": 1023}
         assert kwargs["max_tokens"] == 1024
         assert any(
-            "must be greater than reasoning_max_tokens" in call.args[0]
+            "Clamping OpenRouter reasoning_max_tokens" in call.args[0]
             for call in logger.warning.call_args_list
         )
+
+    @pytest.mark.asyncio
+    async def test_request_local_output_cap_clamps_openrouter_reasoning_budget(self, monkeypatch):
+        with use_ai_request_options(AIRequestOptions(max_output_tokens=1024)):
+            kwargs = await _run(
+                monkeypatch,
+                "openrouter/google/gemini-2.5-pro",
+                {"reasoning_max_tokens": 2048, "max_tokens": 4096},
+            )
+
+        assert kwargs["max_tokens"] == 1024
+        assert kwargs["extra_body"]["reasoning"] == {"max_tokens": 1024}
 
     @pytest.mark.asyncio
     async def test_anthropic_disabled_reasoning_skips_headroom_warning(self, monkeypatch):

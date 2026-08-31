@@ -12,12 +12,214 @@ from unittest.mock import Mock, patch
 import pytest
 
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
+from pr_agent.git_providers.git_provider import IncrementalPR
 from pr_agent.git_providers.github_provider import GithubProvider
 
 
 def _bare_provider():
     """Create a GithubProvider without running __init__ (no network/auth)."""
     return GithubProvider.__new__(GithubProvider)
+
+
+def _incremental_provider(historical_files, net_files, pr_files=None):
+    provider = _bare_provider()
+    commit = SimpleNamespace(
+        commit=SimpleNamespace(message="feature change"),
+        files=list(historical_files),
+    )
+    provider.pr_commits = [commit]
+    if pr_files is None:
+        pr_files = list(net_files) if isinstance(net_files, (list, tuple)) else list(historical_files)
+    provider.pr = SimpleNamespace(
+        head=SimpleNamespace(sha="head-sha"),
+        get_files=Mock(return_value=pr_files),
+        changed_files=len(pr_files) if isinstance(pr_files, (list, tuple)) else 0,
+    )
+    provider.incremental = IncrementalPR(True)
+    provider.incremental.last_seen_commit = SimpleNamespace(sha="base-sha")
+    provider.unreviewed_files_map = {}
+    provider.get_previous_review = Mock(return_value=SimpleNamespace())
+    provider.get_commit_range = Mock(return_value=[commit])
+    repo = SimpleNamespace(
+        default_branch="main",
+        compare=Mock(return_value=SimpleNamespace(files=net_files)),
+    )
+    provider._get_repo = Mock(return_value=repo)
+    return provider, repo
+
+
+class _FailingFilePages:
+    def __init__(self, files):
+        self.files = files
+
+    def __iter__(self):
+        yield from self.files
+        raise RuntimeError("later compare page failed")
+
+
+class _UnavailableChangedFilesPR:
+    def __init__(self, files):
+        self.head = SimpleNamespace(sha="head-sha")
+        self._files = files
+
+    def get_files(self):
+        return self._files
+
+    @property
+    def changed_files(self):
+        raise RuntimeError("changed-file count unavailable")
+
+
+class TestIncrementalNetInventory:
+    def test_reverted_sensitive_history_is_replaced_by_net_docs_change(self):
+        historical = [
+            _make_file("services/auth/reverted.py", "modified"),
+            _make_file("docs/guide.md", "modified"),
+        ]
+        net_docs = _make_file("docs/guide.md", "modified")
+        provider, repo = _incremental_provider(historical, [net_docs])
+
+        provider._get_incremental_commits()
+
+        assert list(provider.unreviewed_files_map) == ["docs/guide.md"]
+        assert provider.get_files_for_routing() == [net_docs]
+        repo.compare.assert_called_once_with("base-sha", "head-sha")
+
+    def test_twenty_five_reverted_paths_do_not_survive_net_inventory(self):
+        historical = [
+            _make_file(f"services/auth/reverted-{index}.py", "modified")
+            for index in range(25)
+        ]
+        net_docs = _make_file("docs/guide.md", "modified")
+        historical.append(net_docs)
+        provider, _ = _incremental_provider(historical, [net_docs])
+
+        provider._get_incremental_commits()
+
+        assert list(provider.unreviewed_files_map) == ["docs/guide.md"]
+        assert [file.filename for file in provider.get_files_for_routing()] == [
+            "docs/guide.md"
+        ]
+
+    def test_target_branch_merge_files_do_not_enter_incremental_pr_inventory(self):
+        target_branch_files = [
+            _make_file(f"services/auth/merged-{index}.py", "modified")
+            for index in range(25)
+        ]
+        net_docs = _make_file("docs/guide.md", "modified")
+        provider, _ = _incremental_provider(
+            [net_docs],
+            [*target_branch_files, net_docs],
+            pr_files=[net_docs],
+        )
+
+        provider._get_incremental_commits()
+
+        assert list(provider.unreviewed_files_map) == ["docs/guide.md"]
+        assert provider.get_files_for_routing() == [net_docs]
+
+    def test_incomplete_pr_inventory_preserves_compare_evidence_and_unknown(self):
+        known_sensitive = _make_file("services/auth/guard.py", "modified")
+        provider, _ = _incremental_provider(
+            [known_sensitive],
+            [known_sensitive],
+            pr_files=_FailingFilePages([]),
+        )
+
+        provider._get_incremental_commits()
+
+        routing = provider.get_files_for_routing()
+        assert routing[0] is known_sensitive
+        assert routing[-1].edit_type is EDIT_TYPE.UNKNOWN
+
+    def test_unavailable_lazy_changed_file_count_preserves_compare_and_unknown(self):
+        net_docs = _make_file("docs/guide.md", "modified")
+        provider, _ = _incremental_provider([net_docs], [net_docs])
+        provider.pr = _UnavailableChangedFilesPR([net_docs])
+
+        provider._get_incremental_commits()
+
+        routing = provider.get_files_for_routing()
+        assert routing[0] is net_docs
+        assert routing[-1].edit_type is EDIT_TYPE.UNKNOWN
+
+    def test_net_inventory_preserves_rename_edit_and_delete_metadata(self):
+        net_files = [
+            _make_file(
+                "docs/new.md",
+                "renamed",
+                previous_filename="services/auth/old.py",
+            ),
+            _make_file("src/app.py", "modified"),
+            _make_file("docs/removed.md", "removed"),
+        ]
+        provider, _ = _incremental_provider(net_files, net_files)
+
+        provider._get_incremental_commits()
+
+        routing = provider.get_files_for_routing()
+        assert [file.filename for file in routing] == [
+            "docs/new.md",
+            "src/app.py",
+            "docs/removed.md",
+        ]
+        assert routing[0].previous_filename == "services/auth/old.py"
+        assert [file.status for file in routing] == ["renamed", "modified", "removed"]
+
+    def test_true_empty_net_inventory_is_authoritative_even_with_reverted_history(self):
+        historical = [_make_file("services/auth/reverted.py", "modified")]
+        provider, _ = _incremental_provider(historical, [])
+
+        provider._get_incremental_commits()
+
+        assert provider.unreviewed_files_map == {}
+        assert provider.get_files_for_routing() == []
+        assert provider.is_incremental_scope_empty() is True
+
+    def test_later_compare_page_failure_preserves_known_paths_and_unknown(self):
+        historical = [_make_file("docs/history.md", "modified")]
+        known_sensitive = _make_file("services/auth/guard.py", "modified")
+        provider, _ = _incremental_provider(
+            historical,
+            _FailingFilePages([known_sensitive]),
+            pr_files=[known_sensitive],
+        )
+
+        provider._get_incremental_commits()
+
+        assert set(provider.unreviewed_files_map) == {
+            "docs/history.md",
+            "services/auth/guard.py",
+        }
+        routing = provider.get_files_for_routing()
+        assert routing[0] is known_sensitive
+        assert routing[-1].edit_type is EDIT_TYPE.UNKNOWN
+        assert provider.is_incremental_scope_empty() is False
+
+    def test_compare_api_failure_retains_historical_review_and_unknown_routing(self):
+        historical = [_make_file("services/auth/history.py", "modified")]
+        provider, repo = _incremental_provider(historical, [])
+        repo.compare.side_effect = RuntimeError("compare unavailable")
+
+        provider._get_incremental_commits()
+
+        assert list(provider.unreviewed_files_map) == ["services/auth/history.py"]
+        routing = provider.get_files_for_routing()
+        assert len(routing) == 1
+        assert routing[0].edit_type is EDIT_TYPE.UNKNOWN
+
+    def test_compare_file_cap_is_treated_as_incomplete(self):
+        net_files = [
+            _make_file(f"docs/page-{index}.md", "modified")
+            for index in range(300)
+        ]
+        provider, _ = _incremental_provider(net_files, net_files)
+
+        provider._get_incremental_commits()
+
+        routing = provider.get_files_for_routing()
+        assert len(routing) == 301
+        assert routing[-1].edit_type is EDIT_TYPE.UNKNOWN
 
 
 # ---------------------------------------------------------------------------

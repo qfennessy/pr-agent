@@ -2859,6 +2859,52 @@ def _rejected_verification_response(*candidate_ids):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route_cap", "global_cap", "expected_cap"),
+    [
+        (1, 3, 1),
+        (3, 9, 3),
+        (6, 3, 6),
+        (None, 3, 3),
+    ],
+)
+async def test_candidate_verification_uses_applied_route_candidate_budget(
+    route_cap,
+    global_cap,
+    expected_cap,
+):
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._review_max_verification_candidates = route_cap
+    settings = _verification_settings()
+    settings.pr_reviewer["candidate_verification_max_candidates"] = global_cap
+    observed = {}
+
+    def capture_candidate_budget(
+        review_data,
+        diff_files,
+        sensitive_globs,
+        max_candidates,
+        **kwargs,
+    ):
+        observed["max_candidates"] = max_candidates
+        return [], []
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch(
+            "pr_agent.tools.pr_reviewer.prepare_candidates",
+            side_effect=capture_candidate_budget,
+        ),
+    ):
+        await reviewer._run_candidate_verification()
+
+    assert observed["max_candidates"] == expected_cap
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("output_cap", [1_499, 1_500, 1_501, 16_000])
 async def test_verifier_prompt_reserves_the_effective_configured_output_cap(output_cap):
     provider = MagicMock()
