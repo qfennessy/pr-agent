@@ -962,17 +962,46 @@ def _matching_static_evidence(candidate: dict, static_evidence: list) -> list[di
     return matches
 
 
-def _changed_patch_range_evidence(diff_file, side: str, start_line: int, end_line: int,
-                                  source: str) -> Optional[dict]:
+def _changed_patch_range_evidence(
+    diff_file,
+    side: str,
+    start_line: int,
+    end_line: int,
+    source: str,
+    *,
+    max_lines: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    token_counter: Optional[Callable[[str], int]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
+    on_budget_exhausted: Optional[Callable[[], None]] = None,
+) -> Optional[dict]:
     """Return a complete side-specific patch range with at least one changed line."""
     if diff_file is None:
         return None
+    range_line_count = end_line - start_line + 1
+    if start_line < 1 or range_line_count < 1:
+        return None
+    if max_lines is not None and range_line_count > max(0, int(max_lines)):
+        # This exact range cannot fit the prompt-visible evidence budget.  Fail
+        # before walking the patch or materializing any range-sized lists.
+        if on_budget_exhausted is not None:
+            on_budget_exhausted()
+        return None
+    if max_tokens is not None and int(max_tokens) < 1:
+        if on_budget_exhausted is not None:
+            on_budget_exhausted()
+        return None
+    count_tokens = token_counter or (lambda value: len(str(value).encode("utf-8")))
+    newline_tokens = count_tokens("\n") if max_tokens is not None else 0
+    selected_tokens = 0
     old_line = None
     new_line = None
     selected = []
     selected_lines = []
-    changed_lines = []
+    start_line_is_changed = False
     for record in iter_git_patch_lines(getattr(diff_file, "patch", "") or ""):
+        if stop_requested is not None and stop_requested():
+            return None
         line = strip_git_line_ending(record)
         header = RE_HUNK_HEADER.match(line)
         if header:
@@ -982,21 +1011,41 @@ def _changed_patch_range_evidence(diff_file, side: str, start_line: int, end_lin
         if old_line is None or new_line is None or line.startswith("\\ No newline at end of file"):
             continue
         if side == "new" and not line.startswith("-") and start_line <= new_line <= end_line:
-            selected.append(line[1:] if line.startswith(("+", " ")) else line)
+            content_line = line[1:] if line.startswith(("+", " ")) else line
+            if max_tokens is not None:
+                next_tokens = count_tokens(content_line) + (newline_tokens if selected else 0)
+                if selected_tokens + next_tokens > int(max_tokens):
+                    if on_budget_exhausted is not None:
+                        on_budget_exhausted()
+                    return None
+                selected_tokens += next_tokens
+            selected.append(content_line)
             selected_lines.append(new_line)
-            if line.startswith("+"):
-                changed_lines.append(new_line)
+            if line.startswith("+") and new_line == start_line:
+                start_line_is_changed = True
         elif side == "old" and not line.startswith("+") and start_line <= old_line <= end_line:
-            selected.append(line[1:] if line.startswith(("-", " ")) else line)
+            content_line = line[1:] if line.startswith(("-", " ")) else line
+            if max_tokens is not None:
+                next_tokens = count_tokens(content_line) + (newline_tokens if selected else 0)
+                if selected_tokens + next_tokens > int(max_tokens):
+                    if on_budget_exhausted is not None:
+                        on_budget_exhausted()
+                    return None
+                selected_tokens += next_tokens
+            selected.append(content_line)
             selected_lines.append(old_line)
-            if line.startswith("-"):
-                changed_lines.append(old_line)
+            if line.startswith("-") and old_line == start_line:
+                start_line_is_changed = True
         if not line.startswith("+"):
             old_line += 1
         if not line.startswith("-"):
             new_line += 1
-    expected_lines = list(range(start_line, end_line + 1))
-    if selected_lines != expected_lines or start_line not in changed_lines or not selected:
+    has_complete_range = (
+        len(selected_lines) == range_line_count
+        and all(line_number == start_line + offset
+                for offset, line_number in enumerate(selected_lines))
+    )
+    if not has_complete_range or not start_line_is_changed or not selected:
         return None
     return {
         "source": source,
@@ -1009,7 +1058,16 @@ def _changed_patch_range_evidence(diff_file, side: str, start_line: int, end_lin
     }
 
 
-def _candidate_changed_patch_evidence(diff_file, candidate: dict) -> Optional[dict]:
+def _candidate_changed_patch_evidence(
+    diff_file,
+    candidate: dict,
+    *,
+    max_lines: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    token_counter: Optional[Callable[[str], int]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
+    on_budget_exhausted: Optional[Callable[[], None]] = None,
+) -> Optional[dict]:
     """Return exact candidate-scoped changed lines from one trusted provider patch."""
     try:
         start_line = int(candidate.get("start_line"))
@@ -1022,6 +1080,11 @@ def _candidate_changed_patch_evidence(diff_file, candidate: dict) -> Optional[di
         start_line,
         end_line,
         "changed_patch",
+        max_lines=max_lines,
+        max_tokens=max_tokens,
+        token_counter=token_counter,
+        stop_requested=stop_requested,
+        on_budget_exhausted=on_budget_exhausted,
     )
 
 
@@ -1280,9 +1343,37 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
     for candidate in candidates:
         candidate_id = candidate["candidate_id"]
         relevant_file = candidate.get("relevant_file")
-        changed_patch = _candidate_changed_patch_evidence(
-            diff_by_file.get(relevant_file), candidate
-        )
+        candidate_line_budget = remaining_lines(relevant_file)
+        try:
+            candidate_range_lines = (
+                int(candidate.get("end_line")) - int(candidate.get("start_line")) + 1
+            )
+        except (TypeError, ValueError):
+            candidate_range_lines = 0
+        changed_patch = None
+        if candidate_range_lines < 1 or candidate_range_lines > candidate_line_budget:
+            budget_exhausted = True
+        elif time.monotonic() >= deadline or total_tokens >= budgets.max_context_tokens:
+            budget_exhausted = True
+            time_budget_exhausted = time.monotonic() >= deadline
+        else:
+            candidate_budget_stop = []
+            changed_patch = _candidate_changed_patch_evidence(
+                diff_by_file.get(relevant_file),
+                candidate,
+                max_lines=candidate_line_budget,
+                max_tokens=budgets.max_context_tokens - total_tokens,
+                token_counter=count_tokens,
+                stop_requested=lambda: time.monotonic() >= deadline,
+                on_budget_exhausted=(
+                    lambda stops=candidate_budget_stop: stops.append(True)
+                ),
+            )
+            if candidate_budget_stop:
+                budget_exhausted = True
+            if changed_patch is None and time.monotonic() >= deadline:
+                budget_exhausted = True
+                time_budget_exhausted = True
         if changed_patch is not None:
             append_evidence(
                 {"candidate_id": candidate_id, **changed_patch},

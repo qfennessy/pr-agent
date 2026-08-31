@@ -1011,6 +1011,160 @@ def test_changed_patch_does_not_claim_unseen_lines_between_visible_hunks():
     assert not any(item["source"] == "changed_patch" for item in evidence)
 
 
+def test_candidate_patch_range_has_exact_preconstruction_line_budget_boundary(
+    monkeypatch,
+):
+    diff_file = _diff_file("auth/generated.py", base_file="", head_file="")
+    diff_file.head_file_is_complete = False
+    diff_file.patch = "@@ -0,0 +1,4 @@\n+one\n+two\n+three\n+four"
+    candidate = {
+        "side": "new",
+        "start_line": 1,
+        "end_line": 4,
+    }
+
+    accepted = candidate_verification._candidate_changed_patch_evidence(
+        diff_file, candidate, max_lines=4
+    )
+    assert accepted is not None
+    assert accepted["content"] == "one\ntwo\nthree\nfour"
+
+    def fail_if_patch_is_materialized(_patch):
+        raise AssertionError("an over-budget candidate range must fail before patch traversal")
+
+    monkeypatch.setattr(
+        candidate_verification, "iter_git_patch_lines", fail_if_patch_is_materialized
+    )
+    assert candidate_verification._candidate_changed_patch_evidence(
+        diff_file, candidate, max_lines=3
+    ) is None
+
+
+def test_candidate_patch_range_has_exact_preconstruction_token_budget_boundary():
+    diff_file = _diff_file("auth/generated.py", base_file="", head_file="")
+    diff_file.head_file_is_complete = False
+    diff_file.patch = "@@ -0,0 +1,1 @@\n+four"
+    candidate = {"side": "new", "start_line": 1, "end_line": 1}
+
+    def byte_counter(value):
+        return len(str(value).encode("utf-8"))
+
+    accepted = candidate_verification._candidate_changed_patch_evidence(
+        diff_file,
+        candidate,
+        max_lines=1,
+        max_tokens=4,
+        token_counter=byte_counter,
+    )
+
+    assert accepted is not None
+    assert accepted["content"] == "four"
+    assert candidate_verification._candidate_changed_patch_evidence(
+        diff_file,
+        candidate,
+        max_lines=1,
+        max_tokens=3,
+        token_counter=byte_counter,
+    ) is None
+
+
+def test_candidate_patch_range_rejects_huge_line_before_evidence_append():
+    diff_file = _diff_file("auth/generated.py", base_file="", head_file="")
+    diff_file.head_file_is_complete = False
+    huge_line = "x" * 2_000_000
+    diff_file.patch = "@@ -0,0 +1,1 @@\n+" + huge_line
+    candidate = {"side": "new", "start_line": 1, "end_line": 1}
+    counted_sizes = []
+
+    evidence = candidate_verification._candidate_changed_patch_evidence(
+        diff_file,
+        candidate,
+        max_lines=1,
+        max_tokens=1,
+        token_counter=lambda value: counted_sizes.append(len(value)) or len(value),
+    )
+
+    assert evidence is None
+    assert counted_sizes == [1, 2_000_000]
+
+
+@pytest.mark.asyncio
+async def test_candidate_patch_token_overflow_is_reported_as_budget_exhaustion():
+    diff_file = _diff_file("src/service.py", base_file="", head_file="")
+    diff_file.head_file_is_complete = False
+    diff_file.patch = "@@ -0,0 +1,1 @@\n+" + ("x" * 100)
+    candidates, rejected = prepare_candidates(
+        _review_data(_candidate(
+            start_line=1,
+            end_line=1,
+            context_files=[],
+            context_symbols=[],
+        )),
+        [diff_file],
+        [],
+        1,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = None
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_lines_per_file=1,
+            max_total_lines=1,
+            max_context_tokens=1,
+        ),
+        [],
+        diff_files=[diff_file],
+        token_counter=len,
+    )
+
+    assert rejected == []
+    assert not any(item["source"] == "changed_patch" for item in evidence)
+    assert artifact["changed_evidence_count"] == 0
+    assert artifact["budget_exhausted"] is True
+
+
+@pytest.mark.asyncio
+async def test_sensitive_generated_range_fails_before_oversized_anchor_collection(
+    monkeypatch,
+):
+    diff_file = _diff_file("auth/generated.py", base_file="", head_file="")
+    diff_file.head_file_is_complete = False
+    diff_file.patch = "@@ -0,0 +1,5000 @@\n" + "\n".join(
+        f"+generated_{line}" for line in range(1, 5001)
+    )
+    candidates, rejected = prepare_candidates(
+        _review_data(), [diff_file], ["auth/**"], 1
+    )
+    original_iter = candidate_verification.iter_git_patch_lines
+    traversals = 0
+
+    def counted_iter(patch):
+        nonlocal traversals
+        traversals += 1
+        return original_iter(patch)
+
+    monkeypatch.setattr(candidate_verification, "iter_git_patch_lines", counted_iter)
+    evidence, artifact = await retrieve_evidence(
+        MagicMock(),
+        candidates,
+        VerificationBudgets(max_lines_per_file=160, max_total_lines=160),
+        [],
+        diff_files=[diff_file],
+    )
+
+    assert rejected == []
+    assert len(candidates) == 1
+    assert candidates[0]["sensitive_path"] is True
+    assert candidates[0]["end_line"] == 5000
+    assert traversals == 0
+    assert not any(item["source"] == "changed_patch" for item in evidence)
+    assert artifact["changed_evidence_count"] == 0
+    assert artifact["budget_exhausted"] is True
+
+
 def test_apply_verification_decisions_rejects_disproved_and_missing_candidates():
     candidates, _ = prepare_candidates(
         _review_data(_candidate(), _candidate(root_cause="second defect")), [_diff_file()], [], 3
