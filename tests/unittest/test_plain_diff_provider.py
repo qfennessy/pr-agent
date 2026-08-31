@@ -69,6 +69,7 @@ def test_get_diff_files(cfg):
     assert len(files) == 1
     assert files[0].filename == "foo.py"
     assert files[0].edit_type == EDIT_TYPE.MODIFIED
+    assert files[0].patch_is_complete is True
 
 
 def test_literal_quotes_in_a_unified_diff_filename_are_preserved():

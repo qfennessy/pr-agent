@@ -482,11 +482,13 @@ def test_anchor_shape_preserves_line_partitions_to_avoid_root_identity_collision
     one_line_identity = candidate_verification._verified_finding_identity({
         "_changed_anchor_shape": one_line_shape,
         "_changed_anchor_ordinal": one_line_ordinal,
+        "_trusted_defect_ordinal": 1,
         "_trusted_lineage_key": "file:src/service.py",
     })
     two_line_identity = candidate_verification._verified_finding_identity({
         "_changed_anchor_shape": two_line_shape,
         "_changed_anchor_ordinal": two_line_ordinal,
+        "_trusted_defect_ordinal": 1,
         "_trusted_lineage_key": "file:src/service.py",
     })
 
@@ -1530,6 +1532,73 @@ def test_same_shaped_changed_operations_use_trusted_patch_ordinals_to_avoid_coll
     assert [record["verdict"] for record in records] == ["verified", "verified"]
 
 
+def test_distinct_verified_defects_on_the_same_changed_range_do_not_collide():
+    diff_file = _diff_file()
+    candidates, rejected = prepare_candidates(
+        _review_data(
+            _candidate(context_files=[], root_cause="missing authentication check"),
+            _candidate(context_files=[], root_cause="unbounded retry loop"),
+        ),
+        [diff_file],
+        [],
+        3,
+    )
+    evidence = [
+        _changed_evidence(
+            candidate_id=candidate["candidate_id"],
+            content="one",
+        )
+        for candidate in candidates
+    ]
+    decisions = [{
+        "candidate_id": candidate["candidate_id"],
+        "verdict": "verified",
+        "issue_content": f"Verified independent defect {index}",
+        "trigger": f"Trigger {index}",
+        "impact": f"Impact {index}",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py"],
+    } for index, candidate in enumerate(candidates, start=1)]
+
+    findings, records = apply_verification_decisions(
+        candidates, evidence, {"verification": {"decisions": decisions}}
+    )
+
+    assert rejected == []
+    assert [candidate["_trusted_defect_ordinal"] for candidate in candidates] == [1, 2]
+    assert len(findings) == 2
+    assert len({finding["root_cause_id"] for finding in findings}) == 2
+    assert len({finding["trusted_stable_key"] for finding in findings}) == 2
+    assert [record["verdict"] for record in records] == ["verified", "verified"]
+
+
+def test_same_anchor_defect_identity_multiset_is_stable_when_candidates_reorder():
+    diff_file = _diff_file()
+
+    def identities(*root_causes):
+        candidates, rejected = prepare_candidates(
+            _review_data(*[
+                _candidate(context_files=[], root_cause=root_cause)
+                for root_cause in root_causes
+            ]),
+            [diff_file],
+            [],
+            3,
+        )
+        assert rejected == []
+        return {
+            candidate_verification._verified_finding_identity(candidate)
+            for candidate in candidates
+        }
+
+    forward = identities("authentication bypass", "unbounded retry loop")
+    reversed_order = identities("unbounded retry loop", "authentication bypass")
+
+    assert forward == reversed_order
+
+
 def test_same_shaped_operations_in_distinct_file_lineages_do_not_collide():
     diff_a = _diff_file("src/a.py")
     diff_a.patch = "@@ -10,1 +12,1 @@\n+return foo(x) + 1"
@@ -2518,6 +2587,177 @@ async def test_added_required_context_uses_complete_head_and_can_publish():
     assert len(findings) == 1
     assert decisions[0]["verdict"] == "verified"
     provider.get_repo_file_content.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_patch_only_added_required_context_satisfies_request_and_can_publish():
+    service_diff = _diff_file()
+    dependency_diff = _diff_file(
+        "src/new_dependency.py",
+        base_file="",
+        head_file="",
+        edit_type=EDIT_TYPE.ADDED,
+    )
+    dependency_diff.head_file_is_complete = False
+    dependency_diff.patch_is_complete = True
+    dependency_diff.patch = "@@ -0,0 +1,1 @@\n+def new_contract(): return True"
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(context_files=["src/new_dependency.py"])),
+        [service_diff, dependency_diff],
+        [],
+        3,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = None
+
+    evidence, artifact = await retrieve_evidence(
+        provider, candidates, VerificationBudgets(), [], diff_files=[service_diff, dependency_diff]
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py", "src/new_dependency.py"],
+    }]}}
+
+    findings, decisions = apply_verification_decisions(
+        candidates, evidence, verification, retrieval_requests=artifact["requests"]
+    )
+
+    dependency_request = next(
+        request for request in artifact["requests"]
+        if request.get("path") == "src/new_dependency.py"
+    )
+    assert dependency_request["status"] == "satisfied_by_changed_patch"
+    assert dependency_request["source"] == "changed_context_patch"
+    assert any(
+        item["source"] == "changed_context_patch"
+        and item["evidence_id"] == dependency_request["evidence_id"]
+        and "new_contract" in item["content"]
+        for item in evidence
+    )
+    assert len(findings) == 1
+    assert decisions[0]["verdict"] == "verified"
+    provider.get_repo_file_content.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hosted_partial_added_patch_cannot_satisfy_required_context():
+    service_diff = _diff_file()
+    dependency_diff = _diff_file(
+        "src/new_dependency.py",
+        base_file="",
+        head_file="",
+        edit_type=EDIT_TYPE.ADDED,
+    )
+    dependency_diff.head_file_is_complete = False
+    # A hosted API can return a self-consistent prefix of an added file.  The
+    # default provenance is intentionally incomplete even though this hunk's
+    # counts look complete.
+    dependency_diff.patch = "@@ -0,0 +1,1 @@\n+visible_prefix_only = True"
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(context_files=["src/new_dependency.py"])),
+        [service_diff, dependency_diff],
+        [],
+        3,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = None
+
+    _, artifact = await retrieve_evidence(
+        provider, candidates, VerificationBudgets(), [], diff_files=[service_diff, dependency_diff]
+    )
+
+    dependency_request = next(
+        request for request in artifact["requests"]
+        if request.get("path") == "src/new_dependency.py"
+    )
+    assert dependency_diff.patch_is_complete is False
+    assert dependency_request["status"] == "missing"
+    provider.get_repo_file_content.assert_called_once_with("src/new_dependency.py", False)
+
+
+@pytest.mark.asyncio
+async def test_truncated_added_context_patch_does_not_satisfy_required_request():
+    service_diff = _diff_file()
+    dependency_diff = _diff_file(
+        "src/new_dependency.py",
+        base_file="",
+        head_file="",
+        edit_type=EDIT_TYPE.ADDED,
+    )
+    dependency_diff.head_file_is_complete = False
+    dependency_diff.patch_is_complete = True
+    dependency_diff.patch = "@@ -0,0 +1,2 @@\n+only_visible_line"
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(context_files=["src/new_dependency.py"])),
+        [service_diff, dependency_diff],
+        [],
+        3,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = None
+
+    _, artifact = await retrieve_evidence(
+        provider, candidates, VerificationBudgets(), [], diff_files=[service_diff, dependency_diff]
+    )
+
+    dependency_request = next(
+        request for request in artifact["requests"]
+        if request.get("path") == "src/new_dependency.py"
+    )
+    assert dependency_request["status"] == "missing"
+    provider.get_repo_file_content.assert_called_once_with("src/new_dependency.py", False)
+
+
+@pytest.mark.asyncio
+async def test_huge_added_context_stops_at_declared_count_before_patch_scan(monkeypatch):
+    service_diff = _diff_file()
+    dependency_diff = _diff_file(
+        "src/generated_dependency.py",
+        base_file="",
+        head_file="",
+        edit_type=EDIT_TYPE.ADDED,
+    )
+    dependency_diff.head_file_is_complete = False
+    dependency_diff.patch_is_complete = True
+    dependency_diff.patch = "@@ -0,0 +1,100000 @@\n" + "\n".join(
+        f"+generated_{line}" for line in range(100000)
+    )
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(context_files=["src/generated_dependency.py"])),
+        [service_diff, dependency_diff],
+        [],
+        3,
+    )
+    original_iter = candidate_verification.iter_git_patch_lines
+    consumed_records = 0
+
+    def counted_iter(patch):
+        nonlocal consumed_records
+        for record in original_iter(patch):
+            if patch == dependency_diff.patch:
+                consumed_records += 1
+            yield record
+
+    monkeypatch.setattr(candidate_verification, "iter_git_patch_lines", counted_iter)
+    _, artifact = await retrieve_evidence(
+        MagicMock(),
+        candidates,
+        VerificationBudgets(max_lines_per_file=2, max_total_lines=3),
+        [],
+        diff_files=[service_diff, dependency_diff],
+    )
+
+    dependency_request = next(
+        request for request in artifact["requests"]
+        if request.get("path") == "src/generated_dependency.py"
+    )
+    assert consumed_records == 1
+    assert dependency_request["status"] == "context_budget_exhausted"
+    assert artifact["budget_exhausted"] is True
 
 
 @pytest.mark.asyncio

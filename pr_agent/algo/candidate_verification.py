@@ -749,6 +749,29 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
         candidate["_trusted_side_line_count"] = trusted_side_line_count
         candidates.append(candidate)
         model_candidate_count += 1
+
+    # A changed location is not itself a root cause: one operation can expose
+    # multiple independently verified defects. Assign a per-run occurrence
+    # within the exact trusted anchor so those findings do not collide. The
+    # occurrence is deliberately independent of rewordable model fields, which
+    # are never part of either identity digest. Stable semantic reconciliation
+    # across arbitrary candidate reordering requires persisted prior-finding
+    # state and belongs to the downstream thread-publication layer.
+    model_candidates_by_anchor = {}
+    for candidate in candidates:
+        anchor_key = (
+            candidate.get("_trusted_lineage_key"),
+            candidate.get("side", "new"),
+            candidate.get("_changed_anchor_shape"),
+            candidate.get("_changed_anchor_ordinal"),
+        )
+        if candidate.get("candidate_type") == "sensitive_path_audit":
+            candidate["_trusted_defect_ordinal"] = 1
+            continue
+        model_candidates_by_anchor.setdefault(anchor_key, []).append(candidate)
+    for anchor_candidates in model_candidates_by_anchor.values():
+        for defect_ordinal, candidate in enumerate(anchor_candidates, start=1):
+            candidate["_trusted_defect_ordinal"] = defect_ordinal
     return candidates, rejected
 
 
@@ -1094,6 +1117,7 @@ def _changed_context_patch_evidence(
     remaining_line_budget: Optional[Callable[[], int]] = None,
     remaining_token_budget: Optional[Callable[[], int]] = None,
     token_counter: Optional[Callable[[str], int]] = None,
+    collection_status: Optional[dict] = None,
 ) -> Iterable[dict]:
     """Yield changed ranges from one patch traversal so retrieval budgets can stop work early."""
     if diff_file is None:
@@ -1102,6 +1126,17 @@ def _changed_context_patch_evidence(
     old_line = None
     new_line = None
     pending = {"new": None, "old": None}
+    added_patch = bool(
+        getattr(diff_file, "edit_type", None) is EDIT_TYPE.ADDED
+        and getattr(diff_file, "patch_is_complete", False)
+    )
+    added_patch_complete = added_patch
+    added_expected_start = 1
+    added_expected_total = 0
+    added_observed_total = 0
+    added_saw_hunk = False
+    if collection_status is not None:
+        collection_status["complete_added_file"] = False
 
     def completed(side: str) -> Optional[dict]:
         current = pending[side]
@@ -1160,6 +1195,27 @@ def _changed_context_patch_evidence(
         line = strip_git_line_ending(record)
         header = RE_HUNK_HEADER.match(line)
         if header:
+            if added_patch:
+                if added_observed_total != added_expected_total:
+                    added_patch_complete = False
+                old_start = int(header.group(1))
+                old_count = int(header.group(2) or 1)
+                next_new_start = int(header.group(3))
+                new_count = int(header.group(4) or 1)
+                if (
+                    old_start != 0
+                    or old_count != 0
+                    or next_new_start != added_expected_start
+                ):
+                    added_patch_complete = False
+                added_saw_hunk = True
+                added_expected_start += new_count
+                added_expected_total += new_count
+                if (
+                    remaining_line_budget is not None
+                    and added_expected_total > remaining_line_budget()
+                ):
+                    raise _ChangedContextCollectionStopped
             next_old_line = int(header.group(1))
             next_new_line = int(header.group(3))
             for side, next_line in (("new", next_new_line), ("old", next_old_line)):
@@ -1173,6 +1229,11 @@ def _changed_context_patch_evidence(
             continue
         if old_line is None or new_line is None or line.startswith("\\ No newline at end of file"):
             continue
+        if added_patch:
+            if line.startswith("+"):
+                added_observed_total += 1
+            else:
+                added_patch_complete = False
         if line.startswith("+"):
             item = append_changed("new", new_line, line[1:])
             if item is not None:
@@ -1195,6 +1256,17 @@ def _changed_context_patch_evidence(
         item = completed(side)
         if item is not None:
             yield item
+    if collection_status is not None:
+        complete_added_file = bool(
+            added_patch_complete
+            and added_saw_hunk
+            and added_observed_total == added_expected_total
+            and added_observed_total > 0
+        )
+        collection_status["complete_added_file"] = complete_added_file
+        collection_status["added_line_count"] = (
+            added_observed_total if complete_added_file else None
+        )
 
 
 def _retrieval_evidence_id(candidate_id: str, path: str, source: str) -> str:
@@ -1225,6 +1297,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
     time_budget_exhausted = False
     changed_evidence_count = 0
     changed_context_head_available = {}
+    changed_context_patch_available = {}
     incomplete_changed_context = set()
     shared_repo_evidence = {}
     diff_by_file = {
@@ -1405,6 +1478,12 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                     incomplete_changed_context.add(context_key)
                 continue
             context_item_count = 0
+            context_collection_status = {}
+            complete_added_patch_evidence_id = _retrieval_evidence_id(
+                candidate_id, context_path, "changed_context_patch"
+            )
+            complete_added_patch_seen = False
+            complete_added_patch_end_line = None
             try:
                 context_items = _changed_context_patch_evidence(
                     context_diff,
@@ -1416,10 +1495,13 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                     remaining_line_budget=lambda path=context_path: remaining_lines(path),
                     remaining_token_budget=lambda: budgets.max_context_tokens - total_tokens,
                     token_counter=count_tokens,
+                    collection_status=context_collection_status,
                 )
                 appended_all = True
                 for context_item in context_items:
                     context_item_count += 1
+                    context_item["evidence_id"] = complete_added_patch_evidence_id
+                    context_item["required_evidence"] = bool(request_spec.get("required"))
                     if not append_evidence(
                         {"candidate_id": candidate_id, **context_item},
                         candidate,
@@ -1427,6 +1509,13 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                     ):
                         appended_all = False
                         break
+                    complete_added_patch_seen = bool(
+                        context_item_count == 1
+                        and context_item.get("side") == "new"
+                        and context_item.get("start_line") == 1
+                    )
+                    if complete_added_patch_seen:
+                        complete_added_patch_end_line = context_item.get("end_line")
             except _ChangedContextCollectionStopped:
                 budget_exhausted = True
                 if time.monotonic() >= deadline:
@@ -1436,6 +1525,15 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 appended_all = append_complete_context_head(
                     candidate, candidate_id, context_path, request_spec, context_diff
                 )
+            elif (
+                appended_all
+                and context_item_count == 1
+                and complete_added_patch_seen
+                and context_collection_status.get("complete_added_file")
+                and complete_added_patch_end_line
+                == context_collection_status.get("added_line_count")
+            ):
+                changed_context_patch_available[context_key] = complete_added_patch_evidence_id
             if not appended_all:
                 incomplete_changed_context.add(context_key)
 
@@ -1478,6 +1576,11 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 request["status"] = "satisfied_by_changed_head"
                 request["source"] = "changed_context_head"
                 request["evidence_id"] = changed_context_head_available[context_key]
+                continue
+            if context_key in changed_context_patch_available:
+                request["status"] = "satisfied_by_changed_patch"
+                request["source"] = "changed_context_patch"
+                request["evidence_id"] = changed_context_patch_available[context_key]
                 continue
             if context_key in incomplete_changed_context:
                 request["status"] = "context_budget_exhausted"
@@ -1705,7 +1808,9 @@ def _candidate_prompt_evidence_gaps(
     missing_required_request_count = sum(
         1 for request in retrieval_requests
         if request.get("required") and (
-            request.get("status") not in {"retrieved", "satisfied_by_changed_head"}
+            request.get("status") not in {
+                "retrieved", "satisfied_by_changed_head", "satisfied_by_changed_patch",
+            }
             or not request.get("evidence_id")
             or request.get("evidence_id") not in visible_evidence_ids
         )
@@ -1784,15 +1889,18 @@ def _verified_finding_identity(candidate: dict) -> Optional[tuple[str, str]]:
     """
     anchor_shape = str(candidate.get("_changed_anchor_shape") or "")
     anchor_ordinal = candidate.get("_changed_anchor_ordinal")
+    defect_ordinal = candidate.get("_trusted_defect_ordinal")
     lineage_key = str(candidate.get("_trusted_lineage_key") or "")
     if (not anchor_shape or not lineage_key
-            or not isinstance(anchor_ordinal, int) or anchor_ordinal < 1):
+            or not isinstance(anchor_ordinal, int) or anchor_ordinal < 1
+            or not isinstance(defect_ordinal, int) or defect_ordinal < 1):
         return None
     root_digest = hashlib.sha256(
         json.dumps({
-            "schema": "verified-root-cause-v1",
+            "schema": "verified-root-cause-v2",
             "changed_anchor_shape": anchor_shape,
             "changed_anchor_ordinal": anchor_ordinal,
+            "trusted_defect_ordinal": defect_ordinal,
         },
                    sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

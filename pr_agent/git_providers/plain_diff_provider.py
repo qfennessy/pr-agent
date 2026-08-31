@@ -135,6 +135,11 @@ class PlainDiffGitProvider(GitProvider):
             reason = "disabled for immutable input" if self.disable_working_tree_enrichment else "no repository root"
             get_logger().info(f"Running in patch-only mode ({reason}).")
         for f in files:
+            # Unlike hosted APIs, the plain-diff provider owns the complete
+            # immutable diff payload supplied for this run.  Downstream code
+            # may use this explicit provenance to reconstruct a complete added
+            # file from patch-only input after validating every hunk.
+            f.patch_is_complete = True
             head = ""
             # A parsed unified diff carries only patch-visible lines.  Keep the
             # completeness marker false until we actually read the current
