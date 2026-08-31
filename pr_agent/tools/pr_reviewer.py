@@ -23,6 +23,7 @@ from pr_agent.algo.candidate_verification import (
     prepare_candidates,
     prompt_evidence_coverage,
     render_verification_payload,
+    retrieval_request_is_complete,
     retrieve_evidence,
     safe_repo_path,
     telemetry_safe_artifact,
@@ -2185,9 +2186,8 @@ class PRReviewer:
                 or sensitive_coverage_incomplete
                 or prompt_evidence_incomplete
                 or rejected_verified_claim
-                or retrieval_artifact["budget_exhausted"]
                 or any(
-                    request["status"] not in {"retrieved", "satisfied_by_changed_head"}
+                    not retrieval_request_is_complete(request)
                     for request in retrieval_artifact["requests"]
                 )
             ) else "complete"

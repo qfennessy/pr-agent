@@ -123,6 +123,21 @@ class VerificationBudgets:
     timeout_seconds: float = 10.0
 
 
+_COMPLETE_RETRIEVAL_REQUEST_STATUSES = frozenset({
+    "retrieved",
+    "satisfied_by_changed_head",
+    "satisfied_by_changed_patch",
+})
+
+
+def retrieval_request_is_complete(request: dict) -> bool:
+    """Return whether a context request is complete for verification status."""
+    return (
+        not bool(request.get("required"))
+        or request.get("status") in _COMPLETE_RETRIEVAL_REQUEST_STATUSES
+    )
+
+
 def telemetry_safe_artifact(artifact: dict) -> dict:
     """Return provider-neutral telemetry without repository or model-generated text."""
     safe = {}
@@ -242,85 +257,64 @@ def safe_repo_path(value) -> Optional[str]:
     return normalized if normalized == value else None
 
 
-def _first_changed_line(patch: str) -> int:
-    new_line = None
-    for record in iter_git_patch_lines(patch or ""):
-        line = strip_git_line_ending(record)
-        header = RE_HUNK_HEADER.match(line)
-        if header:
-            new_line = int(header.group(3))
-            continue
-        if new_line is None or line.startswith("\\ No newline at end of file"):
-            continue
-        if line.startswith("+"):
-            return new_line
-        if not line.startswith("-"):
-            new_line += 1
-    return 1
-
-
-def _consecutive_line_ranges(lines) -> list[tuple[int, int]]:
-    ranges = []
-    for line in lines:
-        if ranges and line == ranges[-1][1] + 1:
-            ranges[-1] = (ranges[-1][0], line)
-        else:
-            ranges.append((line, line))
-    return ranges
-
-
-def _added_line_ranges(patch: str) -> list[tuple[int, int]]:
-    added_lines = []
-    new_line = None
-    for record in iter_git_patch_lines(patch or ""):
-        line = strip_git_line_ending(record)
-        header = RE_HUNK_HEADER.match(line)
-        if header:
-            new_line = int(header.group(3))
-            continue
-        if new_line is None or line.startswith("\\ No newline at end of file"):
-            continue
-        if line.startswith("+"):
-            added_lines.append(new_line)
-        if not line.startswith("-"):
-            new_line += 1
-    return _consecutive_line_ranges(added_lines)
-
-
-def _deleted_line_ranges(patch: str) -> list[tuple[int, int]]:
-    deleted_lines = []
+def _iter_changed_line_ranges(
+    patch: str,
+    side: str,
+) -> Iterable[tuple[int, int]]:
+    """Yield contiguous changed ranges without retaining one integer per line."""
+    if side not in {"new", "old"}:
+        return
     old_line = None
+    new_line = None
+    range_start = None
+    range_end = None
     for record in iter_git_patch_lines(patch or ""):
         line = strip_git_line_ending(record)
         header = RE_HUNK_HEADER.match(line)
         if header:
             old_line = int(header.group(1))
+            new_line = int(header.group(3))
             continue
-        if old_line is None or line.startswith("\\ No newline at end of file"):
+        if old_line is None or new_line is None or line.startswith("\\ No newline at end of file"):
             continue
-        if line.startswith("-"):
-            deleted_lines.append(old_line)
+        changed = line.startswith("+") if side == "new" else line.startswith("-")
+        changed_line = new_line if side == "new" else old_line
+        if changed:
+            if range_end is not None and changed_line == range_end + 1:
+                range_end = changed_line
+            else:
+                if range_start is not None:
+                    yield range_start, range_end
+                range_start = changed_line
+                range_end = changed_line
+        if not line.startswith("-"):
+            new_line += 1
         if not line.startswith("+"):
             old_line += 1
-    return _consecutive_line_ranges(deleted_lines)
+    if range_start is not None:
+        yield range_start, range_end
 
 
-def _first_changed_anchor(patch: str) -> tuple[str, int, list[tuple[int, int]]]:
-    added = _added_line_ranges(patch)
-    if added:
-        return "new", added[0][0], added
-    deleted = _deleted_line_ranges(patch)
-    if deleted:
-        return "old", deleted[0][0], deleted
-    return "new", _first_changed_line(patch), []
+def _changed_range_containing_line(
+    patch: str,
+    side: str,
+    line_number: int,
+) -> list[tuple[int, int]]:
+    """Return only the changed range needed to validate one candidate location."""
+    for start, end in _iter_changed_line_ranges(patch, side):
+        if start <= line_number <= end:
+            return [(start, end)]
+        if start > line_number:
+            break
+    return []
 
 
 def _sensitive_change_anchors(
     patch: str,
 ) -> Iterable[tuple[str, int, int, list[tuple[int, int]]]]:
-    """Return one audit for every visible contiguous changed range on both sides."""
-    for side, ranges in (("new", _added_line_ranges(patch)), ("old", _deleted_line_ranges(patch))):
-        for start, end in ranges:
+    """Yield each visible changed range without constructing an unbounded line list."""
+    for side in ("new", "old"):
+        for start, end in _iter_changed_line_ranges(patch, side):
             yield side, start, end, [(start, end)]
 
 
@@ -541,12 +535,12 @@ def _bounded_sensitive_audit_specs(
         relevant_file = safe_repo_path(getattr(diff_file, "filename", ""))
         old_file = safe_repo_path(getattr(diff_file, "old_filename", ""))
         sensitive_paths = {path for path in (relevant_file, old_file) if path}
-        matched_glob_indexes = [
+        matched_glob_index = next((
             index
             for index, pattern in enumerate(normalized_globs)
             if any(fnmatch.fnmatch(path, pattern) for path in sensitive_paths)
-        ]
-        if not relevant_file or not matched_glob_indexes:
+        ), None)
+        if not relevant_file or matched_glob_index is None:
             continue
         patch = getattr(diff_file, "patch", "")
         patch_digest = hashlib.sha256(str(patch or "").encode("utf-8")).hexdigest()
@@ -560,7 +554,7 @@ def _bounded_sensitive_audit_specs(
             # All remaining tie-breakers come from repository evidence, not
             # provider iteration order.
             priority = (
-                min(matched_glob_indexes),
+                matched_glob_index,
                 0 if side == "old" else 1,
                 lineage_path.casefold(),
                 lineage_path,
@@ -713,7 +707,15 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             value.strip() for value in context_symbols
         ] if context_symbols_valid else []
         diff_file = diff_by_file.get(candidate["relevant_file"])
-        changed_line_ranges = _added_line_ranges(getattr(diff_file, "patch", "")) if diff_file else []
+        changed_line_ranges = (
+            _changed_range_containing_line(
+                getattr(diff_file, "patch", ""),
+                "new",
+                start_line,
+            )
+            if diff_file and isinstance(start_line, int) and not isinstance(start_line, bool)
+            else []
+        )
         trusted_side_line_count = _trusted_side_line_count(diff_file, "new")
         if (proposed_side != "new" or not isinstance(start_line, int) or
                 isinstance(start_line, bool) or not isinstance(end_line, int) or
@@ -1807,12 +1809,15 @@ def _candidate_prompt_evidence_gaps(
     }
     missing_required_request_count = sum(
         1 for request in retrieval_requests
-        if request.get("required") and (
-            request.get("status") not in {
-                "retrieved", "satisfied_by_changed_head", "satisfied_by_changed_patch",
-            }
-            or not request.get("evidence_id")
-            or request.get("evidence_id") not in visible_evidence_ids
+        if (
+            not retrieval_request_is_complete(request)
+            or (
+                request.get("required")
+                and (
+                    not request.get("evidence_id")
+                    or request.get("evidence_id") not in visible_evidence_ids
+                )
+            )
         )
     )
     candidate_side = candidate.get("side", "new")

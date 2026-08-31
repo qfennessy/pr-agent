@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import tomllib
+import tracemalloc
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -339,6 +340,32 @@ def test_sensitive_audit_budget_stays_bounded_across_many_files_and_hunks():
 
     assert outputs[0] == outputs[1]
     assert all(side == "old" for _, side, _ in outputs[0])
+
+
+def test_sensitive_bulk_added_range_does_not_allocate_one_integer_per_line():
+    diff_file = _diff_file("auth/generated_policy.py", base_file="", head_file="")
+    diff_file.base_file_is_complete = False
+    diff_file.head_file_is_complete = False
+    diff_file.patch = "@@ -0,0 +1,100000 @@\n" + "\n".join(
+        "+x" for _ in range(100_000)
+    )
+
+    tracemalloc.start()
+    try:
+        selected, total_count = candidate_verification._bounded_sensitive_audit_specs(
+            [diff_file],
+            ["auth/**"],
+            1,
+        )
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert total_count == 1
+    assert [(item[6], item[7]) for item in selected] == [(1, 100_000)]
+    # The patch itself is constructed before tracing. The range scan should
+    # retain O(number of ranges), not 100,000 Python line-number integers.
+    assert peak_bytes < 2_000_000
 
 
 def test_sensitive_audit_budget_bounds_expensive_shape_work_for_generated_diffs():
@@ -4233,6 +4260,89 @@ async def test_explicit_rejection_for_every_candidate_is_a_valid_clean_verificat
     assert reviewer.candidate_verification_artifact["status"] == "complete"
     assert reviewer.candidate_verification_artifact["publication_safe"] is True
     assert reviewer.candidate_verification_artifact["verified_count"] == 0
+    assert reviewer._candidate_verification_blocks_publication() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("required", "status", "include_context_evidence", "budget_exhausted"),
+    [
+        (False, "missing", False, False),
+        (False, "file_budget_exhausted", False, True),
+        (False, "context_budget_exhausted", False, True),
+        (False, "time_budget_exhausted", False, True),
+        (False, "fetch_capacity_exhausted", False, True),
+        (False, "fetch_failed", False, False),
+        (True, "satisfied_by_changed_patch", True, False),
+    ],
+)
+async def test_complete_request_statuses_do_not_turn_clean_rejection_partial(
+    required,
+    status,
+    include_context_evidence,
+    budget_exhausted,
+):
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._parse_review_prediction = MagicMock(return_value=_review_data(
+        _candidate(context_files=["src/new_dependency.py"] if required else [])
+    ))
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        _rejected_verification_response("candidate-1"),
+        None,
+    ))
+    evidence = [_changed_evidence(content="one")]
+    request = {
+        "candidate_id": "candidate-1",
+        "path": "src/new_dependency.py" if required else "src/optional_hint.py",
+        "required": required,
+        "status": status,
+    }
+    if include_context_evidence:
+        request.update({
+            "source": "changed_context_patch",
+            "evidence_id": "sha256:complete-added-context",
+        })
+        evidence.append({
+            "candidate_id": "candidate-1",
+            "source": "changed_context_patch",
+            "path": "src/new_dependency.py",
+            "content": "def new_contract(): return True",
+            "start_line": 1,
+            "end_line": 1,
+            "anchor_start_line": 1,
+            "anchor_end_line": 1,
+            "evidence_id": "sha256:complete-added-context",
+            "required_evidence": True,
+        })
+    retrieval_artifact = {
+        "requests": [request],
+        "retrieved_evidence": evidence,
+        "budget_exhausted": budget_exhausted,
+        "files_read": 0,
+        "changed_evidence_count": 1,
+        "lines_retrieved": len(evidence),
+        "context_tokens": 10,
+        "duration_seconds": 0.001,
+    }
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+        patch(
+            "pr_agent.tools.pr_reviewer.retrieve_evidence",
+            new=AsyncMock(return_value=(evidence, retrieval_artifact)),
+        ),
+    ):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "complete"
+    assert artifact["publication_safe"] is True
+    assert artifact["prompt_evidence_coverage"]["status"] == "complete"
+    assert artifact["verified_count"] == 0
     assert reviewer._candidate_verification_blocks_publication() is False
 
 
