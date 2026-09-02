@@ -104,8 +104,9 @@ unchanged, including bot-resolved recurrence history, while holding that lock th
 selects the oldest identical safe Bot-owned copy and resolves only duplicate copies with no replies; disagreement or unsafe
 ownership fails closed for a fresh inventory instead of deleting discussion. Updates additionally require the complete
 planned same-finding set to remain unchanged, so an older update plan cannot modify an obsolete thread between replacement
-creation and cleanup. A bot-resolved historical thread is also preserved when it gains a reply or first appears after
-recurrence was planned.
+creation and cleanup. Multi-copy `mark_fixed` plans project each preceding update and Bot resolution into the inventory
+expected by the next update. A bot-resolved historical thread is also preserved when it gains a reply or first appears
+after recurrence was planned.
 
 The foundation also models invalid or rejected inline locations as de-duplicated summary fallbacks. It returns those
 fallback entries to its caller rather than publishing them itself. Runtime publication remains disconnected until

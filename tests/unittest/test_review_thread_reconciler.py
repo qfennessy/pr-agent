@@ -1023,6 +1023,32 @@ def test_mark_fixed_policy_is_visible_then_resolves_with_dependency():
     assert plan.actions[1].depends_on_action_id == plan.actions[0].action_id
 
 
+def test_mark_fixed_projects_prior_copy_mutations_into_later_update_inventory():
+    identity = _identity()
+    first = _snapshot(identity, thread_id="thread-1")
+    second = _snapshot(identity, thread_id="thread-2", database_id=20)
+
+    plan = plan_review_thread_actions(
+        (),
+        (first, second),
+        "head-1",
+        obsolete_policy="mark_fixed",
+        authoritative_absence=True,
+    )
+
+    assert [action.kind for action in plan.actions] == [
+        ReviewThreadActionKind.UPDATE,
+        ReviewThreadActionKind.RESOLVE,
+        ReviewThreadActionKind.UPDATE,
+        ReviewThreadActionKind.RESOLVE,
+    ]
+    projected_by_id = {thread.thread_id: thread for thread in plan.actions[2].expected_threads}
+    assert projected_by_id["thread-1"].is_resolved is True
+    assert projected_by_id["thread-1"].resolved_by_viewer_bot is True
+    assert FIXED_THREAD_NOTICE in projected_by_id["thread-1"].root_comment.body
+    assert projected_by_id["thread-2"] == second
+
+
 def test_duplicate_desired_identity_is_rejected():
     identity = _identity()
     desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 10), "wording")

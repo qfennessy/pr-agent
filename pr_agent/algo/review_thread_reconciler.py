@@ -609,6 +609,16 @@ def _thread_with_root_body(thread: ReviewThreadSnapshot, body: str) -> ReviewThr
     return replace(thread, comments=(replace(root, body=body), *thread.comments[1:]))
 
 
+def _thread_after_viewer_resolution(thread: ReviewThreadSnapshot) -> ReviewThreadSnapshot:
+    """Project the inventory expected after the authenticated Bot resolves a thread."""
+    return replace(
+        thread,
+        is_resolved=True,
+        resolved_by_viewer_bot=True,
+        resolved_by_other_actor=False,
+    )
+
+
 def plan_review_thread_actions(
     desired_threads: tuple[DesiredReviewThread, ...],
     existing_threads: tuple[ReviewThreadSnapshot, ...],
@@ -831,10 +841,16 @@ def plan_review_thread_actions(
     for finding_id, matches in existing_by_id.items():
         if finding_id in desired_by_id:
             continue
+        projected_by_id = {thread.thread_id: thread for thread in matches}
         for thread in matches:
-            root = thread.root_comment
+            projected_thread = projected_by_id[thread.thread_id]
+            projected_set = tuple(projected_by_id[item.thread_id] for item in matches)
+            root = projected_thread.root_comment
             safe_to_mutate = (
-                thread.bot_owned and not thread.has_replies and not thread.is_resolved and thread.viewer_can_resolve
+                projected_thread.bot_owned
+                and not projected_thread.has_replies
+                and not projected_thread.is_resolved
+                and projected_thread.viewer_can_resolve
             )
             if obsolete_policy != "keep" and not authoritative_absence:
                 add(
@@ -850,8 +866,9 @@ def plan_review_thread_actions(
                     "finding_no_longer_present",
                     thread_id=thread.thread_id,
                     root_comment_id=root.database_id if root else None,
-                    expected_thread=thread,
+                    expected_thread=projected_thread,
                 )
+                projected_by_id[thread.thread_id] = _thread_after_viewer_resolution(projected_thread)
             elif obsolete_policy == "mark_fixed" and safe_to_mutate and root and root.database_id:
                 marked_body = body_with_fixed_thread_notice(root.body)
                 if marked_body == root.body.rstrip():
@@ -861,9 +878,11 @@ def plan_review_thread_actions(
                         "visible_fixed_state_already_present",
                         thread_id=thread.thread_id,
                         root_comment_id=root.database_id,
-                        expected_thread=thread,
+                        expected_thread=projected_thread,
                     )
+                    projected_by_id[thread.thread_id] = _thread_after_viewer_resolution(projected_thread)
                 else:
+                    updated_thread = _thread_with_root_body(projected_thread, marked_body)
                     update = add(
                         ReviewThreadActionKind.UPDATE,
                         finding_id,
@@ -871,8 +890,8 @@ def plan_review_thread_actions(
                         thread_id=thread.thread_id,
                         root_comment_id=root.database_id,
                         body=marked_body,
-                        expected_thread=thread,
-                        expected_threads=tuple(matches),
+                        expected_thread=projected_thread,
+                        expected_threads=projected_set,
                     )
                     add(
                         ReviewThreadActionKind.RESOLVE,
@@ -881,8 +900,9 @@ def plan_review_thread_actions(
                         thread_id=thread.thread_id,
                         root_comment_id=root.database_id,
                         depends_on_action_id=update.action_id,
-                        expected_thread=_thread_with_root_body(thread, marked_body),
+                        expected_thread=updated_thread,
                     )
+                    projected_by_id[thread.thread_id] = _thread_after_viewer_resolution(updated_thread)
             else:
                 add(ReviewThreadActionKind.SKIP, finding_id, "obsolete_thread_preserved", thread_id=thread.thread_id)
 
