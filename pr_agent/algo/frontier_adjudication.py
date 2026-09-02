@@ -938,6 +938,19 @@ async def run_frontier_adjudication(
         )
         return _unavailable(request, FrontierState.STALE, "stale_snapshot")
     if getattr(ai_handler, "supports_frontier_adjudication_telemetry", False) is not True:
+        record_adjudication_result(
+            finding_id,
+            provider=None,
+            model_revision=None,
+            model_attempts_configured=config.route.model_retries,
+            provider_retries_configured=config.route.provider_retries,
+            prompt_version=config.prompt_version,
+            input_schema_version=config.input_schema_version,
+            schema_version=config.output_schema_version,
+            state=FrontierState.UNAVAILABLE.value,
+            latency_seconds=time.monotonic() - started_at,
+            failure_reason="handler_telemetry_unsupported",
+        )
         return _unavailable(
             request,
             FrontierState.UNAVAILABLE,

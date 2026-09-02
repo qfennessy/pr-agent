@@ -226,6 +226,14 @@ async def test_unsupported_handler_fails_before_provider_call():
     assert result.state is FrontierState.UNAVAILABLE
     assert result.failure_reason == "handler_telemetry_unsupported"
     assert result.to_telemetry_dict()["stable_finding_id"] == "sha256:finding"
+    assert result.telemetry["state"] == "unavailable"
+    assert result.telemetry["failure_reason"] == "handler_telemetry_unsupported"
+    assert result.telemetry["prompt_version"] == "frontier-adjudication-prompt-v1"
+    assert result.telemetry["input_schema_version"] == FRONTIER_INPUT_SCHEMA_VERSION
+    assert result.telemetry["schema_version"] == FRONTIER_OUTPUT_SCHEMA_VERSION
+    assert result.telemetry["latency_seconds"] >= 0
+    assert result.telemetry["retries"]["model"]["configured_attempts_per_model"] == 1
+    assert result.telemetry["retries"]["provider"]["configured_retries_per_model_attempt"] == 0
     assert handler.calls == []
 
 
