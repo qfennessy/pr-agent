@@ -48,7 +48,10 @@ five artifact types separate:
   thresholds, and minimum support.
 
 Unknown fields are rejected when artifacts are loaded. Answer-only field names are also
-rejected recursively inside model-visible metadata. A manifest cannot reuse snapshot
+rejected recursively inside model-visible metadata. Hash metadata must be a full SHA-256
+identity, string metadata is a bounded lowercase identifier, and stage and change-size values
+use closed enums/ranges. Before execution, the runner independently derives snapshot-backed
+metadata and rejects a mismatch. A manifest cannot reuse snapshot
 identities, mix one lineage across cohorts, or accept a supplied content id that does not
 match its canonical JSON.
 
@@ -126,14 +129,18 @@ runner. It returns `denied` unless all of these facts are true at the same time:
 
 - evaluation and paid execution were explicitly enabled;
 - publication is still disabled;
-- projected cost is complete, not partial or unavailable, and is no greater than a
-  positive cap supplied for this exact manifest;
+- every model-backed case/arm pair has a positive projected per-attempt cost and a bounded
+  maximum attempt count whose full reservation fits a positive cap for this exact manifest;
 - every enabled model arm pins a model revision; and
 - the process has a credential for every named provider.
 
 The request records only credential presence booleans. It never serializes an environment
-variable name, token, key, credential value, or provider request identifier. The default
-cost cap is zero and therefore cannot authorize spending. A caller must invoke
+variable name, token, key, credential value, or provider request identifier. The request is
+immutably bound beside the manifest. Before every adapter call, the runner reloads retained
+attempts, requires complete cost telemetry, and checks cumulative spend plus all remaining
+reserved attempts against the cap. A final failed attempt is terminalized at its immutable
+limit, so restarting cannot create unbounded retries. The default cost cap is zero and
+therefore cannot authorize spending. A caller must invoke
 `PaidExecutionDecision.require_authorized()` immediately before entering production
 orchestration; planning alone is not authorization.
 
@@ -160,6 +167,10 @@ identity hash, and each priced-cost model key against the same frozen arm.
 code calls only bounded `put_nowait`; a daemon worker appends source-free NDJSON in the
 background. A full queue or write failure drops telemetry rather than delaying or failing
 a save. Explicit shutdown may flush the queue, but the save path never waits for disk.
+Each accepted entry is wrapped by the writer with a contiguous sequence, UTC ingestion time,
+and writer-owned monotonic developer-time basis. Reports derive duration and cost-hour evidence
+only from parsed, identity-checked journal records; caller-supplied timestamps or elapsed-time
+wrappers cannot satisfy a gate.
 
 The schema allowlists snapshot and lineage hashes, event and configuration versions,
 selected depth and machine reason codes, model/provider identities, hashed finding
@@ -193,7 +204,7 @@ failed attempt. The scorecard reports:
 - tokens, retries, dollar totals, cost per developer-hour, and cost per verified finding;
 - unavailable-coverage, failed/missing-case, and failed-attempt rates; and
 - matched per-snapshot quality, interruption, structured-output, latency, token, and cost
-  deltas with a 95% paired interval and exact support.
+  deltas with a two-sided 95% paired Student-t interval and exact support.
 
 Lineage timing is explicit evaluation metadata and never model-visible. A truth finding may
 name an exact earliest checkpoint and a later withdrawal checkpoint. Descendant checkpoints
@@ -223,14 +234,17 @@ The canonical rules are:
 
 | Gate | Rules that must have complete evidence |
 | --- | --- |
-| Offline replay | Structured-output rate at least 99.5%, complete immutable replay inventory, an explicit no-holdout-leakage result, and a recorded bounded-retry limit |
+| Offline replay | Structured-output rate at least 99.5%, complete immutable replay inventory, an independently pinned no-holdout-leakage artifact bound to the exact model-visible holdout inventory, and retry limits derived from the immutable paid request |
 | Live shadow | At least seven real elapsed days with both file-save and worktree events, a raw shadow-artifact inventory, and complete p95-latency and cost-per-developer-hour measurements within explicitly accepted positive budgets |
 | Opt-in pair review | Verified precision at least 80%, no negative high-severity recall delta on the temporal cohort, and complete replay artifacts |
 | Default pair review | Actionable precision at least 90% derived from the exact accepted inventory of at least 100 settled candidates, observed false interruptions no greater than an explicitly accepted non-negative threshold, and complete shadow artifacts |
 | PR publication | A strictly positive lower 95% bound for the cascade's quality advantage across all 18 cases in the locked Cocos Story holdout, complete holdout cost within an explicitly accepted positive ceiling, and complete replay artifacts |
 
 Create `PilotRolloutBudgets` only from thresholds a maintainer has actually accepted.
-`PilotRolloutEvidence` carries only separately bound replay declarations; it cannot accept shadow
+`PilotRolloutEvidence` carries only separately bound replay declarations and a content-bound
+leakage-check artifact; a bare leakage boolean cannot satisfy a gate. The checker revision and
+exact model-visible holdout inventory are hashed, and a separate maintainer change must pin the
+check id before it counts. Evidence cannot accept shadow
 timestamps, counts, metrics, artifact hashes, or a settled-candidate precision claim. The report
 derives settled-candidate precision, temporal high-severity
 recall, frozen-holdout paired recall uncertainty, and holdout cost directly from accepted records,
@@ -257,7 +271,8 @@ schema, corpus, assignment, cohort count, or holdout hash is invalid input. Eigh
 19 cases, or a one-case point estimate cannot be represented as a passing confidence bound.
 
 Live shadow evidence follows the same two-step boundary. `ShadowJournalRecord` binds one actual
-`ShadowJournalEntry` content id to its observed time in UTC and its measured developer-time
+`ShadowJournalEntry` content id to the writer-stamped ingestion time in UTC, contiguous sequence,
+and writer-owned monotonic developer-time
 denominator. `build_shadow_pilot_acceptance()` verifies the journal entries use the exact manifest
 policy, configuration, target arm, aggregate model identity, required stage plan, primary/fallback
 route, deployment identity, prompt/configuration/schema versions, cost model identities, and journal
@@ -266,9 +281,9 @@ measurements, preserves the records' observed order, and emits the complete sour
 inventory and journal hash. Generation alone cannot pass a gate; a maintainer must independently pin
 its content id as `CANONICAL_SHADOW_PILOT_ACCEPTANCE_ID`.
 
-Report construction then matches every accepted record id and entry id in order. Truncated, extra,
+Report construction then matches every parsed accepted record id and entry id in order. Truncated, extra,
 substituted, duplicated, or reordered journal records fail validation. Duration is recomputed from
-the first and last UTC observations, p95 latency from every entry's recorded latency, event counts
+the first and last UTC ingestion records, p95 latency from every entry's recorded latency, event counts
 from the recorded event enum, and cost per developer-hour from recorded costs and accepted developer
 elapsed denominators. Missing, partial, or unpriced entries remain partial or unavailable. The report
 contains only the accepted journal and record hashes, UTC span, derived counts, and derived metrics;

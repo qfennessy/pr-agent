@@ -19,7 +19,8 @@ from pr_agent.algo.checkpoint_evaluation import (CheckpointCase, EvaluationArm,
                                                  NumericMeasurement,
                                                  deployment_identity_hash)
 from pr_agent.algo.checkpoint_evaluation_execution import (
-    EvaluationArtifactStore, PaidExecutionRequest, evaluate_paid_execution)
+    EvaluationArtifactStore, PaidExecutionRequest, PaidPlanItemBudget,
+    evaluate_paid_execution)
 from pr_agent.algo.checkpoint_evaluation_runner import (
     ModelTelemetryShape, ProductionArmBinding, ProductionArmResult,
     ProductionDependencyUnavailable, ProductionEvaluationRunner,
@@ -34,15 +35,22 @@ def _hash(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
 
 
-def _write_snapshot(tmp_path, name: str = "snapshot") -> tuple[ReviewSnapshot, object, str]:
+def _write_snapshot(
+    tmp_path,
+    name: str = "snapshot",
+    *,
+    parent_snapshot_id=None,
+    changed_path="src/example.py",
+) -> tuple[ReviewSnapshot, object, str]:
     snapshot = ReviewSnapshot(
         event=ReviewEvent.FILE_SAVE,
         repository_root=str(tmp_path / "source-repository"),
         base_revision="base-revision",
-        changed_paths=("src/example.py",),
+        changed_paths=(changed_path,),
         diff="diff --git a/src/example.py b/src/example.py\n+value = 1\n",
         policy_version="policy-v1",
         created_at="2026-08-30T12:00:00Z",
+        parent_snapshot_id=parent_snapshot_id,
     )
     payload = (json.dumps(snapshot.to_dict(), allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
     path = tmp_path / f"{name}.json"
@@ -107,10 +115,16 @@ def _manifest(snapshot: ReviewSnapshot, artifact_hash: str, *, arms=None) -> Eva
 
 
 def _paid_authorization(manifest: EvaluationManifest):
+    budgets = tuple(
+        PaidPlanItemBudget(case.case_id, arm.arm_id, 0.02, 2)
+        for case in manifest.cases
+        for arm in manifest.arms
+        if arm.enabled and arm.kind is not EvaluationArmKind.DETERMINISTIC
+    )
     request = PaidExecutionRequest(
         manifest_id=manifest.manifest_id,
         cost_cap_usd=2.0,
-        projected_cost_usd=NumericMeasurement(MeasurementStatus.COMPLETE, 1.0),
+        plan_item_budgets=budgets,
         credential_present_by_provider={"provider-v1": True},
     )
     decision = evaluate_paid_execution(
@@ -322,6 +336,75 @@ async def test_snapshot_artifact_hash_mismatch_stops_before_adapter_or_store_cal
     assert store.calls == []
 
 
+def test_snapshot_parent_lineage_must_match_the_manifest_parent(tmp_path):
+    parent, parent_path, parent_hash = _write_snapshot(tmp_path, "parent", changed_path="src/parent.py")
+    child, child_path, child_hash = _write_snapshot(
+        tmp_path,
+        "child",
+        parent_snapshot_id=None,
+        changed_path="src/child.py",
+    )
+    parent_case = CheckpointCase(
+        case_id="parent",
+        snapshot_id=parent.snapshot_id,
+        snapshot_artifact_hash=parent_hash,
+        event=parent.event,
+        cohort=EvaluationCohort.HOLDOUT,
+    )
+    child_case = CheckpointCase(
+        case_id="child",
+        snapshot_id=child.snapshot_id,
+        snapshot_artifact_hash=child_hash,
+        event=child.event,
+        cohort=EvaluationCohort.HOLDOUT,
+        parent_case_id=parent_case.case_id,
+        lineage_elapsed_seconds=1,
+    )
+    manifest = EvaluationManifest(
+        name="lineage-replay",
+        corpus_hash=_hash("corpus"),
+        policy_hash=_hash("policy"),
+        configuration_hash=_hash("configuration"),
+        cases=(parent_case, child_case),
+        arms=tuple(_arm(kind) for kind in EvaluationArmKind),
+    )
+    request, decision = _paid_authorization(manifest)
+    runner = ProductionEvaluationRunner(
+        manifest,
+        snapshot_paths={"parent": parent_path, "child": child_path},
+        bindings=_bindings(manifest),
+        artifact_store=EvaluationArtifactStore(tmp_path / "lineage-artifacts"),
+        paid_request=request,
+        paid_decision=decision,
+        evaluation_enabled=True,
+        allow_paid_execution=True,
+        publish_output=False,
+    )
+
+    with pytest.raises(EvaluationValidationError, match="does not match its manifest parent"):
+        runner.preflight()
+
+
+def test_model_visible_hash_metadata_must_match_the_loaded_snapshot(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    manifest = replace(
+        manifest,
+        cases=(replace(manifest.cases[0], model_visible_metadata={"task_intent_hash": _hash("forged")}),),
+    )
+    request, decision = _paid_authorization(manifest)
+
+    with pytest.raises(EvaluationValidationError, match="task_intent_hash does not match"):
+        _runner(
+            manifest,
+            path,
+            _bindings(manifest),
+            EvaluationArtifactStore(tmp_path / "forged-metadata"),
+            request,
+            decision,
+        ).preflight()
+
+
 def test_binding_rejects_wrong_model_identity_and_telemetry_shape(tmp_path):
     snapshot, path, artifact_hash = _write_snapshot(tmp_path)
     manifest = _manifest(snapshot, artifact_hash)
@@ -495,16 +578,11 @@ async def test_missing_specialist_usage_remains_unavailable_in_stage_and_aggrega
 
         return adapter
 
-    result = await _runner(
-        manifest,
-        path,
-        _bindings(manifest, factory),
-        EvaluationArtifactStore(tmp_path / "missing-stage-telemetry"),
-        request,
-        decision,
-    ).run()
+    store = EvaluationArtifactStore(tmp_path / "missing-stage-telemetry")
+    with pytest.raises(EvaluationValidationError, match="complete cost telemetry"):
+        await _runner(manifest, path, _bindings(manifest, factory), store, request, decision).run()
 
-    record = next(item for item in result.records if item.arm_id == "arm-specialists")
+    record = next(item for item in store.load_records(manifest) if item.arm_id == "arm-specialists")
     stage = record.stage_runs[0]
     assert stage.tokens == NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
     assert stage.cost_usd == NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
@@ -781,6 +859,106 @@ async def test_nonterminal_failure_is_retained_and_only_that_pair_resumes(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_paid_failure_becomes_terminal_at_its_immutable_attempt_limit(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+    store = EvaluationArtifactStore(tmp_path / "paid-attempt-limit")
+    calls = []
+
+    def factory(arm):
+        async def adapter(loaded_snapshot, _context):
+            calls.append(arm.kind)
+            if arm.kind is EvaluationArmKind.GENERAL_REVIEW:
+                attempt = sum(item is EvaluationArmKind.GENERAL_REVIEW for item in calls)
+                return failed_production_arm_result(
+                    loaded_snapshot,
+                    state=EvaluationRunState.PROVIDER_FAILURE,
+                    reason_code="provider_unavailable",
+                    latency_seconds=NumericMeasurement(MeasurementStatus.COMPLETE, 0.1),
+                    retry_count=attempt,
+                    run_details=RunDetails(
+                        model_used=arm.model_id,
+                        prompt_tokens=1,
+                        completion_tokens=1,
+                        total_tokens=2,
+                        num_ai_calls=1,
+                        total_cost_usd=Decimal("0.01"),
+                        known_cost_call_count=1,
+                    ),
+                    model_identity=arm.model_identities()[0],
+                )
+            return _success(arm, loaded_snapshot)
+
+        return adapter
+
+    runner = _runner(manifest, path, _bindings(manifest, factory), store, request, decision)
+    await runner.run()
+    await runner.run()
+    third = await runner.run()
+
+    attempts = [
+        record for record in store.load_records(manifest)
+        if record.arm_id == "arm-general_review"
+    ]
+    assert [record.attempt for record in attempts] == [1, 2]
+    assert [record.terminal for record in attempts] == [False, True]
+    assert third.records == ()
+    assert sum(item is EvaluationArmKind.GENERAL_REVIEW for item in calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_paid_capacity_rechecks_actual_cumulative_spend_before_each_model_call(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    budgets = tuple(
+        PaidPlanItemBudget("case-one", arm.arm_id, 0.02, 2)
+        for arm in manifest.arms
+        if arm.kind is not EvaluationArmKind.DETERMINISTIC
+    )
+    request = PaidExecutionRequest(
+        manifest_id=manifest.manifest_id,
+        cost_cap_usd=0.16,
+        plan_item_budgets=budgets,
+        credential_present_by_provider={"provider-v1": True},
+    )
+    decision = evaluate_paid_execution(
+        manifest,
+        request,
+        evaluation_enabled=True,
+        allow_paid_execution=True,
+        publish_output=False,
+    )
+    decision.require_authorized()
+    calls = []
+
+    def factory(arm):
+        async def adapter(loaded_snapshot, _context):
+            calls.append(arm.kind)
+            if arm.kind is EvaluationArmKind.FULL_CASCADE:
+                details = RunDetails()
+                details.specialist_runs["change_classification"] = _specialist_run(
+                    arm,
+                    total_cost_usd=Decimal("0.10"),
+                    model_costs_usd={arm.model_id: Decimal("0.10")},
+                )
+                return replace(_success(arm, loaded_snapshot, details=False), run_details=details)
+            return _success(arm, loaded_snapshot)
+
+        return adapter
+
+    store = EvaluationArtifactStore(tmp_path / "cumulative-cap")
+    with pytest.raises(EvaluationValidationError, match="cumulative spend plus remaining projected work"):
+        await _runner(manifest, path, _bindings(manifest, factory), store, request, decision).run()
+
+    assert calls == [EvaluationArmKind.DETERMINISTIC, EvaluationArmKind.FULL_CASCADE]
+    assert {record.arm_id for record in store.load_records(manifest)} == {
+        "arm-deterministic",
+        "arm-full_cascade",
+    }
+
+
+@pytest.mark.asyncio
 async def test_missing_token_and_cost_telemetry_never_becomes_zero(tmp_path):
     snapshot, path, artifact_hash = _write_snapshot(tmp_path)
     manifest = _manifest(snapshot, artifact_hash)
@@ -798,15 +976,10 @@ async def test_missing_token_and_cost_telemetry_never_becomes_zero(tmp_path):
 
         return adapter
 
-    result = await _runner(
-        manifest,
-        path,
-        _bindings(manifest, factory),
-        EvaluationArtifactStore(tmp_path / "telemetry"),
-        request,
-        decision,
-    ).run()
-    general = next(record for record in result.records if record.arm_id == "arm-general_review")
+    store = EvaluationArtifactStore(tmp_path / "telemetry")
+    with pytest.raises(EvaluationValidationError, match="complete cost telemetry"):
+        await _runner(manifest, path, _bindings(manifest, factory), store, request, decision).run()
+    general = next(record for record in store.load_records(manifest) if record.arm_id == "arm-general_review")
     assert general.tokens.status is MeasurementStatus.UNAVAILABLE
     assert general.tokens.value is None
     assert general.cost_usd.status is MeasurementStatus.UNAVAILABLE
@@ -860,15 +1033,10 @@ async def test_failed_model_arm_requires_explicit_identity_and_preserves_unavail
 
         return adapter
 
-    result = await _runner(
-        manifest,
-        path,
-        _bindings(manifest, explicit_identity_factory),
-        EvaluationArtifactStore(tmp_path / "explicit-failure-model"),
-        request,
-        decision,
-    ).run()
-    failed = next(record for record in result.records if record.arm_id == "arm-general_review")
+    store = EvaluationArtifactStore(tmp_path / "explicit-failure-model")
+    with pytest.raises(EvaluationValidationError, match="complete cost telemetry"):
+        await _runner(manifest, path, _bindings(manifest, explicit_identity_factory), store, request, decision).run()
+    failed = next(record for record in store.load_records(manifest) if record.arm_id == "arm-general_review")
     general_arm = next(arm for arm in manifest.arms if arm.kind is EvaluationArmKind.GENERAL_REVIEW)
     assert failed.state is EvaluationRunState.PROVIDER_FAILURE
     assert failed.failure_reason_code == "provider_unavailable"

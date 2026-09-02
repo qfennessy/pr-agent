@@ -28,8 +28,9 @@ from pr_agent.algo.checkpoint_evaluation import (CheckpointCase, EvaluationArm,
                                                  EvaluationRunState,
                                                  EvaluationStagePlan,
                                                  EvaluationValidationError,
+                                                 MeasurementStatus,
                                                  NumericMeasurement,
-                                                 ObservedFinding)
+                                                 ObservedFinding, content_hash)
 from pr_agent.algo.checkpoint_evaluation_execution import (
     EvaluationArtifactStore, PaidExecutionDecision, PaidExecutionRequest,
     evaluate_paid_execution)
@@ -163,8 +164,6 @@ class ProductionArmResult:
                 raise EvaluationValidationError("production failure_state is not an adapter failure")
             if self.snapshot_result.state is not ReviewResultState.COVERAGE_UNAVAILABLE:
                 raise EvaluationValidationError("adapter failures require coverage_unavailable snapshot state")
-            if self.terminal:
-                raise EvaluationValidationError("adapter failures must remain resumable")
         if not isinstance(self.stage_latencies_seconds, Mapping) or any(
             not isinstance(name, str) or not name.strip() or not isinstance(measurement, NumericMeasurement)
             for name, measurement in self.stage_latencies_seconds.items()
@@ -278,6 +277,7 @@ class ProductionEvaluationRunner:
             publish_output=self.publish_output,
         )
         snapshots = _load_all_snapshots(self.manifest, self.snapshot_paths)
+        self.artifact_store.bind_paid_request(self.manifest, self.paid_request)
         return ProductionEvaluationPreflight(
             manifest_id=self.manifest.manifest_id,
             snapshots_by_case_id=snapshots,
@@ -312,6 +312,27 @@ class ProductionEvaluationRunner:
             adapter = binding.adapter
             if adapter is None:  # guarded by preflight; keep the paid boundary explicit
                 raise ProductionDependencyUnavailable(f"{binding.kind.value} production adapter is unavailable")
+            paid_budget = next(
+                (
+                    budget
+                    for budget in self.paid_request.plan_item_budgets
+                    if budget.case_id == case.case_id and budget.arm_id == arm.arm_id
+                ),
+                None,
+            )
+            if arm.kind is not EvaluationArmKind.DETERMINISTIC and paid_budget is None:
+                raise EvaluationValidationError(f"pair {case.case_id}/{arm.arm_id} has no immutable paid budget")
+            max_attempts = paid_budget.max_attempts if paid_budget is not None else None
+            if max_attempts is not None and resume_item.next_attempt > max_attempts:
+                raise EvaluationValidationError(
+                    f"pair {case.case_id}/{arm.arm_id} exhausted its immutable attempt limit"
+                )
+            if arm.kind is not EvaluationArmKind.DETERMINISTIC:
+                _require_remaining_paid_capacity(
+                    self.manifest,
+                    self.artifact_store,
+                    self.paid_request,
+                )
             outcome = await adapter(snapshot, context)
             if not isinstance(outcome, ProductionArmResult):
                 raise EvaluationValidationError("production adapter returned an unsupported result type")
@@ -324,6 +345,8 @@ class ProductionEvaluationRunner:
                 binding.telemetry_shape,
                 attempt=resume_item.next_attempt,
             )
+            if not record.terminal and max_attempts is not None and resume_item.next_attempt == max_attempts:
+                record = replace(record, terminal=True)
             self.artifact_store.append_record(self.manifest, record)
             records.append(record)
         return ProductionEvaluationResult(self.manifest.manifest_id, tuple(records))
@@ -420,6 +443,54 @@ def _validate_paid_authorization(
     expected.require_authorized()
 
 
+def _require_remaining_paid_capacity(
+    manifest: EvaluationManifest,
+    artifact_store: EvaluationArtifactStore,
+    request: PaidExecutionRequest,
+) -> None:
+    """Recheck cumulative spend and worst-case remaining work before each paid call."""
+    paid_arm_ids = {
+        arm.arm_id
+        for arm in manifest.arms
+        if arm.enabled and arm.kind is not EvaluationArmKind.DETERMINISTIC
+    }
+    records = artifact_store.load_records(manifest)
+    paid_records = tuple(record for record in records if record.arm_id in paid_arm_ids)
+    if any(
+        record.cost_usd.status is not MeasurementStatus.COMPLETE
+        or record.cost_usd.value is None
+        for record in paid_records
+    ):
+        raise EvaluationValidationError("retained paid attempts require complete cost telemetry before resuming")
+    cumulative_cost = sum(float(record.cost_usd.value) for record in paid_records)
+    terminal_pairs = {
+        (record.case_id, record.arm_id)
+        for record in paid_records
+        if record.terminal
+    }
+    attempts_by_pair: dict[tuple[str, str], int] = {}
+    for record in paid_records:
+        pair = (record.case_id, record.arm_id)
+        attempts_by_pair[pair] = attempts_by_pair.get(pair, 0) + 1
+    budget_by_pair = {
+        (budget.case_id, budget.arm_id): budget
+        for budget in request.plan_item_budgets
+    }
+    remaining_projected_cost = sum(
+        budget.projected_cost_per_attempt_usd
+        * (budget.max_attempts - attempts_by_pair.get(pair, 0))
+        for pair, budget in budget_by_pair.items()
+        if pair not in terminal_pairs
+    )
+    if remaining_projected_cost <= 0:
+        raise EvaluationValidationError("paid replay has no bounded model attempts remaining")
+    worst_case_total = cumulative_cost + remaining_projected_cost
+    if worst_case_total > request.cost_cap_usd + 1e-12:
+        raise EvaluationValidationError(
+            "retained cumulative spend plus remaining projected work exceeds the explicit cost cap"
+        )
+
+
 def _load_all_snapshots(
     manifest: EvaluationManifest,
     snapshot_paths: Mapping[str, str | Path],
@@ -435,7 +506,40 @@ def _load_all_snapshots(
     snapshots: dict[str, ReviewSnapshot] = {}
     for case in sorted(manifest.cases, key=lambda item: item.case_id):
         snapshots[case.case_id] = load_review_snapshot_artifact(snapshot_paths[case.case_id], case)
+    for case in manifest.cases:
+        snapshot = snapshots[case.case_id]
+        expected_parent_snapshot_id = (
+            snapshots[case.parent_case_id].snapshot_id
+            if case.parent_case_id is not None
+            else None
+        )
+        if snapshot.parent_snapshot_id != expected_parent_snapshot_id:
+            raise EvaluationValidationError(
+                f"snapshot lineage for case {case.case_id} does not match its manifest parent"
+            )
+        _validate_loaded_snapshot_metadata(case, snapshot)
     return MappingProxyType(snapshots)
+
+
+def _validate_loaded_snapshot_metadata(case: CheckpointCase, snapshot: ReviewSnapshot) -> None:
+    """Recompute model-visible facts that have an authoritative snapshot source."""
+    metadata = case.model_visible_metadata
+    derived = {
+        "change_size": len(snapshot.changed_paths),
+        "stage": snapshot.event.value,
+        "task_intent_hash": content_hash({"task_intent": snapshot.task_intent}),
+        "repository_context_hash": content_hash({
+            "base_revision": snapshot.base_revision,
+            "base_selector": snapshot.base_selector,
+            "changed_paths": list(snapshot.changed_paths),
+            "focus_path": snapshot.focus_path,
+        }),
+    }
+    for key, expected in derived.items():
+        if key in metadata and metadata[key] != expected:
+            raise EvaluationValidationError(
+                f"model_visible_metadata.{key} does not match the loaded snapshot"
+            )
 
 
 def _record_from_production_result(

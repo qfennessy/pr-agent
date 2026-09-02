@@ -25,10 +25,11 @@ from pr_agent.algo.checkpoint_evaluation import (CheckpointCase,
                                                  TruthArtifact, content_hash)
 from pr_agent.algo.checkpoint_evaluation_cocos import CocosCorpusInventory
 from pr_agent.algo.checkpoint_evaluation_execution import \
-    EvaluationArtifactStore
+    EvaluationArtifactStore, PaidExecutionRequest, PaidPlanItemBudget
 from pr_agent.algo.checkpoint_evaluation_scoring import (ScoreMetric,
                                                          score_matched_arms)
-from pr_agent.algo.checkpoint_shadow_journal import ShadowJournalEntry
+from pr_agent.algo.checkpoint_shadow_journal import (DeveloperTimeBasis,
+                                                     ShadowJournalEntry)
 from pr_agent.algo.review_snapshot import ReviewEvent
 
 DEFAULT_PAIR_REVIEW_GATE = report_module.DEFAULT_PAIR_REVIEW_GATE
@@ -43,18 +44,19 @@ ShadowJournalRecord = report_module.ShadowJournalRecord
 build_checkpoint_pilot_report = report_module.build_checkpoint_pilot_report
 build_cocos_pilot_acceptance = report_module.build_cocos_pilot_acceptance
 build_replay_evidence_binding = report_module.build_replay_evidence_binding
+build_holdout_leakage_check = report_module.build_holdout_leakage_check
 build_settled_pilot_acceptance = report_module.build_settled_pilot_acceptance
 build_shadow_pilot_acceptance = report_module.build_shadow_pilot_acceptance
 canonical_rollout_gate_specs = report_module.canonical_rollout_gate_specs
 
 _PINNED_TEST_COCOS_ACCEPTANCE_ID = (
-    "sha256:9ec1fe03abc2f789117761db1e76def38bc7d994c45df45d198572e9848dcf17"
+    "sha256:d934504cb16b48f81b661fae4962c07fe26d63adef67668e100845a99b2b2459"
 )
 _PINNED_TEST_SHADOW_ACCEPTANCE_ID = (
-    "sha256:905028a252bd46bbec545ccccbfd686f1a26a53c28de96223e43ab1f49ad5527"
+    "sha256:bb46374fc32b07fb647f61091eec34394dd549042bfecca3ea456a6ca5ebbc8a"
 )
 _PINNED_TEST_SETTLED_ACCEPTANCE_ID = (
-    "sha256:e6111b588eaf7e0f32d3969db9d87c8438b90e84bf7ee86194a84b604ee3bd5e"
+    "sha256:fccce140bdb6b685f43e30b49bc38be04101bb6b09b91375c0a8a5312ce8693b"
 )
 
 
@@ -63,6 +65,18 @@ def _hash(value: str) -> str:
 
 
 def _manifest() -> EvaluationManifest:
+    calibration = tuple(
+        CheckpointCase(
+            case_id=f"calibration-{index}",
+            snapshot_id=_hash(f"snapshot-calibration-{index}"),
+            snapshot_artifact_hash=_hash(f"artifact-calibration-{index}"),
+            event=ReviewEvent.FILE_SAVE,
+            cohort=EvaluationCohort.CALIBRATION,
+            lineage_elapsed_seconds=0,
+            developer_elapsed_seconds=60,
+        )
+        for index in range(12)
+    )
     holdouts = tuple(
         CheckpointCase(
             case_id=f"holdout-{index}",
@@ -75,23 +89,29 @@ def _manifest() -> EvaluationManifest:
         )
         for index in range(18)
     )
-    temporal = CheckpointCase(
-        case_id="temporal",
-        snapshot_id=_hash("snapshot-temporal"),
-        snapshot_artifact_hash=_hash("artifact-temporal"),
-        event=ReviewEvent.WORKTREE_IDLE,
-        cohort=EvaluationCohort.TEMPORAL,
-        lineage_elapsed_seconds=0,
-        developer_elapsed_seconds=60,
+    temporal = tuple(
+        CheckpointCase(
+            case_id=f"temporal-{index}",
+            snapshot_id=_hash(f"snapshot-temporal-{index}"),
+            snapshot_artifact_hash=_hash(f"artifact-temporal-{index}"),
+            event=ReviewEvent.WORKTREE_IDLE,
+            cohort=EvaluationCohort.TEMPORAL,
+            lineage_elapsed_seconds=0,
+            developer_elapsed_seconds=60,
+        )
+        for index in range(10)
     )
-    control = CheckpointCase(
-        case_id="control",
-        snapshot_id=_hash("snapshot-control"),
-        snapshot_artifact_hash=_hash("artifact-control"),
-        event=ReviewEvent.PRE_COMMIT,
-        cohort=EvaluationCohort.CLEAN_CONTROL,
-        lineage_elapsed_seconds=0,
-        developer_elapsed_seconds=60,
+    controls = tuple(
+        CheckpointCase(
+            case_id=f"control-{index}",
+            snapshot_id=_hash(f"snapshot-control-{index}"),
+            snapshot_artifact_hash=_hash(f"artifact-control-{index}"),
+            event=ReviewEvent.PRE_COMMIT,
+            cohort=EvaluationCohort.CLEAN_CONTROL,
+            lineage_elapsed_seconds=0,
+            developer_elapsed_seconds=60,
+        )
+        for index in range(16)
     )
     incumbent = EvaluationArm(
         arm_id="incumbent",
@@ -129,39 +149,30 @@ def _manifest() -> EvaluationManifest:
         corpus_hash=_hash("corpus"),
         policy_hash=_hash("policy"),
         configuration_hash=_hash("configuration"),
-        cases=(*holdouts, temporal, control),
+        cases=(*calibration, *holdouts, *temporal, *controls),
         arms=(incumbent, cascade),
     )
 
 
 def _truth(manifest: EvaluationManifest) -> TruthArtifact:
-    temporal_finding = FindingTruth(
-        finding_id="temporal-finding",
-        fingerprint="fingerprint",
-        severity=FindingSeverity.HIGH,
-        earliest_opportunity=ReviewEvent.WORKTREE_IDLE,
-        required_context=("changed_hunk",),
-    )
     return TruthArtifact(
         manifest_id=manifest.manifest_id,
-        truths=(
-            *(
-                CheckpointTruth(
-                    f"holdout-{index}",
-                    False,
-                    _hash(f"truth-holdout-{index}"),
-                    (FindingTruth(
-                        finding_id=f"holdout-finding-{index}",
-                        fingerprint="fingerprint",
-                        severity=FindingSeverity.HIGH,
-                        earliest_opportunity=ReviewEvent.FILE_SAVE,
-                        required_context=("changed_hunk",),
-                    ),),
-                )
-                for index in range(18)
-            ),
-            CheckpointTruth("temporal", False, _hash("truth-temporal"), (temporal_finding,)),
-            CheckpointTruth("control", True, _hash("truth-control")),
+        truths=tuple(
+            CheckpointTruth(case.case_id, True, _hash(f"truth-{case.case_id}"))
+            if case.cohort is EvaluationCohort.CLEAN_CONTROL
+            else CheckpointTruth(
+                case.case_id,
+                False,
+                _hash(f"truth-{case.case_id}"),
+                (FindingTruth(
+                    finding_id=f"finding-{case.case_id}",
+                    fingerprint="fingerprint",
+                    severity=FindingSeverity.HIGH,
+                    earliest_opportunity=case.event,
+                    required_context=("changed_hunk",),
+                ),),
+            )
+            for case in manifest.cases
         ),
     )
 
@@ -169,7 +180,8 @@ def _truth(manifest: EvaluationManifest) -> TruthArtifact:
 def _record(manifest: EvaluationManifest, case: CheckpointCase, arm: EvaluationArm) -> EvaluationRunRecord:
     findings = (
         ()
-        if case.case_id == "control" or (case.case_id.startswith("holdout-") and arm.arm_id == "incumbent")
+        if case.cohort is EvaluationCohort.CLEAN_CONTROL
+        or (case.case_id.startswith("holdout-") and arm.arm_id == "incumbent")
         else (ObservedFinding("fingerprint", FindingSeverity.HIGH),)
     )
     stage_runs = ()
@@ -217,6 +229,25 @@ def _record(manifest: EvaluationManifest, case: CheckpointCase, arm: EvaluationA
 
 def _store(tmp_path, manifest: EvaluationManifest) -> EvaluationArtifactStore:
     store = EvaluationArtifactStore(tmp_path / "artifacts")
+    paid_arms = tuple(
+        arm for arm in manifest.arms
+        if arm.enabled and arm.kind is not EvaluationArmKind.DETERMINISTIC
+    )
+    store.bind_paid_request(
+        manifest,
+        PaidExecutionRequest(
+            manifest_id=manifest.manifest_id,
+            cost_cap_usd=10.0,
+            plan_item_budgets=tuple(
+                PaidPlanItemBudget(case.case_id, arm.arm_id, 0.02, 2)
+                for case in manifest.cases
+                for arm in paid_arms
+            ),
+            credential_present_by_provider={
+                arm.provider_id: True for arm in paid_arms if arm.provider_id is not None
+            },
+        ),
+    )
     for arm in manifest.arms:
         for case in manifest.cases:
             store.append_record(manifest, _record(manifest, case, arm))
@@ -224,10 +255,7 @@ def _store(tmp_path, manifest: EvaluationManifest) -> EvaluationArtifactStore:
 
 
 def _complete_evidence() -> PilotRolloutEvidence:
-    return PilotRolloutEvidence(
-        holdout_leakage_free=True,
-        bounded_retry_limit=2,
-    )
+    return PilotRolloutEvidence()
 
 
 def _budgets() -> PilotRolloutBudgets:
@@ -307,15 +335,29 @@ def _shadow_records(
             cost_usd=NumericMeasurement(MeasurementStatus.COMPLETE, 0.001),
         )
         return ShadowJournalRecord(
-            observed_at=observed_at,
+            sequence=index + 1,
+            ingested_at_utc=observed_at.astimezone(timezone.utc),
+            developer_time_basis=(
+                DeveloperTimeBasis.WRITER_START
+                if index == 0
+                else DeveloperTimeBasis.WRITER_MONOTONIC
+            ),
             entry=entry,
-            developer_elapsed_seconds=60,
+            developer_elapsed_seconds=None if index == 0 else 60,
         )
 
     return (
         record(0, ReviewEvent.FILE_SAVE, started_at),
         record(1, ReviewEvent.WORKTREE_IDLE, started_at + timedelta(days=8)),
     )
+
+
+def _persist_shadow_records(tmp_path, records):
+    payload = "".join(json.dumps(record.to_dict(), sort_keys=True) + "\n" for record in records)
+    path = tmp_path / f"shadow-{content_hash({'payload': payload}).removeprefix('sha256:')}.ndjson"
+    path.write_text(payload, encoding="utf-8")
+    path.chmod(0o600)
+    return path
 
 
 def _settled_candidates(count: int = 100) -> tuple[SettledCandidateRecord, ...]:
@@ -336,6 +378,7 @@ def _report(
     *,
     bind_corpus=True,
     pin_corpus_acceptance=False,
+    pin_leakage_acceptance=False,
     pin_shadow_acceptance=False,
     pin_settled_acceptance=False,
     monkeypatch=None,
@@ -345,6 +388,21 @@ def _report(
     pinned_settled_acceptance_id=_PINNED_TEST_SETTLED_ACCEPTANCE_ID,
 ):
     manifest = _manifest()
+    if evidence is not None:
+        leakage_check = build_holdout_leakage_check(
+            manifest,
+            checker_revision_hash=_hash("leakage-checker-revision"),
+            leakage_free=True,
+        )
+        evidence = replace(evidence, holdout_leakage_check=leakage_check)
+        if pin_leakage_acceptance:
+            if monkeypatch is None:
+                raise AssertionError("pinning the leakage check requires monkeypatch")
+            monkeypatch.setattr(
+                report_module,
+                "CANONICAL_HOLDOUT_LEAKAGE_CHECK_ID",
+                leakage_check.check_id,
+            )
     truth = _truth(manifest)
     store = _store(tmp_path, manifest)
     scorecard = score_matched_arms(
@@ -419,7 +477,7 @@ def _report(
         evidence=evidence or PilotRolloutEvidence(),
         cocos_inventory=cocos_inventory,
         cocos_acceptance=cocos_acceptance,
-        shadow_records=shadow_records,
+        shadow_journal_path=_persist_shadow_records(tmp_path, shadow_records),
         shadow_acceptance=shadow_acceptance,
         settled_candidate_records=settled_candidate_records,
         settled_candidate_acceptance=settled_candidate_acceptance,
@@ -470,6 +528,7 @@ def test_genuine_pinned_canonical_assignments_journal_and_settled_candidates_pas
         _complete_evidence(),
         _budgets(),
         pin_corpus_acceptance=True,
+        pin_leakage_acceptance=True,
         pin_shadow_acceptance=True,
         pin_settled_acceptance=True,
         monkeypatch=monkeypatch,
@@ -482,10 +541,18 @@ def test_genuine_pinned_canonical_assignments_journal_and_settled_candidates_pas
         DEFAULT_PAIR_REVIEW_GATE,
         PR_PUBLICATION_GATE,
     ]
-    assert {decision.status for decision in report.gate_decisions} == {GateStatus.PASSED}
+    assert {decision.status for decision in report.gate_decisions} == {GateStatus.PASSED}, [
+        (
+            decision.gate_name,
+            decision.status,
+            [result.to_dict() for result in decision.rule_results if result.status is not GateStatus.PASSED],
+        )
+        for decision in report.gate_decisions
+        if decision.status is not GateStatus.PASSED
+    ]
     assert report.incomplete_pair_count == 0
-    assert report.terminal_pair_count == 40
-    assert len(report.raw_record_artifact_hashes) == 40
+    assert report.terminal_pair_count == 112
+    assert len(report.raw_record_artifact_hashes) == 112
     assert report.shadow_binding is not None
     assert report.shadow_binding.elapsed_days().value == 8
     assert report.shadow_binding.latency_p95_seconds.value == 0.6
@@ -509,7 +576,7 @@ def test_temporal_and_publication_decisions_are_derived_from_frozen_attempts(
             record = _record(manifest, case, arm)
             if case.case_id.startswith("holdout-") and arm.arm_id == "incumbent":
                 record = replace(record, findings=(ObservedFinding("fingerprint", FindingSeverity.HIGH),))
-            if case.case_id == "temporal" and arm.arm_id == "cascade":
+            if case.case_id == "temporal-0" and arm.arm_id == "cascade":
                 record = replace(record, findings=())
             store.append_record(manifest, record)
     scorecard = score_matched_arms(
@@ -661,6 +728,10 @@ def test_manifest_must_exactly_match_the_pinned_cocos_assignment_inventory(
             snapshot_id=_hash("extra-control-snapshot"),
             snapshot_artifact_hash=_hash("extra-control-artifact"),
         ))
+    if mutation in {"missing", "extra"}:
+        with pytest.raises(EvaluationValidationError, match="cohort counts"):
+            replace(acceptance, assignments=changed_assignments)
+        return
     changed_acceptance = replace(acceptance, assignments=changed_assignments)
     monkeypatch.setattr(
         report_module,
@@ -701,7 +772,7 @@ def test_more_than_the_exact_18_locked_holdout_cases_is_rejected(tmp_path):
         cases=(*base_manifest.cases, extra_case),
         arms=base_manifest.arms,
     )
-    with pytest.raises(EvaluationValidationError, match="exactly 18"):
+    with pytest.raises(EvaluationValidationError, match="cohort counts"):
         build_cocos_pilot_acceptance(manifest, _cocos_inventory(manifest))
 
 
@@ -962,7 +1033,7 @@ def test_partial_journal_measurements_are_recomputed_and_cannot_pass(tmp_path, m
 
     assert live_shadow.status is GateStatus.NOT_EVALUABLE
     assert cost is not None
-    assert cost.status is MeasurementStatus.PARTIAL
+    assert cost.status is MeasurementStatus.UNAVAILABLE
 
 
 def test_single_journal_record_has_no_duration_and_is_not_evaluable(tmp_path, monkeypatch):
@@ -1000,7 +1071,7 @@ def test_single_journal_record_has_no_duration_and_is_not_evaluable(tmp_path, mo
 def test_zero_elapsed_shadow_span_is_unavailable_not_a_zero_day_failure(tmp_path, monkeypatch):
     manifest = _manifest()
     records = _shadow_records(manifest)
-    records = (records[0], replace(records[1], observed_at=records[0].observed_at))
+    records = (records[0], replace(records[1], ingested_at_utc=records[0].ingested_at_utc))
     acceptance_id = build_shadow_pilot_acceptance(
         records,
         manifest=manifest,
@@ -1056,7 +1127,8 @@ def test_shadow_inventory_rejects_truncated_extra_substituted_or_reordered_recor
         extra_entry = replace(records[-1].entry, snapshot_id=_hash("extra-shadow-snapshot"))
         changed_records = (*records, replace(
             records[-1],
-            observed_at=records[-1].observed_at + timedelta(days=1),
+            sequence=records[-1].sequence + 1,
+            ingested_at_utc=records[-1].ingested_at_utc + timedelta(days=1),
             entry=extra_entry,
         ))
     elif mutation == "substituted":
@@ -1079,7 +1151,7 @@ def test_shadow_inventory_rejects_truncated_extra_substituted_or_reordered_recor
             incumbent_arm_id="incumbent",
             budgets=_budgets(),
             evidence=_complete_evidence(),
-            shadow_records=changed_records,
+            shadow_journal_path=_persist_shadow_records(tmp_path, changed_records),
             shadow_acceptance=acceptance,
         )
 
@@ -1093,7 +1165,7 @@ def test_shadow_duration_uses_real_utc_elapsed_time_across_dst(tmp_path, monkeyp
     )
     records = (records[0], replace(
         records[1],
-        observed_at=datetime(2026, 3, 9, 0, tzinfo=eastern),
+        ingested_at_utc=datetime(2026, 3, 9, 0, tzinfo=eastern).astimezone(timezone.utc),
     ))
     dst_acceptance_id = build_shadow_pilot_acceptance(
         records,

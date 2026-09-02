@@ -68,6 +68,8 @@ _MODEL_VISIBLE_METADATA_KEYS = frozenset({
     "subsystem",
     "task_intent_hash",
 })
+_MODEL_VISIBLE_HASH_KEYS = frozenset({"repository_context_hash", "task_intent_hash"})
+_MODEL_VISIBLE_SLUG = re.compile(r"^[a-z][a-z0-9_.+#-]{0,63}$")
 
 
 class EvaluationValidationError(ValueError):
@@ -206,6 +208,13 @@ _EVALUATION_SCHEMA_DESCRIPTOR = {
         "gate_comparator": ("at_least", "at_most"),
     },
     "model_visible_metadata_keys": tuple(sorted(_MODEL_VISIBLE_METADATA_KEYS)),
+    "model_visible_metadata_constraints": {
+        "hash_keys": tuple(sorted(_MODEL_VISIBLE_HASH_KEYS)),
+        "hash_pattern": _SHA256_PATTERN.pattern,
+        "identifier_pattern": _MODEL_VISIBLE_SLUG.pattern,
+        "change_size_range": (0, 1_000_000),
+        "stage_values": tuple(item.value for item in ReviewEvent),
+    },
     "answer_only_keys": tuple(sorted(_ANSWER_ONLY_KEYS)),
 }
 
@@ -298,11 +307,23 @@ def _validate_model_visible_metadata(value: Mapping[str, Any]) -> None:
     if unknown:
         raise EvaluationValidationError(f"model_visible_metadata contains unsupported fields: {unknown}")
     for key, child in value.items():
-        if isinstance(child, bool) or child is None or isinstance(child, str):
-            continue
-        if isinstance(child, (int, float)) and not isinstance(child, bool) and math.isfinite(child):
-            continue
-        raise EvaluationValidationError(f"model_visible_metadata.{key} must be one finite scalar value")
+        if key in _MODEL_VISIBLE_HASH_KEYS:
+            if not isinstance(child, str) or not _SHA256_PATTERN.fullmatch(child):
+                raise EvaluationValidationError(
+                    f"model_visible_metadata.{key} must be a sha256:<64 lowercase hex> identity"
+                )
+        elif key == "change_size":
+            if not isinstance(child, int) or isinstance(child, bool) or not 0 <= child <= 1_000_000:
+                raise EvaluationValidationError(
+                    "model_visible_metadata.change_size must be an integer from 0 to 1000000"
+                )
+        elif key == "stage":
+            if child not in {event.value for event in ReviewEvent}:
+                raise EvaluationValidationError("model_visible_metadata.stage must be a ReviewEvent value")
+        elif not isinstance(child, str) or not _MODEL_VISIBLE_SLUG.fullmatch(child):
+            raise EvaluationValidationError(
+                f"model_visible_metadata.{key} must be a bounded lowercase identifier"
+            )
 
 
 @dataclass(frozen=True)

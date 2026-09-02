@@ -12,6 +12,7 @@ import math
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
 
@@ -37,7 +38,9 @@ from pr_agent.algo.checkpoint_evaluation_scoring import (GateComparator,
                                                          ScoreMetric,
                                                          evaluate_rollout_gate,
                                                          score_matched_arms)
-from pr_agent.algo.checkpoint_shadow_journal import ShadowJournalEntry
+from pr_agent.algo.checkpoint_shadow_journal import (DeveloperTimeBasis,
+                                                     ShadowJournalRecord,
+                                                     load_shadow_journal)
 from pr_agent.algo.review_snapshot import ReviewEvent
 
 PILOT_REPORT_SCHEMA_VERSION = "checkpoint-evaluation-pilot-report-v1"
@@ -50,6 +53,7 @@ SETTLED_PILOT_ACCEPTANCE_SCHEMA_VERSION = "checkpoint-settled-pilot-acceptance-v
 CANONICAL_COCOS_PILOT_ACCEPTANCE_ID: Optional[str] = None
 CANONICAL_SHADOW_PILOT_ACCEPTANCE_ID: Optional[str] = None
 CANONICAL_SETTLED_PILOT_ACCEPTANCE_ID: Optional[str] = None
+CANONICAL_HOLDOUT_LEAKAGE_CHECK_ID: Optional[str] = None
 
 OFFLINE_REPLAY_GATE = "offline-replay"
 LIVE_SHADOW_GATE = "live-shadow"
@@ -70,6 +74,12 @@ _CANONICAL_COCOS_COHORT_COUNTS = {
     "control": 16,
     "confirmation": 16,
     "unique_snapshots": 55,
+}
+_MANIFEST_COHORT_TO_COCOS_COUNT = {
+    EvaluationCohort.CALIBRATION: "calibration",
+    EvaluationCohort.HOLDOUT: "holdout",
+    EvaluationCohort.TEMPORAL: "temporal",
+    EvaluationCohort.CLEAN_CONTROL: "control",
 }
 
 
@@ -296,6 +306,7 @@ class CocosPilotAcceptance:
     manifest_schema_hash: str
     assignments: tuple[CocosPilotCaseAssignment, ...]
     schema_version: str = COCOS_PILOT_ACCEPTANCE_SCHEMA_VERSION
+    cohort_counts: Mapping[str, int] = field(init=False)
     holdout_cohort_hash: str = field(init=False)
     holdout_case_count: int = field(init=False)
     acceptance_id: str = field(init=False)
@@ -319,6 +330,20 @@ class CocosPilotAcceptance:
         case_ids = tuple(assignment.case_id for assignment in self.assignments)
         if len(case_ids) != len(set(case_ids)):
             raise EvaluationValidationError("pilot acceptance case assignments must be unique")
+        cohort_counts = {
+            cohort.value: sum(assignment.cohort == cohort.value for assignment in self.assignments)
+            for cohort in EvaluationCohort
+        }
+        expected_counts = {
+            cohort.value: _CANONICAL_COCOS_COHORT_COUNTS[inventory_key]
+            for cohort, inventory_key in _MANIFEST_COHORT_TO_COCOS_COUNT.items()
+        }
+        expected_counts[EvaluationCohort.THRESHOLD.value] = 0
+        if cohort_counts != expected_counts:
+            raise EvaluationValidationError(
+                "pilot acceptance cohort counts do not match the canonical Cocos inventory"
+            )
+        object.__setattr__(self, "cohort_counts", MappingProxyType(cohort_counts))
         holdouts = tuple(
             assignment for assignment in self.assignments
             if assignment.cohort == EvaluationCohort.HOLDOUT.value
@@ -340,6 +365,7 @@ class CocosPilotAcceptance:
             "manifest_schema_version": self.manifest_schema_version,
             "manifest_schema_hash": self.manifest_schema_hash,
             "assignments": [assignment.to_dict() for assignment in self.assignments],
+            "cohort_counts": dict(self.cohort_counts),
             "holdout_cohort_hash": self.holdout_cohort_hash,
             "holdout_case_count": self.holdout_case_count,
         }
@@ -371,9 +397,19 @@ def build_cocos_pilot_acceptance(
     _validate_canonical_cocos_inventory(inventory)
     if inventory.corpus_hash != manifest.corpus_hash:
         raise EvaluationValidationError("pilot manifest and inventory do not bind the same corpus")
-    holdout_case_count = sum(case.cohort is EvaluationCohort.HOLDOUT for case in manifest.cases)
-    if holdout_case_count != _FROZEN_HOLDOUT_MINIMUM_SUPPORT:
-        raise EvaluationValidationError("pilot manifest must contain exactly 18 Cocos holdout cases")
+    manifest_counts = {
+        cohort: sum(case.cohort is cohort for case in manifest.cases)
+        for cohort in EvaluationCohort
+    }
+    expected_counts = {
+        cohort: inventory.cohort_counts[inventory_key]
+        for cohort, inventory_key in _MANIFEST_COHORT_TO_COCOS_COUNT.items()
+    }
+    expected_counts[EvaluationCohort.THRESHOLD] = 0
+    if manifest_counts != expected_counts:
+        raise EvaluationValidationError(
+            "pilot manifest cohort counts do not match the canonical Cocos inventory"
+        )
     return CocosPilotAcceptance(
         lock_id=inventory.lock_id,
         corpus_hash=inventory.corpus_hash,
@@ -467,45 +503,6 @@ def _build_cocos_pilot_corpus_binding(
 
 
 @dataclass(frozen=True)
-class ShadowJournalRecord:
-    """One timestamped, source-free observation of an actual shadow journal entry."""
-
-    observed_at: datetime
-    entry: ShadowJournalEntry
-    developer_elapsed_seconds: Optional[float]
-    record_id: str = field(init=False)
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.observed_at, datetime) or self.observed_at.tzinfo is None:
-            raise EvaluationValidationError("shadow journal observation time must include a timezone offset")
-        if not isinstance(self.entry, ShadowJournalEntry):
-            raise EvaluationValidationError("shadow journal records require ShadowJournalEntry values")
-        _validate_optional_non_negative(
-            "shadow developer_elapsed_seconds",
-            self.developer_elapsed_seconds,
-        )
-        object.__setattr__(self, "record_id", content_hash(self._identity_payload()))
-
-    def _identity_payload(self) -> dict[str, Any]:
-        return {
-            "observed_at_utc": self.observed_at.astimezone(timezone.utc).isoformat(),
-            "entry_id": self.entry.entry_id,
-            "developer_elapsed_seconds": self.developer_elapsed_seconds,
-        }
-
-    def inventory_dict(self) -> dict[str, Any]:
-        return {
-            **self._identity_payload(),
-            "record_id": self.record_id,
-            "event": self.entry.event.value,
-            "policy_hash": self.entry.policy_hash,
-            "configuration_hash": self.entry.configuration_hash,
-            "arm_id": self.entry.arm_id,
-            "journal_schema_version": self.entry.schema_version,
-        }
-
-
-@dataclass(frozen=True)
 class ShadowPilotAcceptance:
     """Exact source-free journal inventory awaiting independent maintainer acceptance."""
 
@@ -538,7 +535,12 @@ class ShadowPilotAcceptance:
         if not inventory or any(not isinstance(item, dict) for item in inventory):
             raise EvaluationValidationError("shadow pilot acceptance requires a record inventory")
         record_ids = tuple(item.get("record_id") for item in inventory)
-        entry_ids = tuple(item.get("entry_id") for item in inventory)
+        entry_ids = tuple(
+            item.get("entry", {}).get("entry_id")
+            if isinstance(item.get("entry"), dict)
+            else None
+            for item in inventory
+        )
         for identity in (*record_ids, *entry_ids):
             _validate_hash("shadow pilot record identity", identity)
         if len(record_ids) != len(set(record_ids)) or len(entry_ids) != len(set(entry_ids)):
@@ -576,7 +578,7 @@ def build_shadow_pilot_acceptance(
     records = tuple(records)
     if not records or any(not isinstance(record, ShadowJournalRecord) for record in records):
         raise EvaluationValidationError("shadow pilot acceptance requires journal records")
-    observed_at_utc = tuple(record.observed_at.astimezone(timezone.utc) for record in records)
+    observed_at_utc = tuple(record.ingested_at_utc for record in records)
     if any(
         later < earlier
         for earlier, later in zip(observed_at_utc, observed_at_utc[1:], strict=False)
@@ -647,7 +649,7 @@ def build_shadow_pilot_acceptance(
         policy_hash=manifest.policy_hash,
         configuration_hash=manifest.configuration_hash,
         arm_id=target_arm_id,
-        record_inventory=tuple(record.inventory_dict() for record in records),
+        record_inventory=tuple(record.to_dict() for record in records),
     )
 
 
@@ -759,9 +761,14 @@ def _journal_metric(
 def _journal_cost_per_developer_hour(
     records: Sequence[ShadowJournalRecord],
 ) -> ScoreMetric:
-    known = tuple(
+    eligible = tuple(
         record
         for record in records
+        if record.developer_time_basis is DeveloperTimeBasis.WRITER_MONOTONIC
+    )
+    known = tuple(
+        record
+        for record in eligible
         if record.entry.cost_usd.status is MeasurementStatus.COMPLETE
         and record.entry.cost_usd.value is not None
         and record.developer_elapsed_seconds is not None
@@ -770,7 +777,7 @@ def _journal_cost_per_developer_hour(
     if not known or denominator_seconds <= 0:
         return _unavailable_metric()
     total_cost = sum(float(record.entry.cost_usd.value) for record in known)
-    status = MeasurementStatus.COMPLETE if len(known) == len(records) else MeasurementStatus.PARTIAL
+    status = MeasurementStatus.COMPLETE if len(known) == len(eligible) else MeasurementStatus.PARTIAL
     return ScoreMetric(status, total_cost / (denominator_seconds / 3600.0), len(known))
 
 
@@ -795,8 +802,12 @@ def _build_shadow_pilot_binding(
     )
     if actual_acceptance != acceptance:
         raise EvaluationValidationError("shadow records do not exactly match the accepted journal inventory")
-    observed_at_utc = tuple(record.observed_at.astimezone(timezone.utc) for record in records)
-    developer_seconds = tuple(record.developer_elapsed_seconds for record in records)
+    observed_at_utc = tuple(record.ingested_at_utc for record in records)
+    developer_seconds = tuple(
+        record.developer_elapsed_seconds
+        for record in records
+        if record.developer_time_basis is DeveloperTimeBasis.WRITER_MONOTONIC
+    )
     return ShadowPilotBinding(
         acceptance_id=acceptance.acceptance_id,
         journal_hash=acceptance.journal_hash,
@@ -808,7 +819,7 @@ def _build_shadow_pilot_binding(
         worktree_count=sum(record.entry.event is ReviewEvent.WORKTREE_IDLE for record in records),
         developer_elapsed_seconds=(
             sum(float(value) for value in developer_seconds if value is not None)
-            if all(value is not None for value in developer_seconds)
+            if developer_seconds and all(value is not None for value in developer_seconds)
             else None
         ),
         latency_p95_seconds=_journal_metric(records, "latency_seconds"),
@@ -1041,32 +1052,106 @@ def _build_settled_pilot_binding(
 
 
 @dataclass(frozen=True)
+class HoldoutLeakageCheck:
+    """Content-bound result awaiting independent pinning before it can satisfy a gate."""
+
+    manifest_id: str
+    holdout_cohort_hash: str
+    model_visible_inventory_hash: str
+    checker_revision_hash: str
+    leakage_free: bool
+    check_id: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "manifest_id", "holdout_cohort_hash", "model_visible_inventory_hash", "checker_revision_hash",
+        ):
+            _validate_hash(name, getattr(self, name))
+        if not isinstance(self.leakage_free, bool):
+            raise EvaluationValidationError("holdout leakage result must be a boolean")
+        object.__setattr__(self, "check_id", content_hash(self._identity_payload()))
+
+    def _identity_payload(self) -> dict[str, Any]:
+        return {
+            "manifest_id": self.manifest_id,
+            "holdout_cohort_hash": self.holdout_cohort_hash,
+            "model_visible_inventory_hash": self.model_visible_inventory_hash,
+            "checker_revision_hash": self.checker_revision_hash,
+            "leakage_free": self.leakage_free,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self._identity_payload(), "check_id": self.check_id}
+
+
+def build_holdout_leakage_check(
+    manifest: EvaluationManifest,
+    *,
+    checker_revision_hash: str,
+    leakage_free: bool,
+) -> HoldoutLeakageCheck:
+    """Bind an external checker verdict to the exact model-visible holdout inventory."""
+    if not isinstance(manifest, EvaluationManifest):
+        raise EvaluationValidationError("holdout leakage check requires an EvaluationManifest")
+    inventory = tuple(
+        {
+            "case_id": case.case_id,
+            "snapshot_id": case.snapshot_id,
+            "snapshot_artifact_hash": case.snapshot_artifact_hash,
+            "model_visible_payload": case.model_visible_payload(),
+        }
+        for case in manifest.cases
+        if case.cohort is EvaluationCohort.HOLDOUT
+    )
+    if not inventory:
+        raise EvaluationValidationError("holdout leakage check requires holdout cases")
+    return HoldoutLeakageCheck(
+        manifest_id=manifest.manifest_id,
+        holdout_cohort_hash=_cohort_identity_hash(manifest, EvaluationCohort.HOLDOUT),
+        model_visible_inventory_hash=content_hash({"holdouts": inventory}),
+        checker_revision_hash=checker_revision_hash,
+        leakage_free=leakage_free,
+    )
+
+
+def _accepted_holdout_leakage(
+    manifest: EvaluationManifest,
+    check: Optional[HoldoutLeakageCheck],
+) -> Optional[bool]:
+    if check is None or CANONICAL_HOLDOUT_LEAKAGE_CHECK_ID is None:
+        return None
+    if not isinstance(check, HoldoutLeakageCheck):
+        raise EvaluationValidationError("holdout leakage evidence must use HoldoutLeakageCheck")
+    actual = build_holdout_leakage_check(
+        manifest,
+        checker_revision_hash=check.checker_revision_hash,
+        leakage_free=check.leakage_free,
+    )
+    if actual != check or check.check_id != CANONICAL_HOLDOUT_LEAKAGE_CHECK_ID:
+        raise EvaluationValidationError("holdout leakage evidence is not independently accepted for this manifest")
+    return check.leakage_free
+
+
+@dataclass(frozen=True)
 class PilotRolloutEvidence:
     """Source-free facts that are not derivable from the frozen replay scorecard."""
 
-    holdout_leakage_free: Optional[bool] = None
-    bounded_retry_limit: Optional[int] = None
+    holdout_leakage_check: Optional[HoldoutLeakageCheck] = None
     replay_binding: Optional[ReplayEvidenceBinding] = None
 
     def __post_init__(self) -> None:
-        if self.holdout_leakage_free is not None and not isinstance(self.holdout_leakage_free, bool):
-            raise EvaluationValidationError("holdout_leakage_free must be a boolean when supplied")
-        if (
-            self.bounded_retry_limit is not None
-            and (
-                not isinstance(self.bounded_retry_limit, int)
-                or isinstance(self.bounded_retry_limit, bool)
-                or self.bounded_retry_limit < 0
-            )
+        if self.holdout_leakage_check is not None and not isinstance(
+            self.holdout_leakage_check, HoldoutLeakageCheck
         ):
-            raise EvaluationValidationError("bounded_retry_limit must be a non-negative integer when supplied")
+            raise EvaluationValidationError("holdout_leakage_check must use HoldoutLeakageCheck when supplied")
         if self.replay_binding is not None and not isinstance(self.replay_binding, ReplayEvidenceBinding):
             raise EvaluationValidationError("replay_binding must use ReplayEvidenceBinding when supplied")
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "holdout_leakage_free": self.holdout_leakage_free,
-            "bounded_retry_limit": self.bounded_retry_limit,
+            "holdout_leakage_check": (
+                self.holdout_leakage_check.to_dict() if self.holdout_leakage_check else None
+            ),
             "replay_binding": self.replay_binding.to_dict() if self.replay_binding else None,
         }
 
@@ -1324,6 +1409,8 @@ def _external_metrics(
     evidence: PilotRolloutEvidence,
     budgets: PilotRolloutBudgets,
     expected_replay_binding: ReplayEvidenceBinding,
+    holdout_leakage_free: Optional[bool],
+    bounded_retry_configured: bool,
     temporal_high_severity_recall_delta: ScoreMetric,
     holdout_quality_advantage_lower_95: ScoreMetric,
     holdout_cost_usd: ScoreMetric,
@@ -1343,10 +1430,10 @@ def _external_metrics(
     return {
         "evidence.raw_replay_inventory_complete": _presence_metric(True if raw_replay_complete else None),
         "evidence.holdout_leakage_free": _presence_metric(
-            evidence.holdout_leakage_free if replay_evidence_bound else None
+            holdout_leakage_free if replay_evidence_bound else None
         ),
         "evidence.bounded_retry_configured": _presence_metric(
-            True if replay_evidence_bound and evidence.bounded_retry_limit is not None else None
+            True if replay_evidence_bound and bounded_retry_configured else None
         ),
         "evidence.shadow_elapsed_days": (
             shadow_binding.elapsed_days() if shadow_binding is not None else _unavailable_metric()
@@ -1633,7 +1720,7 @@ def build_checkpoint_pilot_report(
     evidence: PilotRolloutEvidence,
     cocos_inventory: Optional[CocosCorpusInventory] = None,
     cocos_acceptance: Optional[CocosPilotAcceptance] = None,
-    shadow_records: Sequence[ShadowJournalRecord] = (),
+    shadow_journal_path: Optional[str | Path] = None,
     shadow_acceptance: Optional[ShadowPilotAcceptance] = None,
     settled_candidate_records: Sequence[SettledCandidateRecord] = (),
     settled_candidate_acceptance: Optional[SettledPilotAcceptance] = None,
@@ -1650,6 +1737,7 @@ def build_checkpoint_pilot_report(
     if incumbent is None or incumbent.kind is not EvaluationArmKind.GENERAL_REVIEW:
         raise EvaluationValidationError("pilot incumbent must be the enabled general-review arm")
     records = artifact_store.load_records(manifest)
+    shadow_records = load_shadow_journal(shadow_journal_path) if shadow_journal_path is not None else ()
     inventory = artifact_store.inventory(manifest)
     for record in records:
         for name, measurement in (
@@ -1705,11 +1793,37 @@ def build_checkpoint_pilot_report(
         target_arm_id=target_arm_id,
         incumbent_arm_id=incumbent_arm_id,
     )
+    holdout_leakage_free = _accepted_holdout_leakage(manifest, evidence.holdout_leakage_check)
+    bound_paid_request = artifact_store.load_paid_request(manifest)
+    paid_budget_by_pair = (
+        {
+            (budget.case_id, budget.arm_id): budget
+            for budget in bound_paid_request.plan_item_budgets
+        }
+        if bound_paid_request is not None
+        else {}
+    )
+    expected_paid_pairs = {
+        (case.case_id, arm.arm_id)
+        for case in manifest.cases
+        for arm in manifest.arms
+        if arm.enabled and arm.kind is not EvaluationArmKind.DETERMINISTIC
+    }
+    bounded_retry_configured = (
+        set(paid_budget_by_pair) == expected_paid_pairs
+        and all(
+            record.attempt <= paid_budget_by_pair[(record.case_id, record.arm_id)].max_attempts
+            for record in records
+            if (record.case_id, record.arm_id) in expected_paid_pairs
+        )
+    )
     external_metrics = _external_metrics(
         inventory,
         evidence,
         budgets,
         expected_replay_binding,
+        holdout_leakage_free,
+        bounded_retry_configured,
         temporal_delta,
         holdout_quality,
         holdout_cost,

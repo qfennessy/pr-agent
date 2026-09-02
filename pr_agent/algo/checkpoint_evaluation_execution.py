@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from pr_agent.algo.checkpoint_evaluation import (EVALUATION_SCHEMA_VERSION,
                                                  EvaluationArmKind,
@@ -24,8 +24,7 @@ from pr_agent.algo.checkpoint_evaluation import (EVALUATION_SCHEMA_VERSION,
                                                  EvaluationRunRecord,
                                                  EvaluationRunState,
                                                  EvaluationValidationError,
-                                                 GateStatus, MeasurementStatus,
-                                                 NumericMeasurement,
+                                                 GateStatus,
                                                  build_evaluation_plan,
                                                  content_hash,
                                                  validate_run_model_telemetry)
@@ -108,12 +107,60 @@ def evaluate_output_permission(
 
 
 @dataclass(frozen=True)
+class PaidPlanItemBudget:
+    """Maximum paid attempts and reserved cost for one immutable case/arm pair."""
+
+    case_id: str
+    arm_id: str
+    projected_cost_per_attempt_usd: float
+    max_attempts: int
+
+    def __post_init__(self) -> None:
+        for name, value in (("case_id", self.case_id), ("arm_id", self.arm_id)):
+            if not isinstance(value, str) or not value.strip():
+                raise EvaluationValidationError(f"paid budget {name} must be non-empty")
+        if (
+            not isinstance(self.projected_cost_per_attempt_usd, (int, float))
+            or isinstance(self.projected_cost_per_attempt_usd, bool)
+            or not math.isfinite(self.projected_cost_per_attempt_usd)
+            or self.projected_cost_per_attempt_usd <= 0
+        ):
+            raise EvaluationValidationError("paid budget projected cost must be finite and positive")
+        if (
+            not isinstance(self.max_attempts, int)
+            or isinstance(self.max_attempts, bool)
+            or not 1 <= self.max_attempts <= 100
+        ):
+            raise EvaluationValidationError("paid budget max_attempts must be an integer from 1 to 100")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "case_id": self.case_id,
+            "arm_id": self.arm_id,
+            "projected_cost_per_attempt_usd": self.projected_cost_per_attempt_usd,
+            "max_attempts": self.max_attempts,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "PaidPlanItemBudget":
+        allowed = {"case_id", "arm_id", "projected_cost_per_attempt_usd", "max_attempts"}
+        if not isinstance(value, Mapping) or set(value) - allowed:
+            raise EvaluationValidationError("paid plan-item budget contains unknown fields")
+        return cls(
+            case_id=value["case_id"],
+            arm_id=value["arm_id"],
+            projected_cost_per_attempt_usd=value["projected_cost_per_attempt_usd"],
+            max_attempts=value["max_attempts"],
+        )
+
+
+@dataclass(frozen=True)
 class PaidExecutionRequest:
     """Secret-free proof that one manifest has an explicit spending boundary."""
 
     manifest_id: str
     cost_cap_usd: float
-    projected_cost_usd: NumericMeasurement
+    plan_item_budgets: tuple[PaidPlanItemBudget, ...]
     credential_present_by_provider: Mapping[str, bool]
     schema_version: str = EVALUATION_SCHEMA_VERSION
     request_id: str = field(init=False)
@@ -127,8 +174,14 @@ class PaidExecutionRequest:
             raise EvaluationValidationError("paid execution cost_cap_usd must be numeric")
         if not math.isfinite(self.cost_cap_usd) or self.cost_cap_usd <= 0:
             raise EvaluationValidationError("paid execution cost_cap_usd must be finite and greater than zero")
-        if not isinstance(self.projected_cost_usd, NumericMeasurement):
-            raise EvaluationValidationError("projected_cost_usd must use NumericMeasurement")
+        object.__setattr__(self, "plan_item_budgets", tuple(self.plan_item_budgets))
+        if not self.plan_item_budgets or any(
+            not isinstance(budget, PaidPlanItemBudget) for budget in self.plan_item_budgets
+        ):
+            raise EvaluationValidationError("paid execution requires per-plan-item budgets")
+        pairs = tuple((budget.case_id, budget.arm_id) for budget in self.plan_item_budgets)
+        if len(pairs) != len(set(pairs)):
+            raise EvaluationValidationError("paid execution plan-item budgets must be unique")
         if not isinstance(self.credential_present_by_provider, Mapping) or any(
             not isinstance(provider, str)
             or not provider.strip()
@@ -145,12 +198,31 @@ class PaidExecutionRequest:
             "schema_version": self.schema_version,
             "manifest_id": self.manifest_id,
             "cost_cap_usd": self.cost_cap_usd,
-            "projected_cost_usd": self.projected_cost_usd.to_dict(),
+            "plan_item_budgets": [budget.to_dict() for budget in self.plan_item_budgets],
             "credential_present_by_provider": dict(sorted(self.credential_present_by_provider.items())),
         }
 
     def to_dict(self) -> dict[str, Any]:
         return {**self._identity_payload(), "request_id": self.request_id}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "PaidExecutionRequest":
+        allowed = {
+            "schema_version", "manifest_id", "cost_cap_usd", "plan_item_budgets",
+            "credential_present_by_provider", "request_id",
+        }
+        if not isinstance(value, Mapping) or set(value) - allowed:
+            raise EvaluationValidationError("paid execution request contains unknown fields")
+        request = cls(
+            manifest_id=value["manifest_id"],
+            cost_cap_usd=value["cost_cap_usd"],
+            plan_item_budgets=tuple(PaidPlanItemBudget.from_dict(item) for item in value["plan_item_budgets"]),
+            credential_present_by_provider=value["credential_present_by_provider"],
+            schema_version=value["schema_version"],
+        )
+        if value.get("request_id") != request.request_id:
+            raise EvaluationValidationError("paid execution request identity does not match its content")
+        return request
 
 
 @dataclass(frozen=True)
@@ -205,14 +277,21 @@ def evaluate_paid_execution(
         reasons.append("paid execution is disabled")
     if publish_output:
         reasons.append("evaluation replay cannot publish developer-visible output")
-    if request.projected_cost_usd.status is not MeasurementStatus.COMPLETE:
-        reasons.append("projected cost is partial or unavailable")
-    elif (
-        request.projected_cost_usd.value is None
-        or request.projected_cost_usd.value <= 0
-        or request.projected_cost_usd.value > request.cost_cap_usd
-    ):
-        reasons.append("projected cost must be positive and within the explicit cap")
+    paid_pairs = {
+        (case.case_id, arm.arm_id)
+        for case in manifest.cases
+        for arm in manifest.arms
+        if arm.enabled and arm.kind is not EvaluationArmKind.DETERMINISTIC
+    }
+    budget_pairs = {(budget.case_id, budget.arm_id) for budget in request.plan_item_budgets}
+    if budget_pairs != paid_pairs:
+        reasons.append("paid budgets must match every model-backed plan item exactly")
+    projected_cost = sum(
+        budget.projected_cost_per_attempt_usd * budget.max_attempts
+        for budget in request.plan_item_budgets
+    )
+    if projected_cost > request.cost_cap_usd:
+        reasons.append("reserved paid plan-item cost exceeds the explicit cap")
 
     for arm in sorted((item for item in manifest.arms if item.enabled), key=lambda item: item.arm_id):
         if arm.kind is EvaluationArmKind.DETERMINISTIC:
@@ -334,6 +413,36 @@ class EvaluationArtifactStore:
 
     def bind_manifest(self, manifest: EvaluationManifest) -> bool:
         return _write_exclusive(self.root / "manifest.json", _canonical_bytes(manifest.to_dict()))
+
+    def bind_paid_request(self, manifest: EvaluationManifest, request: PaidExecutionRequest) -> bool:
+        if request.manifest_id != manifest.manifest_id:
+            raise EvaluationValidationError("paid execution request belongs to a different manifest")
+        self.bind_manifest(manifest)
+        return _write_exclusive(
+            self.root / "paid-execution-request.json",
+            _canonical_bytes(request.to_dict()),
+        )
+
+    def load_paid_request(self, manifest: EvaluationManifest) -> Optional[PaidExecutionRequest]:
+        self.bind_manifest(manifest)
+        path = self.root / "paid-execution-request.json"
+        if not path.exists():
+            return None
+        metadata = path.lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+        ):
+            raise EvaluationValidationError("bound paid execution request must be a private regular file")
+        try:
+            request = PaidExecutionRequest.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise EvaluationValidationError("invalid bound paid execution request") from exc
+        if request.manifest_id != manifest.manifest_id:
+            raise EvaluationValidationError("bound paid execution request belongs to a different manifest")
+        return request
 
     def append_record(self, manifest: EvaluationManifest, record: EvaluationRunRecord) -> bool:
         if record.manifest_id != manifest.manifest_id:

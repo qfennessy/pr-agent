@@ -24,6 +24,12 @@ from pr_agent.algo.checkpoint_evaluation import (EVALUATION_SCHEMA_VERSION,
                                                  validate_run_model_telemetry)
 from pr_agent.algo.review_snapshot import ReviewEvent
 
+_TWO_SIDED_95_T_CRITICAL = (
+    12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+    2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+    2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+)
+
 
 class GateComparator(str, Enum):
     AT_LEAST = "at_least"
@@ -846,7 +852,19 @@ def _paired_interval(values: Sequence[float]) -> tuple[float, float, float]:
     if len(values) == 1:
         return mean, mean, mean
     variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
-    margin = 1.96 * math.sqrt(variance / len(values))
+    degrees_of_freedom = len(values) - 1
+    if degrees_of_freedom <= len(_TWO_SIDED_95_T_CRITICAL):
+        critical_value = _TWO_SIDED_95_T_CRITICAL[degrees_of_freedom - 1]
+    else:
+        # Cornish-Fisher expansion for t(0.975, df), retaining the finite-sample
+        # correction instead of silently switching to the narrower normal bound.
+        z = 1.959963984540054
+        critical_value = (
+            z
+            + (z ** 3 + z) / (4 * degrees_of_freedom)
+            + (5 * z ** 5 + 16 * z ** 3 + 3 * z) / (96 * degrees_of_freedom ** 2)
+        )
+    margin = critical_value * math.sqrt(variance / len(values))
     return mean, mean - margin, mean + margin
 
 

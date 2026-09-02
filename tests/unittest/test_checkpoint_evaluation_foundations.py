@@ -2,6 +2,7 @@ import json
 import threading
 import tomllib
 from dataclasses import replace
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -31,17 +32,20 @@ from pr_agent.algo.checkpoint_evaluation_cocos import (
     validate_cocos_story_corpus)
 from pr_agent.algo.checkpoint_evaluation_execution import (
     EvaluationArtifactStore, OutputCapability, PaidExecutionRequest,
+    PaidPlanItemBudget,
     PaidExecutionStatus, evaluate_output_permission, evaluate_paid_execution)
 from pr_agent.algo.checkpoint_evaluation_scoring import (GateComparator,
                                                          GateRule,
                                                          GateRuleResult,
                                                          RolloutGateDecision,
                                                          ScoreMetric,
+                                                         _paired_interval,
                                                          evaluate_rollout_gate,
                                                          score_matched_arms)
 from pr_agent.algo.checkpoint_shadow_journal import (ShadowJournalEntry,
                                                      ShadowJournalWriter,
-                                                     ShadowSubmitStatus)
+                                                     ShadowSubmitStatus,
+                                                     load_shadow_journal)
 from pr_agent.algo.review_snapshot import (ReviewEvent, ReviewResultState,
                                            ReviewSnapshotResult)
 from pr_agent.algo.run_details import RunDetails
@@ -200,7 +204,7 @@ def test_paid_execution_requires_every_gate_and_never_records_credentials():
     request = PaidExecutionRequest(
         manifest_id=manifest.manifest_id,
         cost_cap_usd=2.0,
-        projected_cost_usd=NumericMeasurement(MeasurementStatus.COMPLETE, 1.0),
+        plan_item_budgets=(PaidPlanItemBudget(case.case_id, unpinned.arm_id, 0.5, 2),),
         credential_present_by_provider={"provider-v1": True},
     )
 
@@ -222,7 +226,7 @@ def test_paid_execution_requires_every_gate_and_never_records_credentials():
     authorized_request = PaidExecutionRequest(
         manifest_id=pinned_manifest.manifest_id,
         cost_cap_usd=2.0,
-        projected_cost_usd=NumericMeasurement(MeasurementStatus.COMPLETE, 1.0),
+        plan_item_budgets=(PaidPlanItemBudget(case.case_id, "small", 0.5, 2),),
         credential_present_by_provider={"provider-v1": True},
     )
     authorized = evaluate_paid_execution(
@@ -236,27 +240,34 @@ def test_paid_execution_requires_every_gate_and_never_records_credentials():
     authorized.require_authorized()
 
 
+def test_small_paired_sample_uses_student_t_instead_of_the_normal_approximation():
+    mean, lower, upper = _paired_interval([1.0] * 13 + [-1.0] * 5)
+    normal_lower = mean - 1.96 * (((18 * (1 - mean ** 2)) / 17) / 18) ** 0.5
+
+    assert normal_lower > 0
+    assert lower < 0
+    assert upper > mean
+
+
 @pytest.mark.parametrize(
-    ("enabled", "allow_paid", "publish", "cost_status", "cost", "credentials"),
+    ("enabled", "allow_paid", "publish", "projected_cost", "credentials"),
     [
-        (False, True, False, MeasurementStatus.COMPLETE, 1.0, True),
-        (True, False, False, MeasurementStatus.COMPLETE, 1.0, True),
-        (True, True, True, MeasurementStatus.COMPLETE, 1.0, True),
-        (True, True, False, MeasurementStatus.PARTIAL, 1.0, True),
-        (True, True, False, MeasurementStatus.COMPLETE, 0.0, True),
-        (True, True, False, MeasurementStatus.COMPLETE, 3.0, True),
-        (True, True, False, MeasurementStatus.COMPLETE, 1.0, False),
+        (False, True, False, 1.0, True),
+        (True, False, False, 1.0, True),
+        (True, True, True, 1.0, True),
+        (True, True, False, 3.0, True),
+        (True, True, False, 1.0, False),
     ],
 )
 def test_paid_execution_fails_closed_for_each_missing_proof(
-    enabled, allow_paid, publish, cost_status, cost, credentials
+    enabled, allow_paid, publish, projected_cost, credentials
 ):
     case = _case("case", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
     manifest = _manifest((case,), (_arm("small", EvaluationArmKind.GENERAL_REVIEW),))
     request = PaidExecutionRequest(
         manifest_id=manifest.manifest_id,
         cost_cap_usd=2.0,
-        projected_cost_usd=NumericMeasurement(cost_status, cost),
+        plan_item_budgets=(PaidPlanItemBudget(case.case_id, "small", projected_cost, 1),),
         credential_present_by_provider={"provider-v1": credentials},
     )
     assert evaluate_paid_execution(
@@ -266,6 +277,12 @@ def test_paid_execution_fails_closed_for_each_missing_proof(
         allow_paid_execution=allow_paid,
         publish_output=publish,
     ).status is PaidExecutionStatus.DENIED
+
+
+@pytest.mark.parametrize("projected_cost", [0.0, -1.0, float("inf")])
+def test_paid_execution_request_rejects_invalid_plan_item_cost(projected_cost):
+    with pytest.raises(EvaluationValidationError, match="projected cost"):
+        PaidPlanItemBudget("case", "small", projected_cost, 1)
 
 
 def test_frozen_production_fallback_identity_is_authorized_retained_and_scored(tmp_path):
@@ -281,7 +298,7 @@ def test_frozen_production_fallback_identity_is_authorized_retained_and_scored(t
     request = PaidExecutionRequest(
         manifest_id=manifest.manifest_id,
         cost_cap_usd=2.0,
-        projected_cost_usd=NumericMeasurement(MeasurementStatus.COMPLETE, 1.0),
+        plan_item_budgets=(PaidPlanItemBudget(case.case_id, arm.arm_id, 0.5, 2),),
         credential_present_by_provider={"provider-v1": True, "fallback-provider": True},
     )
     assert evaluate_paid_execution(
@@ -416,6 +433,25 @@ def test_artifact_store_rejects_a_record_for_the_wrong_snapshot(tmp_path):
     assert not tuple((tmp_path / "wrong-snapshot" / "records").glob("*.json"))
 
 
+def test_artifact_store_immutably_binds_the_paid_request(tmp_path):
+    case = _case("case", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
+    arm = _arm("small", EvaluationArmKind.GENERAL_REVIEW)
+    manifest = _manifest((case,), (arm,))
+    request = PaidExecutionRequest(
+        manifest_id=manifest.manifest_id,
+        cost_cap_usd=1.0,
+        plan_item_budgets=(PaidPlanItemBudget(case.case_id, arm.arm_id, 0.1, 2),),
+        credential_present_by_provider={"provider-v1": True},
+    )
+    store = EvaluationArtifactStore(tmp_path / "paid-binding")
+
+    assert store.bind_paid_request(manifest, request) is True
+    assert store.bind_paid_request(manifest, request) is False
+    assert store.load_paid_request(manifest) == request
+    with pytest.raises(EvaluationValidationError, match="immutable artifact content changed"):
+        store.bind_paid_request(manifest, replace(request, cost_cap_usd=2.0))
+
+
 def test_shadow_journal_is_opt_in_source_free_and_non_blocking(tmp_path):
     case = _case("case", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
     manifest = _manifest((case,), (_arm("deterministic", EvaluationArmKind.DETERMINISTIC),))
@@ -450,6 +486,11 @@ def test_shadow_journal_is_opt_in_source_free_and_non_blocking(tmp_path):
     assert "raw-sensitive-fingerprint" not in serialized
     for forbidden in ("source", "diff", "secret", "reasoning", "request_id", "credential", "task_intent"):
         assert forbidden not in payload
+    parsed = load_shadow_journal(path)
+    assert len(parsed) == 1
+    assert parsed[0].sequence == 1
+    assert parsed[0].developer_elapsed_seconds is None
+    assert parsed[0].entry == entry
 
     failed_record = _record(
         manifest,
@@ -466,6 +507,53 @@ def test_shadow_journal_is_opt_in_source_free_and_non_blocking(tmp_path):
         configuration_hash=manifest.configuration_hash,
     )
     assert failed_entry.coverage_status is MeasurementStatus.UNAVAILABLE
+
+
+def test_shadow_journal_writer_stamps_contiguous_time_evidence_and_loader_rejects_forgery(tmp_path):
+    case = _case("case", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
+    manifest = _manifest((case,), (_arm("deterministic", EvaluationArmKind.DETERMINISTIC),))
+    entry = ShadowJournalEntry.from_run_record(
+        _record(manifest, case, "deterministic"),
+        arm=manifest.arms[0],
+        event=case.event,
+        policy_hash=manifest.policy_hash,
+        configuration_hash=manifest.configuration_hash,
+    )
+    path = tmp_path / "writer-stamped.ndjson"
+    writer = ShadowJournalWriter(path, enabled=True)
+    assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
+    assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
+    assert writer.close()
+    records = load_shadow_journal(path)
+
+    assert [record.sequence for record in records] == [1, 2]
+    assert records[0].developer_time_basis.value == "writer_start"
+    assert records[0].developer_elapsed_seconds is None
+    assert records[1].developer_time_basis.value == "writer_monotonic"
+    assert records[1].developer_elapsed_seconds is not None
+
+    def rewrite(changed_records):
+        path.write_text(
+            "".join(json.dumps(record.to_dict(), sort_keys=True) + "\n" for record in changed_records),
+            encoding="utf-8",
+        )
+
+    rewrite((records[0], replace(records[1], sequence=3)))
+    with pytest.raises(EvaluationValidationError, match="sequence must be contiguous"):
+        load_shadow_journal(path)
+
+    rewrite((records[0], replace(
+        records[1],
+        ingested_at_utc=records[0].ingested_at_utc - timedelta(seconds=1),
+    )))
+    with pytest.raises(EvaluationValidationError, match="cannot move backwards"):
+        load_shadow_journal(path)
+
+    injected = records[0].to_dict()
+    injected["source"] = "must never survive parsing"
+    path.write_text(json.dumps(injected) + "\n", encoding="utf-8")
+    with pytest.raises(EvaluationValidationError, match="unknown fields"):
+        load_shadow_journal(path)
 
 
 def test_shadow_journal_preserves_and_revalidates_source_free_stage_telemetry(tmp_path):
@@ -528,8 +616,8 @@ def test_shadow_journal_preserves_and_revalidates_source_free_stage_telemetry(tm
     writer_closed = writer.close()
     assert writer_closed
     persisted = json.loads((tmp_path / "specialist-shadow.ndjson").read_text(encoding="utf-8"))
-    assert persisted["model_id"] is None
-    assert persisted["stage_runs"][0]["model_id"] == arm.model_id
+    assert persisted["entry"]["model_id"] is None
+    assert persisted["entry"]["stage_runs"][0]["model_id"] == arm.model_id
 
     failed_stage = replace(
         stage,
@@ -868,7 +956,7 @@ def test_scorer_reports_lineage_lifecycle_events_stages_cohorts_and_paired_uncer
         "pr-publication",
         scorecard,
         "cascade",
-        (GateRule("paired.case_recall.lower_95", GateComparator.AT_LEAST, -1.0),),
+        (GateRule("paired.case_recall.lower_95", GateComparator.AT_LEAST, -10.0),),
     )
     assert paired_gate.status is GateStatus.PASSED
     assert paired_gate.rule_results[0].observed.support == 2
