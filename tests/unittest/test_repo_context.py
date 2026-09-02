@@ -596,6 +596,7 @@ def test_github_provider_reads_from_default_branch_when_requested():
                 "publication_threshold": "none",
                 "num_pr_files": 1,
                 "is_ai_metadata": False,
+                "enable_candidate_verification": False,
             },
         ),
         (
@@ -651,6 +652,7 @@ def test_prompt_templates_render_configured_repo_context(prompt_name, variables)
 def test_bugs_only_review_prompt_renders_ci_failure_evidence_contract():
     variables = {
         "bugs_only": True,
+        "enable_candidate_verification": False,
         "ci_failure_context": (
             '{"status": "available", "failures": [{"name": "Unit tests", '
             '"title": "Cache isolation failed", "summary": "Tenant key omitted"}]}'

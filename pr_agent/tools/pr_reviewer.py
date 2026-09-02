@@ -2,25 +2,49 @@ import copy
 import datetime
 import json
 import re
+import time
 from dataclasses import replace
 from functools import partial
 from typing import Any, List, Mapping, Optional, Tuple
 
-from jinja2 import Environment, StrictUndefined
+from jinja2 import Environment, StrictUndefined, select_autoescape
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import (
-    LiteLLMAIHandler, get_effective_litellm_output_token_cap)
+    LiteLLMAIHandler,
+    get_effective_litellm_output_token_cap,
+)
 from pr_agent.algo.ai_request_context import AIModelRoute, get_ai_request_options
+from pr_agent.algo.candidate_verification import (
+    VerificationBudgets,
+    apply_specialist_prioritization,
+    apply_verification_decisions,
+    bounded_verification_evidence,
+    prepare_candidates,
+    prompt_evidence_coverage,
+    render_verification_payload,
+    retrieval_request_is_complete,
+    retrieve_evidence,
+    safe_repo_path,
+    telemetry_safe_artifact,
+    validated_specialist_prioritization,
+)
 from pr_agent.algo.git_patch_processing import iter_git_patch_lines, split_git_file_lines
 from pr_agent.algo.inline_comment_dedup import (
-    InlineCommentStore, can_verify_inline_comment_publication,
-    get_inline_comment_store, key_issue_body_with_markers,
-    key_issue_fingerprint, key_issue_location_fingerprint)
-from pr_agent.algo.pr_processing import (PRDiffCoverage,
-                                         add_ai_metadata_to_diff_files,
-                                         get_pr_diff,
-                                         retry_with_fallback_models)
+    InlineCommentStore,
+    can_verify_inline_comment_publication,
+    get_inline_comment_store,
+    key_issue_body_with_markers,
+    key_issue_fingerprint,
+    key_issue_location_fingerprint,
+)
+from pr_agent.algo.pr_processing import (
+    OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+    PRDiffCoverage,
+    add_ai_metadata_to_diff_files,
+    get_pr_diff,
+    retry_with_fallback_models,
+)
 from pr_agent.algo.repo_context import build_repo_context
 from pr_agent.algo.review_router import (
     ChangedFile,
@@ -47,26 +71,38 @@ from pr_agent.algo.review_specialists import (
     unavailable_specialist_batch,
     validate_specialist_output,
 )
-from pr_agent.algo.run_details import (get_run_details, init_run_details,
-                                       record_review_profile,
-                                       record_review_route)
+from pr_agent.algo.run_details import (
+    get_run_details,
+    init_run_details,
+    record_review_profile,
+    record_review_route,
+)
 from pr_agent.algo.skills_loader import get_skills_context
-from pr_agent.algo.token_handler import TokenHandler
+from pr_agent.algo.token_handler import TokenEncoder, TokenHandler
 from pr_agent.algo.types import EDIT_TYPE
-from pr_agent.algo.utils import (ModelType, PRReviewHeader, PRReviewIdentity,
-                                 add_pr_review_identity,
-                                 convert_to_markdown_v2, get_model,
-                                 github_action_output, load_yaml,
-                                 show_relevant_configurations,
-                                 show_run_details)
+from pr_agent.algo.utils import (
+    ModelType,
+    PRReviewHeader,
+    PRReviewIdentity,
+    add_pr_review_identity,
+    convert_to_markdown_v2,
+    get_max_tokens,
+    get_model,
+    github_action_output,
+    load_yaml,
+    show_relevant_configurations,
+    show_run_details,
+)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import get_git_provider_with_context
-from pr_agent.git_providers.git_provider import (GitProvider, IncrementalPR,
-                                                 get_main_pr_language)
+from pr_agent.git_providers.git_provider import (
+    GitProvider,
+    IncrementalPR,
+    get_main_pr_language,
+)
 from pr_agent.log import get_logger
 from pr_agent.servers.help import HelpMessage
-from pr_agent.tools.ticket_pr_compliance_check import \
-    extract_and_cache_pr_tickets
+from pr_agent.tools.ticket_pr_compliance_check import extract_and_cache_pr_tickets
 
 MAX_REVIEW_COVERAGE_FILES = 50
 _SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
@@ -130,6 +166,10 @@ class PRReviewer:
         self.remaining_files_list = []
         self.deleted_files_list = []
         self.prediction = None
+        self.candidate_verification_artifact = None
+        self._candidate_verification_published_finding_count = None
+        self.verified_review_data = None
+        self.specialist_shadow_input = None
         self.specialist_shadow_result = None
         self._specialists_started = False
         self.review_routing_configuration = None
@@ -205,6 +245,7 @@ class PRReviewer:
             "related_tickets": [] if bugs_only else get_settings().get('related_tickets', []),
             'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False),
             "date": datetime.datetime.now().strftime('%Y-%m-%d'),
+            "enable_candidate_verification": self._candidate_verification_enabled(),
             "ci_failure_context": json.dumps(self.ci_failure_context, ensure_ascii=False),
         }
 
@@ -326,6 +367,8 @@ class PRReviewer:
                 )
             if not self.prediction:
                 return None
+            if self._candidate_verification_enabled():
+                await self._run_candidate_verification()
 
             pr_review = self._prepare_pr_review()
             get_logger().debug(f"PR output", artifact=pr_review)
@@ -334,7 +377,9 @@ class PRReviewer:
             if not should_publish:
                 self._clear_stale_persistent_bugs_only_review()
                 reason = "Review output is not published"
-                if get_settings().config.publish_output:
+                if self._candidate_verification_blocks_publication():
+                    reason += ": candidate verification did not complete successfully."
+                elif get_settings().config.publish_output:
                     reason += ": no major issues detected."
                 get_logger().info(reason)
                 get_settings().data = {"artifact": pr_review}
@@ -402,7 +447,10 @@ class PRReviewer:
                     get_logger().exception(f"Failed to publish review failure result, error: {e}")
 
     def _should_publish_review_no_suggestions(self, pr_review: str) -> bool:
-        if getattr(self, "_review_shadow_only", False):
+        if (
+            self._candidate_verification_blocks_publication()
+            or getattr(self, "_review_shadow_only", False)
+        ):
             return False
         if self._review_profile() == "bugs_only":
             return bool(pr_review.strip())
@@ -1129,7 +1177,9 @@ class PRReviewer:
 
     def _clear_stale_persistent_bugs_only_review(self) -> None:
         """Remove a prior persistent defect summary after a clean bugs-only rerun."""
-        if (not self._provider_mutations_allowed() or self._review_profile() != "bugs_only" or
+        if (not self._provider_mutations_allowed() or
+                self._candidate_verification_blocks_publication() or
+                self._review_profile() != "bugs_only" or
                 not get_settings().config.publish_output or
                 not get_settings().pr_reviewer.persistent_comment or self.incremental.is_incremental):
             return
@@ -1253,6 +1303,7 @@ class PRReviewer:
                 additional_deterministic_results=self._specialist_deterministic_results(),
                 allowed_change_labels=pipeline.allowed_change_labels,
             )
+            self.specialist_shadow_input = specialist_input
             self._specialist_input = specialist_input
             self.specialist_shadow_result = await run_shadow_specialists(
                 specialist_input,
@@ -1409,6 +1460,11 @@ class PRReviewer:
         """Keep only complete, changed-line defect reports and collapse shared root causes."""
         if self._review_profile() != "bugs_only":
             return data
+        if getattr(self, "candidate_verification_artifact", None) is not None:
+            issues = (data.get("review") or {}).get("key_issues_to_review")
+            if not isinstance(issues, list):
+                issues = []
+            return {"review": {"key_issues_to_review": issues[:get_settings().pr_reviewer.num_max_findings]}}
 
         issues = (data.get("review") or {}).get("key_issues_to_review")
         if not isinstance(issues, list):
@@ -1458,17 +1514,734 @@ class PRReviewer:
                 break
         return {"review": {"key_issues_to_review": normalized_issues}}
 
+    @staticmethod
+    def _candidate_verification_enabled() -> bool:
+        value = get_settings().pr_reviewer.get("enable_candidate_verification", False)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _candidate_verification_blocks_publication(
+        self,
+        review_data: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Fail closed unless verification and the final publication agree."""
+        artifact = getattr(self, "candidate_verification_artifact", None)
+        if not isinstance(artifact, dict):
+            return False
+
+        published_finding_count = getattr(
+            self, "_candidate_verification_published_finding_count", None
+        )
+        if review_data is not None:
+            issues = (review_data.get("review") or {}).get("key_issues_to_review")
+            published_finding_count = len(issues) if isinstance(issues, list) else 0
+            self._candidate_verification_published_finding_count = published_finding_count
+
+        if artifact.get("publication_safe") is False:
+            return True
+        status = artifact.get("status")
+        if status == "complete":
+            return False
+        if status == "no_candidates":
+            return published_finding_count not in (None, 0)
+        if status == "partial":
+            effective_finding_count = (
+                published_finding_count
+                if published_finding_count is not None
+                else int(artifact.get("verified_count") or 0)
+            )
+            return effective_finding_count <= 0
+        return True
+
+    @staticmethod
+    def _verification_response_contract_error(
+        candidates: list[dict], verification_data: dict
+    ) -> Optional[str]:
+        """Return a source-free error when a verifier response is not complete and unambiguous."""
+        if not isinstance(verification_data, dict):
+            return "invalid_response"
+        verification = verification_data.get("verification")
+        if not isinstance(verification, dict):
+            return "invalid_verification"
+        decisions = verification.get("decisions")
+        if not isinstance(decisions, list):
+            return "invalid_decisions"
+        expected_ids = {candidate["candidate_id"] for candidate in candidates}
+        seen_ids = set()
+        for decision in decisions:
+            if not isinstance(decision, dict):
+                return "invalid_decision"
+            candidate_id = str(decision.get("candidate_id") or "").strip()
+            if candidate_id not in expected_ids:
+                return "unknown_candidate"
+            if candidate_id in seen_ids:
+                return "duplicate_decision"
+            if str(decision.get("verdict") or "").strip().lower() not in {"verified", "rejected"}:
+                return "invalid_verdict"
+            if str(decision.get("verdict") or "").strip().lower() == "verified":
+                required_text = (
+                    "issue_header", "issue_content", "trigger", "impact",
+                )
+                if (
+                    safe_repo_path(decision.get("relevant_file")) is None
+                    or any(
+                        not isinstance(decision.get(key), str)
+                        or not decision[key].strip()
+                        for key in required_text
+                    )
+                ):
+                    return "invalid_verified_decision"
+                start_line = decision.get("start_line")
+                end_line = decision.get("end_line")
+                if (
+                    not isinstance(start_line, int)
+                    or isinstance(start_line, bool)
+                    or not isinstance(end_line, int)
+                    or isinstance(end_line, bool)
+                    or start_line < 1
+                    or end_line < start_line
+                ):
+                    return "invalid_verified_decision"
+                evidence_paths = decision.get("evidence_paths")
+                if (
+                    not isinstance(evidence_paths, list)
+                    or not evidence_paths
+                    or any(safe_repo_path(path) is None for path in evidence_paths)
+                ):
+                    return "invalid_verified_decision"
+            seen_ids.add(candidate_id)
+        if seen_ids != expected_ids:
+            return "missing_decision"
+        return None
+
+    @staticmethod
+    def _candidate_specialist_prioritization_enabled() -> bool:
+        value = get_settings().pr_reviewer.get(
+            "candidate_verification_consume_specialist_prioritization", False
+        )
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _candidate_verifier_model_route(self, config) -> AIModelRoute:
+        """Build an immutable verifier route without inheriting an incompatible Azure deployment."""
+
+        def string_tuple(value, key: str) -> tuple[str, ...]:
+            if value in (None, "", []):
+                return ()
+            if isinstance(value, str):
+                values = [part.strip() for part in value.split(",")]
+            elif isinstance(value, (list, tuple)):
+                values = [str(part).strip() for part in value]
+            else:
+                raise ValueError(f"{key} must be a string list")
+            if any(not part for part in values):
+                raise ValueError(f"{key} cannot contain blank entries")
+            return tuple(values)
+
+        def deployment_tuple(value, key: str) -> tuple[Optional[str], ...]:
+            if value in (None, "", []):
+                return ()
+            if isinstance(value, str):
+                values = value.split(",")
+            elif isinstance(value, (list, tuple)):
+                values = value
+            else:
+                raise ValueError(f"{key} must be a string list")
+            return tuple(str(part).strip() or None for part in values)
+
+        settings = get_settings()
+        primary_model = str(settings.config.model).strip()
+        configured_model = str(config.get("candidate_verification_model", "") or "").strip()
+        model = configured_model or primary_model
+        if not model:
+            raise ValueError("candidate verifier model cannot be blank")
+        fallback_models = string_tuple(
+            config.get("candidate_verification_fallback_models", []),
+            "candidate_verification_fallback_models",
+        )
+
+        global_deployment = str(
+            settings.get("openai.deployment_id", "") or ""
+        ).strip() or None
+        explicit_deployment = str(
+            config.get("candidate_verification_deployment", "") or ""
+        ).strip() or None
+        azure_route = getattr(self.ai_handler, "azure", False) is True or global_deployment is not None
+        if explicit_deployment is not None:
+            deployment = explicit_deployment
+        elif not configured_model or model == primary_model:
+            deployment = global_deployment
+        elif azure_route:
+            raise ValueError(
+                "candidate_verification_deployment is required when the Azure verifier model differs"
+            )
+        else:
+            deployment = None
+
+        fallback_deployments = deployment_tuple(
+            config.get("candidate_verification_fallback_deployments", []),
+            "candidate_verification_fallback_deployments",
+        )
+        if fallback_deployments and len(fallback_deployments) != len(fallback_models):
+            raise ValueError(
+                "candidate_verification_fallback_deployments must match fallback models"
+            )
+        if not fallback_deployments:
+            if azure_route and fallback_models:
+                raise ValueError(
+                    "Azure verifier fallback models require matching fallback deployments"
+                )
+            fallback_deployments = (None,) * len(fallback_models)
+        deployments = (deployment, *fallback_deployments)
+        if azure_route and any(item is None for item in deployments):
+            raise ValueError("every Azure verifier model requires a deployment")
+
+        configured_output_cap = config.get("candidate_verification_max_output_tokens", 0)
+        try:
+            output_cap = int(configured_output_cap)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("candidate_verification_max_output_tokens must be an integer") from exc
+        if output_cap < 0:
+            raise ValueError("candidate_verification_max_output_tokens cannot be negative")
+        if output_cap == 0:
+            try:
+                output_cap = int(settings.config.get("max_output_tokens", 0))
+            except (TypeError, ValueError):
+                output_cap = 0
+
+        return AIModelRoute(
+            models=(model, *fallback_models),
+            deployments=deployments,
+            timeout_seconds=max(
+                0.001, float(config.get("candidate_verification_timeout_seconds", 10))
+            ),
+            model_retries=1,
+            provider_retries=0,
+            max_output_tokens=output_cap or None,
+            attribution="candidate_verification",
+        )
+
+    def _parse_review_prediction(self) -> dict:
+        return load_yaml(
+            self.prediction.strip(),
+            keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:",
+                           "security_concerns:", "key_issues_to_review:", "relevant_file:",
+                           "relevant_line:", "suggestion:"],
+            first_key="review",
+            last_key="security_concerns",
+        )
+
+    async def _run_candidate_verification(self) -> None:
+        """Verify review candidates against bounded base-branch repository evidence."""
+        config = get_settings().pr_reviewer
+        consume_specialist_prioritization = self._candidate_specialist_prioritization_enabled()
+        artifact = {
+            "enabled": True,
+            "status": "initializing",
+            "model_calls": 0,
+            "publication_safe": False,
+            "specialist_prioritization": {
+                "status": "pending" if consume_specialist_prioritization else "disabled"
+            },
+        }
+        verifier_started = None
+        details_before = None
+        self.candidate_verification_artifact = artifact
+        try:
+            review_data = self._parse_review_prediction()
+            if not isinstance(review_data, dict) or not isinstance(review_data.get("review"), dict):
+                artifact.update({"status": "candidate_parse_failed", "verified_count": 0})
+                return
+            raw_candidate_input = review_data["review"].get("key_issues_to_review")
+            raw_candidate_list_valid = isinstance(raw_candidate_input, list)
+            proposed_candidate_count = (
+                len(raw_candidate_input) if raw_candidate_list_valid else 0
+            )
+            artifact.update({
+                "proposal_source": "first_pass_review",
+                "proposal_shape": "list" if raw_candidate_list_valid else "invalid",
+                "proposed_candidate_count": proposed_candidate_count,
+            })
+            self.verified_review_data = copy.deepcopy(review_data)
+            self.verified_review_data["review"]["key_issues_to_review"] = []
+
+            if not raw_candidate_list_valid:
+                artifact.update({
+                    "status": "candidate_input_invalid",
+                    "candidate_count": 0,
+                    "accepted_model_candidate_count": 0,
+                    "candidate_rejection_count": 0,
+                    "verified_count": 0,
+                    "publication_safe": False,
+                })
+                return
+
+            capability = getattr(self.git_provider, "supports_repo_file_fetching", None)
+            if not callable(capability) or not capability():
+                artifact.update({"status": "unsupported_provider", "verified_count": 0})
+                return
+
+            route_candidate_cap = getattr(
+                self, "_review_max_verification_candidates", None
+            )
+            if route_candidate_cap is not None and (
+                isinstance(route_candidate_cap, bool)
+                or not isinstance(route_candidate_cap, int)
+                or route_candidate_cap <= 0
+            ):
+                raise ValueError(
+                    "routed max_verification_candidates must be a positive integer"
+                )
+            budgets = VerificationBudgets(
+                max_candidates=(
+                    route_candidate_cap
+                    if route_candidate_cap is not None
+                    else max(
+                        0,
+                        int(config.get("candidate_verification_max_candidates", 3)),
+                    )
+                ),
+                max_files=max(0, int(config.get("candidate_verification_max_files", 6))),
+                max_lines_per_file=max(0, int(config.get("candidate_verification_max_lines_per_file", 160))),
+                max_total_lines=max(0, int(config.get("candidate_verification_max_total_lines", 600))),
+                max_context_tokens=max(0, int(config.get("candidate_verification_max_context_tokens", 6000))),
+                timeout_seconds=max(0.0, float(config.get("candidate_verification_timeout_seconds", 10))),
+            )
+            sensitive_globs = config.get("candidate_verification_sensitive_path_globs", []) or []
+            if isinstance(sensitive_globs, str):
+                sensitive_globs = [sensitive_globs]
+            diff_files = self.git_provider.get_diff_files()
+            candidates, candidate_rejections = prepare_candidates(
+                review_data,
+                diff_files,
+                sensitive_globs,
+                budgets.max_candidates,
+                max_sensitive_candidates=max(
+                    0, int(config.get("candidate_verification_max_sensitive_candidates", 6))
+                ),
+            )
+            sensitive_candidates = [
+                candidate for candidate in candidates if candidate.get("sensitive_path")
+            ]
+            accepted_model_candidate_count = sum(
+                1 for candidate in candidates if not candidate.get("sensitive_path")
+            )
+            model_candidate_rejection_count = sum(
+                1 for rejection in candidate_rejections
+                if not rejection.get("sensitive_path")
+            )
+            model_candidate_budget_exhausted = any(
+                rejection.get("reason") == "candidate_budget_exhausted"
+                for rejection in candidate_rejections
+                if not rejection.get("sensitive_path")
+            )
+            model_candidate_coverage_incomplete = bool(
+                proposed_candidate_count
+                and (
+                    not accepted_model_candidate_count
+                    or model_candidate_budget_exhausted
+                )
+            )
+            if proposed_candidate_count == 0:
+                model_candidate_coverage_status = "complete"
+            elif model_candidate_coverage_incomplete:
+                model_candidate_coverage_status = "incomplete"
+            elif model_candidate_rejection_count:
+                model_candidate_coverage_status = "partial"
+            else:
+                model_candidate_coverage_status = "complete"
+            sensitive_rejections = [
+                rejection for rejection in candidate_rejections
+                if rejection.get("sensitive_path")
+            ]
+            sensitive_overflow = next((
+                rejection for rejection in sensitive_rejections
+                if rejection.get("reason") == "sensitive_audit_budget_exhausted"
+            ), {})
+            sensitive_invalid_count = sum(
+                1 for rejection in sensitive_rejections
+                if rejection.get("reason") != "sensitive_audit_budget_exhausted"
+            )
+            sensitive_selected_count = int(
+                sensitive_overflow.get(
+                    "selected_count", len(sensitive_candidates) + sensitive_invalid_count
+                )
+            )
+            sensitive_omitted_count = int(sensitive_overflow.get("omitted_count", 0))
+            sensitive_total_count = int(
+                sensitive_overflow.get(
+                    "total_count", sensitive_selected_count + sensitive_omitted_count
+                )
+            )
+            sensitive_coverage_incomplete = bool(sensitive_rejections)
+            artifact["sensitive_audit_coverage"] = {
+                "status": "incomplete" if sensitive_coverage_incomplete else "complete",
+                "budget": max(
+                    0, int(config.get("candidate_verification_max_sensitive_candidates", 6))
+                ),
+                "total_count": sensitive_total_count,
+                "selected_count": sensitive_selected_count,
+                "candidate_count": len(sensitive_candidates),
+                "omitted_count": sensitive_omitted_count,
+                "unavailable_count": sensitive_invalid_count,
+            }
+            if consume_specialist_prioritization:
+                specialist_input = getattr(self, "specialist_shadow_input", None)
+                prioritization = validated_specialist_prioritization(
+                    getattr(self, "specialist_shadow_result", None), specialist_input
+                )
+                if prioritization is None:
+                    artifact["specialist_prioritization"] = {"status": "validated_output_unavailable"}
+                else:
+                    candidates, prioritization_artifact = apply_specialist_prioritization(
+                        candidates, prioritization, specialist_input
+                    )
+                    artifact["specialist_prioritization"] = prioritization_artifact
+            artifact.update({
+                "candidate_count": len(candidates),
+                "accepted_model_candidate_count": accepted_model_candidate_count,
+                "sensitive_candidate_count": len(sensitive_candidates),
+                "candidate_rejection_count": len(candidate_rejections),
+                "model_candidate_coverage": {
+                    "status": model_candidate_coverage_status,
+                    "proposed_count": proposed_candidate_count,
+                    "accepted_count": accepted_model_candidate_count,
+                    "rejected_count": model_candidate_rejection_count,
+                },
+                "candidate_rejections": candidate_rejections,
+                "verified_count": 0,
+            })
+            if not candidates:
+                if sensitive_coverage_incomplete:
+                    artifact.update({
+                        "status": "sensitive_audit_coverage_incomplete",
+                        "publication_safe": False,
+                    })
+                elif model_candidate_coverage_incomplete:
+                    artifact.update({
+                        "status": "candidate_validation_incomplete",
+                        "publication_safe": False,
+                    })
+                else:
+                    artifact.update({"status": "no_candidates", "publication_safe": True})
+                return
+
+            try:
+                verifier_route = self._candidate_verifier_model_route(config)
+            except (TypeError, ValueError):
+                artifact.update({
+                    "status": "verifier_route_invalid",
+                    "failure": "invalid_model_route",
+                    "verified_count": 0,
+                })
+                return
+            model = verifier_route.models[0]
+            artifact["model"] = model
+            encoder = TokenEncoder.get_token_encoder(model)
+            runtime_data = get_settings().get("data", {}) or {}
+            static_evidence = runtime_data.get("static_analysis_evidence", []) if isinstance(runtime_data, dict) else []
+            evidence, retrieval_artifact = await retrieve_evidence(
+                self.git_provider,
+                candidates,
+                budgets,
+                static_evidence,
+                diff_files=diff_files,
+                token_counter=lambda value: len(encoder.encode(value, disallowed_special=())),
+                prefer_pr_head=bool(
+                    getattr(getattr(self, "incremental", None), "is_incremental", False)
+                ),
+            )
+            artifact["retrieval"] = retrieval_artifact
+            if int(config.get("candidate_verification_max_model_calls", 1)) < 1:
+                artifact["status"] = "model_call_budget_exhausted"
+                return
+
+            environment = Environment(
+                autoescape=select_autoescape(default_for_string=False),
+                undefined=StrictUndefined,
+            )
+            verification_prompt = get_settings().pr_review_verification_prompt
+            route_encoders = {
+                route_model: TokenEncoder.get_token_encoder(route_model)
+                for route_model in verifier_route.models
+            }
+            try:
+                route_completion_reserves = {
+                    route_model: get_effective_litellm_output_token_cap(
+                        route_model,
+                        verifier_route.max_output_tokens,
+                        require_bounded_reasoning=True,
+                    )
+                    for route_model in verifier_route.models
+                }
+                if any(cap is None for cap in route_completion_reserves.values()):
+                    verifier_route = AIModelRoute(
+                        models=verifier_route.models,
+                        deployments=verifier_route.deployments,
+                        timeout_seconds=verifier_route.timeout_seconds,
+                        model_retries=verifier_route.model_retries,
+                        provider_retries=verifier_route.provider_retries,
+                        max_output_tokens=OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+                        attribution=verifier_route.attribution,
+                    )
+                    route_completion_reserves = {
+                        route_model: get_effective_litellm_output_token_cap(
+                            route_model,
+                            verifier_route.max_output_tokens,
+                            require_bounded_reasoning=True,
+                        )
+                        for route_model in verifier_route.models
+                    }
+            except ValueError:
+                artifact.update({
+                    "status": "verifier_route_invalid",
+                    "failure": "invalid_output_budget",
+                    "verified_count": 0,
+                })
+                return
+            route_model_max_tokens = {
+                route_model: get_max_tokens(route_model)
+                for route_model in verifier_route.models
+            }
+            route_prompt_limits = {
+                route_model: max(
+                    0,
+                    route_model_max_tokens[route_model]
+                    - route_completion_reserves[route_model],
+                )
+                for route_model in verifier_route.models
+            }
+            model_max_tokens = min(route_model_max_tokens.values())
+            reserved_completion_tokens = max(route_completion_reserves.values())
+            max_prompt_tokens = min(route_prompt_limits.values())
+
+            def render_prompts(evidence_fraction: float, changed_diff_fraction: float) -> tuple[str, str, int]:
+                variables = {
+                    "verification_payload": render_verification_payload(
+                        candidates,
+                        self.patches_diff or "",
+                        evidence,
+                        content_fraction=evidence_fraction,
+                        changed_diff_fraction=changed_diff_fraction,
+                    ),
+                }
+                rendered_system = environment.from_string(verification_prompt.system).render(variables)
+                rendered_user = environment.from_string(verification_prompt.user).render(variables)
+                prompt_tokens = max(
+                    len(route_encoder.encode(rendered_system, disallowed_special=()))
+                    + len(route_encoder.encode(rendered_user, disallowed_special=()))
+                    for route_encoder in route_encoders.values()
+                )
+                return rendered_system, rendered_user, prompt_tokens
+
+            full_system_prompt, full_user_prompt, full_prompt_tokens = render_prompts(1.0, 1.0)
+            evidence_fraction = 1.0
+            changed_diff_fraction = 1.0
+            system_prompt = full_system_prompt
+            user_prompt = full_user_prompt
+            prompt_tokens = full_prompt_tokens
+            if full_prompt_tokens > max_prompt_tokens:
+                diff_free_system, diff_free_user, diff_free_tokens = render_prompts(1.0, 0.0)
+                if diff_free_tokens <= max_prompt_tokens:
+                    system_prompt = diff_free_system
+                    user_prompt = diff_free_user
+                    prompt_tokens = diff_free_tokens
+                    changed_diff_fraction = 0.0
+                    lower = 0.0
+                    upper = 1.0
+                    for _ in range(18):
+                        midpoint = (lower + upper) / 2
+                        candidate_system, candidate_user, candidate_tokens = render_prompts(1.0, midpoint)
+                        if candidate_tokens <= max_prompt_tokens:
+                            lower = midpoint
+                            changed_diff_fraction = midpoint
+                            system_prompt = candidate_system
+                            user_prompt = candidate_user
+                            prompt_tokens = candidate_tokens
+                        else:
+                            upper = midpoint
+                else:
+                    system_prompt, user_prompt, prompt_tokens = render_prompts(0.0, 0.0)
+                    evidence_fraction = 0.0
+                    changed_diff_fraction = 0.0
+                    if prompt_tokens > max_prompt_tokens:
+                        artifact.update({
+                            "status": "prompt_budget_exhausted",
+                            "prompt_budget": {
+                                "model_max_tokens": model_max_tokens,
+                                "reserved_completion_tokens": reserved_completion_tokens,
+                                "max_prompt_tokens": max_prompt_tokens,
+                                "prompt_tokens": prompt_tokens,
+                                "truncated": True,
+                            },
+                        })
+                        return
+                    lower = 0.0
+                    upper = 1.0
+                    for _ in range(18):
+                        midpoint = (lower + upper) / 2
+                        candidate_system, candidate_user, candidate_tokens = render_prompts(midpoint, 0.0)
+                        if candidate_tokens <= max_prompt_tokens:
+                            lower = midpoint
+                            evidence_fraction = midpoint
+                            system_prompt = candidate_system
+                            user_prompt = candidate_user
+                            prompt_tokens = candidate_tokens
+                        else:
+                            upper = midpoint
+            artifact["prompt_budget"] = {
+                "model_max_tokens": model_max_tokens,
+                "reserved_completion_tokens": reserved_completion_tokens,
+                "max_prompt_tokens": max_prompt_tokens,
+                "prompt_tokens": prompt_tokens,
+                "route_count": len(verifier_route.models),
+                "truncated": evidence_fraction < 1.0 or changed_diff_fraction < 1.0,
+                "evidence_content_fraction": (
+                    1.0 if evidence_fraction >= 1.0
+                    else min(round(evidence_fraction, 4), 0.9999)
+                ),
+                "changed_diff_fraction": (
+                    1.0 if changed_diff_fraction >= 1.0
+                    else min(round(changed_diff_fraction, 4), 0.9999)
+                ),
+            }
+            artifact["model_calls"] = 1
+            verifier_started = time.monotonic()
+            details = get_run_details()
+            if details is not None:
+                details_before = {
+                    "prompt_tokens": details.prompt_tokens,
+                    "completion_tokens": details.completion_tokens,
+                    "total_tokens": details.total_tokens,
+                    "total_cost_usd": details.total_cost_usd,
+                    "known_cost_call_count": details.known_cost_call_count,
+                }
+            artifact["verifier_attempts"] = 0
+
+            async def call_verifier(attempt_model: str):
+                artifact["verifier_attempts"] += 1
+                prediction_result = await self.ai_handler.chat_completion(
+                    model=attempt_model,
+                    temperature=get_settings().config.temperature,
+                    system=system_prompt,
+                    user=user_prompt,
+                )
+                artifact["model"] = attempt_model
+                return prediction_result
+
+            prediction, _ = await retry_with_fallback_models(
+                call_verifier,
+                model_route=verifier_route,
+            )
+            verification_data = load_yaml(
+                prediction.strip(),
+                keys_fix_yaml=["verification:", "decisions:", "candidate_id:", "relevant_file:",
+                               "start_line:", "end_line:", "evidence_paths:"],
+                first_key="verification",
+                last_key="decisions",
+            )
+            response_error = self._verification_response_contract_error(
+                candidates, verification_data
+            )
+            if response_error is not None:
+                artifact.update({
+                    "status": "verifier_response_invalid",
+                    "failure": response_error,
+                    "verified_count": 0,
+                })
+                return
+            prompt_evidence = bounded_verification_evidence(evidence, evidence_fraction)
+            visible_coverage = prompt_evidence_coverage(
+                candidates,
+                prompt_evidence,
+                retrieval_artifact["requests"],
+            )
+            prompt_evidence_incomplete = visible_coverage["status"] != "complete"
+            verified_findings, decisions = apply_verification_decisions(
+                candidates,
+                prompt_evidence,
+                verification_data,
+                retrieval_requests=retrieval_artifact["requests"],
+            )
+            max_findings = max(0, int(config.get("num_max_findings", 3)))
+            published_findings = (
+                [] if model_candidate_coverage_incomplete
+                else verified_findings[:max_findings]
+            )
+            self.verified_review_data["review"]["key_issues_to_review"] = published_findings
+            verifier_claimed_ids = {
+                str(decision.get("candidate_id") or "").strip()
+                for decision in verification_data["verification"]["decisions"]
+                if str(decision.get("verdict") or "").strip().lower() == "verified"
+            }
+            rejected_verified_claim = any(
+                decision.get("candidate_id") in verifier_claimed_ids
+                and decision.get("verdict") != "verified"
+                for decision in decisions
+            )
+            verification_status = "partial" if (
+                model_candidate_coverage_incomplete
+                or sensitive_coverage_incomplete
+                or prompt_evidence_incomplete
+                or rejected_verified_claim
+                or any(
+                    not retrieval_request_is_complete(request)
+                    for request in retrieval_artifact["requests"]
+                )
+            ) else "complete"
+            artifact.update({
+                "status": (
+                    "candidate_validation_incomplete"
+                    if model_candidate_coverage_incomplete else verification_status
+                ),
+                "publication_safe": (
+                    not model_candidate_coverage_incomplete
+                    and not sensitive_coverage_incomplete
+                    and (verification_status == "complete" or bool(published_findings))
+                ),
+                "decisions": decisions,
+                "prompt_evidence_coverage": visible_coverage,
+                "verified_count": len(published_findings),
+                "verifier_verified_count": len(verified_findings),
+                "finding_limit_dropped": len(verified_findings) - len(published_findings),
+                "rejected_count": len(candidates) - len(published_findings),
+            })
+        except Exception as exc:
+            failure = exc.__cause__ if exc.__cause__ is not None else exc
+            artifact.update({
+                "status": "verifier_failed",
+                "failure": type(failure).__name__,
+                "verified_count": 0,
+            })
+            get_logger().error(
+                "Candidate verification failed", artifact=telemetry_safe_artifact(artifact)
+            )
+        finally:
+            if verifier_started is not None:
+                artifact["verifier_latency_seconds"] = round(time.monotonic() - verifier_started, 3)
+                details = get_run_details()
+                if details is not None and details_before is not None:
+                    artifact["verifier_usage"] = {
+                        "prompt_tokens": details.prompt_tokens - details_before["prompt_tokens"],
+                        "completion_tokens": details.completion_tokens - details_before["completion_tokens"],
+                        "total_tokens": details.total_tokens - details_before["total_tokens"],
+                    }
+                    known_cost_delta = details.known_cost_call_count - details_before["known_cost_call_count"]
+                    artifact["verifier_cost"] = {
+                        "status": "complete" if known_cost_delta > 0 else "unavailable",
+                        "usd": str(details.total_cost_usd - details_before["total_cost_usd"])
+                        if known_cost_delta > 0 else None,
+                    }
+            get_logger().info("Candidate verification finished", artifact=telemetry_safe_artifact(artifact))
+
     def _prepare_pr_review(self) -> str:
         """
         Prepare the PR review by processing the AI prediction and generating a markdown-formatted text that summarizes
         the feedback.
         """
-        first_key = 'review'
-        last_key = 'security_concerns'
-        data = load_yaml(self.prediction.strip(),
-                         keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:", "security_concerns:", "key_issues_to_review:",
-                                        "relevant_file:", "relevant_line:", "suggestion:"],
-                         first_key=first_key, last_key=last_key)
+        data = copy.deepcopy(getattr(self, "verified_review_data", None)) or self._parse_review_prediction()
 
         if not isinstance(data, dict) or 'review' not in data:
             get_logger().exception("Failed to parse review data", artifact={"data": data})
@@ -1476,7 +2249,9 @@ class PRReviewer:
         data = self._normalize_bugs_only_review(data)
         data = self._apply_finding_budget(data)
         data = self._apply_publication_budget(data)
-        github_action_output(data, 'review')
+        candidate_verification_blocked = self._candidate_verification_blocks_publication(
+            data
+        )
 
         structured_publisher = getattr(self.git_provider, "publish_structured_review", None)
         if self._provider_mutations_allowed() and callable(structured_publisher):
@@ -1499,6 +2274,10 @@ class PRReviewer:
                 "omitted_files": sorted(set(self.remaining_files_list)),
                 "deleted_files": sorted(set(getattr(self, "deleted_files_list", []))),
             }
+            if getattr(self, "candidate_verification_artifact", None) is not None:
+                structured_data["candidate_verification"] = telemetry_safe_artifact(
+                    self.candidate_verification_artifact
+                )
             review_route_decision = getattr(self, "review_route_decision", None)
             if review_route_decision is not None and review_route_decision.routing_enabled:
                 structured_data["metadata"]["review_route"] = review_route_decision_to_dict(
@@ -1508,6 +2287,11 @@ class PRReviewer:
             if specialist_shadow_result is not None:
                 structured_data["metadata"]["specialist_shadow"] = specialist_shadow_result.to_dict()
             structured_publisher(structured_data)
+
+        if candidate_verification_blocked:
+            return ""
+
+        github_action_output(data, 'review')
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
         if 'key_issues_to_review' in data['review']:
@@ -1615,6 +2399,12 @@ class PRReviewer:
             get_logger().warning("Review finding has no usable location, keeping it in the summary",
                                  artifact={"relevant_file": relevant_file, "start_line": start_line,
                                            "end_line": end_line})
+            return None
+        if issue.get("side") == "old":
+            get_logger().info(
+                "Review finding targets deleted code, keeping its old-side location in the summary",
+                artifact={"relevant_file": relevant_file, "start_line": start_line, "end_line": end_line},
+            )
             return None
 
         file = diff_files.get(relevant_file) or diff_files.get(relevant_file.lstrip("/"))

@@ -52,9 +52,10 @@ def _restore_litellm_globals():
                 os.environ[name] = value
 
 
-def _make_settings(config_values=None):
+def _make_settings(config_values=None, settings_values=None):
     """Minimal settings whose `config.get(key, ...)` serves the given dict."""
     config_values = config_values or {}
+    settings_values = settings_values or {}
 
     class Config:
         reasoning_effort = None
@@ -72,7 +73,7 @@ def _make_settings(config_values=None):
         "litellm": type("LiteLLM", (), {
             "get": lambda self, key, default=None: default,
         })(),
-        "get": lambda self, key, default=None: default,
+        "get": lambda self, key, default=None: settings_values.get(key, default),
     })()
 
 
@@ -95,6 +96,47 @@ async def _run(monkeypatch, model, config_values):
 
 
 class TestMaxOutputTokens:
+
+    def test_effective_cap_ignores_explicitly_disabled_openrouter_reasoning(
+        self,
+        monkeypatch,
+    ):
+        settings = _make_settings(settings_values={
+            "openrouter": {
+                "max_tokens": 1_500,
+                "reasoning_effort": "none",
+                "reasoning_max_tokens": 16_000,
+            },
+        })
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: settings)
+
+        cap = litellm_handler.get_effective_litellm_output_token_cap(
+            "openrouter/anthropic/claude-sonnet-4",
+            require_bounded_reasoning=True,
+        )
+
+        assert cap == 1_500
+
+    @pytest.mark.parametrize("reasoning_effort", ["", "medium", "invalid"])
+    def test_effective_cap_requires_headroom_when_openrouter_reasoning_is_not_disabled(
+        self,
+        monkeypatch,
+        reasoning_effort,
+    ):
+        settings = _make_settings(settings_values={
+            "openrouter": {
+                "max_tokens": 1_500,
+                "reasoning_effort": reasoning_effort,
+                "reasoning_max_tokens": 16_000,
+            },
+        })
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: settings)
+
+        with pytest.raises(ValueError, match="response headroom"):
+            litellm_handler.get_effective_litellm_output_token_cap(
+                "openrouter/anthropic/claude-sonnet-4",
+                require_bounded_reasoning=True,
+            )
 
     @pytest.mark.asyncio
     async def test_default_sends_no_max_tokens(self, monkeypatch):
@@ -205,6 +247,34 @@ class TestMaxOutputTokens:
         assert [call["model"] for call in calls] == ["gpt-4o", "claude-3-7-sonnet-20250219"]
         assert calls[1]["max_tokens"] == 2_048
         assert "thinking" not in calls[1]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("request_cap", "thinking_enabled"),
+        [(2047, False), (2048, False), (2049, True)],
+    )
+    async def test_request_local_cap_matches_thinking_headroom_boundary(
+        self,
+        monkeypatch,
+        request_cap,
+        thinking_enabled,
+    ):
+        config_values = {
+            "enable_claude_extended_thinking": True,
+            "extended_thinking_budget_tokens": 2048,
+            "extended_thinking_max_output_tokens": 4096,
+        }
+        with use_ai_request_options(AIRequestOptions(max_output_tokens=request_cap)):
+            kwargs = await _run(
+                monkeypatch,
+                "claude-3-7-sonnet-20250219",
+                config_values,
+            )
+
+        assert kwargs["max_tokens"] == request_cap
+        assert ("thinking" in kwargs) is thinking_enabled
+        if thinking_enabled:
+            assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 2048}
 
     @pytest.mark.asyncio
     async def test_string_override_is_coerced(self, monkeypatch):

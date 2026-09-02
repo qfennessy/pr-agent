@@ -760,6 +760,31 @@ class AzureDevopsProvider(GitProvider):
                 return ""
             raise
 
+    def get_pr_head_file_content(self, file_path: str):
+        """Read candidate-verification context from the current PR head commit."""
+        head_commit = getattr(getattr(self, "pr", None), "last_merge_commit", None)
+        head_sha = getattr(head_commit, "commit_id", None)
+        if not head_sha:
+            return ""
+        try:
+            item = self.azure_devops_client.get_item(
+                repository_id=self.repo_slug,
+                path=file_path,
+                project=self.workspace_slug,
+                version_descriptor=GitVersionDescriptor(
+                    version=head_sha, version_type="commit"
+                ),
+                download=False,
+                include_content=True,
+            )
+            return item.content or ""
+        except Exception as e:
+            if get_settings().config.verbosity_level >= 2:
+                get_logger().warning(f"Failed to load PR-head file: {file_path}, error: {e}")
+            if _is_not_found_error(e):
+                return ""
+            raise
+
     def get_files(self):
         if (isinstance(getattr(self, "incremental", None), IncrementalPR)
                 and self.incremental.is_incremental):

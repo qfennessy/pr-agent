@@ -28,6 +28,7 @@ from pr_agent.algo.run_details import (get_run_details, init_run_details,
                                        record_model_used)
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.algo.utils import (PRReviewHeader, PRReviewIdentity,
+                                 convert_to_markdown_v2,
                                  show_run_details)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
@@ -1124,6 +1125,135 @@ def test_generated_and_publication_finding_budgets_are_independent_and_immutable
     ]
     assert [issue["issue_header"] for issue in published["review"]["key_issues_to_review"]] == ["one"]
     assert len(data["review"]["key_issues_to_review"]) == 3
+
+
+def test_partial_candidate_verification_fails_closed_when_route_drops_last_finding(
+    monkeypatch,
+):
+    git_provider = MagicMock()
+    git_provider.is_supported.return_value = True
+    git_provider.get_pr_labels.return_value = []
+    git_provider.get_diff_files.return_value = [_route_file("docs/guide.md")]
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "bugs_only"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration()
+    decision = reviewer._prepare_review_route()
+    decision = replace(
+        decision,
+        applied_budget=replace(
+            decision.applied_budget,
+            max_published_findings=0,
+        ),
+    )
+    reviewer._apply_review_route(decision)
+    reviewer.verified_review_data = {
+        "review": {"key_issues_to_review": [{"issue_header": "verified"}]}
+    }
+    reviewer.candidate_verification_artifact = {
+        "status": "partial",
+        "publication_safe": True,
+        "verified_count": 1,
+    }
+    reviewer.set_review_labels = MagicMock()
+
+    settings_snapshot = snapshot_settings((
+        "config.publish_output",
+        "pr_reviewer.persistent_comment",
+    ))
+    try:
+        get_settings().set("config.publish_output", True)
+        get_settings().set("pr_reviewer.persistent_comment", True)
+        with (
+            patch("pr_agent.tools.pr_reviewer.github_action_output") as action_output,
+            patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2") as markdown,
+        ):
+            review = reviewer._prepare_pr_review()
+        reviewer._clear_stale_persistent_bugs_only_review()
+    finally:
+        restore_settings(settings_snapshot)
+
+    assert review == ""
+    assert reviewer._candidate_verification_blocks_publication() is True
+    action_output.assert_not_called()
+    markdown.assert_not_called()
+    git_provider.clear_persistent_review.assert_not_called()
+    structured = git_provider.publish_structured_review.call_args.args[0]
+    assert structured["review"]["key_issues_to_review"] == []
+    assert structured["candidate_verification"]["status"] == "partial"
+    assert structured["metadata"]["review_route"] == review_route_decision_to_dict(
+        decision
+    )
+
+
+def test_partial_candidate_verification_remains_safe_when_route_retains_a_finding(
+    monkeypatch,
+):
+    git_provider = MagicMock()
+    git_provider.is_supported.return_value = False
+    git_provider.get_diff_files.return_value = []
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "full"
+    reviewer._review_max_published_findings = 1
+    reviewer.verified_review_data = {
+        "review": {
+            "key_issues_to_review": [
+                {"issue_header": "one"},
+                {"issue_header": "two"},
+            ]
+        }
+    }
+    reviewer.candidate_verification_artifact = {
+        "status": "partial",
+        "publication_safe": True,
+        "verified_count": 2,
+    }
+    reviewer.set_review_labels = MagicMock()
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+        lambda *args, **kwargs: "verified review",
+    )
+
+    review = reviewer._prepare_pr_review()
+
+    assert review == "verified review"
+    assert reviewer._candidate_verification_blocks_publication() is False
+    structured = git_provider.publish_structured_review.call_args.args[0]
+    assert [
+        finding["issue_header"]
+        for finding in structured["review"]["key_issues_to_review"]
+    ] == ["one"]
+
+
+def test_complete_candidate_verification_can_publish_clean_after_route_budgeting(
+    monkeypatch,
+):
+    git_provider = MagicMock()
+    git_provider.is_supported.return_value = False
+    git_provider.get_diff_files.return_value = []
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "full"
+    reviewer._review_max_published_findings = 0
+    reviewer.verified_review_data = {
+        "review": {"key_issues_to_review": [{"issue_header": "rejected downstream"}]}
+    }
+    reviewer.candidate_verification_artifact = {
+        "status": "complete",
+        "publication_safe": True,
+        "verified_count": 1,
+    }
+    reviewer.set_review_labels = MagicMock()
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+        lambda *args, **kwargs: "No major issues detected",
+    )
+
+    review = reviewer._prepare_pr_review()
+
+    assert review == "No major issues detected"
+    assert reviewer._candidate_verification_blocks_publication() is False
+    structured = git_provider.publish_structured_review.call_args.args[0]
+    assert structured["review"]["key_issues_to_review"] == []
 
 
 @pytest.mark.asyncio
@@ -4032,6 +4162,23 @@ def test_bugs_only_preserves_an_empty_finding_list():
     assert reviewer._normalize_bugs_only_review(data) == {"review": {"key_issues_to_review": []}}
 
 
+def test_bugs_only_preserves_fail_closed_verifier_output_without_requiring_candidate_fields():
+    verified_finding = {
+        "relevant_file": "app.py",
+        "issue_header": "Bug",
+        "issue_content": "Verified defect with repository evidence.",
+        "start_line": 2,
+        "end_line": 2,
+        "verification_evidence": ["app.py"],
+    }
+    reviewer, data = _bugs_only_reviewer(verified_finding)
+    reviewer.candidate_verification_artifact = {"status": "complete"}
+
+    assert reviewer._normalize_bugs_only_review(data) == {
+        "review": {"key_issues_to_review": [verified_finding]}
+    }
+
+
 def _reviewer_with_findings(*issues, head_file="one\ntwo\nthree\nfour\n"):
     git_provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
     git_provider.azure_devops_client = MagicMock()
@@ -4145,6 +4292,41 @@ def test_key_issue_without_file_content_stays_in_the_summary():
 
     reviewer.git_provider.publish_code_suggestions.assert_not_called()
     assert result["review"]["key_issues_to_review"] == [issue]
+
+
+@pytest.mark.parametrize("gfm_supported", [True, False])
+def test_old_side_summary_omits_right_side_link_and_head_snippet(gfm_supported):
+    provider = MagicMock()
+    provider.get_line_link.return_value = "https://example.invalid/file.py#R10"
+    files = [FilePatchInfo(
+        base_file="deleted_secret()",
+        head_file="unrelated_current_code()",
+        patch="@@ -10,1 +10,0 @@\n-deleted_secret()",
+        filename="auth/policy.py",
+    )]
+    data = {"review": {"key_issues_to_review": [{
+        "relevant_file": "auth/policy.py",
+        "issue_header": "Deleted authorization guard",
+        "issue_content": "Removing this guard exposes the operation.",
+        "start_line": 10,
+        "end_line": 10,
+        "side": "old",
+    }]}}
+
+    rendered = convert_to_markdown_v2(
+        data,
+        gfm_supported=gfm_supported,
+        git_provider=provider,
+        files=files,
+        review_profile="bugs_only",
+    )
+
+    provider.get_line_link.assert_not_called()
+    assert "Deleted location" in rendered
+    assert "auth/policy.py" in rendered
+    assert "line 10" in rendered
+    assert "unrelated_current_code" not in rendered
+    assert "#R10" not in rendered
 
 
 def test_key_issue_is_not_published_when_the_provider_cannot_verify_it():
@@ -4922,6 +5104,52 @@ def test_prepare_review_publishes_provider_neutral_structured_data(monkeypatch):
     # (assert_called_once_with cannot catch this: dict equality ignores key order.)
     published = git_provider.publish_structured_review.call_args[0][0]
     assert list(published["review"].keys()) == ["key_issues_to_review", "security_concerns"]
+
+
+def test_prepare_review_sanitizes_candidate_verification_structured_data(monkeypatch):
+    git_provider = MagicMock()
+    git_provider.is_supported.return_value = False
+    git_provider.get_diff_files.return_value = []
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.prediction = "review:\n  key_issues_to_review: []\n"
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.set_review_labels = MagicMock()
+    reviewer.candidate_verification_artifact = {
+        "status": "complete",
+        "decisions": [{
+            "candidate_id": "candidate-1",
+            "verdict": "rejected",
+            "reason": "model reason containing private source details",
+            "evidence_paths": ["src/private.py"],
+        }],
+        "retrieval": {
+            "retrieved_evidence": [{
+                "candidate_id": "candidate-1",
+                "source": "repository_file",
+                "path": "src/private.py",
+                "start_line": 1,
+                "end_line": 1,
+                "content": "PRIVATE_SOURCE_TEXT",
+            }],
+        },
+        "verified_findings": [{"issue_content": "model-generated private explanation"}],
+    }
+
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+        lambda *args, **kwargs: "## Review",
+    )
+
+    reviewer._prepare_pr_review()
+
+    published = git_provider.publish_structured_review.call_args.args[0]
+    verification = published["candidate_verification"]
+    assert verification["decisions"][0]["reason"] == "rejected_by_verifier"
+    assert verification["retrieval"]["retrieved_evidence"][0]["content_characters"] == 19
+    assert "content" not in verification["retrieval"]["retrieved_evidence"][0]
+    assert "verified_findings" not in verification
+    assert "PRIVATE_SOURCE_TEXT" not in repr(published)
+    assert "private explanation" not in repr(published)
 
 
 def test_structured_review_includes_applied_route_without_aliasing_decision(monkeypatch):

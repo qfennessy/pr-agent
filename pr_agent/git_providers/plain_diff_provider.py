@@ -135,8 +135,30 @@ class PlainDiffGitProvider(GitProvider):
             reason = "disabled for immutable input" if self.disable_working_tree_enrichment else "no repository root"
             get_logger().info(f"Running in patch-only mode ({reason}).")
         for f in files:
+            # Unlike hosted APIs, the plain-diff provider owns the complete
+            # immutable diff payload supplied for this run.  Downstream code
+            # may use this explicit provenance to reconstruct a complete added
+            # file from patch-only input after validating every hunk.
+            f.patch_is_complete = True
             head = ""
-            if root is not None and f.filename:
+            # A parsed unified diff carries only patch-visible lines.  Keep the
+            # completeness marker false until we actually read the current
+            # file so downstream verification can validate changed anchors
+            # against the patch instead of treating an empty placeholder as a
+            # complete, zero-line file.
+            normalized_path = os.path.normpath(f.filename) if f.filename else ""
+            safe_relative_path = bool(
+                normalized_path
+                and normalized_path not in (".", "..")
+                and not os.path.isabs(normalized_path)
+                and not normalized_path.startswith(".." + os.sep)
+            )
+            # The /dev/null target of a safe deletion proves that the current
+            # side is the complete empty file even when enrichment is disabled.
+            head_file_is_complete = bool(
+                f.edit_type is EDIT_TYPE.DELETED and safe_relative_path
+            )
+            if root is not None and f.filename and f.edit_type is not EDIT_TYPE.DELETED:
                 if os.path.isabs(f.filename):
                     get_logger().info(
                         f"Skipping absolute path in diff (unsafe): {f.filename}"
@@ -151,9 +173,11 @@ class PlainDiffGitProvider(GitProvider):
                         try:
                             with open(candidate, "r", encoding="utf-8") as fh:
                                 head = fh.read()
+                            head_file_is_complete = True
                         except (OSError, UnicodeDecodeError) as e:
                             get_logger().info(f"Could not read working-tree file {f.filename}: {e}")
             f.head_file = head
+            f.head_file_is_complete = head_file_is_complete
             f.base_file = reconstruct_base_file(head, f.patch) if head else ""
             # Reconstruction needs the full patch (with --- /+++ headers); the
             # rest of the pipeline expects hunk-only patches, so normalize after.

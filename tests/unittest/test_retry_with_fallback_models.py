@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -222,6 +223,28 @@ def test_concurrent_explicit_routes_do_not_leak_deployments_or_controls():
         assert get_settings().get("openai.deployment_id", None) == "shared-deployment"
     finally:
         _restore_settings(snapshot)
+
+
+def test_attributed_route_failure_log_omits_provider_exception_text(monkeypatch):
+    secret = "PRIVATE_REPOSITORY_EXCERPT_FROM_PROVIDER_ERROR"
+    logger = MagicMock()
+    monkeypatch.setattr("pr_agent.algo.pr_processing.get_logger", lambda: logger)
+    route = AIModelRoute(
+        models=("verifier-model",),
+        deployments=(None,),
+        attribution="candidate_verification",
+    )
+
+    async def fail(_model):
+        raise RuntimeError(secret)
+
+    with pytest.raises(Exception, match="Failed to generate prediction with any model"):
+        asyncio.run(retry_with_fallback_models(fail, model_route=route))
+
+    warning_call = logger.warning.call_args
+    assert secret not in str(warning_call)
+    assert "error" not in warning_call.kwargs["artifact"]
+    assert warning_call.kwargs["artifact"]["error_class"] == "RuntimeError"
 
 
 def test_weak_model_type_uses_weak_setting_and_forwards_identifier():

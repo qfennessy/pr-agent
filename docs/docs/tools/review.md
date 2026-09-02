@@ -376,6 +376,56 @@ extra_instructions = "..."
       </tr>
     </table>
 
+### Candidate verification
+
+Candidate verification is an opt-in second pass that checks proposed findings against bounded repository context before
+publishing them. It requires a provider that supports base-branch file reads. Unsupported providers, missing files,
+retrieval failures, exhausted budgets, and verifier failures are recorded as non-successful verification outcomes; an
+unverified candidate is never promoted to a finding.
+
+```toml
+[pr_reviewer]
+enable_candidate_verification = true
+candidate_verification_consume_specialist_prioritization = false
+candidate_verification_model = "" # Empty uses config.model
+candidate_verification_deployment = "" # Required for a different Azure verifier model
+candidate_verification_fallback_models = []
+candidate_verification_fallback_deployments = []
+candidate_verification_max_output_tokens = 0 # 0 inherits the effective provider/config cap
+candidate_verification_max_model_calls = 1
+candidate_verification_max_candidates = 3
+candidate_verification_max_sensitive_candidates = 6
+candidate_verification_max_files = 6
+candidate_verification_max_lines_per_file = 160
+candidate_verification_max_total_lines = 600
+candidate_verification_max_context_tokens = 6000
+candidate_verification_timeout_seconds = 10
+candidate_verification_sensitive_path_globs = ["auth/**", "payments/**"]
+```
+
+Configured sensitive paths create independent audit candidates, so the first model cannot suppress them. The separate
+sensitive-candidate budget keeps that audit payload bounded. If it cannot cover every changed range, verification records
+the omitted count and fails publication closed instead of reporting a clean review. Earlier glob entries have higher
+overflow priority, and removed ranges are selected before added ranges within the same glob. Repository and static-analysis
+text is passed to the verifier as untrusted data. Structured review publishers receive a
+`candidate_verification` artifact containing candidate and decision counts, the verifier model and call count, retrieval
+statuses, budget usage, latency, and concise rejection or failure reasons.
+
+Verifier model/deployment pairs use an immutable request-local route. Azure deployments must be explicit when the verifier
+or any fallback differs from the primary reviewer model; missing or mismatched routes fail closed. Prompt clipping reserves
+the effective completion allowance actually sent for every primary/fallback attempt, including configured output caps and
+Claude extended thinking, so prompt plus requested completion stays within each model context window.
+
+The specialist-prioritization consumer remains disabled separately. When enabled, it accepts only a successful or cached,
+validated `diff_prioritization` result whose immutable input identity matches the review. Ranked hunks can reorder
+verification work, and context requests anchored to the candidate's exact hunk can add bounded file or symbol lookups.
+They never remove a candidate, bypass sensitive-path audits, select a review depth, or act as verification evidence.
+
+Keep this feature disabled by default until a representative frozen benchmark shows an acceptable precision/recall
+tradeoff. Compare the same PR corpus with the feature off and on, and record verified true positives, rejected false
+positives, missed defects, end-to-end latency, token usage, and model cost. Re-run the benchmark whenever prompts,
+models, or budgets change.
+
 ## Usage Tips
 
 ### General guidelines

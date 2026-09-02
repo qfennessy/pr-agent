@@ -554,7 +554,11 @@ async def retry_with_fallback_models(
             get_logger().warning(
                 f"Failed to generate prediction with {model} "
                 f"(attempt {i + 1}/{len(all_models)}, {elapsed}s)",
-                artifact={"error": e, **attempt},
+                artifact=(
+                    attempt
+                    if model_route.attribution is not None
+                    else {"error": e, **attempt}
+                ),
             )
             if i == len(all_models) - 1:  # If it's the last iteration
                 if model_route.attribution is None:

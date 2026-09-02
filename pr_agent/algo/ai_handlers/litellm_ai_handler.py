@@ -8,18 +8,22 @@ import litellm
 import openai
 import requests
 from litellm import acompletion
-from tenacity import (retry, retry_if_exception_type,
-                      retry_if_not_exception_type)
+from tenacity import retry, retry_if_exception_type, retry_if_not_exception_type
 
-from pr_agent.algo import (CLAUDE_EXTENDED_THINKING_MODELS,
-                           NO_SUPPORT_TEMPERATURE_MODELS,
-                           STREAMING_REQUIRED_MODELS,
-                           SUPPORT_REASONING_EFFORT_MODELS,
-                           USER_MESSAGE_ONLY_MODELS)
-from pr_agent.algo.ai_handlers.litellm_helpers import (
-    _get_azure_ad_token, _handle_streaming_response,
-    _process_litellm_extra_body, _response_field)
+from pr_agent.algo import (
+    CLAUDE_EXTENDED_THINKING_MODELS,
+    NO_SUPPORT_TEMPERATURE_MODELS,
+    STREAMING_REQUIRED_MODELS,
+    SUPPORT_REASONING_EFFORT_MODELS,
+    USER_MESSAGE_ONLY_MODELS,
+)
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
+from pr_agent.algo.ai_handlers.litellm_helpers import (
+    _get_azure_ad_token,
+    _handle_streaming_response,
+    _process_litellm_extra_body,
+    _response_field,
+)
 from pr_agent.algo.ai_request_context import get_ai_request_options
 from pr_agent.algo.run_details import _as_decimal_cost, record_ai_call
 from pr_agent.algo.utils import ReasoningEffort, get_version
@@ -50,7 +54,6 @@ def _resolve_claude_extended_thinking(
     effective output cap while disabling thinking whenever it would consume the
     entire completion allowance.
     """
-
     settings = get_settings()
     if (
         model not in claude_extended_thinking_models
@@ -97,7 +100,6 @@ def get_effective_litellm_output_token_cap(
     extended thinking and OpenRouter can also establish or reduce ``max_tokens``;
     include those provider controls so prompt pruning reserves the same bound.
     """
-
     settings = get_settings()
     cap = _positive_token_cap(
         request_max_output_tokens
@@ -125,13 +127,22 @@ def get_effective_litellm_output_token_cap(
         openrouter_cap = _positive_token_cap(openrouter_settings.get("max_tokens", 0))
         if openrouter_cap is not None:
             cap = min(cap, openrouter_cap) if cap is not None else openrouter_cap
-        reasoning_cap = _positive_token_cap(
-            openrouter_settings.get("reasoning_max_tokens", 0)
+        reasoning_effort = str(
+            openrouter_settings.get("reasoning_effort", "") or ""
+        ).strip().lower()
+        reasoning_cap = (
+            None
+            if reasoning_effort == ReasoningEffort.NONE.value
+            else _positive_token_cap(openrouter_settings.get("reasoning_max_tokens", 0))
         )
-        if require_bounded_reasoning and reasoning_cap is not None and cap is None:
+        if (
+            require_bounded_reasoning
+            and reasoning_cap is not None
+            and (cap is None or cap <= reasoning_cap)
+        ):
             raise ValueError(
                 "routed OpenRouter reasoning_max_tokens requires a positive total "
-                "max_output_tokens or openrouter.max_tokens cap"
+                "output cap with response headroom"
             )
     return cap
 

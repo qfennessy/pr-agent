@@ -48,6 +48,7 @@ ADD requirements-dev.txt .
 RUN pip install --no-cache-dir -r requirements-dev.txt && rm requirements-dev.txt
 ADD pr_agent pr_agent
 ADD tests tests
+ADD .pr_agent.toml .pr_agent.toml
 ADD docker/mosaico docker/mosaico
 
 FROM base AS cli
