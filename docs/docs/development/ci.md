@@ -21,7 +21,7 @@ no-op jobs or update the ruleset so documentation-only PRs do not wait forever f
 | `PR-Agent E2E tests` | Manual dispatch | Builds the test image and tests the GitHub, GitLab, and Bitbucket integrations | Provider test tokens listed below |
 | `pre-commit` | Manual dispatch | Runs the hooks in `.pre-commit-config.yaml` | Read-only checkout |
 | `PR-Agent` | A non-draft pull request is opened, reopened, or marked ready | Runs describe, review, and improve through the fork's own action | Model and Pinecone secrets; PR and issue write access |
-| `Upstream provenance` | Pull request activity targeting `main` | On `sync/upstream-*` branches, verifies that the branch, title, body, head SHA, and upstream ancestry agree | Read-only checkout; network read from upstream |
+| `Upstream provenance` | `pull_request_target` activity targeting `main` | On `sync/upstream-*` branches, runs the base-owned verifier and validates the immutable pin, fork baseline, and candidate topology | Read-only checkout of the protected base; network read from the PR ref and upstream |
 | `Upstream sync PR` | Mondays at 12:17 UTC, or manual dispatch | Pins upstream `main`, creates a local sync branch, and opens a review PR | `main`-restricted environment containing a repository-only deploy key; pull-request write access |
 | `Publish` | Published GitHub release, or manual dispatch | Publishes PyPI distributions and a multi-platform Docker image matrix, records provenance, and finalizes repository release state | Release environment and publishing secrets |
 
@@ -88,11 +88,19 @@ The workflow receives these secrets and tokens:
 
 `upstream-sync.yml` runs only in `qfennessy/pr-agent`. It fetches `The-PR-Agent/pr-agent` and accepts either the
 current upstream `main` or a manually supplied commit. The resolved value must be a canonical commit on upstream
-`main`. If the fork does not already contain it and no sync PR is open, the workflow creates:
+`main`. If the fork does not already contain it and no sync PR is open, the workflow records both that upstream pin
+and the current fork-main baseline, then creates:
 
 ```text
 sync/upstream-YYYYMMDD-<8-character-sha>
 ```
+
+The branch suffix names the upstream pin, not necessarily the PR head. The workflow first attempts a no-fast-forward
+merge of the pin into the recorded fork baseline. A clean merge produces the final, two-parent review candidate. A
+conflict produces a temporary raw-pin candidate and PR instructions for resolving the conflict in a dedicated
+worktree. The maintainer replaces that raw head, with an exact force-with-lease, using one merge commit whose parents
+are exactly the declared baseline and pin. Commits before or after that merge are rejected; if fork `main` advances
+and conflicts, rebuild the candidate on the new baseline rather than merging `main` into the old candidate.
 
 The generated PR names high-scrutiny paths such as workflows, dependencies, prompts, secret handling, and Docker
 files. The workflow uses the protected `upstream-sync` Actions environment, which permits only `main`. Its
@@ -102,10 +110,22 @@ cannot push upstream commits that modify `.github/workflows/**`, so the job fail
 secret is missing instead of falling back. Never permit `sync/upstream-*` branches to use this environment: they
 contain unreviewed upstream workflow code.
 
-`upstream-provenance.yml` checks the sync PR's fixed head SHA and metadata. Because it runs on `pull_request`,
-GitHub executes the workflow from the PR merge ref rather than guaranteeing the protected base-branch definition.
-A sync PR that changes this workflow can therefore change its own verification logic while retaining the required
-check name. On ordinary PRs, the provenance job reports success without checking out code.
+`upstream-provenance.yml` uses `pull_request_target` with read-only contents permission so GitHub loads the workflow
+from the protected base branch. It checks out the event's exact base SHA, fetches the PR head as a Git object without
+checking it out, and runs only the packaged `pr_agent.upstream_provenance` module from that protected base. It never
+executes a script, action, hook, or configuration from the PR candidate.
+
+The verifier binds the branch suffix, title, and exactly one PR-body pin to the immutable upstream SHA; verifies the
+pin is on upstream `main`; and requires exactly one declared fork baseline that remains an ancestor of the PR base.
+The PR head may be the raw upstream pin or a conflict-resolved merge with exactly two parents: the pin and baseline,
+in either order. This permits reviewed conflict resolutions without allowing an arbitrary commit chain to acquire
+upstream provenance. Raw-pin candidates remain useful for clean legacy syncs and as temporary conflict placeholders,
+but a conflicting raw pin must be converted to the two-parent form before GitHub can merge it.
+
+After the repository merge, inspect its PR-candidate parent. A raw candidate must equal the pin; a resolved candidate
+must have only the recorded pin and baseline as parents. Exact commands and the procedure for converting existing
+raw-pin PRs such as PR #35 are in
+[`FORK-MAINTENANCE.md`](https://github.com/qfennessy/pr-agent/blob/main/FORK-MAINTENANCE.md).
 
 The merge policy and post-merge verification steps are documented in the repository's
 [`FORK-MAINTENANCE.md`](https://github.com/qfennessy/pr-agent/blob/main/FORK-MAINTENANCE.md).
@@ -190,8 +210,8 @@ Before treating all CI as comprehensive, account for these boundaries:
 - Documentation-only changes skip Docker unit tests and CodeQL and run the focused MkDocs validation instead.
 - The self-review workflow trusts the moving `qfennessy/pr-agent@main` ref. That is consistent with the fork policy
   only while `main` remains protected and reviewed.
-- The upstream provenance workflow runs from the pull-request merge ref. A sync PR can alter its own verification
-  workflow, so the check name alone does not prove that the protected verifier ran.
+- The upstream provenance workflow deliberately uses `pull_request_target`. It has read-only permission and runs
+  only the verifier checked out from the exact protected base SHA; never add a PR-head checkout or execution step.
 - The publish workflow intentionally permits Docker/repository finalization when PyPI fails. Release operators must
   treat the warning as a partial release and complete the missing registry publication.
 - `.github/release-drafter.yml` still contains categories and version-resolution rules, but no active workflow invokes
