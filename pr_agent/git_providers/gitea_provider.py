@@ -74,6 +74,7 @@ class GiteaProvider(GitProvider):
         self.temp_comments = []
         self.pr = None
         self.git_files = []
+        self._routing_git_files = ()
         self.file_contents = {}
         self.file_diffs = {}
         self.sha = None
@@ -98,6 +99,7 @@ class GiteaProvider(GitProvider):
                 repo=self.repo,
                 pr_number=self.pr_number
             )
+            self._routing_git_files = tuple(self.git_files or ())
             # Optional ignore with user custom
             self.git_files = filter_ignored(self.git_files, platform="gitea")
 
@@ -597,7 +599,8 @@ class GiteaProvider(GitProvider):
                 filename=filename,
                 num_minus_lines=num_minus_lines,
                 num_plus_lines=num_plus_lines,
-                edit_type=edit_type
+                edit_type=edit_type,
+                old_filename=file.get("previous_filename"),
             )
             diff_files.append(file_patch_info)
 
@@ -629,6 +632,10 @@ class GiteaProvider(GitProvider):
     def get_files(self) -> List[Dict[str, Any]]:
         """Get all files in the PR"""
         return [file.get("filename","") for file in self.git_files]
+
+    def get_files_for_routing(self) -> List[Dict[str, Any]]:
+        """Keep unfiltered status and previous-path metadata for safety routing."""
+        return list(getattr(self, "_routing_git_files", None) or self.git_files)
 
     def get_num_of_files(self) -> int:
         """Get number of files changed in the PR"""

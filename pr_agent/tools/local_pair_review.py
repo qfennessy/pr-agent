@@ -2150,6 +2150,26 @@ def build_snapshot_result(
             if isinstance(path, str) and path
         )
     findings = finding_count(structured_review)
+    if isinstance(structured_review, Mapping) and "candidate_verification" in structured_review:
+        candidate_verification = structured_review.get("candidate_verification")
+        verification_status = (
+            candidate_verification.get("status")
+            if isinstance(candidate_verification, Mapping) else None
+        )
+        verification_result_consistent = bool(
+            isinstance(verification_status, str)
+            and (
+                verification_status == "complete"
+                or (verification_status == "no_candidates" and findings == 0)
+                or (verification_status == "partial" and isinstance(findings, int) and findings > 0)
+            )
+        )
+        if (
+            not isinstance(candidate_verification, Mapping)
+            or candidate_verification.get("publication_safe") is not True
+            or not verification_result_consistent
+        ):
+            error = error or "CandidateVerificationUnsafe"
     if (
         structured_review is not None
         and (

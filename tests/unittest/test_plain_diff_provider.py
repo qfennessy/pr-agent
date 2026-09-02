@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from pr_agent.algo.types import EDIT_TYPE
@@ -67,6 +69,7 @@ def test_get_diff_files(cfg):
     assert len(files) == 1
     assert files[0].filename == "foo.py"
     assert files[0].edit_type == EDIT_TYPE.MODIFIED
+    assert files[0].patch_is_complete is True
 
 
 def test_literal_quotes_in_a_unified_diff_filename_are_preserved():
@@ -291,6 +294,56 @@ def test_no_repo_root_disables_enrichment(cfg, tmp_path, monkeypatch):
         "Enrichment must be disabled when no .git root is found (patch-only)"
     )
     assert files[0].base_file == ""
+    assert files[0].head_file_is_complete is False
+
+
+def test_patch_only_diff_keeps_added_candidate_valid_for_patch_evidence(
+    cfg, tmp_path, monkeypatch
+):
+    from pr_agent.algo.candidate_verification import (
+        VerificationBudgets,
+        prepare_candidates,
+        retrieve_evidence,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    cfg("plain_diff.content", DIFF)
+    cfg("plain_diff.output_path", None)
+    cfg("plain_diff.disable_working_tree_enrichment", True)
+
+    provider = PlainDiffGitProvider(None)
+    files = provider.get_diff_files()
+    review_data = {"review": {"key_issues_to_review": [{
+        "relevant_file": "foo.py",
+        "issue_header": "Changed behavior",
+        "issue_content": "The changed line produces the wrong result.",
+        "start_line": 2,
+        "end_line": 2,
+        "trigger": "The updated branch runs.",
+        "impact": "The caller receives an incorrect value.",
+        "root_cause": "The replacement uses the wrong expression.",
+        "context_files": [],
+        "context_symbols": [],
+    }]}}
+
+    candidates, rejected = prepare_candidates(review_data, files, [], 1)
+    evidence, _ = asyncio.run(retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(max_lines_per_file=3, max_total_lines=3),
+        [],
+        diff_files=files,
+    ))
+
+    assert rejected == []
+    assert files[0].head_file_is_complete is False
+    assert any(
+        item["source"] == "changed_patch"
+        and item["path"] == "foo.py"
+        and item["start_line"] == 2
+        and item["content"] == "line2-changed"
+        for item in evidence
+    )
 
 
 def test_immutable_snapshot_mode_disables_live_worktree_enrichment(cfg, tmp_path, monkeypatch):
@@ -307,6 +360,48 @@ def test_immutable_snapshot_mode_disables_live_worktree_enrichment(cfg, tmp_path
 
     assert files[0].head_file == ""
     assert files[0].base_file == ""
+    assert files[0].head_file_is_complete is False
+
+
+def test_patch_only_safe_deletion_has_a_complete_empty_head(cfg, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cfg("plain_diff.content", (
+        "diff --git a/obsolete.py b/obsolete.py\n"
+        "deleted file mode 100644\n"
+        "--- a/obsolete.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,1 +0,0 @@\n"
+        "-obsolete\n"
+    ))
+    cfg("plain_diff.output_path", None)
+    cfg("plain_diff.disable_working_tree_enrichment", True)
+
+    deleted = PlainDiffGitProvider(None).get_diff_files()[0]
+
+    assert deleted.edit_type is EDIT_TYPE.DELETED
+    assert deleted.head_file == ""
+    assert deleted.head_file_is_complete is True
+
+
+def test_patch_only_unsafe_deletion_does_not_claim_complete_head(
+    cfg, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    cfg("plain_diff.content", (
+        "diff --git a/../obsolete.py b/../obsolete.py\n"
+        "deleted file mode 100644\n"
+        "--- a/../obsolete.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,1 +0,0 @@\n"
+        "-obsolete\n"
+    ))
+    cfg("plain_diff.output_path", None)
+    cfg("plain_diff.disable_working_tree_enrichment", True)
+
+    deleted = PlainDiffGitProvider(None).get_diff_files()[0]
+
+    assert deleted.head_file == ""
+    assert deleted.head_file_is_complete is False
 
 
 def test_publish_code_suggestions_renders_to_stdout(cfg, capsys):

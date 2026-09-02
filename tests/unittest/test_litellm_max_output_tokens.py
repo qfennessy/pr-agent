@@ -11,7 +11,12 @@ import openai
 import pytest
 
 import pr_agent.algo.ai_handlers.litellm_ai_handler as litellm_handler
-from pr_agent.algo.ai_request_context import AIRequestOptions, use_ai_request_options
+from pr_agent.algo.ai_request_context import (AIModelRoute, AIRequestOptions,
+                                              use_ai_request_options)
+from pr_agent.algo.pr_processing import retry_with_fallback_models
+from pr_agent.config_loader import get_settings
+from tests.unittest._settings_helpers import (restore_settings,
+                                              snapshot_settings)
 
 # Environment variables that LiteLLMAIHandler.__init__ reads or mutates: the AWS
 # credential path (entered when AWS_USE_IMDS is set) writes the AWS_* variables,
@@ -47,9 +52,10 @@ def _restore_litellm_globals():
                 os.environ[name] = value
 
 
-def _make_settings(config_values=None):
+def _make_settings(config_values=None, settings_values=None):
     """Minimal settings whose `config.get(key, ...)` serves the given dict."""
     config_values = config_values or {}
+    settings_values = settings_values or {}
 
     class Config:
         reasoning_effort = None
@@ -67,7 +73,7 @@ def _make_settings(config_values=None):
         "litellm": type("LiteLLM", (), {
             "get": lambda self, key, default=None: default,
         })(),
-        "get": lambda self, key, default=None: default,
+        "get": lambda self, key, default=None: settings_values.get(key, default),
     })()
 
 
@@ -90,6 +96,47 @@ async def _run(monkeypatch, model, config_values):
 
 
 class TestMaxOutputTokens:
+
+    def test_effective_cap_ignores_explicitly_disabled_openrouter_reasoning(
+        self,
+        monkeypatch,
+    ):
+        settings = _make_settings(settings_values={
+            "openrouter": {
+                "max_tokens": 1_500,
+                "reasoning_effort": "none",
+                "reasoning_max_tokens": 16_000,
+            },
+        })
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: settings)
+
+        cap = litellm_handler.get_effective_litellm_output_token_cap(
+            "openrouter/anthropic/claude-sonnet-4",
+            require_bounded_reasoning=True,
+        )
+
+        assert cap == 1_500
+
+    @pytest.mark.parametrize("reasoning_effort", ["", "medium", "invalid"])
+    def test_effective_cap_requires_headroom_when_openrouter_reasoning_is_not_disabled(
+        self,
+        monkeypatch,
+        reasoning_effort,
+    ):
+        settings = _make_settings(settings_values={
+            "openrouter": {
+                "max_tokens": 1_500,
+                "reasoning_effort": reasoning_effort,
+                "reasoning_max_tokens": 16_000,
+            },
+        })
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: settings)
+
+        with pytest.raises(ValueError, match="response headroom"):
+            litellm_handler.get_effective_litellm_output_token_cap(
+                "openrouter/anthropic/claude-sonnet-4",
+                require_bounded_reasoning=True,
+            )
 
     @pytest.mark.asyncio
     async def test_default_sends_no_max_tokens(self, monkeypatch):
@@ -117,16 +164,117 @@ class TestMaxOutputTokens:
         assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 2048}
 
     @pytest.mark.asyncio
-    async def test_request_local_cap_overrides_extended_thinking_limit(self, monkeypatch):
-        with use_ai_request_options(AIRequestOptions(max_output_tokens=600)):
+    @pytest.mark.parametrize(
+        ("output_cap", "thinking_enabled"),
+        [(2_047, False), (2_048, False), (2_049, True)],
+    )
+    async def test_request_local_cap_requires_strict_thinking_headroom(
+        self, monkeypatch, output_cap, thinking_enabled
+    ):
+        with use_ai_request_options(AIRequestOptions(max_output_tokens=output_cap)):
             kwargs = await _run(monkeypatch, "claude-3-7-sonnet-20250219", {
                 "enable_claude_extended_thinking": True,
                 "extended_thinking_budget_tokens": 2048,
                 "extended_thinking_max_output_tokens": 4096,
             })
 
-        assert kwargs["max_tokens"] == 600
-        assert "thinking" not in kwargs
+        assert kwargs["max_tokens"] == output_cap
+        if thinking_enabled:
+            assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+        else:
+            assert "thinking" not in kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("output_cap", "thinking_enabled"),
+        [(2_047, False), (2_048, False), (2_049, True)],
+    )
+    async def test_global_cap_requires_strict_thinking_headroom(
+        self, monkeypatch, output_cap, thinking_enabled
+    ):
+        kwargs = await _run(monkeypatch, "claude-3-7-sonnet-20250219", {
+            "max_output_tokens": output_cap,
+            "enable_claude_extended_thinking": True,
+            "extended_thinking_budget_tokens": 2048,
+            "extended_thinking_max_output_tokens": 4096,
+        })
+
+        assert kwargs["max_tokens"] == output_cap
+        if thinking_enabled:
+            assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+        else:
+            assert "thinking" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_equal_cap_is_applied_to_claude_fallback_without_thinking(self, monkeypatch):
+        tracked_keys = (
+            "config.enable_claude_extended_thinking",
+            "config.extended_thinking_budget_tokens",
+            "config.extended_thinking_max_output_tokens",
+            "config.last_used_model",
+        )
+        snapshot = snapshot_settings(tracked_keys)
+        calls = []
+
+        async def fake_completion(**kwargs):
+            calls.append(kwargs)
+            if kwargs["model"] == "gpt-4o":
+                raise RuntimeError("primary unavailable")
+            return _mock_response()
+
+        try:
+            settings = get_settings()
+            settings.set("config.enable_claude_extended_thinking", True)
+            settings.set("config.extended_thinking_budget_tokens", 2_048)
+            settings.set("config.extended_thinking_max_output_tokens", 4_096)
+            monkeypatch.setattr(litellm_handler, "acompletion", fake_completion)
+            handler = litellm_handler.LiteLLMAIHandler()
+            route = AIModelRoute(
+                models=("gpt-4o", "claude-3-7-sonnet-20250219"),
+                deployments=(None, None),
+                model_retries=1,
+                max_output_tokens=2_048,
+            )
+
+            result = await retry_with_fallback_models(
+                lambda model: handler.chat_completion(model=model, system="sys", user="usr"),
+                model_route=route,
+            )
+        finally:
+            restore_settings(snapshot)
+
+        assert result[0] == "ok"
+        assert [call["model"] for call in calls] == ["gpt-4o", "claude-3-7-sonnet-20250219"]
+        assert calls[1]["max_tokens"] == 2_048
+        assert "thinking" not in calls[1]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("request_cap", "thinking_enabled"),
+        [(2047, False), (2048, False), (2049, True)],
+    )
+    async def test_request_local_cap_matches_thinking_headroom_boundary(
+        self,
+        monkeypatch,
+        request_cap,
+        thinking_enabled,
+    ):
+        config_values = {
+            "enable_claude_extended_thinking": True,
+            "extended_thinking_budget_tokens": 2048,
+            "extended_thinking_max_output_tokens": 4096,
+        }
+        with use_ai_request_options(AIRequestOptions(max_output_tokens=request_cap)):
+            kwargs = await _run(
+                monkeypatch,
+                "claude-3-7-sonnet-20250219",
+                config_values,
+            )
+
+        assert kwargs["max_tokens"] == request_cap
+        assert ("thinking" in kwargs) is thinking_enabled
+        if thinking_enabled:
+            assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 2048}
 
     @pytest.mark.asyncio
     async def test_string_override_is_coerced(self, monkeypatch):

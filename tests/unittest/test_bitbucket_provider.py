@@ -353,6 +353,52 @@ class TestBitbucketServerProvider:
 
         assert provider.get_repo_file_content("AGENTS.md") == ""
 
+    def test_get_files_for_routing_preserves_unfiltered_move_endpoints(self):
+        provider = BitbucketServerProvider.__new__(BitbucketServerProvider)
+        provider.workspace_slug = "AAA"
+        provider.repo_slug = "my-repo"
+        provider.pr_num = 1
+        provider.bitbucket_client = MagicMock(Bitbucket)
+        provider.bitbucket_client.get_pull_requests_changes.return_value = [
+            {
+                "path": {"toString": "generated/guard.md"},
+                "srcPath": {"toString": "services/auth/guard.py"},
+                "type": "MOVE",
+            },
+            {"path": {"toString": "docs/guide.md"}, "type": "MODIFY"},
+        ]
+
+        routing_files = provider.get_files_for_routing()
+
+        assert routing_files == [
+            {
+                "filename": "generated/guard.md",
+                "previous_filename": "services/auth/guard.py",
+                "status": "renamed",
+            },
+            {
+                "filename": "docs/guide.md",
+                "previous_filename": None,
+                "status": "modified",
+            },
+        ]
+
+    def test_get_files_for_routing_keeps_malformed_changes_as_incomplete_evidence(self):
+        provider = BitbucketServerProvider.__new__(BitbucketServerProvider)
+        provider.workspace_slug = "AAA"
+        provider.repo_slug = "my-repo"
+        provider.pr_num = 1
+        provider.bitbucket_client = MagicMock(Bitbucket)
+        provider.bitbucket_client.get_pull_requests_changes.return_value = [
+            {"path": {}, "srcPath": {}, "type": "MOVE"},
+        ]
+
+        assert provider.get_files_for_routing() == [{
+            "filename": None,
+            "previous_filename": None,
+            "status": "renamed",
+        }]
+
     def test_get_repo_file_content_propagates_non_404_errors(self):
         provider = BitbucketServerProvider.__new__(BitbucketServerProvider)
         provider.workspace_slug = "AAA"

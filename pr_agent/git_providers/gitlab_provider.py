@@ -499,6 +499,7 @@ class GitLabProvider(GitProvider):
         if incremental is None:
             incremental = IncrementalPR(False)
         self.incremental = incremental
+        self._incremental_scope_complete = None
         # Provider instances are cached per PR URL in server mode, so `diff_files` may hold
         # a diff computed under a different incremental scope (or none). Invalidate it so the
         # next get_diff_files() call reflects the scope configured here.
@@ -556,6 +557,8 @@ class GitLabProvider(GitProvider):
                     "(missing/unparseable timestamps); falling back to a full review"
                 )
                 self.incremental.is_incremental = False
+            else:
+                self._incremental_scope_complete = True
             return
 
         last_seen_sha = self.incremental.last_seen_commit_sha
@@ -599,13 +602,28 @@ class GitLabProvider(GitProvider):
         # `mr.changes()` is anchored on the MR's merge-base with target, so it correctly excludes
         # target-side changes. Intersect file paths to drop "phantom" files brought in via merge.
         mr_change_paths = None
+        incremental_scope_complete = True
         try:
-            mr_change_paths = {
-                c.get('new_path')
-                for c in self._get_merge_request_changes().get('changes', [])
-                if c.get('new_path')
-            }
+            mr_changes = self._get_merge_request_changes().get('changes', [])
+            candidate_paths = set()
+            malformed_filter = not isinstance(mr_changes, (list, tuple))
+            if not malformed_filter:
+                for change in mr_changes:
+                    new_path = change.get('new_path') if isinstance(change, dict) else None
+                    if not isinstance(new_path, str) or not new_path.strip():
+                        malformed_filter = True
+                        break
+                    candidate_paths.add(new_path)
+            if malformed_filter:
+                incremental_scope_complete = False
+                get_logger().warning(
+                    "Could not validate every mr.changes() path; preserving compare "
+                    "evidence and marking incremental scope incomplete."
+                )
+            else:
+                mr_change_paths = candidate_paths
         except Exception as e:
+            incremental_scope_complete = False
             get_logger().warning(
                 f"Could not fetch mr.changes() to filter incremental scope; "
                 f"merge-from-target changes may leak into the review: {e}"
@@ -623,6 +641,7 @@ class GitLabProvider(GitProvider):
                                     'new_file', 'deleted_file', 'renamed_file')}
             new_path = diff.get('new_path')
             if not new_path:
+                incremental_scope_complete = False
                 continue
             if mr_change_paths is not None and new_path not in mr_change_paths:
                 get_logger().debug(
@@ -631,6 +650,7 @@ class GitLabProvider(GitProvider):
                 )
                 continue
             self.unreviewed_files_map[new_path] = diff
+        self._incremental_scope_complete = incremental_scope_complete
 
     def get_commit_range(self):
         last_review_time = getattr(self.previous_review, 'anchor_time', None)
@@ -904,6 +924,33 @@ class GitLabProvider(GitProvider):
             raw_changes = self._expand_submodule_changes(raw_changes)
             self.git_files = [c.get('new_path') for c in raw_changes if c.get('new_path')]
         return self.git_files
+
+    def get_files_for_routing(self) -> list[dict]:
+        """Return GitLab's unfiltered changed-file records for safety routing.
+
+        The regular file list intentionally exposes only destination paths, while
+        ``get_diff_files()`` filters ignored or unsupported destinations. Routing
+        needs GitLab's original old/new path pair so a rename cannot hide a
+        sensitive source path behind an ignored destination.
+        """
+        incremental_active = bool(
+            getattr(self, 'incremental', None)
+            and getattr(self.incremental, 'is_incremental', False)
+        )
+        if incremental_active:
+            inventory = getattr(self, 'unreviewed_files_map', None)
+            raw_changes = list(inventory.values()) if isinstance(inventory, dict) else []
+            if getattr(self, '_incremental_scope_complete', None) is not True:
+                raw_changes.append({})
+        else:
+            raw_changes = self._get_merge_request_changes().get('changes', [])
+        return list(self._expand_submodule_changes(raw_changes))
+
+    def is_incremental_scope_empty(self) -> bool | None:
+        empty = super().is_incremental_scope_empty()
+        if empty is True and getattr(self, '_incremental_scope_complete', None) is not True:
+            return None
+        return empty
 
     def publish_description(self, pr_title: str, pr_body: str):
         try:

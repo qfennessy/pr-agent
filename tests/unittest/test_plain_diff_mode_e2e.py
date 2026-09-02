@@ -95,6 +95,7 @@ def test_base_file_reconstructed_from_working_tree(cfg, tmp_path, monkeypatch):
 
     # head_file must be the working-tree content (non-empty)
     assert files[0].head_file != "", "head_file should be populated from the working-tree file"
+    assert files[0].head_file_is_complete is True
     assert "line2-changed" in files[0].head_file
 
     # base_file must be reconstructed (non-empty)

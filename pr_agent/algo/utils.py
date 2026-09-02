@@ -451,12 +451,24 @@ def convert_to_markdown_v2(output_data: dict,
                         issue_content = issue.get('issue_content', '').strip()
                         start_line = int(str(issue.get('start_line', 0)).strip())
                         end_line = int(str(issue.get('end_line', 0)).strip())
-
-                        relevant_lines_str = extract_relevant_lines_str(end_line, files, relevant_file, start_line, dedent=True)
-                        if git_provider:
-                            reference_link = git_provider.get_line_link(relevant_file, start_line, end_line)
-                        else:
+                        if issue.get('side') == 'old':
+                            relevant_lines_str = ""
                             reference_link = None
+                            escaped_file = html.escape(relevant_file)
+                            line_label = (
+                                f"line {start_line}" if start_line == end_line
+                                else f"lines {start_line}-{end_line}"
+                            )
+                            issue_content += (
+                                f"\n\n<em>Deleted location: <code>{escaped_file}</code>, {line_label}.</em>"
+                            )
+                        else:
+                            relevant_lines_str = extract_relevant_lines_str(
+                                end_line, files, relevant_file, start_line, dedent=True
+                            )
+                            reference_link = None
+                        if git_provider and issue.get('side') != 'old':
+                            reference_link = git_provider.get_line_link(relevant_file, start_line, end_line)
 
                         if gfm_supported:
                             if reference_link is not None and len(reference_link) > 0:
@@ -1630,6 +1642,10 @@ def show_run_details(gfm_supported: bool) -> str:
     lines = [f"- Model: {details.model_used}{' (fallback)' if details.fallback_used else ''}"]
     if details.review_profile:
         lines.append(f"- Review profile: {details.review_profile}")
+    if details.review_route:
+        applied_depth = details.review_route.get("applied_depth")
+        if applied_depth:
+            lines.append(f"- Review depth: {applied_depth}")
     if details.has_token_usage:
         # A counter still at zero after a successful call means the provider never
         # reported that component, so drop it instead of claiming it was zero.
