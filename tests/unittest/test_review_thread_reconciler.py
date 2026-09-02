@@ -2,21 +2,34 @@ import hashlib
 
 import pytest
 
-from pr_agent.algo.candidate_verification import (
-    _changed_anchor_identity_details, apply_verification_decisions)
+from pr_agent.algo.candidate_verification import _changed_anchor_identity_details, apply_verification_decisions
 from pr_agent.algo.inline_comment_dedup import (
-    body_fingerprint, body_with_finding_identity_marker,
-    build_summary_fallback_marker, finding_identity_markers, has_marker,
-    marker_fingerprints)
+    body_fingerprint,
+    body_with_finding_identity_marker,
+    build_summary_fallback_marker,
+    finding_identity_markers,
+    has_marker,
+    marker_fingerprints,
+)
 from pr_agent.algo.review_thread_reconciler import (
-    FIXED_THREAD_NOTICE, FIXED_THREAD_STATE_MARKER,
-    VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION, DesiredReviewThread,
-    FindingIdentity, ReviewThreadActionKind, ReviewThreadActionOutcome,
-    ReviewThreadActionState, ReviewThreadAnchor, ReviewThreadCommentSnapshot,
-    ReviewThreadFailureKind, ReviewThreadReconciliationOutcome,
-    ReviewThreadSnapshot, SummaryFallbackReason,
-    execute_review_thread_action_plan, finding_identities_from_verified_findings,
-    plan_review_thread_actions)
+    FIXED_THREAD_NOTICE,
+    FIXED_THREAD_STATE_MARKER,
+    VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
+    DesiredReviewThread,
+    FindingIdentity,
+    ReviewThreadActionKind,
+    ReviewThreadActionOutcome,
+    ReviewThreadActionState,
+    ReviewThreadAnchor,
+    ReviewThreadCommentSnapshot,
+    ReviewThreadFailureKind,
+    ReviewThreadReconciliationOutcome,
+    ReviewThreadSnapshot,
+    SummaryFallbackReason,
+    execute_review_thread_action_plan,
+    finding_identities_from_verified_findings,
+    plan_review_thread_actions,
+)
 
 
 def _identity(root_cause_id="cause-1", path="src/app.py", symbol="run", trusted_stable_key=None):
@@ -186,6 +199,7 @@ def test_verified_finding_identity_consumes_exact_upstream_hashes_without_derivi
         "_trusted_anchor_shape_id": f"sha256:{'c' * 64}",
         "_trusted_anchor_shape_occurrence_count": 1,
         "_trusted_same_anchor_candidate_count": 1,
+        "_trusted_patch_is_complete": True,
         "side": "new",
         "start_line": 12,
     }], repository="owner/repo", pull_request_number=7)[0]
@@ -208,6 +222,7 @@ def test_verified_finding_identity_consumes_exact_upstream_hashes_without_derivi
         ({"_trusted_anchor_shape_occurrence_count": True}, "occurrence count"),
         ({"_trusted_same_anchor_candidate_count": None}, "same-anchor candidate count"),
         ({"_trusted_same_anchor_candidate_count": True}, "same-anchor candidate count"),
+        ({"_trusted_patch_is_complete": False}, "complete patch"),
     ],
 )
 def test_verified_finding_identity_fails_closed_on_untrusted_or_malformed_identity(replacement, error):
@@ -218,6 +233,7 @@ def test_verified_finding_identity_fails_closed_on_untrusted_or_malformed_identi
         "_trusted_anchor_shape_id": f"sha256:{'c' * 64}",
         "_trusted_anchor_shape_occurrence_count": 1,
         "_trusted_same_anchor_candidate_count": 1,
+        "_trusted_patch_is_complete": True,
         "side": "new",
         "start_line": 12,
     }
@@ -246,6 +262,7 @@ def test_verified_finding_identity_accepts_actual_verification_output():
         "_changed_anchor_occurrence_count": 1,
         "_trusted_defect_ordinal": 1,
         "_trusted_same_anchor_candidate_count": 1,
+        "_trusted_patch_is_complete": True,
         "_trusted_lineage_key": "file:src/service.py",
         "_trusted_side_line_count": 20,
     }
@@ -285,6 +302,16 @@ def test_verified_finding_identity_accepts_actual_verification_output():
     assert identity.path == findings[0]["relevant_file"]
     assert identity.root_cause_id_schema == "verified-root-cause-v2"
 
+    incomplete_candidate = {**candidate, "_trusted_patch_is_complete": False}
+    incomplete_findings, _ = apply_verification_decisions(
+        [incomplete_candidate], evidence, verification
+    )
+    assert incomplete_findings[0]["_trusted_patch_is_complete"] is False
+    with pytest.raises(ValueError, match="complete patch"):
+        finding_identities_from_verified_findings(
+            incomplete_findings, repository="owner/repo", pull_request_number=7
+        )
+
 
 def test_same_anchor_v2_identity_reordering_fails_closed_without_swapping_thread_mapping():
     def verified_findings(labels, verified_labels=None):
@@ -310,6 +337,7 @@ def test_same_anchor_v2_identity_reordering_fails_closed_without_swapping_thread
                 "_changed_anchor_occurrence_count": 1,
                 "_trusted_defect_ordinal": ordinal,
                 "_trusted_same_anchor_candidate_count": len(labels),
+                "_trusted_patch_is_complete": True,
                 "_trusted_lineage_key": "file:src/service.py",
                 "_trusted_side_line_count": 20,
             })
@@ -384,6 +412,7 @@ def test_equal_shape_v2_occurrence_shift_after_deletion_fails_closed_before_mapp
                 "_changed_anchor_occurrence_count": len(specs),
                 "_trusted_defect_ordinal": 1,
                 "_trusted_same_anchor_candidate_count": 1,
+                "_trusted_patch_is_complete": True,
                 "_trusted_lineage_key": "file:src/service.py",
                 "_trusted_side_line_count": 30,
             })
@@ -441,6 +470,7 @@ def test_distinct_trusted_anchor_shapes_in_one_file_remain_eligible():
             "_trusted_anchor_shape_id": f"sha256:{shape_id * 64}",
             "_trusted_anchor_shape_occurrence_count": 1,
             "_trusted_same_anchor_candidate_count": 1,
+            "_trusted_patch_is_complete": True,
             "side": "new",
             "start_line": index * 10,
         })
@@ -478,6 +508,7 @@ def test_single_verified_finding_with_a_patch_repeated_anchor_shape_fails_closed
         "_changed_anchor_occurrence_count": anchor_occurrence_count,
         "_trusted_defect_ordinal": 1,
         "_trusted_same_anchor_candidate_count": 1,
+        "_trusted_patch_is_complete": True,
         "_trusted_lineage_key": "file:src/service.py",
         "_trusted_side_line_count": 20,
     }

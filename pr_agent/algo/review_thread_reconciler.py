@@ -15,9 +15,12 @@ from enum import Enum
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
 from pr_agent.algo.inline_comment_dedup import (
-    SUMMARY_FALLBACK_MARKER_VERSION, body_with_finding_identity_marker,
+    SUMMARY_FALLBACK_MARKER_VERSION,
+    body_with_finding_identity_marker,
     build_summary_fallback_marker,
-    strip_inline_comment_markers, summary_fallback_markers)
+    strip_inline_comment_markers,
+    summary_fallback_markers,
+)
 
 REVIEW_THREAD_LIFECYCLE_SCHEMA_VERSION = "review-thread-lifecycle-v1"
 VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION = "verified-root-cause-v2"
@@ -192,6 +195,8 @@ def finding_identities_from_verified_findings(
             raise ValueError("verified finding requires a trusted same-anchor candidate count")
         if same_anchor_candidate_count != 1:
             raise ValueError("verified finding has an ambiguous same-anchor candidate set")
+        if finding.get("_trusted_patch_is_complete") is not True:
+            raise ValueError("verified finding identity requires a complete patch")
         shape_ids_by_file_side.setdefault(anchor[:2], []).append(
             shape_id.strip()
         )

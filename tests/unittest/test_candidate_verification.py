@@ -422,6 +422,18 @@ def test_late_model_candidate_computes_anchor_identity_in_one_patch_pass():
     assert patch_lines.call_count == 2
 
 
+def test_prepare_candidate_carries_explicit_patch_completeness():
+    diff_file = _diff_file()
+    review_data = _review_data(_candidate(context_files=[]))
+
+    incomplete, _ = prepare_candidates(review_data, [diff_file], [], 1)
+    diff_file.patch_is_complete = True
+    complete, _ = prepare_candidates(review_data, [diff_file], [], 1)
+
+    assert incomplete[0]["_trusted_patch_is_complete"] is False
+    assert complete[0]["_trusted_patch_is_complete"] is True
+
+
 @pytest.mark.parametrize("side", ["new", "old"])
 def test_late_replacement_anchor_ordinal_is_linear_and_exact_on_both_sides(side):
     patch_text = "@@ -1,5000 +1,5000 @@\n" + "\n".join(

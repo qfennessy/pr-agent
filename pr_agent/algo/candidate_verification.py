@@ -693,6 +693,7 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             "_changed_anchor_ordinal": anchor_ordinal,
             "_changed_anchor_occurrence_count": anchor_occurrence_count,
             "_trusted_lineage_key": _trusted_file_lineage(diff_file),
+            "_trusted_patch_is_complete": getattr(diff_file, "patch_is_complete", False) is True,
             "_trusted_side_line_count": trusted_side_line_count,
             "_display_file": (
                 safe_repo_path(getattr(diff_file, "old_filename", None))
@@ -810,6 +811,7 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             candidate["end_line"],
         )
         candidate["_trusted_lineage_key"] = _trusted_file_lineage(diff_file)
+        candidate["_trusted_patch_is_complete"] = getattr(diff_file, "patch_is_complete", False) is True
         candidate["_trusted_side_line_count"] = trusted_side_line_count
         candidates.append(candidate)
         model_candidate_count += 1
@@ -2819,6 +2821,7 @@ def apply_verification_decisions(
         finding["_trusted_anchor_shape_id"] = anchor_shape_id
         finding["_trusted_anchor_shape_occurrence_count"] = anchor_occurrence_count
         finding["_trusted_same_anchor_candidate_count"] = same_anchor_candidate_count
+        finding["_trusted_patch_is_complete"] = candidate.get("_trusted_patch_is_complete") is True
         if identity in seen_identities:
             record["verdict"] = "rejected"
             record["reason"] = "trusted_identity_collision"

@@ -19,36 +19,48 @@ from retry.api import retry_call
 from starlette_context import context
 
 from ..algo.file_filter import filter_ignored
-from ..algo.git_patch_processing import (extract_hunk_headers,
-                                         iter_git_patch_lines,
-                                         strip_git_line_ending)
-from ..algo.inline_comment_dedup import (FINDING_IDENTITY_MARKER_VERSION,
-                                         body_fingerprint, body_with_markers,
-                                         code_fingerprint,
-                                         finding_identity_markers,
-                                         get_inline_comment_store, has_marker,
-                                         is_agent_inline_comment)
+from ..algo.git_patch_processing import extract_hunk_headers, iter_git_patch_lines, strip_git_line_ending
+from ..algo.inline_comment_dedup import (
+    FINDING_IDENTITY_MARKER_VERSION,
+    body_fingerprint,
+    body_with_markers,
+    code_fingerprint,
+    finding_identity_markers,
+    get_inline_comment_store,
+    has_marker,
+    is_agent_inline_comment,
+)
 from ..algo.language_handler import is_valid_file
-from ..algo.review_thread_reconciler import (ReviewThreadActionKind,
-                                             ReviewThreadActionOutcome,
-                                             ReviewThreadActionState,
-                                             ReviewThreadAnchor,
-                                             ReviewThreadCommentSnapshot,
-                                             ReviewThreadFailureKind,
-                                             ReviewThreadSnapshot)
+from ..algo.review_thread_reconciler import (
+    ReviewThreadActionKind,
+    ReviewThreadActionOutcome,
+    ReviewThreadActionState,
+    ReviewThreadAnchor,
+    ReviewThreadCommentSnapshot,
+    ReviewThreadFailureKind,
+    ReviewThreadSnapshot,
+)
 from ..algo.types import EDIT_TYPE
-from ..algo.utils import (Range, clip_tokens,
-                          comment_matches_pr_review_identity,
-                          find_line_number_of_relevant_line_in_file,
-                          get_pr_review_comment_identifiers, load_large_diff,
-                          set_file_languages)
+from ..algo.utils import (
+    Range,
+    clip_tokens,
+    comment_matches_pr_review_identity,
+    find_line_number_of_relevant_line_in_file,
+    get_pr_review_comment_identifiers,
+    load_large_diff,
+    set_file_languages,
+)
 from ..config_loader import get_settings
 from ..log import get_logger
 from ..servers.utils import RateLimitExceeded
-from .git_provider import (MAX_FILES_ALLOWED_FULL, FilePatchInfo, GitProvider,
-                           IncrementalPR, get_cached_global_settings,
-                           is_own_persistent_comment_for_identities)
-
+from .git_provider import (
+    MAX_FILES_ALLOWED_FULL,
+    FilePatchInfo,
+    GitProvider,
+    IncrementalPR,
+    get_cached_global_settings,
+    is_own_persistent_comment_for_identities,
+)
 
 _REVIEW_THREAD_CREATE_LOCKS_GUARD = threading.Lock()
 _REVIEW_THREAD_CREATE_LOCKS = WeakValueDictionary()

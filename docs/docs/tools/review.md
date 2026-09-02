@@ -66,9 +66,10 @@ the finding reaches this boundary. Because v2 uses occurrence ordinals to distin
 the batch adapter consumes a non-reversible trusted shape discriminator, a patch-derived total occurrence count, and the
 prepared same-anchor candidate count. It only accepts shapes that occur exactly once anywhere in the patch and anchors
 that had exactly one prepared candidate, even when the verifier retained just one of several candidates, and rejects
-same-anchor or equal-shape ambiguity. Older batches without all trusted values fail closed. This leaves any persisted
-thread mapping untouched instead of swapping content when candidates reorder or one repeated shape is deleted. The
-reserved setting remains off and has no runtime effect until the publication integration is implemented and rollout
+same-anchor or equal-shape ambiguity. The adapter also requires the provider patch to be explicitly complete, so a
+truncated diff cannot hide another matching shape. Older batches without all trusted values fail closed. This leaves any
+persisted thread mapping untouched instead of swapping content when candidates reorder or one repeated shape is deleted.
+The reserved setting remains off and has no runtime effect until the publication integration is implemented and rollout
 evidence exists:
 
 ```toml

@@ -4,14 +4,20 @@ from types import SimpleNamespace
 
 import pytest
 
-from pr_agent.algo.inline_comment_dedup import \
-    body_with_finding_identity_marker
+from pr_agent.algo.inline_comment_dedup import body_with_finding_identity_marker
 from pr_agent.algo.review_thread_reconciler import (
-    FIXED_THREAD_STATE_MARKER, VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
-    FindingIdentity, ReviewThreadActionKind, ReviewThreadActionState,
-    ReviewThreadAnchor, ReviewThreadCommentSnapshot, ReviewThreadFailureKind,
-    ReviewThreadSnapshot, execute_review_thread_action_plan,
-    plan_review_thread_actions)
+    FIXED_THREAD_STATE_MARKER,
+    VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
+    FindingIdentity,
+    ReviewThreadActionKind,
+    ReviewThreadActionState,
+    ReviewThreadAnchor,
+    ReviewThreadCommentSnapshot,
+    ReviewThreadFailureKind,
+    ReviewThreadSnapshot,
+    execute_review_thread_action_plan,
+    plan_review_thread_actions,
+)
 from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.servers.utils import RateLimitExceeded
 
