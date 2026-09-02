@@ -222,6 +222,7 @@ async def test_unsupported_handler_fails_before_provider_call():
     assert result.decision is FrontierDecision.UNAVAILABLE
     assert result.state is FrontierState.UNAVAILABLE
     assert result.failure_reason == "handler_telemetry_unsupported"
+    assert result.to_telemetry_dict()["stable_finding_id"] == "sha256:finding"
     assert handler.calls == []
 
 
@@ -275,6 +276,7 @@ async def test_reject_retains_source_free_lifecycle_telemetry():
     )
     assert result.decision is FrontierDecision.REJECT
     assert result.normalized_finding is None
+    assert result.to_telemetry_dict()["stable_finding_id"] == "sha256:finding"
     assert result.to_telemetry_dict()["publication_safe"] is False
     assert "src/auth.py" not in json.dumps(result.to_telemetry_dict())
 
@@ -513,6 +515,7 @@ async def test_stale_snapshot_before_call_fails_without_provider():
         current_identity=lambda: "head-2",
     )
     assert result.state is FrontierState.STALE
+    assert result.to_telemetry_dict()["stable_finding_id"] == "sha256:finding"
     assert handler.calls == []
 
 

@@ -361,6 +361,7 @@ class NormalizedFrontierFinding:
 @dataclass(frozen=True, slots=True)
 class FrontierAdjudicationResult:
     schema_version: str
+    stable_finding_id: str
     decision: FrontierDecision
     state: FrontierState
     confidence: Optional[float]
@@ -378,9 +379,7 @@ class FrontierAdjudicationResult:
             "state": self.state.value,
             "confidence": self.confidence,
             "evidence_citation_count": len(self.evidence_citations),
-            "stable_finding_id": (
-                self.normalized_finding.stable_finding_id if self.normalized_finding else None
-            ),
+            "stable_finding_id": self.stable_finding_id,
             "normalized_severity": (
                 self.normalized_finding.severity.value if self.normalized_finding else None
             ),
@@ -563,6 +562,7 @@ def _unavailable(
     telemetry = adjudication_runs_to_dict().get(request.candidate.stable_finding_id, {})
     return FrontierAdjudicationResult(
         schema_version=FRONTIER_OUTPUT_SCHEMA_VERSION,
+        stable_finding_id=request.candidate.stable_finding_id,
         decision=FrontierDecision.UNAVAILABLE,
         state=state,
         confidence=None,
@@ -904,6 +904,7 @@ async def run_frontier_adjudication(
     if parsed["decision"] is FrontierDecision.REJECT:
         return FrontierAdjudicationResult(
             schema_version=config.output_schema_version,
+            stable_finding_id=request.candidate.stable_finding_id,
             decision=FrontierDecision.REJECT,
             state=FrontierState.REJECTED,
             confidence=parsed["confidence"],
@@ -924,6 +925,7 @@ async def run_frontier_adjudication(
     )
     return FrontierAdjudicationResult(
         schema_version=config.output_schema_version,
+        stable_finding_id=request.candidate.stable_finding_id,
         decision=FrontierDecision.CONFIRM,
         state=FrontierState.CONFIRMED,
         confidence=parsed["confidence"],

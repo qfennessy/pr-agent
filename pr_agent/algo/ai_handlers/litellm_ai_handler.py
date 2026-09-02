@@ -578,7 +578,7 @@ class LiteLLMAIHandler(BaseAiHandler):
 
     @staticmethod
     def _record_completion_metadata(response, model=None, display_model=None) -> None:
-        """Count a successful call and synchronously collect usage-based cost when possible."""
+        """Count a completed provider response and collect usage-based cost when possible."""
         usage = _response_field(response, "usage")
         request_options = get_ai_request_options()
 
@@ -1410,7 +1410,10 @@ class LiteLLMAIHandler(BaseAiHandler):
                     kwargs["custom_llm_provider"] = custom_llm_provider
 
                 # Get completion with automatic streaming detection
-                resp, finish_reason, response_obj = await self._get_completion(**kwargs)
+                resp, finish_reason, response_obj = await self._get_completion(
+                    display_model=user_model,
+                    **kwargs,
+                )
 
             except openai.RateLimitError as e:
                 get_logger().error(f"Rate limit error during LLM inference: {e}")
@@ -1422,7 +1425,10 @@ class LiteLLMAIHandler(BaseAiHandler):
                     # env-var swap is fully visible to this call. Letting @retry
                     # handle the retry would release the lock between attempts,
                     # allowing a concurrent coroutine to overwrite os.environ.
-                    resp, finish_reason, response_obj = await self._get_completion(**kwargs)
+                    resp, finish_reason, response_obj = await self._get_completion(
+                        display_model=user_model,
+                        **kwargs,
+                    )
                 else:
                     get_logger().warning(f"Error during LLM inference: {e}")
                     raise
@@ -1452,7 +1458,7 @@ class LiteLLMAIHandler(BaseAiHandler):
 
         return resp, finish_reason
 
-    async def _get_completion(self, **kwargs):
+    async def _get_completion(self, *, display_model=None, **kwargs):
         """
         Wrapper that automatically handles streaming for required models.
         """
@@ -1490,6 +1496,12 @@ class LiteLLMAIHandler(BaseAiHandler):
             record_provider_request_attempt()
             response = await acompletion(**kwargs)
             if response is None or len(response["choices"]) == 0:
+                if response is not None:
+                    self._record_completion_metadata(
+                        response,
+                        model=model,
+                        display_model=display_model,
+                    )
                 raise openai.APIError(
                     f"No choices in model response from {model}",
                     request=httpx.Request("POST", model),
@@ -1498,6 +1510,11 @@ class LiteLLMAIHandler(BaseAiHandler):
             content = response["choices"][0]['message']['content']
             finish_reason = response["choices"][0]["finish_reason"]
             if not content:
+                self._record_completion_metadata(
+                    response,
+                    model=model,
+                    display_model=display_model,
+                )
                 get_logger().warning(
                     f"Empty content in model response, finish_reason: {finish_reason}")
                 raise openai.APIError(

@@ -26,14 +26,39 @@ class _Usage:
 class _Response:
     """Minimal stand-in for a litellm response object."""
 
-    def __init__(self, usage):
+    def __init__(
+        self,
+        usage,
+        *,
+        content="resp",
+        finish_reason="stop",
+        model=None,
+        provider=None,
+        response_cost=None,
+    ):
         self.usage = usage
+        self.content = content
+        self.finish_reason = finish_reason
+        self.model = model
+        self._hidden_params = {}
+        if provider is not None:
+            self._hidden_params["custom_llm_provider"] = provider
+        if response_cost is not None:
+            self._hidden_params["response_cost"] = response_cost
 
     def dict(self):
-        return {
-            "choices": [{"message": {"content": "resp"}, "finish_reason": "stop"}],
+        response = {
+            "choices": [{
+                "message": {"content": self.content},
+                "finish_reason": self.finish_reason,
+            }],
             "usage": self.usage,
         }
+        if self.model is not None:
+            response["model"] = self.model
+        if self._hidden_params:
+            response["_hidden_params"] = self._hidden_params
+        return response
 
     def __getitem__(self, key):
         return self.dict()[key]
@@ -383,6 +408,59 @@ async def test_frontier_route_records_each_litellm_retry_attempt(monkeypatch):
     assert adjudication.model_retry_attempts == 1
     assert adjudication.provider_attempts == 2
     assert adjudication.provider_retry_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_frontier_retry_accounts_for_metered_empty_response(monkeypatch):
+    handler = _bare_handler()
+    handler.streaming_required_models = []
+    handler.force_streaming_provider = ""
+    handler.force_streaming_api_base_substrings = []
+    failed_response = _Response(
+        _Usage(80, 4, 84),
+        content="",
+        model="revision-a",
+        provider="provider-a",
+        response_cost=0.003,
+    )
+    successful_response = _Response(
+        _Usage(100, 10, 110),
+        model="revision-a",
+        provider="provider-a",
+        response_cost=0.007,
+    )
+    route = AIModelRoute(
+        models=("some-model",),
+        deployments=("deployment-a",),
+        timeout_seconds=1,
+        model_retries=2,
+        provider_retries=0,
+        attribution="frontier_adjudication:sha256:finding",
+        collect_cost=True,
+    )
+    init_run_details()
+
+    with patch(
+        "pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion",
+        new_callable=AsyncMock,
+    ) as completion:
+        completion.side_effect = [failed_response, successful_response]
+        result = await retry_with_fallback_models(
+            lambda model: handler.chat_completion(model=model, system="sys", user="usr"),
+            model_route=route,
+        )
+
+    assert result == ("resp", "stop")
+    adjudication = get_run_details().adjudication_runs["sha256:finding"]
+    assert adjudication.model_attempts == 2
+    assert adjudication.provider_attempts == 2
+    assert adjudication.num_ai_calls == 2
+    assert adjudication.prompt_tokens == 180
+    assert adjudication.completion_tokens == 14
+    assert adjudication.total_tokens == 194
+    assert adjudication.total_cost_usd == Decimal("0.010")
+    assert adjudication.known_usage_call_count == 2
+    assert adjudication.known_cost_call_count == 2
 
 
 @pytest.mark.asyncio
