@@ -9,6 +9,7 @@ import json
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from math import isfinite
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
@@ -309,8 +310,20 @@ class FrontierAdjudicationConfig:
                 raise FrontierContractError("frontier model identity does not match its route entry")
         if not 0 <= self.minimum_confidence <= 1:
             raise FrontierContractError("frontier minimum confidence must be between 0 and 1")
-        if self.stage_timeout_seconds <= 0:
-            raise FrontierContractError("frontier stage timeout must be positive")
+        if (
+            not isinstance(self.stage_timeout_seconds, (int, float))
+            or isinstance(self.stage_timeout_seconds, bool)
+            or not isfinite(self.stage_timeout_seconds)
+            or self.stage_timeout_seconds <= 0
+        ):
+            raise FrontierContractError("frontier stage timeout must be finite and positive")
+        if (
+            not isinstance(self.route.timeout_seconds, (int, float))
+            or isinstance(self.route.timeout_seconds, bool)
+            or not isfinite(self.route.timeout_seconds)
+            or self.route.timeout_seconds <= 0
+        ):
+            raise FrontierContractError("frontier model timeout must be finite and positive")
         if isinstance(self.max_calls, bool) or self.max_calls < 0:
             raise FrontierContractError("frontier max calls cannot be negative")
         if not self.system_prompt.strip() or not self.user_prompt.strip() or not self.prompt_version.strip():

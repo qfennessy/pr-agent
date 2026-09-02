@@ -1689,6 +1689,152 @@ def test_label_only_sensitive_route_applies_to_every_frontier_candidate():
     assert unrelated_signals.deterministic_severity_floor.value == "high"
 
 
+def test_renamed_candidate_matches_sensitive_router_evidence_for_trusted_old_path():
+    from pr_agent.algo.candidate_verification import prepare_candidates
+
+    old_path = "legacy/auth/guard.py"
+    new_path = "services/guard.py"
+    raw_file = _incremental_raw_file(
+        new_path,
+        status="renamed",
+        previous_filename=old_path,
+    )
+    diff_file = _route_file(
+        new_path,
+        edit_type=EDIT_TYPE.RENAMED,
+        old_filename=old_path,
+    )
+    provider = _MutatingIncrementalProvider([raw_file], [diff_file])
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=({
+        "name": "authorization",
+        "path_patterns": ["**/auth/**"],
+        "labels": [],
+    },))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+    candidates, rejections = prepare_candidates(
+        {"review": {"key_issues_to_review": [{
+            "relevant_file": new_path,
+            "issue_header": "Renamed guard regression",
+            "issue_content": "The renamed guard can return the wrong result.",
+            "start_line": 1,
+            "end_line": 1,
+            "trigger": "A request reaches the renamed guard.",
+            "impact": "Authorization can be bypassed.",
+            "root_cause": "The renamed guard omits the required check.",
+            "context_files": [],
+            "context_symbols": [],
+        }]}},
+        [diff_file],
+        [],
+        3,
+    )
+
+    assert rejections == []
+    assert candidates[0]["relevant_file"] == new_path
+    assert candidates[0]["_trusted_lineage_key"] == f"file:{old_path}"
+    assert reviewer._frontier_sensitive_categories(
+        candidates[0], decision
+    ) == ("authorization",)
+    _, signals = reviewer._frontier_signals(
+        candidates[0], {"normalized_severity": "medium"}, decision
+    )
+    assert signals.deterministic_forced is True
+    assert signals.deterministic_severity_floor.value == "high"
+
+
+@pytest.mark.parametrize(
+    ("verification_status", "publication_safe", "frontier_status", "failure"),
+    [
+        ("candidate_parse_failed", False, "unavailable", "candidate_verification_candidate_parse_failed"),
+        ("candidate_input_invalid", False, "unavailable", "candidate_verification_candidate_input_invalid"),
+        ("unsupported_provider", False, "unavailable", "candidate_verification_unsupported_provider"),
+        (
+            "sensitive_audit_coverage_incomplete",
+            False,
+            "unavailable",
+            "candidate_verification_sensitive_audit_coverage_incomplete",
+        ),
+        (
+            "candidate_validation_incomplete",
+            False,
+            "unavailable",
+            "candidate_verification_candidate_validation_incomplete",
+        ),
+        ("verifier_route_invalid", False, "unavailable", "candidate_verification_verifier_route_invalid"),
+        (
+            "model_call_budget_exhausted",
+            False,
+            "unavailable",
+            "candidate_verification_model_call_budget_exhausted",
+        ),
+        ("prompt_budget_exhausted", False, "unavailable", "candidate_verification_prompt_budget_exhausted"),
+        (
+            "verifier_response_invalid",
+            False,
+            "unavailable",
+            "candidate_verification_verifier_response_invalid",
+        ),
+        ("verifier_failed", False, "unavailable", "candidate_verification_verifier_failed"),
+        ("no_candidates", True, "not_required", None),
+    ],
+)
+def test_frontier_dependency_artifact_covers_candidate_verification_early_exits(
+    verification_status,
+    publication_safe,
+    frontier_status,
+    failure,
+):
+    artifact = PRReviewer._frontier_verification_dependency_artifact()
+
+    PRReviewer._finalize_frontier_verification_dependency(
+        artifact,
+        {"status": verification_status, "publication_safe": publication_safe},
+    )
+
+    assert artifact == {
+        "enabled": True,
+        "status": frontier_status,
+        **({"failure": failure} if failure is not None else {}),
+        "results": [],
+        "publication_safe": False,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frontier_enabled", [False, True])
+async def test_candidate_verification_early_exit_distinguishes_frontier_disabled_run(
+    frontier_enabled,
+):
+    reviewer = _make_reviewer()
+    reviewer._parse_review_prediction = MagicMock(return_value=None)
+    settings = get_settings()
+    snapshot = snapshot_settings(("pr_reviewer.enable_frontier_adjudication",))
+    try:
+        settings.pr_reviewer.enable_frontier_adjudication = frontier_enabled
+        await reviewer._run_candidate_verification()
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.candidate_verification_artifact["status"] == "candidate_parse_failed"
+    expected = (
+        {
+            "enabled": True,
+            "status": "unavailable",
+            "failure": "candidate_verification_candidate_parse_failed",
+            "results": [],
+            "publication_safe": False,
+        }
+        if frontier_enabled
+        else None
+    )
+    assert reviewer.frontier_adjudication_artifact == expected
+
+
 @pytest.mark.asyncio
 async def test_frontier_adjudication_binds_the_accepted_sensitive_candidate_on_identity_collision(
         monkeypatch):

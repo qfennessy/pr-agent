@@ -744,6 +744,43 @@ def test_loader_requires_exact_fallback_identities():
 
 
 @pytest.mark.parametrize(
+    ("timeout_key", "timeout_value", "timeout_name"),
+    [
+        ("frontier_adjudication_timeout_seconds", "inf", "stage"),
+        ("frontier_adjudication_timeout_seconds", "nan", "stage"),
+        ("frontier_adjudication_model_timeout_seconds", "inf", "model"),
+        ("frontier_adjudication_model_timeout_seconds", "nan", "model"),
+    ],
+)
+def test_loader_rejects_non_finite_frontier_timeouts(
+    timeout_key,
+    timeout_value,
+    timeout_name,
+):
+    section = {
+        "enable_frontier_adjudication": True,
+        "enable_candidate_verification": True,
+        "frontier_adjudication_model": "frontier-primary",
+        "frontier_adjudication_provider": "provider-primary",
+        "frontier_adjudication_revision": "revision-primary",
+        timeout_key: timeout_value,
+    }
+    prompt = {
+        "system": SYSTEM_PROMPT,
+        "user": USER_PROMPT,
+        "prompt_version": "frontier-adjudication-prompt-v1",
+        "input_schema_version": FRONTIER_INPUT_SCHEMA_VERSION,
+        "schema_version": FRONTIER_OUTPUT_SCHEMA_VERSION,
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=rf"frontier {timeout_name} timeout must be finite and positive",
+    ):
+        load_frontier_adjudication_config(section, prompt)
+
+
+@pytest.mark.parametrize(
     "candidate_verification_config",
     [{}, {"enable_candidate_verification": False}, {"enable_candidate_verification": "false"}],
 )

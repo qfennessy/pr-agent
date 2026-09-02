@@ -1839,6 +1839,12 @@ class PRReviewer:
         """Return deterministic candidate-local and PR-wide sensitive categories."""
 
         candidate_path = safe_repo_path(candidate.get("relevant_file"))
+        candidate_paths = {candidate_path} if candidate_path else set()
+        lineage_key = candidate.get("_trusted_lineage_key")
+        if isinstance(lineage_key, str) and lineage_key.startswith("file:"):
+            lineage_path = safe_repo_path(lineage_key.removeprefix("file:"))
+            if lineage_path:
+                candidate_paths.add(lineage_path)
         categories = ["candidate_verification"] if candidate.get("sensitive_path") is True else []
         if route_decision is not None:
             for reason in route_decision.reasons:
@@ -1853,9 +1859,39 @@ class PRReviewer:
                     for item in reason.evidence
                     if isinstance(item, str) and item.startswith("path:")
                 }
-                if label_matched or (candidate_path and candidate_path in matched_paths):
+                if label_matched or not candidate_paths.isdisjoint(matched_paths):
                     categories.append(reason.code.removeprefix("sensitive_category:"))
         return tuple(dict.fromkeys(categories))
+
+    @staticmethod
+    def _frontier_verification_dependency_artifact() -> dict:
+        return {
+            "enabled": True,
+            "status": "unavailable",
+            "failure": "candidate_verification_incomplete",
+            "results": [],
+            "publication_safe": False,
+        }
+
+    @staticmethod
+    def _finalize_frontier_verification_dependency(
+        frontier_artifact: dict,
+        verification_artifact: Mapping[str, Any],
+    ) -> None:
+        verification_status = str(
+            verification_artifact.get("status") or "incomplete"
+        ).strip() or "incomplete"
+        if (
+            verification_status == "no_candidates"
+            and verification_artifact.get("publication_safe") is True
+        ):
+            frontier_artifact["status"] = "not_required"
+            frontier_artifact.pop("failure", None)
+            return
+        frontier_artifact.update({
+            "status": "unavailable",
+            "failure": f"candidate_verification_{verification_status}",
+        })
 
     @classmethod
     def _frontier_signals(
@@ -2064,6 +2100,10 @@ class PRReviewer:
         """Verify review candidates against bounded base-branch repository evidence."""
         config = get_settings().pr_reviewer
         consume_specialist_prioritization = self._candidate_specialist_prioritization_enabled()
+        frontier_dependency_artifact = None
+        if self._frontier_adjudication_enabled():
+            frontier_dependency_artifact = self._frontier_verification_dependency_artifact()
+        self.frontier_adjudication_artifact = frontier_dependency_artifact
         artifact = {
             "enabled": True,
             "status": "initializing",
@@ -2564,6 +2604,14 @@ class PRReviewer:
                 "Candidate verification failed", artifact=telemetry_safe_artifact(artifact)
             )
         finally:
+            if (
+                frontier_dependency_artifact is not None
+                and self.frontier_adjudication_artifact is frontier_dependency_artifact
+            ):
+                self._finalize_frontier_verification_dependency(
+                    frontier_dependency_artifact,
+                    artifact,
+                )
             if verifier_started is not None:
                 artifact["verifier_latency_seconds"] = round(time.monotonic() - verifier_started, 3)
                 details = get_run_details()
