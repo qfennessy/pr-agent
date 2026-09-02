@@ -38,12 +38,15 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.event.pull_request.base.sha }}
+          # For pull_request_target, github.sha is the protected base head for
+          # this run. pull_request.base.sha can remain pinned to the commit from
+          # which an older PR was opened and may predate this verifier.
+          ref: ${{ github.sha }}
 
       - name: Fetch candidate and upstream history
         if: steps.classify.outputs.is_sync == 'true'
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
@@ -54,7 +57,7 @@ jobs:
             exit 1
           fi
           if [[ "$(git rev-parse HEAD)" != "$BASE_SHA" ]]; then
-            echo "::error::Protected verifier checkout does not match the event base SHA."
+            echo "::error::Protected verifier checkout does not match the workflow base SHA."
             exit 1
           fi
           git fetch https://github.com/The-PR-Agent/pr-agent.git \
@@ -64,7 +67,7 @@ jobs:
         if: steps.classify.outputs.is_sync == 'true'
         env:
           BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.sha }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
