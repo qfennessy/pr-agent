@@ -1603,6 +1603,25 @@ def test_distinct_verified_defects_on_the_same_changed_range_do_not_collide():
     assert [record["verdict"] for record in records] == ["verified", "verified"]
 
 
+def test_sensitive_and_model_candidates_share_the_trusted_anchor_candidate_count():
+    diff_file = _diff_file("auth/policy.py")
+    diff_file.patch = "@@ -10,0 +12,1 @@\n+one"
+    candidates, rejected = prepare_candidates(
+        _review_data(_candidate(
+            relevant_file="auth/policy.py",
+            context_files=[],
+            context_symbols=[],
+        )),
+        [diff_file],
+        ["auth/**"],
+        3,
+    )
+
+    assert rejected == []
+    assert [candidate["_trusted_defect_ordinal"] for candidate in candidates] == [1, 2]
+    assert [candidate["_trusted_same_anchor_candidate_count"] for candidate in candidates] == [2, 2]
+
+
 def test_same_anchor_defect_identity_multiset_is_stable_when_candidates_reorder():
     diff_file = _diff_file()
 

@@ -821,7 +821,7 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
     # are never part of either identity digest. Stable semantic reconciliation
     # across arbitrary candidate reordering requires persisted prior-finding
     # state and belongs to the downstream thread-publication layer.
-    model_candidates_by_anchor = {}
+    candidates_by_anchor = {}
     for candidate in candidates:
         anchor_key = (
             candidate.get("_trusted_lineage_key"),
@@ -829,12 +829,8 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             candidate.get("_changed_anchor_shape"),
             candidate.get("_changed_anchor_ordinal"),
         )
-        if candidate.get("candidate_type") == "sensitive_path_audit":
-            candidate["_trusted_defect_ordinal"] = 1
-            candidate["_trusted_same_anchor_candidate_count"] = 1
-            continue
-        model_candidates_by_anchor.setdefault(anchor_key, []).append(candidate)
-    for anchor_candidates in model_candidates_by_anchor.values():
+        candidates_by_anchor.setdefault(anchor_key, []).append(candidate)
+    for anchor_candidates in candidates_by_anchor.values():
         same_anchor_candidate_count = len(anchor_candidates)
         for defect_ordinal, candidate in enumerate(anchor_candidates, start=1):
             candidate["_trusted_defect_ordinal"] = defect_ordinal
