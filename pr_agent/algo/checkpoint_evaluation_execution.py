@@ -30,6 +30,7 @@ from pr_agent.algo.checkpoint_evaluation import (
     NumericMeasurement,
     build_evaluation_plan,
     content_hash,
+    validate_run_model_telemetry,
 )
 from pr_agent.algo.checkpoint_evaluation_scoring import RolloutGateDecision
 
@@ -388,12 +389,7 @@ class EvaluationArtifactStore:
             if record.snapshot_id != cases[record.case_id].snapshot_id:
                 raise EvaluationValidationError("artifact store run snapshot does not match its checkpoint case")
             arm = arms[record.arm_id]
-            if not arm.accepts_run_identity(
-                record.model_id,
-                record.provider_id,
-                record.model_revision,
-            ):
-                raise EvaluationValidationError("artifact store run model identity does not match its frozen arm")
+            validate_run_model_telemetry(arm, record, context="artifact store run")
             if record.state is EvaluationRunState.COMPLETED and not record.terminal:
                 raise EvaluationValidationError("artifact store cannot retain a non-terminal completed result")
             attempt_key = (*pair, record.attempt)

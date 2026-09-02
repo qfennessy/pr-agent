@@ -6,9 +6,8 @@ retry loop, token counter, diff provider, router, specialist, or verifier.  Each
 ``ProductionArmBinding`` must adapt the corresponding production orchestration to
 ``ReviewSnapshotResult`` and ``RunDetails`` without publishing output.
 
-Bindings for specialists must remain unavailable until their concurrent role model
-identities and normalized findings fit the evaluation run schema.  Treating those
-models as fallbacks for one selected model would lose production evidence.
+Concurrent specialist role identities are retained as per-stage run telemetry. Treating
+those models as fallbacks for one selected model would lose production evidence.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ from pr_agent.algo.checkpoint_evaluation import (
     EvaluationManifest,
     EvaluationRunRecord,
     EvaluationRunState,
+    EvaluationStagePlan,
     EvaluationValidationError,
     NumericMeasurement,
     ObservedFinding,
@@ -111,11 +111,6 @@ class ProductionArmResult:
             raise EvaluationValidationError("production arm result must use ReviewSnapshotResult")
         if self.run_details is not None and not isinstance(self.run_details, RunDetails):
             raise EvaluationValidationError("production arm telemetry must use RunDetails")
-        if self.run_details is not None and self.run_details.specialist_runs:
-            raise EvaluationValidationError(
-                "production arm result contains per-stage or per-role model telemetry "
-                "that EvaluationRunRecord cannot preserve"
-            )
         if not isinstance(self.snapshot_result.state, ReviewResultState):
             raise EvaluationValidationError("production snapshot result state is invalid")
         latency = self.snapshot_result.latency_seconds
@@ -193,6 +188,7 @@ class ProductionArmBinding:
     configuration_hash: str
     prompt_hash: str
     model_identities: tuple[ModelIdentity, ...]
+    stage_plan: tuple[EvaluationStagePlan, ...]
     telemetry_shape: ModelTelemetryShape
     adapter: Optional[ProductionArmAdapter]
     available: bool
@@ -205,6 +201,12 @@ class ProductionArmBinding:
         object.__setattr__(self, "model_identities", tuple(tuple(identity) for identity in self.model_identities))
         if any(len(identity) != 3 for identity in self.model_identities):
             raise EvaluationValidationError("production binding model identities must be triples")
+        object.__setattr__(self, "stage_plan", tuple(self.stage_plan))
+        if any(not isinstance(stage, EvaluationStagePlan) for stage in self.stage_plan):
+            raise EvaluationValidationError("production binding stage_plan must use EvaluationStagePlan")
+        stage_names = [stage.stage for stage in self.stage_plan]
+        if len(stage_names) != len(set(stage_names)):
+            raise EvaluationValidationError("production binding stage_plan must contain unique stages")
         if not isinstance(self.telemetry_shape, ModelTelemetryShape):
             raise EvaluationValidationError("production binding telemetry_shape is invalid")
         if not isinstance(self.available, bool) or not isinstance(self.publish_output, bool):
@@ -322,6 +324,7 @@ class ProductionEvaluationRunner:
                 arm,
                 snapshot,
                 outcome,
+                binding.telemetry_shape,
                 attempt=resume_item.next_attempt,
             )
             self.artifact_store.append_record(self.manifest, record)
@@ -374,16 +377,18 @@ def _validate_bindings(
             raise EvaluationValidationError(f"{kind.value} binding prompt hash does not match its arm")
         if binding.model_identities != arm.model_identities():
             raise EvaluationValidationError(f"{kind.value} binding model identities do not match its arm")
+        if binding.stage_plan != arm.stage_plan:
+            raise EvaluationValidationError(f"{kind.value} binding stage plan does not match its arm")
         if binding.publish_output:
             raise EvaluationValidationError(f"{kind.value} binding can publish output")
-        expected_shape = (
-            ModelTelemetryShape.NONE if kind is EvaluationArmKind.DETERMINISTIC else ModelTelemetryShape.SINGLE_SELECTED
-        )
-        if binding.telemetry_shape is ModelTelemetryShape.PER_STAGE:
-            unavailable.append(
-                f"{kind.value}: EvaluationRunRecord cannot preserve per-stage or per-role model identities"
-            )
-        elif binding.telemetry_shape is not expected_shape:
+        expected_shape = {
+            EvaluationArmKind.DETERMINISTIC: ModelTelemetryShape.NONE,
+            EvaluationArmKind.GENERAL_REVIEW: ModelTelemetryShape.SINGLE_SELECTED,
+            EvaluationArmKind.SPECIALISTS: ModelTelemetryShape.PER_STAGE,
+            EvaluationArmKind.VERIFIED_SPECIALISTS: ModelTelemetryShape.PER_STAGE,
+            EvaluationArmKind.FULL_CASCADE: ModelTelemetryShape.PER_STAGE,
+        }[kind]
+        if binding.telemetry_shape is not expected_shape:
             raise EvaluationValidationError(f"{kind.value} binding has the wrong model telemetry shape")
         if not binding.available:
             unavailable.append(f"{kind.value}: {binding.unavailable_reason}")
@@ -442,17 +447,10 @@ def _record_from_production_result(
     arm: EvaluationArm,
     snapshot: ReviewSnapshot,
     outcome: ProductionArmResult,
+    telemetry_shape: ModelTelemetryShape,
     *,
     attempt: int,
 ) -> EvaluationRunRecord:
-    if outcome.run_details is not None and outcome.run_details.specialist_runs:
-        # RunDetails is mutable even though ProductionArmResult is frozen. Recheck at
-        # the persistence boundary so an adapter cannot add role telemetry after the
-        # result was constructed and silently collapse it into one selected model.
-        raise EvaluationValidationError(
-            "production arm result contains per-stage or per-role model telemetry "
-            "that EvaluationRunRecord cannot preserve"
-        )
     result = outcome.snapshot_result
     if result.snapshot_id != snapshot.snapshot_id:
         raise EvaluationValidationError("production result names a different immutable snapshot")
@@ -475,6 +473,13 @@ def _record_from_production_result(
         stage_latencies_seconds=outcome.stage_latencies_seconds,
         failure_reason_code=outcome.failure_reason_code,
     )
+    has_stage_runs = bool(record.stage_runs)
+    if telemetry_shape is ModelTelemetryShape.NONE and has_stage_runs:
+        raise EvaluationValidationError("deterministic production bindings cannot emit model stage telemetry")
+    if telemetry_shape is ModelTelemetryShape.SINGLE_SELECTED and has_stage_runs:
+        raise EvaluationValidationError("single-model production bindings cannot emit per-stage model telemetry")
+    if telemetry_shape is ModelTelemetryShape.PER_STAGE and not has_stage_runs:
+        raise EvaluationValidationError("per-stage production bindings require model stage telemetry")
     replacements = {}
     if outcome.latency_measurement is not None:
         replacements["latency_seconds"] = outcome.latency_measurement
@@ -485,9 +490,12 @@ def _record_from_production_result(
         model_identity = outcome.model_identity
         details_model = outcome.run_details.model_used if outcome.run_details is not None else None
         if model_identity is None:
-            if not details_model:
+            if details_model:
+                model_identity = arm.resolve_model_identity(details_model)
+            elif has_stage_runs:
+                model_identity = (None, None, None)
+            else:
                 raise EvaluationValidationError("model-backed results require an observed model identity")
-            model_identity = arm.resolve_model_identity(details_model)
         elif not arm.accepts_run_identity(*model_identity):
             raise EvaluationValidationError("production result selected an unpinned model identity")
         if details_model is not None and details_model != model_identity[0]:

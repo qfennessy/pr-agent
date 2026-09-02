@@ -24,6 +24,7 @@ from pr_agent.algo.checkpoint_evaluation import (
     MeasurementStatus,
     TruthArtifact,
     content_hash,
+    validate_run_model_telemetry,
 )
 from pr_agent.algo.review_snapshot import ReviewEvent
 
@@ -965,12 +966,7 @@ def _validate_records(
         if record.snapshot_id != case.snapshot_id:
             raise EvaluationValidationError("run record snapshot does not match its checkpoint case")
         arm = arms_by_id[record.arm_id]
-        if not arm.accepts_run_identity(
-            record.model_id,
-            record.provider_id,
-            record.model_revision,
-        ):
-            raise EvaluationValidationError("run record model identity does not match its frozen arm")
+        validate_run_model_telemetry(arm, record)
         attempt_key = (record.case_id, record.arm_id, record.attempt)
         if attempt_key in attempts:
             raise EvaluationValidationError("run attempts must be unique per case and arm")

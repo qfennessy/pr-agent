@@ -17,6 +17,9 @@ from pr_agent.algo.checkpoint_evaluation import (
     EvaluationModelIdentity,
     EvaluationRunRecord,
     EvaluationRunState,
+    EvaluationStageModelIdentity,
+    EvaluationStagePlan,
+    EvaluationStageRun,
     EvaluationValidationError,
     FindingLifecycleState,
     FindingSeverity,
@@ -71,6 +74,28 @@ def _arm(
     revision: str | None = "2026-08-30.1",
 ) -> EvaluationArm:
     deterministic = kind is EvaluationArmKind.DETERMINISTIC
+    stage_backed = kind in {
+        EvaluationArmKind.SPECIALISTS,
+        EvaluationArmKind.VERIFIED_SPECIALISTS,
+        EvaluationArmKind.FULL_CASCADE,
+    }
+    stage_plan = (
+        EvaluationStagePlan(
+            stage="change_classification",
+            model_route=(
+                EvaluationStageModelIdentity(
+                    model_id="small-reviewer",
+                    provider_id="provider-v1",
+                    model_revision=revision,
+                ),
+            ),
+            configuration_hash=_hash(f"change-classification-config-{arm_id}"),
+            prompt_hash=_hash(f"change-classification-prompt-{arm_id}"),
+            prompt_version="change-classification-prompt-v2",
+            input_schema_version="change-classification-input-v2",
+            output_schema_version="change-classification-output-v2",
+        ),
+    ) if stage_backed else ()
     return EvaluationArm(
         arm_id=arm_id,
         kind=kind,
@@ -79,6 +104,7 @@ def _arm(
         model_id=None if deterministic else "small-reviewer",
         provider_id=None if deterministic else "provider-v1",
         model_revision=None if deterministic else revision,
+        stage_plan=stage_plan,
     )
 
 
@@ -127,6 +153,39 @@ def _record(
     latency: float = 1,
 ) -> EvaluationRunRecord:
     arm = next(item for item in manifest.arms if item.arm_id == arm_id)
+    stage_runs = ()
+    stage_latencies = {
+        "router": NumericMeasurement(MeasurementStatus.COMPLETE, latency / 4),
+        "review": NumericMeasurement(MeasurementStatus.COMPLETE, latency * 3 / 4),
+    }
+    if arm.stage_plan:
+        plan = arm.stage_plan[0]
+        identity = plan.model_route[0]
+        stage_latency = NumericMeasurement(MeasurementStatus.COMPLETE, latency * 3 / 4)
+        stage_runs = (
+            EvaluationStageRun(
+                stage=plan.stage,
+                state="success",
+                coverage_status=MeasurementStatus.COMPLETE,
+                model_id=identity.model_id,
+                provider_id=identity.provider_id,
+                model_revision=identity.model_revision,
+                deployment_id_hash=identity.deployment_id_hash,
+                configuration_hash=plan.configuration_hash,
+                prompt_hash=plan.prompt_hash,
+                prompt_version=plan.prompt_version,
+                input_schema_version=plan.input_schema_version,
+                output_schema_version=plan.output_schema_version,
+                latency_seconds=stage_latency,
+                tokens=NumericMeasurement(MeasurementStatus.COMPLETE, 10),
+                cost_usd=NumericMeasurement(MeasurementStatus.COMPLETE, 0.01),
+                ai_call_count=1,
+                cached=False,
+                fallback_used=False,
+                cost_by_model_usd={identity.model_id: 0.01},
+            ),
+        )
+        stage_latencies[plan.stage] = stage_latency
     return EvaluationRunRecord(
         manifest_id=manifest.manifest_id,
         case_id=case.case_id,
@@ -141,13 +200,11 @@ def _record(
         cost_usd=NumericMeasurement(MeasurementStatus.COMPLETE, 0.01),
         retry_count=max(0, attempt - 1),
         escalated=escalated,
-        stage_latencies_seconds={
-            "router": NumericMeasurement(MeasurementStatus.COMPLETE, latency / 4),
-            "review": NumericMeasurement(MeasurementStatus.COMPLETE, latency * 3 / 4),
-        },
+        stage_latencies_seconds=stage_latencies,
         model_id=arm.model_id,
         provider_id=arm.provider_id,
         model_revision=arm.model_revision,
+        stage_runs=stage_runs,
     )
 
 
@@ -385,6 +442,7 @@ def test_shadow_journal_is_opt_in_source_free_and_non_blocking(tmp_path):
     )
     entry = ShadowJournalEntry.from_run_record(
         record,
+        arm=manifest.arms[0],
         event=case.event,
         policy_hash=manifest.policy_hash,
         configuration_hash=manifest.configuration_hash,
@@ -416,6 +474,7 @@ def test_shadow_journal_is_opt_in_source_free_and_non_blocking(tmp_path):
     )
     failed_entry = ShadowJournalEntry.from_run_record(
         failed_record,
+        arm=manifest.arms[0],
         event=case.event,
         policy_hash=manifest.policy_hash,
         configuration_hash=manifest.configuration_hash,
@@ -423,11 +482,218 @@ def test_shadow_journal_is_opt_in_source_free_and_non_blocking(tmp_path):
     assert failed_entry.coverage_status is MeasurementStatus.UNAVAILABLE
 
 
+def test_shadow_journal_preserves_and_revalidates_source_free_stage_telemetry(tmp_path):
+    case = _case("case", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
+    arm = _arm("specialists", EvaluationArmKind.SPECIALISTS)
+    manifest = _manifest((case,), (arm,))
+    plan = arm.stage_plan[0]
+    identity = plan.model_route[0]
+    stage = EvaluationStageRun(
+        stage=plan.stage,
+        state="success",
+        coverage_status=MeasurementStatus.COMPLETE,
+        model_id=identity.model_id,
+        provider_id=identity.provider_id,
+        model_revision=identity.model_revision,
+        deployment_id_hash=identity.deployment_id_hash,
+        configuration_hash=plan.configuration_hash,
+        prompt_hash=plan.prompt_hash,
+        prompt_version=plan.prompt_version,
+        input_schema_version=plan.input_schema_version,
+        output_schema_version=plan.output_schema_version,
+        latency_seconds=NumericMeasurement(MeasurementStatus.COMPLETE, 0.2),
+        tokens=NumericMeasurement(MeasurementStatus.PARTIAL, 10),
+        cost_usd=NumericMeasurement(MeasurementStatus.COMPLETE, 0.001),
+        cost_by_model_usd={arm.model_id: 0.001},
+        ai_call_count=1,
+        confidence=0.9,
+    )
+    record = EvaluationRunRecord(
+        manifest_id=manifest.manifest_id,
+        case_id=case.case_id,
+        arm_id=arm.arm_id,
+        snapshot_id=case.snapshot_id,
+        attempt=1,
+        state=EvaluationRunState.COMPLETED,
+        terminal=True,
+        latency_seconds=NumericMeasurement(MeasurementStatus.COMPLETE, 0.25),
+        tokens=stage.tokens,
+        cost_usd=stage.cost_usd,
+        stage_latencies_seconds={stage.stage: stage.latency_seconds},
+        stage_runs=(stage,),
+    )
+
+    entry = ShadowJournalEntry.from_run_record(
+        record,
+        arm=arm,
+        event=case.event,
+        policy_hash=manifest.policy_hash,
+        configuration_hash=manifest.configuration_hash,
+    )
+    assert (entry.model_id, entry.provider_id, entry.model_revision) == (None, None, None)
+    assert entry.stage_runs == (stage,)
+    assert entry.coverage_status is MeasurementStatus.COMPLETE
+    serialized = json.dumps(entry.to_dict())
+    assert "change_classification" in serialized
+    for forbidden in ("source", "diff --git", "private-deployment-name", "private-output"):
+        assert forbidden not in serialized
+    writer = ShadowJournalWriter(tmp_path / "specialist-shadow.ndjson", enabled=True)
+    assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
+    assert writer.close()
+    persisted = json.loads((tmp_path / "specialist-shadow.ndjson").read_text(encoding="utf-8"))
+    assert persisted["model_id"] is None
+    assert persisted["stage_runs"][0]["model_id"] == arm.model_id
+
+    failed_stage = replace(
+        stage,
+        state="provider_failure",
+        coverage_status=MeasurementStatus.UNAVAILABLE,
+        tokens=NumericMeasurement(MeasurementStatus.UNAVAILABLE, None),
+        cost_usd=NumericMeasurement(MeasurementStatus.UNAVAILABLE, None),
+        cost_by_model_usd={},
+        ai_call_count=0,
+        confidence=None,
+        failure_reason_code="RuntimeError",
+    )
+    failed_record = replace(
+        record,
+        tokens=failed_stage.tokens,
+        cost_usd=failed_stage.cost_usd,
+        stage_latencies_seconds={failed_stage.stage: failed_stage.latency_seconds},
+        stage_runs=(failed_stage,),
+    )
+    failed_entry = ShadowJournalEntry.from_run_record(
+        failed_record,
+        arm=arm,
+        event=case.event,
+        policy_hash=manifest.policy_hash,
+        configuration_hash=manifest.configuration_hash,
+    )
+    assert failed_entry.coverage_status is MeasurementStatus.UNAVAILABLE
+    assert failed_entry.stage_runs[0].failure_reason_code == "RuntimeError"
+
+    missing_stage_record = replace(record, stage_latencies_seconds={}, stage_runs=())
+    with pytest.raises(EvaluationValidationError, match="omits both aggregate and per-stage"):
+        ShadowJournalEntry.from_run_record(
+            missing_stage_record,
+            arm=arm,
+            event=case.event,
+            policy_hash=manifest.policy_hash,
+            configuration_hash=manifest.configuration_hash,
+        )
+
+    no_findings_missing_stage = replace(
+        missing_stage_record,
+        snapshot_result_state=ReviewResultState.NO_FINDINGS,
+    )
+    with pytest.raises(EvaluationValidationError, match="omits both aggregate and per-stage"):
+        ShadowJournalEntry.from_run_record(
+            no_findings_missing_stage,
+            arm=arm,
+            event=case.event,
+            policy_hash=manifest.policy_hash,
+            configuration_hash=manifest.configuration_hash,
+        )
+
+    second_plan = replace(
+        plan,
+        stage="independent_verification",
+        configuration_hash=_hash("independent-verification-config"),
+        prompt_hash=_hash("independent-verification-prompt"),
+        prompt_version="independent-verification-prompt-v2",
+        input_schema_version="independent-verification-input-v2",
+        output_schema_version="independent-verification-output-v2",
+    )
+    two_stage_arm = replace(arm, stage_plan=(plan, second_plan))
+    with pytest.raises(EvaluationValidationError, match=r"missing=\['independent_verification'\]"):
+        ShadowJournalEntry.from_run_record(
+            record,
+            arm=two_stage_arm,
+            event=case.event,
+            policy_hash=manifest.policy_hash,
+            configuration_hash=manifest.configuration_hash,
+        )
+
+    invented_stage = replace(
+        stage,
+        stage="invented_stage",
+        prompt_version="unfrozen-prompt-v9",
+    )
+    invented_record = replace(
+        record,
+        snapshot_result_state=ReviewResultState.NO_FINDINGS,
+        stage_latencies_seconds={invented_stage.stage: invented_stage.latency_seconds},
+        stage_runs=(invented_stage,),
+    )
+    with pytest.raises(EvaluationValidationError, match="stages do not match its frozen plan"):
+        ShadowJournalEntry.from_run_record(
+            invented_record,
+            arm=arm,
+            event=case.event,
+            policy_hash=manifest.policy_hash,
+            configuration_hash=manifest.configuration_hash,
+        )
+
+    with pytest.raises(EvaluationValidationError, match="unique stage identities"):
+        replace(record, stage_runs=(stage, stage))
+
+    version_mismatch = replace(stage, prompt_version="unfrozen-prompt-v9")
+    version_mismatch_record = replace(
+        record,
+        stage_runs=(version_mismatch,),
+    )
+    with pytest.raises(EvaluationValidationError, match="versions do not match its frozen plan"):
+        ShadowJournalEntry.from_run_record(
+            version_mismatch_record,
+            arm=arm,
+            event=case.event,
+            policy_hash=manifest.policy_hash,
+            configuration_hash=manifest.configuration_hash,
+        )
+
+    with pytest.raises(EvaluationValidationError, match="cannot claim clean coverage"):
+        replace(
+            failed_record,
+            snapshot_result_state=ReviewResultState.NO_FINDINGS,
+        )
+
+    forged_stage = replace(stage, model_id="unpinned-model")
+    forged_record = replace(
+        record,
+        stage_latencies_seconds={forged_stage.stage: forged_stage.latency_seconds},
+        stage_runs=(forged_stage,),
+    )
+    with pytest.raises(EvaluationValidationError, match="unpinned model identity"):
+        ShadowJournalEntry.from_run_record(
+            forged_record,
+            arm=arm,
+            event=case.event,
+            policy_hash=manifest.policy_hash,
+            configuration_hash=manifest.configuration_hash,
+        )
+
+    forged_cost_stage = replace(stage, cost_by_model_usd={"unpinned-cost-model": 0.001})
+    forged_cost_record = replace(
+        record,
+        stage_latencies_seconds={forged_cost_stage.stage: forged_cost_stage.latency_seconds},
+        stage_runs=(forged_cost_stage,),
+    )
+    with pytest.raises(EvaluationValidationError, match="unpinned model identity"):
+        ShadowJournalEntry.from_run_record(
+            forged_cost_record,
+            arm=arm,
+            event=case.event,
+            policy_hash=manifest.policy_hash,
+            configuration_hash=manifest.configuration_hash,
+        )
+
+
 def test_shadow_journal_close_retries_when_the_bounded_queue_was_full(tmp_path, monkeypatch):
     case = _case("case", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
     manifest = _manifest((case,), (_arm("deterministic", EvaluationArmKind.DETERMINISTIC),))
     entry = ShadowJournalEntry.from_run_record(
         _record(manifest, case, "deterministic"),
+        arm=manifest.arms[0],
         event=case.event,
         policy_hash=manifest.policy_hash,
         configuration_hash=manifest.configuration_hash,

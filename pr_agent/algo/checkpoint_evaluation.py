@@ -18,11 +18,29 @@ from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
 
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshotResult
-from pr_agent.algo.run_details import RunDetails
+from pr_agent.algo.run_details import RunDetails, SpecialistRunDetails
 
-EVALUATION_SCHEMA_VERSION = "checkpoint-evaluation-v1"
+EVALUATION_SCHEMA_VERSION = "checkpoint-evaluation-v2"
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _FAILURE_REASON_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_STAGE_FAILURE_REASON_CODE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
+_STAGE_STATE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_STAGE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SPECIALIST_STAGE_STATES = frozenset({
+    "aggregate_budget_exhausted",
+    "cached",
+    "cancelled",
+    "disabled",
+    "input_budget_exhausted",
+    "low_confidence",
+    "malformed_output",
+    "provider_failure",
+    "stale",
+    "success",
+    "timeout",
+    "unavailable",
+})
+_COMPLETE_SPECIALIST_STAGE_STATES = frozenset({"cached", "success"})
 _ANSWER_ONLY_KEYS = frozenset({
     "adjudication",
     "adjudication_hash",
@@ -110,9 +128,16 @@ _EVALUATION_SCHEMA_DESCRIPTOR = {
     "artifacts": {
         "arm": (
             "arm_id", "kind", "configuration_hash", "prompt_hash", "model_id", "provider_id",
-            "model_revision", "fallback_models", "enabled",
+            "model_revision", "fallback_models", "stage_plan", "enabled",
         ),
         "model_identity": ("model_id", "provider_id", "model_revision"),
+        "stage_model_identity": (
+            "model_id", "provider_id", "model_revision", "deployment_id_hash",
+        ),
+        "stage_plan": (
+            "stage", "model_route", "configuration_hash", "prompt_hash", "prompt_version",
+            "input_schema_version", "output_schema_version",
+        ),
         "checkpoint_case": (
             "case_id", "snapshot_id", "snapshot_artifact_hash", "event", "cohort", "parent_case_id",
             "lineage_elapsed_seconds", "developer_elapsed_seconds", "model_visible_metadata",
@@ -128,6 +153,13 @@ _EVALUATION_SCHEMA_DESCRIPTOR = {
         ),
         "truth_artifact": ("schema_version", "manifest_id", "truths", "truth_artifact_id"),
         "measurement": ("status", "value"),
+        "stage_run": (
+            "stage", "state", "coverage_status", "model_id", "provider_id", "model_revision",
+            "deployment_id_hash", "fallback_used", "configuration_hash", "prompt_hash",
+            "prompt_version", "input_schema_version", "output_schema_version", "latency_seconds",
+            "tokens", "cost_usd", "cost_by_model_usd", "ai_call_count", "cached", "confidence",
+            "failure_reason_code",
+        ),
         "observed_finding": (
             "fingerprint", "severity", "lifecycle_state", "deterministic_overlap", "stage",
         ),
@@ -135,7 +167,7 @@ _EVALUATION_SCHEMA_DESCRIPTOR = {
             "schema_version", "manifest_id", "case_id", "arm_id", "snapshot_id", "attempt", "state",
             "terminal", "findings", "snapshot_result_state", "latency_seconds", "tokens", "cost_usd",
             "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id", "provider_id",
-            "model_revision", "failure_reason_code", "record_id",
+            "model_revision", "stage_runs", "failure_reason_code", "record_id",
         ),
         "gate_rule": ("metric", "comparator", "threshold", "minimum_support"),
         "score_metric": ("status", "value", "support"),
@@ -185,6 +217,15 @@ def content_hash(value: Any) -> str:
     """Return a stable sha256 identity for a JSON-compatible value."""
     digest = hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
+
+
+def deployment_identity_hash(deployment_id: Optional[str]) -> Optional[str]:
+    """Return a source-free identity for a configured production deployment."""
+    if deployment_id is None:
+        return None
+    if not isinstance(deployment_id, str) or not deployment_id.strip():
+        raise EvaluationValidationError("deployment_id must be a non-empty string or null")
+    return content_hash({"deployment_id": deployment_id})
 
 
 def evaluation_schema_hash() -> str:
@@ -298,6 +339,122 @@ class EvaluationModelIdentity:
 
 
 @dataclass(frozen=True)
+class EvaluationStageModelIdentity:
+    """One exact primary or fallback deployment allowed for a required stage."""
+
+    model_id: str
+    provider_id: str
+    model_revision: str
+    deployment_id_hash: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        _validate_identifier("stage model_id", self.model_id)
+        _validate_identifier("stage provider_id", self.provider_id)
+        _validate_identifier("stage model_revision", self.model_revision)
+        if self.deployment_id_hash is not None:
+            _validate_hash("stage deployment_id_hash", self.deployment_id_hash)
+
+    def to_dict(self) -> dict[str, Optional[str]]:
+        return {
+            "model_id": self.model_id,
+            "provider_id": self.provider_id,
+            "model_revision": self.model_revision,
+            "deployment_id_hash": self.deployment_id_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "EvaluationStageModelIdentity":
+        _reject_unknown_fields(
+            "evaluation stage model identity",
+            value,
+            {"model_id", "provider_id", "model_revision", "deployment_id_hash"},
+        )
+        return cls(
+            model_id=value["model_id"],
+            provider_id=value["provider_id"],
+            model_revision=value["model_revision"],
+            deployment_id_hash=value.get("deployment_id_hash"),
+        )
+
+
+@dataclass(frozen=True)
+class EvaluationStagePlan:
+    """Immutable production contract for one required stage and its fallback route."""
+
+    stage: str
+    model_route: tuple[EvaluationStageModelIdentity, ...]
+    configuration_hash: str
+    prompt_hash: str
+    prompt_version: str
+    input_schema_version: str
+    output_schema_version: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stage, str) or not _STAGE_STATE_PATTERN.fullmatch(self.stage):
+            raise EvaluationValidationError("stage plan name must be a bounded machine-readable identifier")
+        object.__setattr__(self, "model_route", tuple(self.model_route))
+        if not self.model_route or any(
+            not isinstance(identity, EvaluationStageModelIdentity) for identity in self.model_route
+        ):
+            raise EvaluationValidationError("stage plan model_route requires stage model identities")
+        model_ids = [identity.model_id for identity in self.model_route]
+        if len(model_ids) != len(set(model_ids)):
+            raise EvaluationValidationError("stage plan primary and fallback model ids must be unique")
+        _validate_hash("stage plan configuration_hash", self.configuration_hash)
+        _validate_hash("stage plan prompt_hash", self.prompt_hash)
+        for name in ("prompt_version", "input_schema_version", "output_schema_version"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not _STAGE_VERSION_PATTERN.fullmatch(value):
+                raise EvaluationValidationError(f"stage plan {name} must be a bounded version identifier")
+
+    def resolve_model(self, model_id: str) -> tuple[int, EvaluationStageModelIdentity]:
+        matches = [
+            (index, identity)
+            for index, identity in enumerate(self.model_route)
+            if identity.model_id == model_id
+        ]
+        if len(matches) != 1:
+            raise EvaluationValidationError(
+                f"stage {self.stage} selected an unpinned model identity: {model_id}"
+            )
+        return matches[0]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "model_route": [identity.to_dict() for identity in self.model_route],
+            "configuration_hash": self.configuration_hash,
+            "prompt_hash": self.prompt_hash,
+            "prompt_version": self.prompt_version,
+            "input_schema_version": self.input_schema_version,
+            "output_schema_version": self.output_schema_version,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "EvaluationStagePlan":
+        _reject_unknown_fields(
+            "evaluation stage plan",
+            value,
+            {
+                "stage", "model_route", "configuration_hash", "prompt_hash", "prompt_version",
+                "input_schema_version", "output_schema_version",
+            },
+        )
+        return cls(
+            stage=value["stage"],
+            model_route=tuple(
+                EvaluationStageModelIdentity.from_dict(identity)
+                for identity in value["model_route"]
+            ),
+            configuration_hash=value["configuration_hash"],
+            prompt_hash=value["prompt_hash"],
+            prompt_version=value["prompt_version"],
+            input_schema_version=value["input_schema_version"],
+            output_schema_version=value["output_schema_version"],
+        )
+
+
+@dataclass(frozen=True)
 class EvaluationArm:
     """One production-backed arm in a paired evaluation."""
 
@@ -309,6 +466,7 @@ class EvaluationArm:
     provider_id: Optional[str] = None
     model_revision: Optional[str] = None
     fallback_models: tuple[EvaluationModelIdentity, ...] = field(default_factory=tuple)
+    stage_plan: tuple[EvaluationStagePlan, ...] = field(default_factory=tuple)
     enabled: bool = True
 
     def __post_init__(self) -> None:
@@ -322,15 +480,22 @@ class EvaluationArm:
         object.__setattr__(self, "fallback_models", tuple(self.fallback_models))
         if any(not isinstance(identity, EvaluationModelIdentity) for identity in self.fallback_models):
             raise EvaluationValidationError("fallback_models must use EvaluationModelIdentity")
+        object.__setattr__(self, "stage_plan", tuple(self.stage_plan))
+        if any(not isinstance(stage, EvaluationStagePlan) for stage in self.stage_plan):
+            raise EvaluationValidationError("stage_plan must use EvaluationStagePlan")
+        stage_names = [stage.stage for stage in self.stage_plan]
+        if len(stage_names) != len(set(stage_names)):
+            raise EvaluationValidationError("stage_plan must contain unique required stage names")
         if self.kind is EvaluationArmKind.DETERMINISTIC:
             if (
                 self.model_id is not None
                 or self.provider_id is not None
                 or self.model_revision is not None
                 or self.fallback_models
+                or self.stage_plan
             ):
                 raise EvaluationValidationError(
-                    "the deterministic arm cannot name a model, provider, revision, or fallback"
+                    "the deterministic arm cannot name a model, provider, revision, fallback, or stage"
                 )
         elif not self.model_id or not self.provider_id:
             raise EvaluationValidationError("model-backed arms require immutable model_id and provider_id values")
@@ -342,8 +507,40 @@ class EvaluationArm:
             model_ids = [self.model_id, *(identity.model_id for identity in self.fallback_models)]
             if len(model_ids) != len(set(model_ids)):
                 raise EvaluationValidationError("primary and fallback model ids must be unique within an arm")
+        stage_backed = self.kind in {
+            EvaluationArmKind.SPECIALISTS,
+            EvaluationArmKind.VERIFIED_SPECIALISTS,
+            EvaluationArmKind.FULL_CASCADE,
+        }
+        if stage_backed and not self.stage_plan:
+            raise EvaluationValidationError("specialist-backed arms require an immutable nonempty stage_plan")
+        if not stage_backed and self.stage_plan:
+            raise EvaluationValidationError("deterministic and general-review arms cannot define a stage_plan")
+
+    def required_stage(self, stage: str) -> EvaluationStagePlan:
+        matches = [item for item in self.stage_plan if item.stage == stage]
+        if len(matches) != 1:
+            raise EvaluationValidationError(f"run emitted an unexpected stage: {stage}")
+        return matches[0]
 
     def model_identities(self) -> tuple[tuple[Optional[str], Optional[str], Optional[str]], ...]:
+        if self.kind is EvaluationArmKind.DETERMINISTIC:
+            return ((None, None, None),)
+        identities = (
+            (self.model_id, self.provider_id, self.model_revision),
+            *(
+                (identity.model_id, identity.provider_id, identity.model_revision)
+                for identity in self.fallback_models
+            ),
+            *(
+                (identity.model_id, identity.provider_id, identity.model_revision)
+                for stage in self.stage_plan
+                for identity in stage.model_route
+            ),
+        )
+        return tuple(dict.fromkeys(identities))
+
+    def aggregate_model_identities(self) -> tuple[tuple[Optional[str], Optional[str], Optional[str]], ...]:
         if self.kind is EvaluationArmKind.DETERMINISTIC:
             return ((None, None, None),)
         return (
@@ -360,10 +557,10 @@ class EvaluationArm:
         provider_id: Optional[str],
         model_revision: Optional[str],
     ) -> bool:
-        return (model_id, provider_id, model_revision) in self.model_identities()
+        return (model_id, provider_id, model_revision) in self.aggregate_model_identities()
 
     def resolve_model_identity(self, model_id: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
-        matches = [identity for identity in self.model_identities() if identity[0] == model_id]
+        matches = [identity for identity in self.aggregate_model_identities() if identity[0] == model_id]
         if len(matches) != 1:
             raise EvaluationValidationError(f"run selected an unpinned model identity: {model_id}")
         return matches[0]
@@ -378,6 +575,7 @@ class EvaluationArm:
             "provider_id": self.provider_id,
             "model_revision": self.model_revision,
             "fallback_models": [identity.to_dict() for identity in self.fallback_models],
+            "stage_plan": [stage.to_dict() for stage in self.stage_plan],
             "enabled": self.enabled,
         }
 
@@ -388,7 +586,7 @@ class EvaluationArm:
             value,
             {
                 "arm_id", "kind", "configuration_hash", "prompt_hash", "model_id", "provider_id",
-                "model_revision", "fallback_models", "enabled",
+                "model_revision", "fallback_models", "stage_plan", "enabled",
             },
         )
         return cls(
@@ -402,6 +600,10 @@ class EvaluationArm:
             fallback_models=tuple(
                 EvaluationModelIdentity.from_dict(identity)
                 for identity in value.get("fallback_models", [])
+            ),
+            stage_plan=tuple(
+                EvaluationStagePlan.from_dict(stage)
+                for stage in value.get("stage_plan", [])
             ),
             enabled=value.get("enabled", True),
         )
@@ -876,6 +1078,336 @@ class NumericMeasurement:
         return cls(status=MeasurementStatus(value["status"]), value=value.get("value"))
 
 
+def _sum_measurements(measurements: Sequence[NumericMeasurement]) -> NumericMeasurement:
+    """Sum known components without turning an absent component into zero."""
+    measurements = tuple(measurements)
+    known = tuple(item for item in measurements if item.status is not MeasurementStatus.UNAVAILABLE)
+    if not known:
+        return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+    status = (
+        MeasurementStatus.COMPLETE
+        if len(known) == len(measurements)
+        and all(item.status is MeasurementStatus.COMPLETE for item in known)
+        else MeasurementStatus.PARTIAL
+    )
+    return NumericMeasurement(status, sum(float(item.value) for item in known if item.value is not None))
+
+
+@dataclass(frozen=True)
+class EvaluationStageRun:
+    """Source-free telemetry for one production model stage or specialist role."""
+
+    stage: str
+    state: str
+    coverage_status: MeasurementStatus
+    model_id: str
+    provider_id: str
+    model_revision: str
+    deployment_id_hash: Optional[str]
+    configuration_hash: str
+    prompt_hash: str
+    prompt_version: str
+    input_schema_version: str
+    output_schema_version: str
+    latency_seconds: NumericMeasurement
+    tokens: NumericMeasurement
+    cost_usd: NumericMeasurement
+    cost_by_model_usd: Mapping[str, float] = field(default_factory=dict)
+    ai_call_count: int = 0
+    cached: bool = False
+    fallback_used: bool = False
+    confidence: Optional[float] = None
+    failure_reason_code: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        for name in ("model_id", "provider_id", "model_revision"):
+            _validate_identifier(f"stage run {name}", getattr(self, name))
+        if self.deployment_id_hash is not None:
+            _validate_hash("stage run deployment_id_hash", self.deployment_id_hash)
+        _validate_hash("stage run configuration_hash", self.configuration_hash)
+        _validate_hash("stage run prompt_hash", self.prompt_hash)
+        if not isinstance(self.stage, str) or not _STAGE_STATE_PATTERN.fullmatch(self.stage):
+            raise EvaluationValidationError("stage run stage must be a bounded machine-readable identifier")
+        for name in ("prompt_version", "input_schema_version", "output_schema_version"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not _STAGE_VERSION_PATTERN.fullmatch(value):
+                raise EvaluationValidationError(f"stage run {name} must be a bounded version identifier")
+        if not isinstance(self.state, str) or not _STAGE_STATE_PATTERN.fullmatch(self.state):
+            raise EvaluationValidationError("stage run state must be a bounded machine-readable code")
+        if self.state not in _SPECIALIST_STAGE_STATES:
+            raise EvaluationValidationError(f"stage run state is unsupported: {self.state}")
+        if not isinstance(self.coverage_status, MeasurementStatus):
+            raise EvaluationValidationError("stage run coverage_status must be a MeasurementStatus")
+        expected_coverage = (
+            MeasurementStatus.COMPLETE
+            if self.state in _COMPLETE_SPECIALIST_STAGE_STATES
+            else MeasurementStatus.UNAVAILABLE
+        )
+        if self.coverage_status is not expected_coverage:
+            raise EvaluationValidationError("stage run coverage_status contradicts its state")
+        for name, measurement in (
+            ("latency_seconds", self.latency_seconds),
+            ("tokens", self.tokens),
+            ("cost_usd", self.cost_usd),
+        ):
+            if not isinstance(measurement, NumericMeasurement):
+                raise EvaluationValidationError(f"stage run {name} must use NumericMeasurement")
+            if measurement.value is not None and measurement.value <= 0:
+                raise EvaluationValidationError(f"stage run known {name} must be positive")
+        if self.tokens.value is not None and not float(self.tokens.value).is_integer():
+            raise EvaluationValidationError("stage run tokens must be an integer count")
+        if not isinstance(self.ai_call_count, int) or isinstance(self.ai_call_count, bool) or self.ai_call_count < 0:
+            raise EvaluationValidationError("stage run ai_call_count must be a non-negative integer")
+        if not isinstance(self.cached, bool) or not isinstance(self.fallback_used, bool):
+            raise EvaluationValidationError("stage run cache and fallback flags must be booleans")
+        if self.state == "cached" and not self.cached:
+            raise EvaluationValidationError("a cached stage run must set cached")
+        if self.state != "cached" and self.cached:
+            raise EvaluationValidationError("only a cached stage run may set cached")
+        if self.state == "success" and self.ai_call_count < 1:
+            raise EvaluationValidationError("a successful stage run requires at least one observed AI call")
+        if self.state == "cached" and self.ai_call_count:
+            raise EvaluationValidationError("a cached stage run cannot claim a new AI call")
+        if self.confidence is not None:
+            if (
+                not isinstance(self.confidence, (int, float))
+                or isinstance(self.confidence, bool)
+                or not math.isfinite(self.confidence)
+                or not 0 <= self.confidence <= 1
+            ):
+                raise EvaluationValidationError("stage run confidence must be a finite value from 0 to 1")
+        if self.state in _COMPLETE_SPECIALIST_STAGE_STATES:
+            if self.failure_reason_code is not None:
+                raise EvaluationValidationError("a covered stage run cannot have a failure_reason_code")
+        elif (
+            not isinstance(self.failure_reason_code, str)
+            or not _STAGE_FAILURE_REASON_CODE_PATTERN.fullmatch(self.failure_reason_code)
+        ):
+            raise EvaluationValidationError("an uncovered stage run requires a bounded machine-readable reason code")
+        if not isinstance(self.cost_by_model_usd, Mapping):
+            raise EvaluationValidationError("stage run cost_by_model_usd must be a JSON object")
+        normalized_costs: dict[str, float] = {}
+        for model_id, value in self.cost_by_model_usd.items():
+            _validate_identifier("stage run cost model_id", model_id)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise EvaluationValidationError("stage run per-model costs must be finite positive numbers")
+            normalized_costs[model_id] = float(value)
+        if self.cost_usd.status is MeasurementStatus.UNAVAILABLE and normalized_costs:
+            raise EvaluationValidationError("an unavailable stage cost cannot contain per-model costs")
+        if self.cost_usd.value is not None and not math.isclose(
+            self.cost_usd.value,
+            sum(normalized_costs.values()),
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise EvaluationValidationError("stage run per-model costs must sum to cost_usd")
+        object.__setattr__(self, "cost_by_model_usd", MappingProxyType(dict(sorted(normalized_costs.items()))))
+
+    @classmethod
+    def from_specialist_details(
+        cls,
+        arm: EvaluationArm,
+        stage: str,
+        details: SpecialistRunDetails,
+    ) -> "EvaluationStageRun":
+        """Normalize one mutable production role record against its frozen arm."""
+        if not isinstance(details, SpecialistRunDetails):
+            raise EvaluationValidationError("specialist stage telemetry must use SpecialistRunDetails")
+        if details.role != stage:
+            raise EvaluationValidationError("specialist stage key contradicts its role")
+        if not details.model_used:
+            raise EvaluationValidationError(f"specialist stage {stage} has no observed model identity")
+        stage_plan = arm.required_stage(stage)
+        route_index, stage_identity = stage_plan.resolve_model(details.model_used)
+        observed_deployment_hash = deployment_identity_hash(details.deployment_id)
+        if observed_deployment_hash != stage_identity.deployment_id_hash:
+            raise EvaluationValidationError(f"specialist stage {stage} selected an unpinned deployment identity")
+        if details.fallback_used is not (route_index > 0):
+            raise EvaluationValidationError(f"specialist stage {stage} fallback telemetry contradicts its route")
+        for name in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "num_ai_calls",
+            "known_cost_call_count",
+        ):
+            value = getattr(details, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise EvaluationValidationError(f"specialist stage {stage} has invalid {name}")
+        if details.known_cost_call_count > details.num_ai_calls:
+            raise EvaluationValidationError(f"specialist stage {stage} prices more calls than it observed")
+        if details.num_ai_calls == 0 and (
+            details.prompt_tokens or details.completion_tokens or details.total_tokens
+        ):
+            raise EvaluationValidationError(f"specialist stage {stage} has token usage without an AI call")
+        if details.total_tokens == 0 and (details.prompt_tokens or details.completion_tokens):
+            raise EvaluationValidationError(f"specialist stage {stage} has inconsistent token totals")
+        token_measurement = (
+            NumericMeasurement(MeasurementStatus.PARTIAL, float(details.total_tokens))
+            if details.total_tokens > 0
+            else NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+        )
+
+        try:
+            total_cost = float(details.total_cost_usd)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise EvaluationValidationError(f"specialist stage {stage} has invalid cost telemetry") from exc
+        if not math.isfinite(total_cost) or total_cost < 0:
+            raise EvaluationValidationError(f"specialist stage {stage} has invalid cost telemetry")
+        if not isinstance(details.model_costs_usd, Mapping):
+            raise EvaluationValidationError(f"specialist stage {stage} has invalid per-model cost telemetry")
+        normalized_costs: dict[str, float] = {}
+        for cost_model_id, cost in details.model_costs_usd.items():
+            stage_plan.resolve_model(cost_model_id)
+            try:
+                numeric_cost = float(cost)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise EvaluationValidationError(
+                    f"specialist stage {stage} has invalid per-model cost telemetry"
+                ) from exc
+            if not math.isfinite(numeric_cost) or numeric_cost <= 0:
+                raise EvaluationValidationError(f"specialist stage {stage} has invalid per-model cost telemetry")
+            normalized_costs[cost_model_id] = numeric_cost
+        if details.known_cost_call_count == 0:
+            if total_cost != 0 or normalized_costs:
+                raise EvaluationValidationError(f"specialist stage {stage} has cost without a priced call")
+            cost_measurement = NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+        else:
+            if total_cost <= 0 or not normalized_costs:
+                raise EvaluationValidationError(f"specialist stage {stage} omits priced-call cost telemetry")
+            if not math.isclose(total_cost, sum(normalized_costs.values()), rel_tol=1e-12, abs_tol=1e-12):
+                raise EvaluationValidationError(f"specialist stage {stage} has inconsistent per-model costs")
+            cost_measurement = NumericMeasurement(MeasurementStatus(details.cost_status), total_cost)
+
+        latency = details.latency_seconds
+        if (
+            not isinstance(latency, (int, float))
+            or isinstance(latency, bool)
+            or not math.isfinite(latency)
+            or latency < 0
+        ):
+            raise EvaluationValidationError(f"specialist stage {stage} has invalid latency telemetry")
+        latency_measurement = (
+            NumericMeasurement(MeasurementStatus.COMPLETE, float(latency))
+            if latency > 0
+            else NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+        )
+        state = details.state
+        if not isinstance(state, str) or state not in _SPECIALIST_STAGE_STATES:
+            raise EvaluationValidationError(f"specialist stage {stage} has unsupported state telemetry")
+        coverage_status = (
+            MeasurementStatus.COMPLETE
+            if state in _COMPLETE_SPECIALIST_STAGE_STATES
+            else MeasurementStatus.UNAVAILABLE
+        )
+        for name in ("prompt_version", "input_schema_version", "schema_version"):
+            value = getattr(details, name)
+            if not isinstance(value, str) or not _STAGE_VERSION_PATTERN.fullmatch(value):
+                raise EvaluationValidationError(f"specialist stage {stage} has invalid {name}")
+        observed_versions = (
+            details.prompt_version,
+            details.input_schema_version,
+            details.schema_version,
+        )
+        expected_versions = (
+            stage_plan.prompt_version,
+            stage_plan.input_schema_version,
+            stage_plan.output_schema_version,
+        )
+        if observed_versions != expected_versions:
+            raise EvaluationValidationError(f"specialist stage {stage} versions do not match its frozen plan")
+        return cls(
+            stage=stage,
+            state=state,
+            coverage_status=coverage_status,
+            model_id=stage_identity.model_id,
+            provider_id=stage_identity.provider_id,
+            model_revision=stage_identity.model_revision,
+            deployment_id_hash=stage_identity.deployment_id_hash,
+            configuration_hash=stage_plan.configuration_hash,
+            prompt_hash=stage_plan.prompt_hash,
+            prompt_version=stage_plan.prompt_version,
+            input_schema_version=stage_plan.input_schema_version,
+            output_schema_version=stage_plan.output_schema_version,
+            latency_seconds=latency_measurement,
+            tokens=token_measurement,
+            cost_usd=cost_measurement,
+            cost_by_model_usd=normalized_costs,
+            ai_call_count=details.num_ai_calls,
+            cached=details.cached,
+            fallback_used=details.fallback_used,
+            confidence=details.confidence,
+            failure_reason_code=details.failure_reason,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "state": self.state,
+            "coverage_status": self.coverage_status.value,
+            "model_id": self.model_id,
+            "provider_id": self.provider_id,
+            "model_revision": self.model_revision,
+            "deployment_id_hash": self.deployment_id_hash,
+            "fallback_used": self.fallback_used,
+            "configuration_hash": self.configuration_hash,
+            "prompt_hash": self.prompt_hash,
+            "prompt_version": self.prompt_version,
+            "input_schema_version": self.input_schema_version,
+            "output_schema_version": self.output_schema_version,
+            "latency_seconds": self.latency_seconds.to_dict(),
+            "tokens": self.tokens.to_dict(),
+            "cost_usd": self.cost_usd.to_dict(),
+            "cost_by_model_usd": dict(self.cost_by_model_usd),
+            "ai_call_count": self.ai_call_count,
+            "cached": self.cached,
+            "confidence": self.confidence,
+            "failure_reason_code": self.failure_reason_code,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "EvaluationStageRun":
+        _reject_unknown_fields(
+            "evaluation stage run",
+            value,
+            {
+                "stage", "state", "coverage_status", "model_id", "provider_id", "model_revision",
+                "deployment_id_hash", "fallback_used", "configuration_hash", "prompt_hash",
+                "prompt_version", "input_schema_version", "output_schema_version", "latency_seconds",
+                "tokens", "cost_usd", "cost_by_model_usd", "ai_call_count", "cached", "confidence",
+                "failure_reason_code",
+            },
+        )
+        return cls(
+            stage=value["stage"],
+            state=value["state"],
+            coverage_status=MeasurementStatus(value["coverage_status"]),
+            model_id=value["model_id"],
+            provider_id=value["provider_id"],
+            model_revision=value["model_revision"],
+            deployment_id_hash=value.get("deployment_id_hash"),
+            fallback_used=value["fallback_used"],
+            configuration_hash=value["configuration_hash"],
+            prompt_hash=value["prompt_hash"],
+            prompt_version=value["prompt_version"],
+            input_schema_version=value["input_schema_version"],
+            output_schema_version=value["output_schema_version"],
+            latency_seconds=NumericMeasurement.from_dict(value["latency_seconds"]),
+            tokens=NumericMeasurement.from_dict(value["tokens"]),
+            cost_usd=NumericMeasurement.from_dict(value["cost_usd"]),
+            cost_by_model_usd=value.get("cost_by_model_usd", {}),
+            ai_call_count=value["ai_call_count"],
+            cached=value["cached"],
+            confidence=value.get("confidence"),
+            failure_reason_code=value.get("failure_reason_code"),
+        )
+
+
 @dataclass(frozen=True)
 class ObservedFinding:
     fingerprint: str
@@ -949,6 +1481,7 @@ class EvaluationRunRecord:
     model_id: Optional[str] = None
     provider_id: Optional[str] = None
     model_revision: Optional[str] = None
+    stage_runs: tuple[EvaluationStageRun, ...] = field(default_factory=tuple)
     failure_reason_code: Optional[str] = None
     schema_version: str = EVALUATION_SCHEMA_VERSION
     record_id: str = field(init=False)
@@ -1006,12 +1539,27 @@ class EvaluationRunRecord:
         ):
             raise EvaluationValidationError("stage latencies must map stage names to NumericMeasurement values")
         object.__setattr__(self, "stage_latencies_seconds", MappingProxyType(dict(self.stage_latencies_seconds)))
-        if self.model_id is not None:
-            _validate_identifier("run model_id", self.model_id)
-        if self.provider_id is not None:
-            _validate_identifier("run provider_id", self.provider_id)
-        if self.model_revision is not None:
-            _validate_identifier("run model_revision", self.model_revision)
+        identity = (self.model_id, self.provider_id, self.model_revision)
+        if any(value is not None for value in identity) and not all(value is not None for value in identity):
+            raise EvaluationValidationError("run model identity must be a complete model/provider/revision triple")
+        for name, value in zip(("model_id", "provider_id", "model_revision"), identity, strict=True):
+            if value is not None:
+                _validate_identifier(f"run {name}", value)
+        object.__setattr__(self, "stage_runs", tuple(self.stage_runs))
+        if any(not isinstance(stage_run, EvaluationStageRun) for stage_run in self.stage_runs):
+            raise EvaluationValidationError("stage_runs must use EvaluationStageRun")
+        stage_names = [stage_run.stage for stage_run in self.stage_runs]
+        if len(stage_names) != len(set(stage_names)):
+            raise EvaluationValidationError("stage_runs must contain unique stage identities")
+        for stage_run in self.stage_runs:
+            stage_latency = self.stage_latencies_seconds.get(stage_run.stage)
+            if stage_latency is not None and stage_latency != stage_run.latency_seconds:
+                raise EvaluationValidationError("stage latency telemetry contradicts its stage run")
+        if (
+            self.snapshot_result_state is ReviewResultState.NO_FINDINGS
+            and any(stage.coverage_status is not MeasurementStatus.COMPLETE for stage in self.stage_runs)
+        ):
+            raise EvaluationValidationError("a no-findings run cannot claim clean coverage with an uncovered stage")
         if self.failure_reason_code is not None and (
             not isinstance(self.failure_reason_code, str)
             or not _FAILURE_REASON_CODE_PATTERN.fullmatch(self.failure_reason_code)
@@ -1048,6 +1596,8 @@ class EvaluationRunRecord:
             "provider_id": self.provider_id,
             "model_revision": self.model_revision,
         }
+        if self.stage_runs:
+            payload["stage_runs"] = [stage_run.to_dict() for stage_run in self.stage_runs]
         if self.failure_reason_code is not None:
             payload["failure_reason_code"] = self.failure_reason_code
         return payload
@@ -1064,7 +1614,7 @@ class EvaluationRunRecord:
                 "schema_version", "manifest_id", "case_id", "arm_id", "snapshot_id", "attempt", "state",
                 "terminal", "findings", "snapshot_result_state", "latency_seconds", "tokens", "cost_usd",
                 "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id", "provider_id",
-                "model_revision", "failure_reason_code", "record_id",
+                "model_revision", "stage_runs", "failure_reason_code", "record_id",
             },
         )
         snapshot_result_state = value.get("snapshot_result_state")
@@ -1091,6 +1641,7 @@ class EvaluationRunRecord:
             model_id=value.get("model_id"),
             provider_id=value.get("provider_id"),
             model_revision=value.get("model_revision"),
+            stage_runs=tuple(EvaluationStageRun.from_dict(item) for item in value.get("stage_runs", [])),
             failure_reason_code=value.get("failure_reason_code"),
             schema_version=value.get("schema_version", EVALUATION_SCHEMA_VERSION),
         )
@@ -1132,22 +1683,61 @@ class EvaluationRunRecord:
         }
         token_measurement = NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
         cost_measurement = NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+        stage_runs: tuple[EvaluationStageRun, ...] = ()
         if details is not None:
-            if details.has_token_usage:
+            if not isinstance(details.specialist_runs, Mapping) or any(
+                not isinstance(stage, str) or not _STAGE_STATE_PATTERN.fullmatch(stage)
+                for stage in details.specialist_runs
+            ):
+                raise EvaluationValidationError("RunDetails specialist_runs contains an invalid stage identity")
+            stage_runs = tuple(
+                EvaluationStageRun.from_specialist_details(arm, stage, stage_details)
+                for stage, stage_details in sorted(details.specialist_runs.items())
+            )
+            token_components: list[NumericMeasurement] = []
+            cost_components: list[NumericMeasurement] = []
+            has_primary_call = bool(details.num_ai_calls or details.has_token_usage or details.model_used)
+            if has_primary_call:
                 token_total = details.total_tokens or details.prompt_tokens + details.completion_tokens
-                token_measurement = NumericMeasurement(MeasurementStatus.PARTIAL, float(token_total))
-            cost_status = MeasurementStatus(details.cost_status)
-            cost_value = float(details.total_cost_usd) if cost_status is not MeasurementStatus.UNAVAILABLE else None
-            cost_measurement = NumericMeasurement(cost_status, cost_value)
+                token_components.append(
+                    NumericMeasurement(MeasurementStatus.PARTIAL, float(token_total))
+                    if token_total > 0
+                    else NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+                )
+                primary_cost_status = MeasurementStatus(details.cost_status)
+                primary_cost_value = (
+                    float(details.total_cost_usd)
+                    if primary_cost_status is not MeasurementStatus.UNAVAILABLE
+                    else None
+                )
+                cost_components.append(NumericMeasurement(primary_cost_status, primary_cost_value))
+            token_components.extend(stage.tokens for stage in stage_runs)
+            cost_components.extend(stage.cost_usd for stage in stage_runs)
+            token_measurement = _sum_measurements(token_components)
+            cost_measurement = _sum_measurements(cost_components)
         selected_model_id = (
             None
             if arm.kind is EvaluationArmKind.DETERMINISTIC
-            else details.model_used if details and details.model_used else arm.model_id
+            else (
+                details.model_used
+                if details and details.model_used
+                else None if stage_runs else arm.model_id
+            )
         )
-        selected_model_id, selected_provider_id, selected_model_revision = arm.resolve_model_identity(
-            selected_model_id
-        )
-        return cls(
+        if selected_model_id is None and arm.kind is not EvaluationArmKind.DETERMINISTIC:
+            selected_provider_id = None
+            selected_model_revision = None
+        else:
+            selected_model_id, selected_provider_id, selected_model_revision = arm.resolve_model_identity(
+                selected_model_id
+            )
+        merged_stage_latencies = dict(stage_latencies_seconds or {})
+        for stage_run in stage_runs:
+            supplied = merged_stage_latencies.get(stage_run.stage)
+            if supplied is not None and supplied != stage_run.latency_seconds:
+                raise EvaluationValidationError("supplied stage latency contradicts RunDetails specialist telemetry")
+            merged_stage_latencies[stage_run.stage] = stage_run.latency_seconds
+        record = cls(
             manifest_id=manifest.manifest_id,
             case_id=case.case_id,
             arm_id=arm.arm_id,
@@ -1163,12 +1753,81 @@ class EvaluationRunRecord:
             retry_count=retry_count,
             cached=result.cached,
             escalated=escalated,
-            stage_latencies_seconds=stage_latencies_seconds or {},
+            stage_latencies_seconds=merged_stage_latencies,
             model_id=selected_model_id,
             provider_id=selected_provider_id,
             model_revision=selected_model_revision,
+            stage_runs=stage_runs,
             failure_reason_code=failure_reason_code,
         )
+        validate_run_model_telemetry(arm, record)
+        return record
+
+
+def validate_run_model_telemetry(
+    arm: EvaluationArm,
+    record: EvaluationRunRecord,
+    *,
+    context: str = "run record",
+) -> None:
+    """Validate aggregate and per-stage identities against one frozen arm."""
+    if not isinstance(arm, EvaluationArm) or not isinstance(record, EvaluationRunRecord):
+        raise EvaluationValidationError("run model telemetry validation requires an arm and run record")
+    aggregate_identity = (record.model_id, record.provider_id, record.model_revision)
+    if aggregate_identity == (None, None, None):
+        if arm.kind is not EvaluationArmKind.DETERMINISTIC and not record.stage_runs:
+            raise EvaluationValidationError(
+                f"{context} omits both aggregate and per-stage model identities"
+            )
+    elif not arm.accepts_run_identity(*aggregate_identity):
+        raise EvaluationValidationError(f"{context} model identity does not match its frozen arm")
+    expected_by_stage = {stage.stage: stage for stage in arm.stage_plan}
+    actual_by_stage = {stage.stage: stage for stage in record.stage_runs}
+    missing = sorted(set(expected_by_stage) - set(actual_by_stage))
+    unexpected = sorted(set(actual_by_stage) - set(expected_by_stage))
+    if missing or unexpected:
+        raise EvaluationValidationError(
+            f"{context} stages do not match its frozen plan; missing={missing}, unexpected={unexpected}"
+        )
+    for stage_name, stage_run in actual_by_stage.items():
+        stage_plan = expected_by_stage[stage_name]
+        route_index, expected_identity = stage_plan.resolve_model(stage_run.model_id)
+        observed_identity = (
+            stage_run.model_id,
+            stage_run.provider_id,
+            stage_run.model_revision,
+            stage_run.deployment_id_hash,
+        )
+        planned_identity = (
+            expected_identity.model_id,
+            expected_identity.provider_id,
+            expected_identity.model_revision,
+            expected_identity.deployment_id_hash,
+        )
+        if observed_identity != planned_identity:
+            raise EvaluationValidationError(
+                f"{context} stage model or deployment identity does not match its frozen plan"
+            )
+        if stage_run.fallback_used is not (route_index > 0):
+            raise EvaluationValidationError(f"{context} stage fallback telemetry contradicts its frozen plan")
+        observed_contract = (
+            stage_run.configuration_hash,
+            stage_run.prompt_hash,
+            stage_run.prompt_version,
+            stage_run.input_schema_version,
+            stage_run.output_schema_version,
+        )
+        planned_contract = (
+            stage_plan.configuration_hash,
+            stage_plan.prompt_hash,
+            stage_plan.prompt_version,
+            stage_plan.input_schema_version,
+            stage_plan.output_schema_version,
+        )
+        if observed_contract != planned_contract:
+            raise EvaluationValidationError(f"{context} stage versions do not match its frozen plan")
+        for cost_model_id in stage_run.cost_by_model_usd:
+            stage_plan.resolve_model(cost_model_id)
 
 
 @dataclass(frozen=True)
@@ -1184,6 +1843,7 @@ class EvaluationPlanItem:
     provider_id: Optional[str]
     model_revision: Optional[str]
     fallback_models: tuple[EvaluationModelIdentity, ...]
+    stage_plan: tuple[EvaluationStagePlan, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1198,6 +1858,7 @@ class EvaluationPlanItem:
             "provider_id": self.provider_id,
             "model_revision": self.model_revision,
             "fallback_models": [identity.to_dict() for identity in self.fallback_models],
+            "stage_plan": [stage.to_dict() for stage in self.stage_plan],
         }
 
 
@@ -1236,6 +1897,7 @@ def build_evaluation_plan(manifest: EvaluationManifest) -> EvaluationPlan:
             provider_id=arm.provider_id,
             model_revision=arm.model_revision,
             fallback_models=arm.fallback_models,
+            stage_plan=arm.stage_plan,
         )
         for case in sorted(manifest.cases, key=lambda item: item.case_id)
         for arm in sorted((item for item in manifest.arms if item.enabled), key=lambda item: item.arm_id)

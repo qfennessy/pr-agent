@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -12,6 +13,9 @@ from pr_agent.algo.checkpoint_evaluation import (
     EvaluationManifest,
     EvaluationRunRecord,
     EvaluationRunState,
+    EvaluationStageModelIdentity,
+    EvaluationStagePlan,
+    EvaluationStageRun,
     EvaluationValidationError,
     FindingSeverity,
     FindingTruth,
@@ -319,6 +323,100 @@ def test_score_keeps_failures_and_missing_pairs_in_denominators():
     assert arm.metrics["verified_recall"].value == 0.5
     assert arm.metrics["failure_attempt_rate"].value == pytest.approx(1 / 3)
     assert arm.metrics["total_tokens"].status is MeasurementStatus.PARTIAL
+
+
+def test_score_accepts_pinned_stage_identities_and_rejects_forged_stage_telemetry():
+    case = _case("specialist", EvaluationCohort.CLEAN_CONTROL)
+    stage_plan = EvaluationStagePlan(
+        stage="change_classification",
+        model_route=(
+            EvaluationStageModelIdentity(
+                model_id="small-reviewer",
+                provider_id="provider-v1",
+                model_revision="revision-2026-08-30",
+            ),
+        ),
+        configuration_hash=_hash("change-classification-configuration"),
+        prompt_hash=_hash("change-classification-prompt"),
+        prompt_version="change-classification-v1",
+        input_schema_version="change-classification-input-v1",
+        output_schema_version="change-classification-output-v1",
+    )
+    arm = EvaluationArm(
+        arm_id="specialists",
+        kind=EvaluationArmKind.SPECIALISTS,
+        configuration_hash=_hash("specialist-configuration"),
+        prompt_hash=_hash("specialist-prompt"),
+        model_id="small-reviewer",
+        provider_id="provider-v1",
+        model_revision="revision-2026-08-30",
+        stage_plan=(stage_plan,),
+    )
+    manifest = _manifest(case, arms=(arm,))
+    assert EvaluationManifest.from_dict(manifest.to_dict()) == manifest
+    assert build_evaluation_plan(manifest).to_dict()["items"][0]["stage_plan"] == [
+        stage_plan.to_dict()
+    ]
+    truth = TruthArtifact(
+        manifest_id=manifest.manifest_id,
+        truths=(_truth(case, clean=True),),
+    )
+    stage = EvaluationStageRun(
+        stage="change_classification",
+        state="success",
+        coverage_status=MeasurementStatus.COMPLETE,
+        model_id="small-reviewer",
+        provider_id="provider-v1",
+        model_revision="revision-2026-08-30",
+        deployment_id_hash=None,
+        configuration_hash=stage_plan.configuration_hash,
+        prompt_hash=stage_plan.prompt_hash,
+        prompt_version="change-classification-v1",
+        input_schema_version="change-classification-input-v1",
+        output_schema_version="change-classification-output-v1",
+        latency_seconds=NumericMeasurement(MeasurementStatus.COMPLETE, 0.2),
+        tokens=NumericMeasurement(MeasurementStatus.PARTIAL, 10),
+        cost_usd=NumericMeasurement(MeasurementStatus.COMPLETE, 0.001),
+        cost_by_model_usd={"small-reviewer": 0.001},
+        ai_call_count=1,
+        confidence=0.9,
+    )
+    record = EvaluationRunRecord(
+        manifest_id=manifest.manifest_id,
+        case_id=case.case_id,
+        arm_id=arm.arm_id,
+        snapshot_id=case.snapshot_id,
+        attempt=1,
+        state=EvaluationRunState.COMPLETED,
+        terminal=True,
+        snapshot_result_state=ReviewResultState.NO_FINDINGS,
+        latency_seconds=NumericMeasurement(MeasurementStatus.COMPLETE, 0.25),
+        tokens=stage.tokens,
+        cost_usd=stage.cost_usd,
+        stage_latencies_seconds={stage.stage: stage.latency_seconds},
+        stage_runs=(stage,),
+    )
+
+    assert EvaluationRunRecord.from_dict(record.to_dict()) == record
+    assert score_matched_arms(manifest, truth, (record,)).arms[0].completed_case_count == 1
+
+    forged_stage = replace(stage, model_id="unpinned-reviewer")
+    forged_record = replace(
+        record,
+        stage_latencies_seconds={forged_stage.stage: forged_stage.latency_seconds},
+        stage_runs=(forged_stage,),
+    )
+    with pytest.raises(EvaluationValidationError, match="unpinned model identity"):
+        score_matched_arms(manifest, truth, (forged_record,))
+
+    forged_cost_stage = replace(stage, cost_by_model_usd={"unpinned-cost-model": 0.001})
+    forged_cost_record = replace(
+        record,
+        stage_latencies_seconds={forged_cost_stage.stage: forged_cost_stage.latency_seconds},
+        stage_runs=(forged_cost_stage,),
+    )
+    with pytest.raises(EvaluationValidationError, match="unpinned model identity"):
+        score_matched_arms(manifest, truth, (forged_cost_record,))
 
 
 def test_gate_fails_known_bad_evidence_and_never_passes_missing_evidence():

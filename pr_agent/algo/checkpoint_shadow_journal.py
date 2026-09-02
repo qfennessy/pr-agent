@@ -15,13 +15,16 @@ from typing import Any, Optional
 
 from pr_agent.algo.checkpoint_evaluation import (
     EVALUATION_SCHEMA_VERSION,
+    EvaluationArm,
     EvaluationRunRecord,
     EvaluationRunState,
+    EvaluationStageRun,
     EvaluationValidationError,
     FindingLifecycleState,
     MeasurementStatus,
     NumericMeasurement,
     content_hash,
+    validate_run_model_telemetry,
 )
 from pr_agent.algo.review_snapshot import ReviewEvent
 
@@ -75,6 +78,7 @@ class ShadowJournalEntry:
     model_id: Optional[str] = None
     provider_id: Optional[str] = None
     model_revision: Optional[str] = None
+    stage_runs: tuple[EvaluationStageRun, ...] = field(default_factory=tuple)
     findings: tuple[ShadowFinding, ...] = field(default_factory=tuple)
     coverage_status: MeasurementStatus = MeasurementStatus.UNAVAILABLE
     latency_seconds: NumericMeasurement = field(
@@ -137,6 +141,22 @@ class ShadowJournalEntry:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise EvaluationValidationError(f"shadow {name} must be a non-empty string or null")
+        aggregate_identity = (self.model_id, self.provider_id, self.model_revision)
+        if any(value is not None for value in aggregate_identity) and not all(
+            value is not None for value in aggregate_identity
+        ):
+            raise EvaluationValidationError("shadow model identity must be a complete triple or null")
+        object.__setattr__(self, "stage_runs", tuple(self.stage_runs))
+        if any(not isinstance(stage_run, EvaluationStageRun) for stage_run in self.stage_runs):
+            raise EvaluationValidationError("shadow stage_runs must use EvaluationStageRun")
+        stage_names = [stage_run.stage for stage_run in self.stage_runs]
+        if len(stage_names) != len(set(stage_names)):
+            raise EvaluationValidationError("shadow stage_runs must contain unique stage identities")
+        if (
+            self.coverage_status is MeasurementStatus.COMPLETE
+            and any(stage.coverage_status is not MeasurementStatus.COMPLETE for stage in self.stage_runs)
+        ):
+            raise EvaluationValidationError("shadow coverage cannot be complete with an uncovered stage")
         if self.selected_depth is not None and self.selected_depth not in _REVIEW_DEPTHS:
             raise EvaluationValidationError("shadow selected_depth must be quick, standard, or deep")
         object.__setattr__(self, "entry_id", content_hash(self._identity_payload()))
@@ -155,6 +175,7 @@ class ShadowJournalEntry:
             "model_id": self.model_id,
             "provider_id": self.provider_id,
             "model_revision": self.model_revision,
+            "stage_runs": [stage_run.to_dict() for stage_run in self.stage_runs],
             "result_state": self.result_state.value,
             "findings": [finding.to_dict() for finding in self.findings],
             "coverage_status": self.coverage_status.value,
@@ -173,6 +194,7 @@ class ShadowJournalEntry:
         cls,
         record: EvaluationRunRecord,
         *,
+        arm: EvaluationArm,
         event: ReviewEvent,
         policy_hash: str,
         configuration_hash: str,
@@ -180,9 +202,14 @@ class ShadowJournalEntry:
         selected_depth: Optional[str] = None,
         reason_codes: tuple[str, ...] = (),
     ) -> "ShadowJournalEntry":
+        if not isinstance(arm, EvaluationArm) or arm.arm_id != record.arm_id:
+            raise EvaluationValidationError("shadow run record requires its exact frozen arm")
+        validate_run_model_telemetry(arm, record, context="shadow run")
         coverage_status = (
             MeasurementStatus.COMPLETE
-            if record.state.value == "completed"
+            if record.state is EvaluationRunState.COMPLETED
+            and len(record.stage_runs) == len(arm.stage_plan)
+            and all(stage.coverage_status is MeasurementStatus.COMPLETE for stage in record.stage_runs)
             else MeasurementStatus.UNAVAILABLE
         )
         return cls(
@@ -197,6 +224,7 @@ class ShadowJournalEntry:
             model_id=record.model_id,
             provider_id=record.provider_id,
             model_revision=record.model_revision,
+            stage_runs=record.stage_runs,
             result_state=record.state,
             findings=tuple(
                 ShadowFinding.from_fingerprint(finding.fingerprint, finding.lifecycle_state)

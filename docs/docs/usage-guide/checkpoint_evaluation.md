@@ -1,10 +1,9 @@
 # Checkpoint evaluation planning
 
 Checkpoint evaluation artifacts describe how to replay the same immutable local-review
-snapshot through several production review arms. The first implementation is deliberately
-limited to local validation, deterministic planning, pure scoring, and rollout-gate
-decisions. It does not call a model, contact a provider, publish a review, or enable any
-developer-visible behavior.
+snapshot through several production review arms. List and dry-run modes remain limited to
+local validation and deterministic planning. The separately authorized production runner
+can call the frozen arms, but it cannot publish a review or enable developer-visible behavior.
 
 All runtime settings remain disabled:
 
@@ -25,7 +24,7 @@ evidence are also required before any rollout gate can grant permission.
 
 ## Artifact boundary
 
-The `checkpoint-evaluation-v1` contracts use content-derived SHA-256 identities, including
+The `checkpoint-evaluation-v2` contracts use content-derived SHA-256 identities, including
 a hash of the concrete field/enum schema rather than only its version label, and keep
 five artifact types separate:
 
@@ -39,7 +38,12 @@ five artifact types separate:
 - `EvaluationRunRecord` binds one retained attempt to a manifest, case, arm, and snapshot.
   It maps shipped `ReviewSnapshotResult` and `RunDetails` telemetry without turning missing
   tokens, cost, latency, or coverage into zero. Optional route, cache, stage-latency,
-  overlap, and lifecycle fields remain structured and source-free.
+  overlap, and lifecycle fields remain structured and source-free. Model-backed specialist
+  arms retain one `EvaluationStageRun` per required role, including its pinned
+  model/provider/revision, one-way deployment identity hash, configuration and prompt
+  hashes, prompt and schema versions, coverage and failure state, latency, tokens, priced
+  cost, cache/fallback state, and confidence. Full specialist output and deployment names
+  are excluded because they can contain source or environment-specific details.
 - `RolloutGateDecision` records `passed`, `failed`, or `not_evaluable` for explicit metrics,
   thresholds, and minimum support.
 
@@ -48,7 +52,7 @@ rejected recursively inside model-visible metadata. A manifest cannot reuse snap
 identities, mix one lineage across cohorts, or accept a supplied content id that does not
 match its canonical JSON.
 
-Before any future runner may use a source-bearing snapshot, it must call
+Before the production runner uses a source-bearing snapshot, it must call
 `load_review_snapshot_artifact()`. The loader reads one bounded regular file without
 following any supplied path component (using descriptor-relative component walking), rejects
 duplicate keys and non-finite JSON, verifies the exact file-byte hash against the checkpoint,
@@ -62,6 +66,25 @@ The evaluation artifacts above contain no source text, full diff, secret, hidden
 provider request identifier, or credential. The separate serialized `ReviewSnapshot` is
 source-bearing, stays in local source storage outside published artifact directories, and is
 referenced by its exact byte hash.
+
+Production bindings declare their telemetry shape. The deterministic arm must be model-free,
+the general-review arm must name one selected pinned model, and specialist, verified-specialist,
+and full-cascade arms freeze an exact, nonempty stage plan. Each required stage fixes its
+name, primary/fallback route, hashed deployment identity, configuration and prompt hashes,
+and prompt/input/output schema versions. Runtime telemetry must contain that exact set once
+each; missing, duplicate, unexpected, mismatched, or unpinned stages fail closed. A stage
+identity and every model named in its priced-cost map must belong to that stage's frozen
+route. Missing, partial, ambiguous, or unpinned identities fail before an artifact is written.
+A specialist-only record may omit
+the top-level model triple only when it contains complete nonempty per-stage identities. Role
+telemetry is also folded into the arm's token and cost totals because production `RunDetails`
+intentionally keeps specialist usage separate from the main review footer.
+
+The role collector cannot prove how many calls reported token usage, so any observed role-token
+subtotal is `partial`; an absent subtotal is `unavailable`. Cost is `complete` only when every
+successful role call was priced, `partial` when only some were priced, and `unavailable` when
+none were. A default numeric zero is never persisted as measured latency, tokens, or cost. A
+failed role cannot turn a `no_findings` result into apparently clean coverage.
 
 ## Credential-free list and dry run
 
@@ -93,7 +116,8 @@ python -m pr_agent.cli evaluation-plan \
 Both modes are local-only. Their machine-readable output states `network_calls: 0` and
 `model_calls: 0`. The plan includes the same `snapshot_id` for every enabled arm paired
 with a checkpoint, freezes its serialized-artifact hash and every arm's prompt,
-configuration, provider, model, and revision identity, and never includes truth.
+configuration, provider, model, revision, and source-free per-stage contract, and never
+includes truth.
 
 ## Paid execution is fail closed
 
@@ -126,7 +150,9 @@ unexpected file fails resume.
 `resume_plan()` omits only case/arm pairs that already have one terminal record. For every
 other pair it returns the next attempt number and the identities of all retained attempts.
 `inventory()` produces the hashes needed for a pilot report without copying source or
-model-visible snapshot bytes into the report.
+model-visible snapshot bytes into the report. Resume loading and scoring both revalidate each
+aggregate or stage identity, stage name/cardinality, stage contract version, deployment
+identity hash, and each priced-cost model key against the same frozen arm.
 
 ## Privacy-safe live shadow journal
 
@@ -138,10 +164,17 @@ a save. Explicit shutdown may flush the queue, but the save path never waits for
 The schema allowlists snapshot and lineage hashes, event and configuration versions,
 selected depth and machine reason codes, model/provider identities, hashed finding
 fingerprints and lifecycle state, coverage/failure/cache/retry status, tokens, cost, and
-latency. It has no field for source, a diff, task intent, prompt, secret, credential,
-provider request id, or hidden reasoning. Fingerprints are re-hashed before persistence.
-Only a completed review marks coverage complete; timeout, malformed, stale, cancelled,
-provider-failed, and explicit coverage-unavailable attempts keep coverage unavailable.
+latency. Specialist-only entries keep the same source-free per-stage identity, version,
+coverage, failure, latency, token, and priced-cost records as their immutable raw attempt.
+Creating a journal entry requires the exact frozen arm and revalidates aggregate identities,
+the exact required stage set, every stage identity and contract version, and every per-model
+cost key. It has no field for source, a diff, task
+intent, prompt text, model output, deployment name, secret, credential, provider request id,
+or hidden reasoning. Fingerprints are re-hashed before persistence. Only a completed review
+whose complete required stage plan is present and covered marks aggregate coverage complete;
+an empty or partial stage set can never pass by vacuous truth. Timeout, malformed, stale,
+cancelled, provider-failed, stage-failed, and explicit coverage-unavailable attempts
+keep coverage unavailable.
 
 ## Scoring and gate interpretation
 
@@ -172,6 +205,94 @@ returns `failed`. An absent metric, partial/unavailable measurement, or insuffic
 returns `not_evaluable`; it never becomes permission to roll out. Loaded rule-result and
 top-level decision statuses are recomputed from their frozen evidence, so a serialized
 artifact cannot claim `passed` over failed or missing measurements.
+
+### Canonical pilot report and rollout gates
+
+`build_checkpoint_pilot_report()` is the source-free report boundary for the target-repository
+pilot. It loads every retained attempt through `EvaluationArtifactStore`, calls
+`score_matched_arms()` with the frozen incumbent, and evaluates the canonical rules through
+`evaluate_rollout_gate()`. The report records the manifest, corpus, schema, policy,
+configuration, arm-configuration, prompt, and hashed model identities; the raw replay, shadow,
+and settled-candidate artifact hash inventories; terminal and incomplete pair counts; the exact scorecard id;
+the full source-free scorecard with cohort support and paired uncertainty; accepted budgets;
+source-free observed measurements; and all five gate decisions. It does not
+serialize source, diffs, truth or adjudication identifiers, model/provider identifiers,
+provider request ids, or credentials.
+
+The canonical rules are:
+
+| Gate | Rules that must have complete evidence |
+| --- | --- |
+| Offline replay | Structured-output rate at least 99.5%, complete immutable replay inventory, an explicit no-holdout-leakage result, and a recorded bounded-retry limit |
+| Live shadow | At least seven real elapsed days with both file-save and worktree events, a raw shadow-artifact inventory, and complete p95-latency and cost-per-developer-hour measurements within explicitly accepted positive budgets |
+| Opt-in pair review | Verified precision at least 80%, no negative high-severity recall delta on the temporal cohort, and complete replay artifacts |
+| Default pair review | Actionable precision at least 90% derived from the exact accepted inventory of at least 100 settled candidates, observed false interruptions no greater than an explicitly accepted non-negative threshold, and complete shadow artifacts |
+| PR publication | A strictly positive lower 95% bound for the cascade's quality advantage across all 18 cases in the locked Cocos Story holdout, complete holdout cost within an explicitly accepted positive ceiling, and complete replay artifacts |
+
+Create `PilotRolloutBudgets` only from thresholds a maintainer has actually accepted.
+`PilotRolloutEvidence` carries only separately bound replay declarations; it cannot accept shadow
+timestamps, counts, metrics, artifact hashes, or a settled-candidate precision claim. The report
+derives settled-candidate precision, temporal high-severity
+recall, frozen-holdout paired recall uncertainty, and holdout cost directly from accepted records,
+immutable attempts, and the separate answer ledger. Callers cannot supply those rollout measurements.
+The publication comparison also requires the validated `CocosCorpusInventory` and a separately
+reviewed `CocosPilotAcceptance`. `build_cocos_pilot_acceptance()` generates a source-free artifact
+containing the canonical adapter lock, manifest schema version/hash, corpus hash, and the full
+ordered case inventory. Every assignment records only its case id, snapshot identity/artifact hash,
+cohort, event, and parent case. It therefore commits to every calibration, holdout, temporal, and
+control assignment without copying source. Generation does not approve it. A maintainer must
+independently review that artifact and pin its
+content-derived `acceptance_id` as `CANONICAL_COCOS_PILOT_ACCEPTANCE_ID` in a separate change before
+publication can pass. This prevents one report call from supplying both the evidence and the values
+that supposedly accept it.
+
+The inventory must use the checked-in canonical Cocos lock and its exact cohort counts, the manifest
+and inventory must match the pinned artifact's schema and corpus identities, and every manifest case
+must match the accepted ordered assignment tuple exactly. Substitution, reordering, extra or missing
+cases, a changed cohort, and a changed snapshot hash are rejected even when the aggregate count stays
+18. The report records only the acceptance id, a reproducible source-free inventory hash, and those
+accepted identities; it omits the assignment details, corpus path, and source revision. Missing or
+generated-but-unpinned acceptance produces `not_evaluable`, while a conflicting acceptance id, lock,
+schema, corpus, assignment, cohort count, or holdout hash is invalid input. Eighteen arbitrary cases,
+19 cases, or a one-case point estimate cannot be represented as a passing confidence bound.
+
+Live shadow evidence follows the same two-step boundary. `ShadowJournalRecord` binds one actual
+`ShadowJournalEntry` content id to its observed time in UTC and its measured developer-time
+denominator. `build_shadow_pilot_acceptance()` verifies the journal entries use the exact manifest
+policy, configuration, target arm, aggregate model identity, required stage plan, primary/fallback
+route, deployment identity, prompt/configuration/schema versions, cost model identities, and journal
+schema. It also rejects negative aggregate or stage latency, token, cost, or developer-time
+measurements, preserves the records' observed order, and emits the complete source-free record
+inventory and journal hash. Generation alone cannot pass a gate; a maintainer must independently pin
+its content id as `CANONICAL_SHADOW_PILOT_ACCEPTANCE_ID`.
+
+Report construction then matches every accepted record id and entry id in order. Truncated, extra,
+substituted, duplicated, or reordered journal records fail validation. Duration is recomputed from
+the first and last UTC observations, p95 latency from every entry's recorded latency, event counts
+from the recorded event enum, and cost per developer-hour from recorded costs and accepted developer
+elapsed denominators. Missing, partial, or unpriced entries remain partial or unavailable. The report
+contains only the accepted journal and record hashes, UTC span, derived counts, and derived metrics;
+it does not expose journal model/provider identities or entry payloads.
+
+Default pair-review evidence has the same independent boundary. Each `SettledCandidateRecord`
+contains only a hashed candidate identity, its independent adjudication hash, and the boolean
+actionable result. `build_settled_pilot_acceptance()` commits to the full ordered source-free record
+inventory and binds it to the exact manifest, policy, configuration, and target arm. A maintainer must
+review that artifact and separately pin its content id as
+`CANONICAL_SETTLED_PILOT_ACCEPTANCE_ID`. Report construction rejects truncated, extra, substituted,
+duplicated, or reordered records, then derives both the settled denominator and actionable precision
+from the accepted records. A caller-supplied point estimate and generated-but-unpinned records remain
+`not_evaluable`; they can never satisfy the 100-candidate or 90% thresholds.
+
+A missing budget is represented as `None`, not zero. Missing or empty duration, event
+denominator, raw inventory, cap, accepted false-interruption threshold, or partial/unavailable
+measurement produces `not_evaluable`. A complete measurement that misses its threshold
+produces `failed`.
+
+The report's model identity values are one-way hashes over the frozen manifest identities.
+The separately stored answer ledger is used for scoring but its id and contents never enter
+the report. Keep the report JSON publishable and keep the manifest, source-bearing snapshots,
+truth ledger, raw attempt files, and shadow journals in their existing private stores.
 
 `evaluate_output_permission()` separately binds opt-in advice, default advice, or PR
 publication to one exact passed gate, arm, and scorecard id. Missing decisions, stale
