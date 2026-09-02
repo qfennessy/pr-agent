@@ -338,6 +338,93 @@ def test_same_anchor_v2_identity_reordering_fails_closed_without_swapping_thread
     assert persisted_mapping == forward_ids
 
 
+def test_equal_shape_v2_occurrence_shift_after_deletion_fails_closed_before_mapping():
+    def verified_findings(specs):
+        candidates = []
+        evidence = []
+        decisions = []
+        for label, line, anchor_ordinal, anchor_shape in specs:
+            candidate_id = f"candidate-{label}"
+            candidates.append({
+                "candidate_id": candidate_id,
+                "relevant_file": "src/service.py",
+                "issue_header": label,
+                "issue_content": f"{label} candidate",
+                "start_line": line,
+                "end_line": line,
+                "side": "new",
+                "trigger": f"{label} trigger",
+                "impact": f"{label} impact",
+                "_changed_line_ranges": [(line, line)],
+                "_changed_anchor_shape": anchor_shape,
+                "_changed_anchor_ordinal": anchor_ordinal,
+                "_trusted_defect_ordinal": 1,
+                "_trusted_lineage_key": "file:src/service.py",
+                "_trusted_side_line_count": 30,
+            })
+            evidence.append({
+                "candidate_id": candidate_id,
+                "source": "changed_head",
+                "path": "src/service.py",
+                "content": f"return {label}(value)",
+                "start_line": line,
+                "end_line": line,
+                "side": "new",
+            })
+            decisions.append({
+                "candidate_id": candidate_id,
+                "verdict": "verified",
+                "issue_header": label,
+                "issue_content": f"Verified {label}",
+                "trigger": f"{label} trigger",
+                "impact": f"{label} impact",
+                "relevant_file": "src/service.py",
+                "start_line": line,
+                "end_line": line,
+                "evidence_paths": ["src/service.py"],
+            })
+        return apply_verification_decisions(
+            candidates,
+            evidence,
+            {"verification": {"decisions": decisions}},
+        )[0]
+
+    repeated_shape = "return <id> ( <id> )"
+    before = verified_findings((
+        ("first", 12, 1, repeated_shape),
+        ("second", 20, 2, repeated_shape),
+    ))
+    after_deletion = verified_findings((("second", 12, 1, repeated_shape),))
+    before_by_header = {finding["issue_header"]: finding for finding in before}
+
+    assert before_by_header["first"]["root_cause_id"] == after_deletion[0]["root_cause_id"]
+    assert before_by_header["second"]["root_cause_id"] != after_deletion[0]["root_cause_id"]
+    assert len({finding["_trusted_anchor_shape_id"] for finding in before}) == 1
+    with pytest.raises(ValueError, match="ambiguous equal anchor shape"):
+        finding_identities_from_verified_findings(
+            tuple(before), repository="owner/repo", pull_request_number=7
+        )
+
+
+def test_distinct_trusted_anchor_shapes_in_one_file_remain_eligible():
+    findings = []
+    for index, shape_id in enumerate(("a", "b"), start=1):
+        findings.append({
+            "root_cause_id": f"sha256:{str(index) * 64}",
+            "relevant_file": "src/service.py",
+            "trusted_stable_key": f"sha256:{str(index + 2) * 64}",
+            "_trusted_anchor_shape_id": f"sha256:{shape_id * 64}",
+            "side": "new",
+            "start_line": index * 10,
+        })
+
+    identities = finding_identities_from_verified_findings(
+        findings, repository="owner/repo", pull_request_number=7
+    )
+
+    assert len(identities) == 2
+
+
 @pytest.mark.parametrize(
     "overrides,error",
     [

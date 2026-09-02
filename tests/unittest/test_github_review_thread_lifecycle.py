@@ -1024,6 +1024,39 @@ def test_graphql_rate_limit_preserves_headers_for_retry_evidence():
     assert outcome.retry_source == "retry-after"
 
 
+@pytest.mark.parametrize(
+    "response,expected_kind,expected_retry_after",
+    [
+        (
+            (429, {"Retry-After": "20"}, json.dumps({"message": "too many requests"})),
+            ReviewThreadFailureKind.RATE_LIMITED,
+            20.0,
+        ),
+        (
+            (403, {}, "upstream proxy denied the request"),
+            ReviewThreadFailureKind.PERMISSION_DENIED,
+            None,
+        ),
+    ],
+)
+def test_graphql_http_and_malformed_body_failures_preserve_response_evidence(
+    response,
+    expected_kind,
+    expected_retry_after,
+):
+    expected_thread, inventory = _owned_thread_state()
+    requester = _Requester(
+        rest=[{"head": {"sha": "head-1"}}, {"head": {"sha": "head-1"}}],
+        graphql=[inventory, response],
+    )
+
+    outcome = _provider(requester).resolve_review_thread("thread-1", "head-1", expected_thread)
+
+    assert outcome.state == ReviewThreadActionState.FAILED
+    assert outcome.failure_kind == expected_kind
+    assert outcome.retry_after_seconds == expected_retry_after
+
+
 def test_create_422_is_classified_as_invalid_inline_location_with_details():
     class _ValidationFailure(RuntimeError):
         status = 422

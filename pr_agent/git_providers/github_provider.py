@@ -979,9 +979,29 @@ class GithubProvider(GitProvider):
         if not isinstance(response, tuple) or len(response) != 3:
             raise RuntimeError("unexpected GitHub GraphQL response format")
         status, headers, raw_body = response
-        body = json.loads(raw_body) if isinstance(raw_body, str) else raw_body
+        try:
+            body = json.loads(raw_body) if isinstance(raw_body, str) else raw_body
+        except (TypeError, ValueError) as e:
+            raise _ReviewThreadGraphQLError(
+                f"GitHub GraphQL response is not valid JSON: {e}",
+                status=status,
+                headers=headers,
+                data=raw_body,
+            ) from e
         if not isinstance(body, dict):
-            raise RuntimeError("GitHub GraphQL response body is not an object")
+            raise _ReviewThreadGraphQLError(
+                "GitHub GraphQL response body is not an object",
+                status=status,
+                headers=headers,
+                data=body,
+            )
+        if isinstance(status, int) and status >= 400:
+            raise _ReviewThreadGraphQLError(
+                str(body.get("message") or f"GitHub GraphQL HTTP {status}"),
+                status=status,
+                headers=headers,
+                data=body,
+            )
         if body.get("errors"):
             raise _ReviewThreadGraphQLError(
                 f"GitHub GraphQL errors: {body['errors']}",
@@ -991,7 +1011,12 @@ class GithubProvider(GitProvider):
             )
         data = body.get("data")
         if not isinstance(data, dict):
-            raise RuntimeError("GitHub GraphQL response has no data object")
+            raise _ReviewThreadGraphQLError(
+                "GitHub GraphQL response has no data object",
+                status=status,
+                headers=headers,
+                data=body,
+            )
         return data
 
     def _get_additional_review_thread_comments(self, thread_id: str, cursor: str) -> tuple[list[dict], str]:

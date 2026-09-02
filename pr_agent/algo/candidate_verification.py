@@ -2633,6 +2633,20 @@ def _verified_finding_identity(candidate: dict) -> Optional[tuple[str, str]]:
     return root_cause_id, f"sha256:{stable_digest}"
 
 
+def _verified_anchor_shape_id(candidate: dict) -> Optional[str]:
+    """Expose a non-reversible trusted shape discriminator to downstream lifecycle code."""
+    anchor_shape = str(candidate.get("_changed_anchor_shape") or "")
+    if not anchor_shape:
+        return None
+    digest = hashlib.sha256(
+        json.dumps({
+            "schema": "verified-anchor-shape-v1",
+            "changed_anchor_shape": anchor_shape,
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"sha256:{digest}"
+
+
 def apply_verification_decisions(
     candidates: list[dict],
     evidence: list[dict],
@@ -2769,7 +2783,14 @@ def apply_verification_decisions(
             record["reason"] = "trusted_identity_unavailable"
             result_records.append(record)
             continue
+        anchor_shape_id = _verified_anchor_shape_id(candidate)
+        if anchor_shape_id is None:
+            record["verdict"] = "rejected"
+            record["reason"] = "trusted_identity_unavailable"
+            result_records.append(record)
+            continue
         finding["root_cause_id"], finding["trusted_stable_key"] = identity
+        finding["_trusted_anchor_shape_id"] = anchor_shape_id
         if identity in seen_identities:
             record["verdict"] = "rejected"
             record["reason"] = "trusted_identity_collision"
