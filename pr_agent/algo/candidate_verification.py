@@ -1614,13 +1614,14 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         path: str,
         source: str,
         content: str,
-    ) -> tuple[Optional[list[dict]], list[str], list[str]]:
+    ) -> tuple[Optional[list[dict]], list[str], list[str], bool]:
         symbols = context_symbols_for_request(
             candidate, candidate_id, request_spec, path
         )
         best_group = None
         best_matches: list[str] = []
-        best_score = (-1, -1, -1)
+        best_anchor_compatible = False
+        best_score = (-1, -1, -1, -1)
         for existing_group in shared_repo_evidence.get((source, path), ()):
             combined_content = "\n".join(
                 str(existing.get("content") or "")
@@ -1657,10 +1658,11 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             matched_symbols = [
                 symbol for symbol in symbols if symbol in durable_content
             ]
-            if path == candidate.get("relevant_file") and not symbols:
+            anchor_compatible = True
+            if path == candidate.get("relevant_file"):
                 source_lines = split_git_file_lines(content)
                 resolved_anchor = candidate.get("start_line")
-                matching_anchor = False
+                anchor_compatible = False
                 for existing in existing_group:
                     try:
                         visible_start = int(existing.get("start_line"))
@@ -1677,11 +1679,10 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                         and visible_lines[visible_anchor_index]
                         == source_lines[resolved_anchor - 1]
                     ):
-                        matching_anchor = True
+                        anchor_compatible = True
                         break
-                if not matching_anchor:
-                    continue
             score = (
+                int(anchor_compatible),
                 len(matched_symbols),
                 len(discoverable_symbols),
                 reclaimable_lines,
@@ -1689,8 +1690,9 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             if best_group is None or score > best_score:
                 best_group = existing_group
                 best_matches = matched_symbols
+                best_anchor_compatible = anchor_compatible
                 best_score = score
-            if len(matched_symbols) == len(symbols):
+            if anchor_compatible and len(matched_symbols) == len(symbols):
                 break
         # A shared excerpt may already prove every symbol that exists on this
         # path. Only expand it for additional symbols discoverable in the full
@@ -1701,7 +1703,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             for symbol in symbols
             if symbol not in best_matches and symbol in content
         ]
-        return best_group, best_matches, remaining_symbols
+        return best_group, best_matches, remaining_symbols, best_anchor_compatible
 
     def bind_shared_evidence_group(
         shared_items: list[dict],
@@ -1886,7 +1888,12 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         if not head_file or not getattr(context_diff, "head_file_is_complete", True):
             return False
         source = "changed_context_head"
-        shared_items, matched_symbols, remaining_symbols = find_shared_evidence_group(
+        (
+            shared_items,
+            matched_symbols,
+            remaining_symbols,
+            anchor_compatible,
+        ) = find_shared_evidence_group(
             candidate,
             candidate_id,
             request_spec,
@@ -1903,7 +1910,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                     context_path,
                     matched_symbols,
                 )
-            if not remaining_symbols:
+            if not remaining_symbols and anchor_compatible:
                 changed_context_head_available[(candidate_id, context_path)] = shared_items[0][
                     "evidence_id"
                 ]
@@ -2083,7 +2090,12 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         if (candidate.get("side", "new") == "new" and head_file
                 and getattr(diff_file, "head_file_is_complete", True)):
             head_request = {"required": False}
-            shared_items, matched_symbols, remaining_symbols = find_shared_evidence_group(
+            (
+                shared_items,
+                matched_symbols,
+                remaining_symbols,
+                anchor_compatible,
+            ) = find_shared_evidence_group(
                 candidate,
                 candidate_id,
                 head_request,
@@ -2101,8 +2113,8 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                         matched_symbols,
                     )
                 changed_head_evidence_id = shared_items[0]["evidence_id"]
-                changed_head_available = not remaining_symbols
-                if remaining_symbols:
+                changed_head_available = not remaining_symbols and anchor_compatible
+                if remaining_symbols or not anchor_compatible:
                     compact_shared_evidence_group(shared_items, relevant_file)
             if not changed_head_available:
                 if shared_items is None:
@@ -2174,7 +2186,12 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             cached_content = cache.get(cache_key)
             if isinstance(cached_content, bytes):
                 cached_content = cached_content.decode("utf-8", errors="replace")
-            shared_items, matched_symbols, remaining_symbols = find_shared_evidence_group(
+            (
+                shared_items,
+                matched_symbols,
+                remaining_symbols,
+                anchor_compatible,
+            ) = find_shared_evidence_group(
                 candidate,
                 candidate_id,
                 request,
@@ -2191,7 +2208,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                         path,
                         matched_symbols,
                     )
-                if not remaining_symbols:
+                if not remaining_symbols and anchor_compatible:
                     request.update({
                         "status": "retrieved",
                         "source": source,
@@ -2199,7 +2216,8 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                     })
                     set_request_excerpt_metadata(request, shared_items)
                     continue
-                compact_shared_evidence_group(shared_items, path)
+                if remaining_symbols or not anchor_compatible:
+                    compact_shared_evidence_group(shared_items, path)
             if path not in unique_files and len(unique_files) >= budgets.max_files:
                 request["status"] = "file_budget_exhausted"
                 budget_exhausted = True

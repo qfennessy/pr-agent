@@ -2654,19 +2654,19 @@ async def test_same_file_candidates_keep_own_patch_and_share_one_symbol_head_exc
         (12, 12),
         (200, 200),
     ]
-    assert len(changed_heads) == 2
+    assert len(changed_heads) == 3
     assert {item["evidence_id"] for item in changed_heads} == {
         expected_head_evidence_id
     }
-    assert all(
-        item["candidate_ids"] == ["candidate-1", "candidate-2"]
-        for item in changed_heads
-    )
     symbol_excerpt = next(
         item for item in changed_heads if "shared_contract" in item["content"]
     )
     assert symbol_excerpt["anchor_start_line"] == 100
     assert symbol_excerpt["anchor_end_line"] == 100
+    assert symbol_excerpt["candidate_ids"] == ["candidate-1", "candidate-2"]
+    assert {
+        item["anchor_start_line"] for item in changed_heads
+    } == {12, 100, 200}
     assert [request["status"] for request in requests] == [
         "satisfied_by_changed_head",
         "satisfied_by_changed_head",
@@ -2676,6 +2676,85 @@ async def test_same_file_candidates_keep_own_patch_and_share_one_symbol_head_exc
         expected_head_evidence_id,
     ]
     assert artifact["lines_retrieved"] == 8
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"]) == {
+        "status": "complete",
+        "candidate_count": 2,
+        "complete_candidate_count": 2,
+        "missing_changed_candidate_count": 0,
+        "missing_required_request_count": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_same_file_candidates_keep_distinct_head_anchors_for_external_only_symbol():
+    head_lines = [f"service line {line}" for line in range(1, 221)]
+    head_lines[11] = "return first_value"
+    head_lines[199] = "raise second_error"
+    diff_file = _diff_file(head_file="\n".join(head_lines))
+    diff_file.patch = (
+        "@@ -10,0 +12,1 @@\n+return first_value\n"
+        "@@ -198,0 +200,1 @@\n+raise second_error"
+    )
+    candidates, _ = prepare_candidates(
+        _review_data(
+            _candidate(
+                context_files=["src/helper.py"],
+                context_symbols=["external_contract"],
+                root_cause="first branch violates the external contract",
+            ),
+            _candidate(
+                context_files=["src/helper.py"],
+                context_symbols=["external_contract"],
+                root_cause="second branch violates the external contract",
+                start_line=200,
+                end_line=200,
+            ),
+        ),
+        [diff_file],
+        [],
+        3,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = (
+        "helper prelude\ndef external_contract(): return True\nhelper tail"
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=1,
+            max_lines_per_file=8,
+            max_total_lines=14,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[diff_file],
+    )
+
+    changed_heads = [
+        item for item in evidence if item.get("source") == "changed_head"
+    ]
+    relevant_requests = [
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/service.py"
+    ]
+    assert len(changed_heads) == 2
+    assert any(
+        item["start_line"] <= 12 <= item["end_line"]
+        for item in changed_heads
+    )
+    assert any(
+        item["start_line"] <= 200 <= item["end_line"]
+        for item in changed_heads
+    )
+    assert [request["status"] for request in relevant_requests] == [
+        "satisfied_by_changed_head",
+        "satisfied_by_changed_head",
+    ]
+    assert len({request["evidence_id"] for request in relevant_requests}) == 1
+    assert artifact["lines_retrieved"] <= 14
     assert prompt_evidence_coverage(candidates, evidence, artifact["requests"]) == {
         "status": "complete",
         "candidate_count": 2,
