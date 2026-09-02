@@ -4,7 +4,6 @@ import json
 import sys
 
 import litellm
-import openai
 
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger

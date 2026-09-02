@@ -22,9 +22,9 @@ from pr_agent.algo import (
 )
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_helpers import (
-    _IncompleteStreamingResponseError,
     _get_azure_ad_token,
     _handle_streaming_response,
+    _IncompleteStreamingResponseError,
     _process_litellm_extra_body,
     _response_field,
 )
