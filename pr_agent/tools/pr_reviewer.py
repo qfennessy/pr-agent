@@ -370,14 +370,14 @@ class PRReviewer:
                     }
                     self._publish_structured_review_data({
                         "review": {"key_issues_to_review": []},
-                    })
+                    }, source_free=True)
                     if getattr(self, "_review_shadow_only", False):
                         get_settings().data = {"artifact": ""}
                     return None
                 if not self._prepare_frontier_adjudication_config():
                     self._publish_structured_review_data({
                         "review": {"key_issues_to_review": []},
-                    })
+                    }, source_free=True)
                     if getattr(self, "_review_shadow_only", False):
                         get_settings().data = {"artifact": ""}
                     get_logger().error(
@@ -2692,7 +2692,12 @@ class PRReviewer:
                     }
             get_logger().info("Candidate verification finished", artifact=telemetry_safe_artifact(artifact))
 
-    def _publish_structured_review_data(self, data: Mapping[str, Any]) -> None:
+    def _publish_structured_review_data(
+        self,
+        data: Mapping[str, Any],
+        *,
+        source_free: bool = False,
+    ) -> None:
         """Publish one isolated, provider-neutral review snapshot."""
 
         structured_publisher = getattr(self.git_provider, "publish_structured_review", None)
@@ -2714,8 +2719,14 @@ class PRReviewer:
         structured_data["usage"] = usage
         structured_data["metadata"] = {
             "review_profile": self._review_profile(),
-            "omitted_files": sorted(set(self.remaining_files_list)),
-            "deleted_files": sorted(set(getattr(self, "deleted_files_list", []))),
+            "omitted_files": (
+                [] if source_free else sorted(set(self.remaining_files_list))
+            ),
+            "deleted_files": (
+                []
+                if source_free
+                else sorted(set(getattr(self, "deleted_files_list", [])))
+            ),
         }
         if getattr(self, "candidate_verification_artifact", None) is not None:
             structured_data["candidate_verification"] = telemetry_safe_artifact(
@@ -2728,12 +2739,16 @@ class PRReviewer:
         if adjudication_runs:
             structured_data["adjudication_runs"] = adjudication_runs
         review_route_decision = getattr(self, "review_route_decision", None)
-        if review_route_decision is not None and review_route_decision.routing_enabled:
+        if (
+            not source_free
+            and review_route_decision is not None
+            and review_route_decision.routing_enabled
+        ):
             structured_data["metadata"]["review_route"] = review_route_decision_to_dict(
                 review_route_decision
             )
         specialist_shadow_result = getattr(self, "specialist_shadow_result", None)
-        if specialist_shadow_result is not None:
+        if not source_free and specialist_shadow_result is not None:
             structured_data["metadata"]["specialist_shadow"] = specialist_shadow_result.to_dict()
         structured_publisher(structured_data)
 

@@ -652,7 +652,7 @@ async def _run_sync_identity_refresh(current_identity: Callable[[], Any]) -> Any
     result_future = loop.create_future()
     context = contextvars.copy_context()
 
-    def complete(value: Any = None, error: BaseException | None = None) -> None:
+    def complete(value: Any = None, error: Exception | None = None) -> None:
         if result_future.done():
             return
         if error is not None:
@@ -663,7 +663,7 @@ async def _run_sync_identity_refresh(current_identity: Callable[[], Any]) -> Any
     def worker() -> None:
         try:
             value = context.run(current_identity)
-        except BaseException as exc:
+        except Exception as exc:
             completion = (None, exc)
         else:
             completion = (value, None)

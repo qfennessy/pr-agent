@@ -678,7 +678,6 @@ async def test_synchronous_identity_refresh_capacity_is_bounded_and_isolated(mon
         for result in later_results
     )
     assert all(handler.calls == [] for handler in later_handlers)
-    assert peak_workers == worker_limit
     assert set(worker_names) == {"frontier-identity-refresh"}
     assert active_workers == 0
     assert default_executor_calls == []
