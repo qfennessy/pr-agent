@@ -924,7 +924,7 @@ async def test_paid_failure_becomes_terminal_at_its_immutable_attempt_limit(tmp_
 
 
 @pytest.mark.asyncio
-async def test_paid_capacity_rechecks_actual_cumulative_spend_before_each_model_call(tmp_path):
+async def test_adapter_cost_above_its_hard_cap_is_rejected_and_left_unreconciled(tmp_path):
     snapshot, path, artifact_hash = _write_snapshot(tmp_path)
     manifest = _manifest(snapshot, artifact_hash)
     budgets = tuple(
@@ -964,14 +964,52 @@ async def test_paid_capacity_rechecks_actual_cumulative_spend_before_each_model_
         return adapter
 
     store = EvaluationArtifactStore(tmp_path / "cumulative-cap")
-    with pytest.raises(EvaluationValidationError, match="cumulative spend plus remaining hard-capped work"):
+    with pytest.raises(EvaluationValidationError, match="adapter exceeded its hard cost cap"):
         await _runner(manifest, path, _bindings(manifest, factory), store, request, decision).run()
 
     assert calls == [EvaluationArmKind.DETERMINISTIC, EvaluationArmKind.FULL_CASCADE]
-    assert {record.arm_id for record in store.load_records(manifest)} == {
-        "arm-deterministic",
-        "arm-full_cascade",
+    assert {record.arm_id for record in store.load_records(manifest)} == {"arm-deterministic"}
+    reservations = store.load_paid_attempt_reservations(manifest, request)
+    assert {(item.arm_id, item.attempt) for item in reservations} == {("arm-full_cascade", 1)}
+
+
+@pytest.mark.asyncio
+async def test_paid_adapter_exception_consumes_attempt_before_spending_and_blocks_resume(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+    store = EvaluationArtifactStore(tmp_path / "pre-call-reservation")
+    calls = []
+
+    def factory(arm):
+        async def adapter(loaded_snapshot, _context):
+            calls.append(arm.kind)
+            if arm.kind is EvaluationArmKind.GENERAL_REVIEW:
+                raise RuntimeError("provider failed after charging")
+            return _success(arm, loaded_snapshot)
+
+        return adapter
+
+    runner = _runner(manifest, path, _bindings(manifest, factory), store, request, decision)
+    with pytest.raises(RuntimeError, match="provider failed after charging"):
+        await runner.run()
+
+    reservations = store.load_paid_attempt_reservations(manifest, request)
+    recorded_attempts = {
+        (record.arm_id, record.attempt) for record in store.load_records(manifest)
     }
+    orphaned = [
+        (item.arm_id, item.attempt)
+        for item in reservations
+        if (item.arm_id, item.attempt) not in recorded_attempts
+    ]
+    assert orphaned == [("arm-general_review", 1)]
+    calls_before_resume = tuple(calls)
+
+    with pytest.raises(EvaluationValidationError, match="unreconciled attempt reservation"):
+        await runner.run()
+    assert tuple(calls) == calls_before_resume
+    assert calls.count(EvaluationArmKind.GENERAL_REVIEW) == 1
 
 
 @pytest.mark.asyncio

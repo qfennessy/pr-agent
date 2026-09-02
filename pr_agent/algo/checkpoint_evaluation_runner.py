@@ -306,7 +306,7 @@ class ProductionEvaluationRunner:
             arm.arm_id: preflight.bindings_by_kind[kind] for kind, arm in preflight.arms_by_kind.items()
         }
         records: list[EvaluationRunRecord] = []
-        for resume_item in self.artifact_store.resume_plan(self.manifest):
+        for resume_item in self.artifact_store.resume_plan(self.manifest, self.paid_request):
             item = resume_item.plan_item
             case = cases_by_id[item.case_id]
             arm = arms_by_id[item.arm_id]
@@ -351,6 +351,15 @@ class ProductionEvaluationRunner:
                     self.artifact_store,
                     self.paid_request,
                 )
+                if not self.artifact_store.reserve_paid_attempt(
+                    self.manifest,
+                    self.paid_request,
+                    item,
+                    resume_item.next_attempt,
+                ):
+                    raise EvaluationValidationError(
+                        f"pair {case.case_id}/{arm.arm_id} attempt is already reserved"
+                    )
             outcome = await adapter(snapshot, context)
             if not isinstance(outcome, ProductionArmResult):
                 raise EvaluationValidationError("production adapter returned an unsupported result type")
@@ -363,6 +372,15 @@ class ProductionEvaluationRunner:
                 binding.telemetry_shape,
                 attempt=resume_item.next_attempt,
             )
+            if (
+                paid_budget is not None
+                and record.cost_usd.status is MeasurementStatus.COMPLETE
+                and record.cost_usd.value is not None
+                and record.cost_usd.value > paid_budget.hard_cost_cap_per_attempt_usd
+            ):
+                raise EvaluationValidationError(
+                    f"pair {case.case_id}/{arm.arm_id} adapter exceeded its hard cost cap"
+                )
             if not record.terminal and max_attempts is not None and resume_item.next_attempt == max_attempts:
                 record = replace(record, terminal=True)
             self.artifact_store.append_record(self.manifest, record)

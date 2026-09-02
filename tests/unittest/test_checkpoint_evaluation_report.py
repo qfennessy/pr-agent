@@ -777,6 +777,19 @@ def test_more_than_the_exact_18_locked_holdout_cases_is_rejected(tmp_path):
         build_cocos_pilot_acceptance(manifest, _cocos_inventory(manifest))
 
 
+def test_canonical_corpus_requires_complete_intermediate_controls():
+    manifest = _manifest()
+    inventory = replace(
+        _cocos_inventory(manifest),
+        checkpoint_control_count=None,
+        checkpoint_controls_status="not_evaluable",
+        checkpoint_controls_hash=None,
+    )
+
+    with pytest.raises(EvaluationValidationError, match="15 to 20 complete checkpoint controls"):
+        build_cocos_pilot_acceptance(manifest, inventory)
+
+
 def test_partial_or_small_denominator_stays_not_evaluable(tmp_path, monkeypatch):
     records = _settled_candidates(99)
     manifest = _manifest()

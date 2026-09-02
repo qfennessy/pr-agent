@@ -353,6 +353,84 @@ class ResumePlanItem:
 
 
 @dataclass(frozen=True)
+class PaidAttemptReservation:
+    """Durable proof that one paid attempt number was consumed before its adapter ran."""
+
+    manifest_id: str
+    request_id: str
+    case_id: str
+    arm_id: str
+    snapshot_id: str
+    attempt: int
+    hard_cost_cap_usd: float
+    schema_version: str = EVALUATION_SCHEMA_VERSION
+    reservation_id: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.schema_version != EVALUATION_SCHEMA_VERSION:
+            raise EvaluationValidationError(
+                f"unsupported paid reservation schema_version: {self.schema_version}"
+            )
+        for name, value in (
+            ("manifest_id", self.manifest_id),
+            ("request_id", self.request_id),
+            ("snapshot_id", self.snapshot_id),
+        ):
+            if not isinstance(value, str) or not value.startswith("sha256:"):
+                raise EvaluationValidationError(f"paid reservation {name} must be a sha256 identity")
+        for name, value in (("case_id", self.case_id), ("arm_id", self.arm_id)):
+            if not isinstance(value, str) or not value.strip():
+                raise EvaluationValidationError(f"paid reservation {name} must be non-empty")
+        if not isinstance(self.attempt, int) or isinstance(self.attempt, bool) or self.attempt < 1:
+            raise EvaluationValidationError("paid reservation attempt must be a positive integer")
+        if (
+            not isinstance(self.hard_cost_cap_usd, (int, float))
+            or isinstance(self.hard_cost_cap_usd, bool)
+            or not math.isfinite(self.hard_cost_cap_usd)
+            or self.hard_cost_cap_usd <= 0
+        ):
+            raise EvaluationValidationError("paid reservation hard cost cap must be finite and positive")
+        object.__setattr__(self, "reservation_id", content_hash(self._identity_payload()))
+
+    def _identity_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "manifest_id": self.manifest_id,
+            "request_id": self.request_id,
+            "case_id": self.case_id,
+            "arm_id": self.arm_id,
+            "snapshot_id": self.snapshot_id,
+            "attempt": self.attempt,
+            "hard_cost_cap_usd": self.hard_cost_cap_usd,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self._identity_payload(), "reservation_id": self.reservation_id}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "PaidAttemptReservation":
+        allowed = {
+            "schema_version", "manifest_id", "request_id", "case_id", "arm_id", "snapshot_id",
+            "attempt", "hard_cost_cap_usd", "reservation_id",
+        }
+        if not isinstance(value, Mapping) or set(value) != allowed:
+            raise EvaluationValidationError("paid reservation fields are incomplete or unknown")
+        reservation = cls(
+            manifest_id=value["manifest_id"],
+            request_id=value["request_id"],
+            case_id=value["case_id"],
+            arm_id=value["arm_id"],
+            snapshot_id=value["snapshot_id"],
+            attempt=value["attempt"],
+            hard_cost_cap_usd=value["hard_cost_cap_usd"],
+            schema_version=value["schema_version"],
+        )
+        if value["reservation_id"] != reservation.reservation_id:
+            raise EvaluationValidationError("paid reservation identity does not match its content")
+        return reservation
+
+
+@dataclass(frozen=True)
 class EvaluationArtifactInventory:
     manifest_id: str
     manifest_artifact_hash: str
@@ -427,6 +505,8 @@ class EvaluationArtifactStore:
         _ensure_private_directory(self.root)
         self.records_path = self.root / "records"
         _ensure_private_directory(self.records_path)
+        self.reservations_path = self.root / "paid-attempt-reservations"
+        _ensure_private_directory(self.reservations_path)
 
     def bind_manifest(self, manifest: EvaluationManifest) -> bool:
         return _write_exclusive(self.root / "manifest.json", _canonical_bytes(manifest.to_dict()))
@@ -473,6 +553,82 @@ class EvaluationArtifactStore:
             self.records_path / f"{record.record_id.removeprefix('sha256:')}.json",
             _canonical_bytes(record.to_dict()),
         )
+
+    def reserve_paid_attempt(
+        self,
+        manifest: EvaluationManifest,
+        request: PaidExecutionRequest,
+        plan_item: EvaluationPlanItem,
+        attempt: int,
+    ) -> bool:
+        """Consume one paid attempt number durably before entering its adapter."""
+        budget = next(
+            (
+                item for item in request.plan_item_budgets
+                if item.case_id == plan_item.case_id and item.arm_id == plan_item.arm_id
+            ),
+            None,
+        )
+        if budget is None:
+            raise EvaluationValidationError("paid attempt has no immutable hard cost cap")
+        if attempt > budget.max_attempts:
+            raise EvaluationValidationError("paid attempt exceeds its immutable attempt limit")
+        cases = {case.case_id: case for case in manifest.cases}
+        if plan_item.case_id not in cases or request.manifest_id != manifest.manifest_id:
+            raise EvaluationValidationError("paid attempt does not belong to the immutable manifest")
+        reservation = PaidAttemptReservation(
+            manifest_id=manifest.manifest_id,
+            request_id=request.request_id,
+            case_id=plan_item.case_id,
+            arm_id=plan_item.arm_id,
+            snapshot_id=cases[plan_item.case_id].snapshot_id,
+            attempt=attempt,
+            hard_cost_cap_usd=budget.hard_cost_cap_per_attempt_usd,
+        )
+        return _write_exclusive(
+            self.reservations_path / f"{reservation.reservation_id.removeprefix('sha256:')}.json",
+            _canonical_bytes(reservation.to_dict()),
+        )
+
+    def load_paid_attempt_reservations(
+        self,
+        manifest: EvaluationManifest,
+        request: PaidExecutionRequest,
+    ) -> tuple[PaidAttemptReservation, ...]:
+        reservations: list[PaidAttemptReservation] = []
+        case_by_id = {case.case_id: case for case in manifest.cases}
+        budget_by_pair = {
+            (budget.case_id, budget.arm_id): budget for budget in request.plan_item_budgets
+        }
+        for path in sorted(self.reservations_path.iterdir()):
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or path.suffix != ".json":
+                raise EvaluationValidationError(f"unexpected paid reservation artifact: {path.name}")
+            if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+                raise EvaluationValidationError(f"paid reservation artifact is not private: {path.name}")
+            try:
+                reservation = PaidAttemptReservation.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise EvaluationValidationError(f"invalid paid reservation artifact: {path.name}") from exc
+            expected_name = f"{reservation.reservation_id.removeprefix('sha256:')}.json"
+            if path.name != expected_name:
+                raise EvaluationValidationError("paid reservation filename does not match content")
+            budget = budget_by_pair.get((reservation.case_id, reservation.arm_id))
+            if (
+                reservation.manifest_id != manifest.manifest_id
+                or reservation.request_id != request.request_id
+                or budget is None
+                or reservation.case_id not in case_by_id
+                or reservation.snapshot_id != case_by_id[reservation.case_id].snapshot_id
+                or reservation.hard_cost_cap_usd != budget.hard_cost_cap_per_attempt_usd
+                or reservation.attempt > budget.max_attempts
+            ):
+                raise EvaluationValidationError("paid reservation does not match its immutable authorization")
+            reservations.append(reservation)
+        keys = [(item.case_id, item.arm_id, item.attempt) for item in reservations]
+        if len(keys) != len(set(keys)):
+            raise EvaluationValidationError("paid reservation store contains duplicate attempt numbers")
+        return tuple(sorted(reservations, key=lambda item: (item.case_id, item.arm_id, item.attempt)))
 
     def load_records(self, manifest: EvaluationManifest) -> tuple[EvaluationRunRecord, ...]:
         self.bind_manifest(manifest)
@@ -532,14 +688,34 @@ class EvaluationArtifactStore:
             if terminal_positions and terminal_positions[0] != len(ordered) - 1:
                 raise EvaluationValidationError(f"artifact store has attempts after a terminal record for pair {pair}")
 
-    def resume_plan(self, manifest: EvaluationManifest) -> tuple[ResumePlanItem, ...]:
+    def resume_plan(
+        self,
+        manifest: EvaluationManifest,
+        paid_request: Optional[PaidExecutionRequest] = None,
+    ) -> tuple[ResumePlanItem, ...]:
         records = self.load_records(manifest)
+        reservations = (
+            self.load_paid_attempt_reservations(manifest, paid_request)
+            if paid_request is not None
+            else ()
+        )
+        if paid_request is None and any(self.reservations_path.iterdir()):
+            raise EvaluationValidationError("paid reservations require their immutable authorization")
         by_pair: dict[tuple[str, str], list[EvaluationRunRecord]] = {}
         for record in records:
             by_pair.setdefault((record.case_id, record.arm_id), []).append(record)
+        reservations_by_pair: dict[tuple[str, str], list[PaidAttemptReservation]] = {}
+        for reservation in reservations:
+            reservations_by_pair.setdefault((reservation.case_id, reservation.arm_id), []).append(reservation)
         items: list[ResumePlanItem] = []
         for plan_item in build_evaluation_plan(manifest).items:
             retained = sorted(by_pair.get((plan_item.case_id, plan_item.arm_id), ()), key=lambda item: item.attempt)
+            reserved = reservations_by_pair.get((plan_item.case_id, plan_item.arm_id), ())
+            retained_attempts = {record.attempt for record in retained}
+            if any(reservation.attempt not in retained_attempts for reservation in reserved):
+                raise EvaluationValidationError(
+                    f"paid pair {plan_item.case_id}/{plan_item.arm_id} has an unreconciled attempt reservation"
+                )
             if any(record.terminal for record in retained):
                 continue
             items.append(ResumePlanItem(

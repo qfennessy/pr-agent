@@ -383,8 +383,16 @@ def _validate_canonical_cocos_inventory(inventory: CocosCorpusInventory) -> None
         raise EvaluationValidationError("pilot corpus inventory does not use the canonical Cocos lock")
     if dict(inventory.cohort_counts) != _CANONICAL_COCOS_COHORT_COUNTS:
         raise EvaluationValidationError("pilot corpus inventory does not match the canonical Cocos cohort counts")
-    if inventory.checkpoint_controls_hash is not None:
-        _validate_hash("Cocos checkpoint_controls_hash", inventory.checkpoint_controls_hash)
+    if (
+        inventory.checkpoint_controls_status != "complete"
+        or inventory.checkpoint_control_count is None
+        or not 15 <= inventory.checkpoint_control_count <= 20
+        or inventory.checkpoint_controls_hash is None
+    ):
+        raise EvaluationValidationError(
+            "pilot corpus inventory requires 15 to 20 complete checkpoint controls"
+        )
+    _validate_hash("Cocos checkpoint_controls_hash", inventory.checkpoint_controls_hash)
 
 
 def build_cocos_pilot_acceptance(

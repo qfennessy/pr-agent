@@ -146,6 +146,10 @@ therefore cannot authorize spending. A caller must invoke
 `PaidExecutionDecision.require_authorized()` immediately before entering production
 orchestration; planning alone is not authorization.
 
+Before a paid adapter starts, the artifact store exclusively persists its attempt number
+and hard-cap reservation. A crash, raised adapter exception, or rejected result leaves an
+unreconciled reservation that blocks resume instead of repeating a possibly charged call.
+
 ## Resumable raw attempt artifacts
 
 `EvaluationArtifactStore` writes one content-addressed JSON file per attempt with private
@@ -359,6 +363,8 @@ commit, staged checkpoints, and stale-candidate withdrawal lineages. The adapter
 source-bearing or unknown fields and final clean PR heads as substitutes, and includes the
 control artifact hash in the pilot corpus identity. Its file, corpus root, and every supplied
 parent component must be real directories/files rather than symlinks. The evaluation manifest
+cannot receive a canonical Cocos binding when this control inventory is absent, incomplete,
+outside the 15–20 range, or missing its validated hash.
 must bind that exact resulting corpus identity. Until the ledger is supplied, its status is
 `not_evaluable`.
 
