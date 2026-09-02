@@ -213,7 +213,9 @@ def test_workflow_runs_only_the_protected_base_verifier() -> None:
     workflow = _read_source_contract(".github/workflows/upstream-provenance.yml")
     assert "pull_request_target:" in workflow
     assert "permissions:\n  contents: read" in workflow
-    assert "ref: ${{ github.event.pull_request.base.sha }}" in workflow
+    assert "ref: ${{ github.sha }}" in workflow
+    assert "BASE_SHA: ${{ github.sha }}" in workflow
+    assert "github.event.pull_request.base.sha" not in workflow
     assert "python -m pr_agent.upstream_provenance" in workflow
     assert "persist-credentials: false" in workflow
 
