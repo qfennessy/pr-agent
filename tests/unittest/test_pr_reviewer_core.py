@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import threading
 from dataclasses import replace
 from types import SimpleNamespace
@@ -1539,16 +1540,29 @@ async def test_frontier_without_verification_publishes_one_source_free_preflight
 ):
     from pr_agent.tools import pr_reviewer as pr_reviewer_module
 
+    sensitive_changed_path = "src/private/PRIVATE_TOKEN_ISSUER.py"
+    sensitive_omitted_path = "src/private/OMITTED_PRIVATE_TOKEN.py"
+    sensitive_deleted_path = "src/private/DELETED_PRIVATE_TOKEN.py"
+    sensitive_source = "PRIVATE_SOURCE_TEXT"
+    sensitive_object = "PrivateTokenIssuer"
     provider = MagicMock()
-    provider.get_files.return_value = ["src/PRIVATE_SERVICE.py"]
-    provider.get_diff_files.return_value = [_route_file("src/PRIVATE_SERVICE.py")]
+    provider.get_files.return_value = [sensitive_changed_path]
+    provider.get_diff_files.return_value = [_route_file(sensitive_changed_path)]
+    provider.get_pr_labels.return_value = []
     reviewer = _make_prediction_reviewer(provider)
     reviewer.review_profile = "full"
-    reviewer.vars = {"private_source": "PRIVATE_SOURCE_TEXT"}
-    reviewer.review_routing_configuration = load_review_routing_configuration(
-        {"enabled": False}
+    reviewer.vars = {
+        "private_source": sensitive_source,
+        "private_object": sensitive_object,
+    }
+    reviewer.remaining_files_list = [sensitive_omitted_path]
+    reviewer.deleted_files_list = [sensitive_deleted_path]
+    reviewer.review_routing_configuration = _routing_configuration(
+        sensitive_categories=({
+            "name": "private_auth",
+            "path_patterns": ["src/private/**"],
+        },)
     )
-    reviewer._prepare_review_route = MagicMock()
     reviewer._review_shadow_only = False
     reviewer._prepare_pr_review = MagicMock(return_value="must not render")
     reviewer._run_candidate_verification = AsyncMock()
@@ -1593,8 +1607,19 @@ async def test_frontier_without_verification_publishes_one_source_free_preflight
         "frontier_adjudication": failure,
     })
     structured = provider.publish_structured_review.call_args.args[0]
-    assert "PRIVATE_SOURCE_TEXT" not in repr(structured)
-    assert "PRIVATE_SERVICE" not in repr(structured)
+    serialized_route = json.dumps(review_route_decision_to_dict(
+        reviewer.review_route_decision
+    ))
+    assert sensitive_changed_path in serialized_route
+    serialized = json.dumps(structured)
+    for private_value in (
+        sensitive_changed_path,
+        sensitive_omitted_path,
+        sensitive_deleted_path,
+        sensitive_source,
+        sensitive_object,
+    ):
+        assert private_value not in serialized
     retry.assert_not_awaited()
     extract_tickets.assert_not_awaited()
     reviewer._run_candidate_verification.assert_not_awaited()
@@ -1699,17 +1724,30 @@ async def test_invalid_frontier_preflight_publishes_one_source_free_failure_arti
 ):
     from pr_agent.tools import pr_reviewer as pr_reviewer_module
 
+    sensitive_changed_path = "src/private/PRIVATE_TOKEN_ISSUER.py"
+    sensitive_omitted_path = "src/private/OMITTED_PRIVATE_TOKEN.py"
+    sensitive_deleted_path = "src/private/DELETED_PRIVATE_TOKEN.py"
+    sensitive_source = "PRIVATE_SOURCE_TEXT"
+    sensitive_object = "PrivateTokenIssuer"
     provider = MagicMock()
-    provider.get_files.return_value = ["src/PRIVATE_SERVICE.py"]
-    provider.get_diff_files.return_value = [_route_file("src/PRIVATE_SERVICE.py")]
+    provider.get_files.return_value = [sensitive_changed_path]
+    provider.get_diff_files.return_value = [_route_file(sensitive_changed_path)]
+    provider.get_pr_labels.return_value = []
     reviewer = _make_prediction_reviewer(provider)
     reviewer.review_profile = "full"
-    reviewer.vars = {"private_source": "PRIVATE_SOURCE_TEXT"}
-    reviewer.review_routing_configuration = load_review_routing_configuration(
-        {"enabled": False}
+    reviewer.vars = {
+        "private_source": sensitive_source,
+        "private_object": sensitive_object,
+    }
+    reviewer.remaining_files_list = [sensitive_omitted_path]
+    reviewer.deleted_files_list = [sensitive_deleted_path]
+    reviewer.review_routing_configuration = _routing_configuration(
+        sensitive_categories=({
+            "name": "private_auth",
+            "path_patterns": ["src/private/**"],
+        },)
     )
     reviewer.ai_handler = SimpleNamespace(azure=False, chat_completion=AsyncMock())
-    reviewer._prepare_review_route = MagicMock()
     reviewer._review_shadow_only = False
     reviewer._prepare_pr_review = MagicMock(return_value="must not render")
     reviewer._run_guarded_specialist_escalation = AsyncMock()
@@ -1773,8 +1811,19 @@ async def test_invalid_frontier_preflight_publishes_one_source_free_failure_arti
         "frontier_adjudication": failure,
     })
     structured = provider.publish_structured_review.call_args.args[0]
-    assert "PRIVATE_SOURCE_TEXT" not in repr(structured)
-    assert "PRIVATE_SERVICE" not in repr(structured)
+    serialized_route = json.dumps(review_route_decision_to_dict(
+        reviewer.review_route_decision
+    ))
+    assert sensitive_changed_path in serialized_route
+    serialized = json.dumps(structured)
+    for private_value in (
+        sensitive_changed_path,
+        sensitive_omitted_path,
+        sensitive_deleted_path,
+        sensitive_source,
+        sensitive_object,
+    ):
+        assert private_value not in serialized
     retry.assert_not_awaited()
     extract_tickets.assert_not_awaited()
     reviewer._run_guarded_specialist_escalation.assert_not_awaited()
