@@ -14,7 +14,7 @@ def test_help_docs_is_not_registered():
 @pytest.mark.asyncio
 async def test_help_docs_command_is_not_routed(monkeypatch):
     """An incoming /help_docs command resolves to an unknown command and is rejected."""
-    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url: None)
+    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url, **kwargs: None)
     monkeypatch.setattr(pr_agent_module.CliArgs, "validate_user_args", lambda args: (True, ""))
     monkeypatch.setattr(pr_agent_module, "update_settings_from_args", lambda args: args)
 

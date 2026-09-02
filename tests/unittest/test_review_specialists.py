@@ -509,6 +509,12 @@ def test_repository_configuration_is_default_off_and_loads_three_versioned_roles
     try:
         assert specialists_enabled() is False
         settings.set("specialist_pipeline.enabled", True)
+        assert specialists_enabled() is True
+        settings.set("specialist_pipeline.enabled", "true")
+        assert specialists_enabled() is True
+        settings.set("specialist_pipeline.enabled", "false")
+        assert specialists_enabled() is False
+        settings.set("specialist_pipeline.enabled", True)
         pipeline = load_specialist_pipeline_config()
         assert [config.role for config in pipeline.roles] == list(SpecialistRole)
         assert all(pipeline.prompt(role).prompt_version.endswith("-v2") for role in SpecialistRole)

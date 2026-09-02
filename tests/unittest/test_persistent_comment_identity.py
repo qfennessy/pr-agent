@@ -10,13 +10,15 @@ import pytest
 
 from pr_agent.algo.utils import PRReviewIdentity, add_pr_review_identity
 from pr_agent.config_loader import get_settings
+from pr_agent.git_providers.git_provider import (
+    PERSISTENT_COMMENT_ID_MARKER,
+    GitProvider,
+    attach_persistent_comment_id,
+    get_persistent_comment_id,
+    is_own_persistent_comment,
+    is_own_persistent_comment_for_identities,
+)
 from pr_agent.git_providers.github_provider import GithubProvider
-from pr_agent.git_providers.git_provider import (PERSISTENT_COMMENT_ID_MARKER,
-                                                 GitProvider,
-                                                 attach_persistent_comment_id,
-                                                 get_persistent_comment_id,
-                                                 is_own_persistent_comment,
-                                                 is_own_persistent_comment_for_identities)
 
 HEADER = "## PR Reviewer Guide 🔍"
 
@@ -263,6 +265,28 @@ def test_tool_and_reviewer_identities_both_scope_comment_ownership(comment_id):
 
     comment_id("deepseek")
     assert is_own_persistent_comment_for_identities(marked, (PRReviewIdentity.REGULAR.value,)) is False
+
+
+def test_full_review_does_not_adopt_bugs_only_persistent_comment(comment_id):
+    comment_id("")
+    bugs_only_review = add_pr_review_identity(
+        f"{HEADER}\nbugs-only finding",
+        PRReviewIdentity.BUGS_ONLY.value,
+    )
+    provider = FakeProvider(existing=[bugs_only_review])
+
+    provider.publish_persistent_comment_full(
+        f"{HEADER}\nfull review",
+        initial_header=HEADER,
+        identity_marker=PRReviewIdentity.REGULAR.value,
+        legacy_initial_header=HEADER,
+        final_update_message=False,
+    )
+
+    assert len(provider.existing) == 2
+    assert provider.existing[0].body == bugs_only_review
+    assert PRReviewIdentity.REGULAR.value in provider.existing[1].body
+    assert provider.edited == []
 
 
 def test_github_unidentified_run_skips_identified_previous_review(comment_id):

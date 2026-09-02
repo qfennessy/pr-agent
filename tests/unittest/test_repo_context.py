@@ -6,8 +6,11 @@ from jinja2 import Environment, StrictUndefined, select_autoescape
 
 from pr_agent.algo import repo_context
 from pr_agent.algo.repo_context import (
-    TRUNCATION_MARKER, build_repo_context, render_instruction_files,
-    render_instruction_files_with_line_budget)
+    TRUNCATION_MARKER,
+    build_repo_context,
+    render_instruction_files,
+    render_instruction_files_with_line_budget,
+)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.git_providers.github_provider import GithubProvider
@@ -592,6 +595,9 @@ def test_github_provider_reads_from_default_branch_when_requested():
                 "require_security_review": True,
                 "require_todo_scan": False,
                 "require_estimate_effort_to_review": True,
+                "require_risk_assessment": False,
+                "require_merge_recommendation": False,
+                "require_priority_files": False,
                 "num_max_findings": 3,
                 "publication_threshold": "none",
                 "num_pr_files": 1,
@@ -669,6 +675,9 @@ def test_bugs_only_review_prompt_renders_ci_failure_evidence_contract():
         "require_security_review": False,
         "require_todo_scan": False,
         "require_estimate_effort_to_review": False,
+        "require_risk_assessment": False,
+        "require_merge_recommendation": False,
+        "require_priority_files": False,
         "num_max_findings": 3,
         "publication_threshold": "none",
         "num_pr_files": 1,

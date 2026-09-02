@@ -10,17 +10,17 @@ from typing import Callable, List, Tuple
 from github import RateLimitExceededException
 
 from pr_agent.algo.ai_request_context import AIModelRoute, use_ai_request_options
-from pr_agent.algo.file_filter import filter_ignored
 from pr_agent.algo.git_patch_processing import (
-    decouple_and_convert_to_hunks_with_lines_numbers, extend_patch,
-    handle_patch_deletions)
+    decouple_and_convert_to_hunks_with_lines_numbers,
+    extend_patch,
+    handle_patch_deletions,
+)
 from pr_agent.algo.language_handler import sort_files_by_main_languages
 from pr_agent.algo.run_details import record_model_used, record_specialist_model_attempt
 from pr_agent.algo.token_handler import TokenHandler
-from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
-from pr_agent.algo.utils import (ModelType, clip_tokens, get_max_tokens,
-                                 get_model)
-from pr_agent.config_loader import get_settings
+from pr_agent.algo.types import EDIT_TYPE
+from pr_agent.algo.utils import ModelType, clip_tokens, get_max_tokens, get_model
+from pr_agent.config_loader import get_settings, get_verbosity_level
 from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.log import get_logger
 
@@ -483,7 +483,7 @@ def generate_full_patch(convert_hunks_to_line_numbers, file_dict, max_tokens_mod
             # Current logic is to skip the patch if it's too large
             # TODO: Option for alternative logic to remove hunks from the patch to reduce the number of tokens
             #  until we meet the requirements
-            if get_settings().config.verbosity_level >= 2:
+            if get_verbosity_level() >= 2:
                 get_logger().warning(f"Patch too large, skipping it: '{filename}'")
             remaining_files_list_new.append(filename)
             continue
@@ -494,7 +494,7 @@ def generate_full_patch(convert_hunks_to_line_numbers, file_dict, max_tokens_mod
         else:
             total_tokens = candidate_total_tokens
         files_in_patch_list.append(filename)
-        if get_settings().config.verbosity_level >= 2:
+        if get_verbosity_level() >= 2:
             get_logger().info(f"Tokens: {total_tokens}, last filename: {filename}")
     return total_tokens, patches, remaining_files_list_new, files_in_patch_list
 
@@ -539,8 +539,12 @@ async def retry_with_fallback_models(
                     result = await f(model)
             else:
                 # Preserve the legacy route exactly while the specialist pipeline is off.
+                original_deployment_id = get_settings().get("openai.deployment_id", None)
                 get_settings().set("openai.deployment_id", deployment_id)
-                result = await f(model)
+                try:
+                    result = await f(model)
+                finally:
+                    get_settings().set("openai.deployment_id", original_deployment_id)
         except Exception as e:
             elapsed = round(time.monotonic() - started_at, 1)
             attempt = {
@@ -577,7 +581,6 @@ async def retry_with_fallback_models(
                 deployment_id=deployment_id,
             )
             return result
-
     raise RuntimeError("Model route exhausted without returning or raising an error")
 
 
@@ -723,7 +726,7 @@ def get_pr_multi_diffs(git_provider: GitProvider,
     call_number = 1
     for file in sorted_files:
         if call_number > max_calls:
-            if get_settings().config.verbosity_level >= 2:
+            if get_verbosity_level() >= 2:
                 get_logger().info(f"Reached max calls ({max_calls})")
             break
 
@@ -776,16 +779,16 @@ def get_pr_multi_diffs(git_provider: GitProvider,
             total_tokens = token_handler.prompt_tokens
             call_number += 1
             if call_number > max_calls: # avoid creating new patches
-                if get_settings().config.verbosity_level >= 2:
+                if get_verbosity_level() >= 2:
                     get_logger().info(f"Reached max calls ({max_calls})")
                 break
-            if get_settings().config.verbosity_level >= 2:
+            if get_verbosity_level() >= 2:
                 get_logger().info(f"Call number: {call_number}")
 
         if patch:
             patches.append(patch)
             total_tokens += new_patch_tokens
-            if get_settings().config.verbosity_level >= 2:
+            if get_verbosity_level() >= 2:
                 get_logger().info(f"Tokens: {total_tokens}, last filename: {file.filename}")
 
     # Add the last chunk
@@ -802,7 +805,7 @@ def add_ai_metadata_to_diff_files(git_provider, pr_description_files):
     """
     try:
         if not pr_description_files:
-            get_logger().warning(f"PR description files are empty.")
+            get_logger().warning("PR description files are empty.")
             return
         available_files = {pr_file['full_file_name'].strip(): pr_file for pr_file in pr_description_files}
         diff_files = git_provider.get_diff_files()
@@ -813,7 +816,7 @@ def add_ai_metadata_to_diff_files(git_provider, pr_description_files):
                 file.ai_file_summary = available_files[filename]
                 found_any_match = True
         if not found_any_match:
-            get_logger().error(f"Failed to find any matching files between PR description and diff files.",
+            get_logger().error("Failed to find any matching files between PR description and diff files.",
                                artifact={"pr_description_files": pr_description_files})
     except Exception as e:
         get_logger().error(f"Failed to add AI metadata to diff files: {e}",
