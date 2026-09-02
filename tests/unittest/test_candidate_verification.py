@@ -1856,7 +1856,7 @@ async def test_retrieval_shares_identical_required_context_across_candidates():
                 relevant_file="src/second_caller.py",
                 root_cause="second caller trusts the shared helper",
                 context_files=["src/helper.py"],
-                context_symbols=["missing_local_symbol", "shared_helper"],
+                context_symbols=["current_behavior", "shared_helper"],
             ),
         ),
         [first_diff, second_diff],
@@ -1923,6 +1923,324 @@ async def test_retrieval_shares_identical_required_context_across_candidates():
 
 
 @pytest.mark.asyncio
+async def test_partial_shared_context_compacts_matched_symbol_before_appending_distant_symbol():
+    provider = MagicMock()
+    helper_lines = [f"helper line {line}" for line in range(1, 101)]
+    helper_lines[4] = "def symbol_a(): return first_contract"
+    helper_lines[94] = "def symbol_b(): return distant_contract"
+    provider.get_repo_file_content.return_value = "\n".join(helper_lines)
+    first_diff = _diff_file("src/first_caller.py")
+    second_diff = _diff_file("src/second_caller.py")
+    candidates, _ = prepare_candidates(
+        _review_data(
+            _candidate(
+                relevant_file="src/first_caller.py",
+                root_cause="first caller depends on symbol A",
+                context_files=["src/helper.py"],
+                context_symbols=["symbol_a"],
+            ),
+            _candidate(
+                relevant_file="src/second_caller.py",
+                root_cause="second caller combines distant symbols A and B",
+                context_files=["src/helper.py"],
+                context_symbols=["symbol_a", "symbol_b"],
+            ),
+        ),
+        [first_diff, second_diff],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=1,
+            max_lines_per_file=5,
+            max_total_lines=15,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[first_diff, second_diff],
+    )
+
+    helper_evidence = [item for item in evidence if item["path"] == "src/helper.py"]
+    helper_requests = [
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/helper.py"
+    ]
+    expected_evidence_id = candidate_verification._retrieval_evidence_id(
+        "candidate-1", "src/helper.py", "repository_file"
+    )
+    symbol_a_evidence = next(
+        item for item in helper_evidence if "symbol_a" in item["content"]
+    )
+    symbol_b_evidence = next(
+        item for item in helper_evidence if "symbol_b" in item["content"]
+    )
+
+    provider.get_repo_file_content.assert_called_once_with("src/helper.py", False)
+    assert artifact["files_read"] == 1
+    assert len(helper_evidence) == 2
+    assert {item["evidence_id"] for item in helper_evidence} == {
+        expected_evidence_id
+    }
+    assert symbol_a_evidence["candidate_ids"] == ["candidate-1", "candidate-2"]
+    assert symbol_a_evidence["content"] == helper_lines[4]
+    assert (symbol_a_evidence["start_line"], symbol_a_evidence["end_line"]) == (5, 5)
+    assert symbol_a_evidence["content_truncated"] is True
+    assert symbol_b_evidence["candidate_id"] == "candidate-2"
+    assert (symbol_b_evidence["start_line"], symbol_b_evidence["end_line"]) == (93, 96)
+    assert sum(item["content"].count("\n") + 1 for item in helper_evidence) == 5
+    assert artifact["lines_retrieved"] == 15
+    assert [request["status"] for request in helper_requests] == ["retrieved", "retrieved"]
+    assert [request["evidence_id"] for request in helper_requests] == [
+        expected_evidence_id,
+        expected_evidence_id,
+    ]
+    assert helper_requests[0]["excerpt_count"] == 1
+    assert (helper_requests[0]["start_line"], helper_requests[0]["end_line"]) == (5, 5)
+    assert helper_requests[1]["excerpt_count"] == 2
+    assert helper_requests[1]["excerpt_ranges"] == [
+        {"start_line": 5, "end_line": 5},
+        {"start_line": 93, "end_line": 96},
+    ]
+    assert [request["_required_context_symbols"] for request in helper_requests] == [
+        ["symbol_a"],
+        ["symbol_a", "symbol_b"],
+    ]
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"]) == {
+        "status": "complete",
+        "candidate_count": 2,
+        "complete_candidate_count": 2,
+        "missing_changed_candidate_count": 0,
+        "missing_required_request_count": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_shared_context_does_not_claim_incidental_line_removed_by_compaction():
+    provider = MagicMock()
+    helper_lines = [f"helper line {line}" for line in range(1, 101)]
+    helper_lines[4] = "def symbol_a(): return first_contract"
+    helper_lines[6] = "def symbol_b(): return nearby_contract"
+    helper_lines[94] = "def symbol_c(): return distant_contract"
+    provider.get_repo_file_content.return_value = "\n".join(helper_lines)
+    first_diff = _diff_file("src/first_caller.py")
+    second_diff = _diff_file("src/second_caller.py")
+    candidates, _ = prepare_candidates(
+        _review_data(
+            _candidate(
+                relevant_file="src/first_caller.py",
+                root_cause="first caller depends on symbol A",
+                context_files=["src/helper.py"],
+                context_symbols=["symbol_a"],
+            ),
+            _candidate(
+                relevant_file="src/second_caller.py",
+                root_cause="second caller combines symbols B and C",
+                context_files=["src/helper.py"],
+                context_symbols=["symbol_b", "symbol_c"],
+            ),
+        ),
+        [first_diff, second_diff],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=1,
+            max_lines_per_file=6,
+            max_total_lines=18,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[first_diff, second_diff],
+    )
+
+    helper_evidence = [item for item in evidence if item["path"] == "src/helper.py"]
+    helper_requests = [
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/helper.py"
+    ]
+
+    provider.get_repo_file_content.assert_called_once_with("src/helper.py", False)
+    assert len(helper_evidence) == 3
+    assert helper_evidence[0]["content"] == helper_lines[4]
+    assert any("symbol_b" in item["content"] for item in helper_evidence[1:])
+    assert any("symbol_c" in item["content"] for item in helper_evidence[1:])
+    assert [request["status"] for request in helper_requests] == ["retrieved", "retrieved"]
+    assert helper_requests[1]["_required_context_symbols"] == ["symbol_b", "symbol_c"]
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"]) == {
+        "status": "complete",
+        "candidate_count": 2,
+        "complete_candidate_count": 2,
+        "missing_changed_candidate_count": 0,
+        "missing_required_request_count": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_zero_overlap_shared_context_compacts_before_retrieving_second_symbol():
+    provider = MagicMock()
+    helper_lines = [f"helper line {line}" for line in range(1, 101)]
+    helper_lines[9] = "def symbol_a(): return first_contract"
+    helper_lines[89] = "def symbol_b(): return second_contract"
+    provider.get_repo_file_content.return_value = "\n".join(helper_lines)
+    first_diff = _diff_file("src/first_caller.py")
+    second_diff = _diff_file("src/second_caller.py")
+    candidates, _ = prepare_candidates(
+        _review_data(
+            _candidate(
+                relevant_file="src/first_caller.py",
+                root_cause="first caller depends on symbol A",
+                context_files=["src/helper.py"],
+                context_symbols=["symbol_a"],
+            ),
+            _candidate(
+                relevant_file="src/second_caller.py",
+                root_cause="second caller depends on symbol B",
+                context_files=["src/helper.py"],
+                context_symbols=["symbol_b"],
+            ),
+        ),
+        [first_diff, second_diff],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=1,
+            max_lines_per_file=2,
+            max_total_lines=10,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[first_diff, second_diff],
+    )
+
+    helper_evidence = [item for item in evidence if item["path"] == "src/helper.py"]
+    helper_requests = [
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/helper.py"
+    ]
+    symbol_a_evidence = next(
+        item for item in helper_evidence if "symbol_a" in item["content"]
+    )
+    symbol_b_evidence = next(
+        item for item in helper_evidence if "symbol_b" in item["content"]
+    )
+
+    provider.get_repo_file_content.assert_called_once_with("src/helper.py", False)
+    assert len(helper_evidence) == 2
+    assert symbol_a_evidence["candidate_id"] == "candidate-1"
+    assert "candidate_ids" not in symbol_a_evidence
+    assert symbol_a_evidence["content"] == helper_lines[9]
+    assert symbol_b_evidence["candidate_id"] == "candidate-2"
+    assert symbol_b_evidence["content"] == helper_lines[89]
+    assert [request["status"] for request in helper_requests] == ["retrieved", "retrieved"]
+    assert [request["excerpt_count"] for request in helper_requests] == [1, 1]
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"]) == {
+        "status": "complete",
+        "candidate_count": 2,
+        "complete_candidate_count": 2,
+        "missing_changed_candidate_count": 0,
+        "missing_required_request_count": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_shared_context_reuses_exact_evidence_after_per_candidate_symbol_claims():
+    provider = MagicMock()
+    provider.get_repo_file_content.side_effect = lambda path, _: {
+        "src/first_helper.py": "first prelude\ndef symbol_x(): pass\nfirst tail",
+        "src/second_helper.py": "second prelude\ndef symbol_x(): pass\nsecond tail",
+        "src/shared_helper.py": "shared prelude\ndef symbol_y(): pass\nshared tail",
+    }[path]
+    first_diff = _diff_file("src/first_caller.py")
+    second_diff = _diff_file("src/second_caller.py")
+    candidates, _ = prepare_candidates(
+        _review_data(
+            _candidate(
+                relevant_file="src/first_caller.py",
+                root_cause="first caller combines both contracts",
+                context_files=["src/first_helper.py", "src/shared_helper.py"],
+                context_symbols=["symbol_x", "symbol_y"],
+            ),
+            _candidate(
+                relevant_file="src/second_caller.py",
+                root_cause="second caller combines both contracts",
+                context_files=["src/second_helper.py", "src/shared_helper.py"],
+                context_symbols=["symbol_x", "symbol_y"],
+            ),
+        ),
+        [first_diff, second_diff],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=3,
+            max_lines_per_file=4,
+            max_total_lines=20,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[first_diff, second_diff],
+    )
+
+    shared_requests = [
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/shared_helper.py"
+    ]
+    expected_evidence_id = candidate_verification._retrieval_evidence_id(
+        "candidate-1", "src/shared_helper.py", "repository_file"
+    )
+    shared_evidence = [
+        item for item in evidence if item.get("path") == "src/shared_helper.py"
+    ]
+    coverage = prompt_evidence_coverage(candidates, evidence, artifact["requests"])
+
+    assert artifact["files_read"] == 3
+    assert [request["status"] for request in shared_requests] == ["retrieved", "retrieved"]
+    assert [request["evidence_id"] for request in shared_requests] == [
+        expected_evidence_id,
+        expected_evidence_id,
+    ]
+    assert [request["_required_context_symbols"] for request in shared_requests] == [
+        ["symbol_y"],
+        ["symbol_y"],
+    ]
+    assert len(shared_evidence) == 1
+    assert shared_evidence[0]["candidate_ids"] == ["candidate-1", "candidate-2"]
+    assert "symbol_y" in shared_evidence[0]["content"]
+    assert coverage == {
+        "status": "complete",
+        "candidate_count": 2,
+        "complete_candidate_count": 2,
+        "missing_changed_candidate_count": 0,
+        "missing_required_request_count": 0,
+    }
+    assert sum(
+        call.args == ("src/shared_helper.py", False)
+        for call in provider.get_repo_file_content.call_args_list
+    ) == 1
+
+
+@pytest.mark.asyncio
 async def test_retrieval_shares_token_clipped_context_by_resolved_anchor():
     provider = MagicMock()
     helper_lines = [f"helper line {line}" for line in range(1, 201)]
@@ -1942,7 +2260,7 @@ async def test_retrieval_shares_token_clipped_context_by_resolved_anchor():
                 relevant_file="src/second_caller.py",
                 root_cause="second caller trusts the shared helper",
                 context_files=["src/helper.py"],
-                context_symbols=["missing_local_symbol", "shared_helper"],
+                context_symbols=["current_behavior", "shared_helper"],
             ),
         ),
         [first_diff, second_diff],
@@ -2206,7 +2524,7 @@ async def test_static_evidence_obeys_per_file_and_total_line_budgets():
 async def test_changed_head_satisfies_same_path_request_without_double_line_budget():
     diff_file = _diff_file(head_file="\n".join(f"line {line}" for line in range(1, 16)))
     candidates, _ = prepare_candidates(
-        _review_data(_candidate(context_files=[])), [diff_file], [], 3
+        _review_data(_candidate(context_files=[], context_symbols=[])), [diff_file], [], 3
     )
     provider = MagicMock()
 
@@ -2234,9 +2552,9 @@ async def test_same_file_candidates_reserve_changed_patch_evidence_before_shared
     )
     candidates, _ = prepare_candidates(
         _review_data(
-            _candidate(context_files=[], root_cause="first"),
+            _candidate(context_files=[], context_symbols=[], root_cause="first"),
             _candidate(
-                context_files=[], root_cause="second", start_line=200, end_line=200
+                context_files=[], context_symbols=[], root_cause="second", start_line=200, end_line=200
             ),
         ),
         [diff_file],
@@ -2271,6 +2589,100 @@ async def test_same_file_candidates_reserve_changed_patch_evidence_before_shared
     ]
     assert len(findings) == 2
     assert [decision["verdict"] for decision in decisions] == ["verified", "verified"]
+
+
+@pytest.mark.asyncio
+async def test_same_file_candidates_keep_own_patch_and_share_one_symbol_head_excerpt():
+    head_lines = [f"service line {line}" for line in range(1, 221)]
+    head_lines[11] = "return first_value"
+    head_lines[99] = "def shared_contract(): return current_behavior"
+    head_lines[199] = "raise second_error"
+    diff_file = _diff_file(head_file="\n".join(head_lines))
+    diff_file.patch = (
+        "@@ -10,0 +12,1 @@\n+return first_value\n"
+        "@@ -198,0 +200,1 @@\n+raise second_error"
+    )
+    candidates, _ = prepare_candidates(
+        _review_data(
+            _candidate(
+                context_files=[],
+                context_symbols=["shared_contract"],
+                root_cause="first changed branch trusts the shared contract",
+            ),
+            _candidate(
+                context_files=[],
+                context_symbols=["shared_contract"],
+                root_cause="second changed branch trusts the shared contract",
+                start_line=200,
+                end_line=200,
+            ),
+        ),
+        [diff_file],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        MagicMock(),
+        candidates,
+        VerificationBudgets(
+            max_files=0,
+            max_lines_per_file=8,
+            max_total_lines=8,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[diff_file],
+    )
+
+    changed_patches = [item for item in evidence if item["source"] == "changed_patch"]
+    changed_heads = [item for item in evidence if item["source"] == "changed_head"]
+    requests = [
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/service.py"
+    ]
+    expected_head_evidence_id = candidate_verification._retrieval_evidence_id(
+        "candidate-1", "src/service.py", "changed_head"
+    )
+
+    assert [item["candidate_id"] for item in changed_patches] == [
+        "candidate-1",
+        "candidate-2",
+    ]
+    assert [(item["start_line"], item["end_line"]) for item in changed_patches] == [
+        (12, 12),
+        (200, 200),
+    ]
+    assert len(changed_heads) == 2
+    assert {item["evidence_id"] for item in changed_heads} == {
+        expected_head_evidence_id
+    }
+    assert all(
+        item["candidate_ids"] == ["candidate-1", "candidate-2"]
+        for item in changed_heads
+    )
+    symbol_excerpt = next(
+        item for item in changed_heads if "shared_contract" in item["content"]
+    )
+    assert symbol_excerpt["anchor_start_line"] == 100
+    assert symbol_excerpt["anchor_end_line"] == 100
+    assert [request["status"] for request in requests] == [
+        "satisfied_by_changed_head",
+        "satisfied_by_changed_head",
+    ]
+    assert [request["evidence_id"] for request in requests] == [
+        expected_head_evidence_id,
+        expected_head_evidence_id,
+    ]
+    assert artifact["lines_retrieved"] == 8
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"]) == {
+        "status": "complete",
+        "candidate_count": 2,
+        "complete_candidate_count": 2,
+        "missing_changed_candidate_count": 0,
+        "missing_required_request_count": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -2309,6 +2721,7 @@ async def test_all_candidate_anchors_are_reserved_before_changed_context_patches
 async def test_changed_context_patch_uses_one_pass_and_stops_when_the_budget_is_full(monkeypatch):
     service_diff = _diff_file("src/service.py")
     dependency_diff = _diff_file("src/generated_dependency.py")
+    dependency_diff.head_file_is_complete = False
     dependency_diff.patch = "\n".join(
         f"@@ -{line},0 +{line},1 @@\n+generated_change_{line}"
         for line in range(2, 10_002, 2)
@@ -2373,6 +2786,7 @@ async def test_changed_context_patch_uses_one_pass_and_stops_when_the_budget_is_
 async def test_changed_context_patch_stops_a_contiguous_hunk_at_the_pending_token_budget(monkeypatch):
     service_diff = _diff_file("src/service.py")
     dependency_diff = _diff_file("src/generated_dependency.py")
+    dependency_diff.head_file_is_complete = False
     dependency_diff.patch = "@@ -0,0 +1,5000 @@\n" + "\n".join("+x" for _ in range(5_000))
     candidates, _ = prepare_candidates(
         _review_data(_candidate(context_files=["src/generated_dependency.py"])),
@@ -2512,6 +2926,965 @@ async def test_modified_context_without_patch_uses_trusted_complete_current_head
 
 
 @pytest.mark.asyncio
+async def test_required_context_keeps_every_far_apart_symbol_prompt_visible():
+    service_diff = _diff_file("src/service.py")
+    helper_lines = [f"helper line {line}" for line in range(1, 101)]
+    helper_lines[4] = "def first_contract(): return first_behavior"
+    helper_lines[94] = "def second_contract(): return second_behavior"
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = "\n".join(helper_lines)
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/helper.py"],
+            context_symbols=["first_contract", "second_contract"],
+        )),
+        [service_diff],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=3,
+            max_lines_per_file=6,
+            max_total_lines=12,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[service_diff],
+    )
+
+    request = next(
+        request for request in artifact["requests"] if request.get("path") == "src/helper.py"
+    )
+    helper_evidence = [item for item in evidence if item.get("path") == "src/helper.py"]
+    expected_evidence_id = candidate_verification._retrieval_evidence_id(
+        "candidate-1", "src/helper.py", "repository_file"
+    )
+
+    assert request == {
+        "candidate_id": "candidate-1",
+        "path": "src/helper.py",
+        "required": True,
+        "status": "retrieved",
+        "source": "repository_file",
+        "evidence_id": expected_evidence_id,
+        "excerpt_count": 2,
+        "excerpt_ranges": [
+            {"start_line": 4, "end_line": 6},
+            {"start_line": 94, "end_line": 96},
+        ],
+        "_required_context_symbols": ["first_contract", "second_contract"],
+    }
+    assert len(helper_evidence) == 2
+    assert {item["evidence_id"] for item in helper_evidence} == {expected_evidence_id}
+    assert [(item["anchor_start_line"], item["anchor_end_line"]) for item in helper_evidence] == [
+        (5, 5),
+        (95, 95),
+    ]
+    assert sum(item["content"].count("\n") + 1 for item in helper_evidence) == 6
+    prompt_visible = "\n".join(item["content"] for item in helper_evidence)
+    assert "first_contract" in prompt_visible
+    assert "second_contract" in prompt_visible
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"])["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_same_line_and_duplicate_context_symbols_share_one_bounded_excerpt():
+    service_diff = _diff_file("src/service.py")
+    helper_lines = [f"helper line {line}" for line in range(1, 51)]
+    helper_lines[24] = "def first_contract_and_second_contract(): return True"
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = "\n".join(helper_lines)
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/helper.py"],
+            context_symbols=["first_contract", "second_contract", "first_contract"],
+        )),
+        [service_diff],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=3,
+            max_lines_per_file=5,
+            max_total_lines=10,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[service_diff],
+    )
+
+    request = next(
+        request for request in artifact["requests"] if request.get("path") == "src/helper.py"
+    )
+    helper_evidence = [item for item in evidence if item.get("path") == "src/helper.py"]
+    assert request["_required_context_symbols"] == ["first_contract", "second_contract"]
+    assert request["status"] == "retrieved"
+    assert len(helper_evidence) == 1
+    assert helper_evidence[0]["anchor_start_line"] == 25
+    assert helper_evidence[0]["anchor_end_line"] == 25
+    assert helper_evidence[0]["content"].count("\n") + 1 == 5
+    assert "first_contract" in helper_evidence[0]["content"]
+    assert "second_contract" in helper_evidence[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_missing_original_context_symbol_fails_closed():
+    service_diff = _diff_file("src/service.py")
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = "def first_contract(): return True"
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/helper.py"],
+            context_symbols=["first_contract", "missing_contract"],
+        )),
+        [service_diff],
+        [],
+        3,
+    )
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(),
+        [],
+        diff_files=[service_diff],
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py", "src/helper.py"],
+    }]}}
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    request = next(
+        request for request in artifact["requests"] if request.get("path") == "src/helper.py"
+    )
+    coverage = prompt_evidence_coverage(candidates, evidence, artifact["requests"])
+    assert request["required"] is True
+    assert request["status"] == "context_symbol_missing"
+    assert coverage["status"] == "incomplete"
+    assert decisions[0]["reason"] == "required_context_unavailable"
+    assert findings == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("context", "expected_status", "expect_finding"),
+    [
+        ("def required_contract(): return True", "retrieved", True),
+        ("def optional_hint(): return True", "context_symbol_missing", False),
+    ],
+)
+async def test_specialist_symbol_hint_is_optional_but_original_model_symbol_remains_required(
+    context,
+    expected_status,
+    expect_finding,
+):
+    service_diff = _diff_file("src/service.py")
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/helper.py"],
+            context_symbols=["required_contract"],
+        )),
+        [service_diff],
+        [],
+        3,
+    )
+    candidates, prioritization = apply_specialist_prioritization(
+        candidates,
+        {
+            "ranked_hunks": [],
+            "context_requests": [{
+                "kind": "symbol",
+                "target": "optional_hint",
+                "anchor_path": "src/service.py",
+                "anchor_hunk_id": "hunk-1",
+            }],
+        },
+        _specialist_input(),
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = context
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(),
+        [],
+        diff_files=[service_diff],
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py", "src/helper.py"],
+    }]}}
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    request = next(
+        request for request in artifact["requests"] if request.get("path") == "src/helper.py"
+    )
+    assert prioritization["context_hints_added"] == 1
+    assert candidates[0]["context_symbols"] == ["required_contract", "optional_hint"]
+    assert candidates[0]["_specialist_optional_context_symbols"] == ["optional_hint"]
+    assert request["status"] == expected_status
+    assert bool(findings) is expect_finding
+    assert decisions[0].get("reason", decisions[0]["verdict"]) == (
+        "verified" if expect_finding else "required_context_unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_symbol_required_context_fails_closed_when_excerpt_budget_is_too_small():
+    service_diff = _diff_file("src/service.py", head_file="")
+    service_diff.head_file_is_complete = False
+    helper_lines = [f"helper line {line}" for line in range(1, 21)]
+    helper_lines[1] = "def first_contract(): return True"
+    helper_lines[18] = "def second_contract(): return True"
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = "\n".join(helper_lines)
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/helper.py"],
+            context_symbols=["first_contract", "second_contract"],
+        )),
+        [service_diff],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=3,
+            max_lines_per_file=1,
+            max_total_lines=2,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[service_diff],
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py", "src/helper.py"],
+    }]}}
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    request = next(
+        request for request in artifact["requests"] if request.get("path") == "src/helper.py"
+    )
+    assert request["status"] == "context_budget_exhausted"
+    assert not any(item.get("path") == "src/helper.py" for item in evidence)
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"])["status"] == "incomplete"
+    assert findings == []
+    assert decisions[0]["reason"] == "required_context_unavailable"
+
+
+def test_final_prompt_clipping_rechecks_each_required_context_symbol():
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/helper.py"],
+            context_symbols=["first_contract", "second_contract"],
+        )),
+        [_diff_file("src/service.py")],
+        [],
+        3,
+    )
+    evidence_id = candidate_verification._retrieval_evidence_id(
+        "candidate-1", "src/helper.py", "repository_file"
+    )
+    full_evidence = [
+        {
+            **_changed_evidence(content="one\n" + "nearby context\n" * 8),
+            "anchor_start_line": 12,
+            "anchor_end_line": 12,
+        },
+        {
+            "candidate_id": "candidate-1",
+            "source": "repository_file",
+            "path": "src/helper.py",
+            "content": "first_contract\n" + "short context\n" * 8,
+            "start_line": 5,
+            "end_line": 13,
+            "anchor_start_line": 5,
+            "anchor_end_line": 5,
+            "evidence_id": evidence_id,
+            "required_evidence": True,
+        },
+        {
+            "candidate_id": "candidate-1",
+            "source": "repository_file",
+            "path": "src/helper.py",
+            "content": "second_contract_" + "x" * 200,
+            "start_line": 95,
+            "end_line": 95,
+            "anchor_start_line": 95,
+            "anchor_end_line": 95,
+            "evidence_id": evidence_id,
+            "required_evidence": True,
+        },
+    ]
+    request = {
+        "candidate_id": "candidate-1",
+        "path": "src/helper.py",
+        "required": True,
+        "_required_context_symbols": ["first_contract", "second_contract"],
+        "status": "retrieved",
+        "source": "repository_file",
+        "evidence_id": evidence_id,
+    }
+
+    full_coverage = prompt_evidence_coverage(candidates, full_evidence, [request])
+    clipped_evidence = bounded_verification_evidence(full_evidence, 0.25)
+    clipped_coverage = prompt_evidence_coverage(candidates, clipped_evidence, [request])
+
+    assert full_coverage["status"] == "complete"
+    assert "first_contract" in "\n".join(item["content"] for item in clipped_evidence)
+    assert "second_contract" not in "\n".join(item["content"] for item in clipped_evidence)
+    assert clipped_coverage["status"] == "incomplete"
+    assert clipped_coverage["missing_required_request_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_relevant_file_symbol_remains_required_after_final_prompt_clipping():
+    head_lines = [f"head line {line}" for line in range(1, 101)]
+    head_lines[10] = "x" * 100
+    head_lines[11] = "one"
+    head_lines[12] = "x" * 100
+    head_lines[93] = "y"
+    head_lines[94] = "required_local_contract_" + "z" * 200
+    head_lines[95] = "y"
+    diff_file = _diff_file("src/service.py", head_file="\n".join(head_lines))
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=[],
+            context_symbols=["required_local_contract"],
+        )),
+        [diff_file],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        MagicMock(),
+        candidates,
+        VerificationBudgets(
+            max_files=1,
+            max_lines_per_file=6,
+            max_total_lines=6,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[diff_file],
+    )
+    request = next(
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/service.py"
+    )
+
+    full_coverage = prompt_evidence_coverage(candidates, evidence, artifact["requests"])
+    clipped_evidence = bounded_verification_evidence(evidence, 0.25)
+    clipped_content = "\n".join(item["content"] for item in clipped_evidence)
+    clipped_coverage = prompt_evidence_coverage(
+        candidates,
+        clipped_evidence,
+        artifact["requests"],
+    )
+
+    assert request["required"] is False
+    assert request["status"] == "satisfied_by_changed_head"
+    assert request["_required_context_symbols"] == ["required_local_contract"]
+    assert full_coverage["status"] == "complete"
+    assert "one" in clipped_content
+    assert "required_local_contract" not in clipped_content
+    assert clipped_coverage == {
+        "status": "incomplete",
+        "candidate_count": 1,
+        "complete_candidate_count": 0,
+        "missing_changed_candidate_count": 0,
+        "missing_required_request_count": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_relevant_file_symbol_preserves_missing_status_while_coverage_fails_closed():
+    diff_file = _diff_file("src/service.py", head_file="")
+    diff_file.head_file_is_complete = False
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=[],
+            context_symbols=["required_local_contract"],
+        )),
+        [diff_file],
+        [],
+        3,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = ""
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(),
+        [],
+        diff_files=[diff_file],
+    )
+    request = next(
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/service.py"
+    )
+    coverage = prompt_evidence_coverage(candidates, evidence, artifact["requests"])
+
+    provider.get_repo_file_content.assert_called_once_with("src/service.py", False)
+    assert request["required"] is False
+    assert request["status"] == "missing"
+    assert request["_required_context_symbols"] == ["required_local_contract"]
+    assert coverage == {
+        "status": "incomplete",
+        "candidate_count": 1,
+        "complete_candidate_count": 0,
+        "missing_changed_candidate_count": 0,
+        "missing_required_request_count": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_complete_relevant_head_budget_failure_rejects_stale_base_symbol():
+    base_lines = ["old" for _ in range(30)]
+    base_lines[19] = "required_local_contract = 'stale'"
+    head_lines = ["new" for _ in range(30)]
+    head_lines[19] = "required_local_contract = '" + "x" * 200 + "'"
+    diff_file = _diff_file(
+        "src/service.py",
+        base_file="\n".join(base_lines),
+        head_file="\n".join(head_lines),
+    )
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=[],
+            context_symbols=["required_local_contract"],
+        )),
+        [diff_file],
+        [],
+        3,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = diff_file.base_file
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=1,
+            max_lines_per_file=3,
+            max_total_lines=3,
+            max_context_tokens=40,
+        ),
+        [],
+        diff_files=[diff_file],
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py"],
+    }]}}
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    request = next(
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/service.py"
+    )
+
+    provider.get_repo_file_content.assert_not_called()
+    assert request["status"] == "context_budget_exhausted"
+    assert request["_required_context_symbols"] == ["required_local_contract"]
+    assert not any(item.get("source") == "repository_file" for item in evidence)
+    assert findings == []
+    assert decisions[0]["reason"] == "required_context_unavailable"
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"]) == {
+        "status": "incomplete",
+        "candidate_count": 1,
+        "complete_candidate_count": 0,
+        "missing_changed_candidate_count": 0,
+        "missing_required_request_count": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_adjacent_symbol_anchors_coalesce_and_preserve_budget_for_second_required_file():
+    service_diff = _diff_file("src/service.py")
+    first_lines = [f"first helper line {line}" for line in range(1, 7)]
+    first_lines[0] = "def first_contract(): return True"
+    first_lines[5] = "def boundary_contract(): return True"
+    second_content = "second prelude\ndef second_file_contract(): return True"
+    provider = MagicMock()
+    provider.get_repo_file_content.side_effect = lambda path, _base: {
+        "src/first_helper.py": "\n".join(first_lines),
+        "src/second_helper.py": second_content,
+    }[path]
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/first_helper.py", "src/second_helper.py"],
+            context_symbols=[
+                "first_contract",
+                "boundary_contract",
+                "second_file_contract",
+            ],
+        )),
+        [service_diff],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=3,
+            max_lines_per_file=8,
+            max_total_lines=16,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[service_diff],
+    )
+
+    first_request = next(
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/first_helper.py"
+    )
+    second_request = next(
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/second_helper.py"
+    )
+    first_evidence = [
+        item for item in evidence if item.get("path") == "src/first_helper.py"
+    ]
+    second_evidence = [
+        item for item in evidence if item.get("path") == "src/second_helper.py"
+    ]
+
+    assert first_request["status"] == "retrieved"
+    assert first_request["excerpt_count"] == 1
+    assert first_request["start_line"] == 1
+    assert first_request["end_line"] == 6
+    assert first_request["_required_context_symbols"] == [
+        "first_contract",
+        "boundary_contract",
+    ]
+    assert len(first_evidence) == 1
+    assert first_evidence[0]["anchor_start_line"] == 1
+    assert first_evidence[0]["anchor_end_line"] == 6
+    assert first_evidence[0]["content"].count("\n") + 1 == 6
+    assert len(set(first_evidence[0]["content"].splitlines())) == 6
+    assert second_request["status"] == "retrieved"
+    assert second_request["_required_context_symbols"] == ["second_file_contract"]
+    assert len(second_evidence) == 1
+    assert second_evidence[0]["content"] == second_content
+    assert artifact["lines_retrieved"] == 16
+    assert artifact["lines_retrieved"] == sum(
+        item["content"].count("\n") + 1 for item in evidence
+    )
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"])["status"] == "complete"
+
+
+def test_context_symbol_discovery_scans_each_line_once_at_the_symbol_limit():
+    symbols = [
+        f"bounded_symbol_{index}"
+        for index in range(candidate_verification._MAX_CONTEXT_SYMBOLS_PER_CANDIDATE)
+    ]
+    lines = [f"filler line {line}" for line in range(1, 201)]
+    lines[-1] = " ".join(symbols)
+    scan_checks = 0
+
+    def keep_scanning():
+        nonlocal scan_checks
+        scan_checks += 1
+        return False
+
+    groups = candidate_verification._context_symbol_anchor_groups(
+        "\n".join(lines),
+        _candidate(context_symbols=symbols),
+        "src/helper.py",
+        stop_requested=keep_scanning,
+    )
+
+    assert scan_checks == len(lines)
+    assert groups == [(len(lines), symbols)]
+
+
+def test_context_symbol_discovery_aborts_at_deadline_without_partial_proof():
+    lines = [f"filler line {line}" for line in range(1, 10_001)]
+    lines[-1] = "def required_contract(): return True"
+    scan_checks = 0
+
+    def deadline_reached():
+        nonlocal scan_checks
+        scan_checks += 1
+        return scan_checks > 7
+
+    groups = candidate_verification._context_symbol_anchor_groups(
+        "\n".join(lines),
+        _candidate(context_symbols=["required_contract"]),
+        "src/helper.py",
+        stop_requested=deadline_reached,
+    )
+
+    assert scan_checks == 8
+    assert groups == []
+
+
+@pytest.mark.asyncio
+async def test_complete_modified_context_head_preempts_patch_ranges_and_keeps_exact_identity():
+    service_diff = _diff_file("src/service.py")
+    helper_lines = [f"helper line {line}" for line in range(1, 101)]
+    helper_lines[79] = "def required_contract(): return current_behavior"
+    helper_diff = _diff_file(
+        "src/helper.py",
+        base_file="\n".join(f"base line {line}" for line in range(1, 101)),
+        head_file="\n".join(helper_lines),
+        edit_type=EDIT_TYPE.MODIFIED,
+    )
+    helper_diff.patch = "\n".join(
+        f"@@ -{line},1 +{line},1 @@\n-old_{line}\n+new_{line}"
+        for line in (5, 20, 40, 60, 80)
+    )
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/helper.py"],
+            context_symbols=["required_contract"],
+        )),
+        [service_diff, helper_diff],
+        [],
+        3,
+    )
+    provider = MagicMock()
+
+    with patch.object(
+        candidate_verification,
+        "_changed_context_patch_evidence",
+        side_effect=AssertionError("complete modified head must preempt patch traversal"),
+    ) as patch_collector:
+        evidence, artifact = await retrieve_evidence(
+            provider,
+            candidates,
+            VerificationBudgets(
+                max_files=3,
+                max_lines_per_file=3,
+                max_total_lines=6,
+                max_context_tokens=10_000,
+            ),
+            [],
+            diff_files=[service_diff, helper_diff],
+        )
+
+    request = next(
+        request for request in artifact["requests"] if request.get("path") == "src/helper.py"
+    )
+    helper_evidence = [item for item in evidence if item.get("path") == "src/helper.py"]
+    expected_evidence_id = candidate_verification._retrieval_evidence_id(
+        "candidate-1", "src/helper.py", "changed_context_head"
+    )
+    patch_collector.assert_not_called()
+    provider.get_repo_file_content.assert_not_called()
+    assert request["status"] == "satisfied_by_changed_head"
+    assert request["source"] == "changed_context_head"
+    assert request["evidence_id"] == expected_evidence_id
+    assert len(helper_evidence) == 1
+    assert helper_evidence[0]["source"] == "changed_context_head"
+    assert helper_evidence[0]["evidence_id"] == expected_evidence_id
+    assert helper_evidence[0]["anchor_start_line"] == 80
+    assert helper_evidence[0]["anchor_end_line"] == 80
+    assert helper_evidence[0]["content"].count("\n") + 1 == 3
+    assert "required_contract" in helper_evidence[0]["content"]
+    assert not any(item["source"] == "changed_context_patch" for item in evidence)
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"])["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_complete_modified_context_head_preserves_time_budget_failure_status():
+    service_diff = _diff_file("src/service.py")
+    helper_diff = _diff_file(
+        "src/helper.py",
+        base_file="def required_contract(): return old_behavior",
+        head_file="def required_contract(): return current_behavior",
+        edit_type=EDIT_TYPE.MODIFIED,
+    )
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/helper.py"],
+            context_symbols=["required_contract"],
+        )),
+        [service_diff, helper_diff],
+        [],
+        3,
+    )
+    provider = MagicMock()
+
+    _, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(timeout_seconds=0),
+        [],
+        diff_files=[service_diff, helper_diff],
+    )
+
+    requests_by_path = {
+        request["path"]: request
+        for request in artifact["requests"]
+    }
+    assert requests_by_path["src/service.py"]["status"] == "time_budget_exhausted"
+    assert requests_by_path["src/helper.py"]["status"] == "time_budget_exhausted"
+    provider.get_repo_file_content.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_complete_modified_context_head_is_shared_after_path_budget_is_full():
+    first_diff = _diff_file("src/first_caller.py")
+    second_diff = _diff_file("src/second_caller.py")
+    helper_lines = [f"helper line {line}" for line in range(1, 51)]
+    helper_lines[24] = "def required_contract(): return current_behavior"
+    helper_diff = _diff_file(
+        "src/helper.py",
+        base_file="\n".join(f"base helper line {line}" for line in range(1, 51)),
+        head_file="\n".join(helper_lines),
+        edit_type=EDIT_TYPE.MODIFIED,
+    )
+    helper_diff.patch = "@@ -25,1 +25,1 @@\n-old_behavior\n+current_behavior"
+    candidates, _ = prepare_candidates(
+        _review_data(
+            _candidate(
+                relevant_file="src/first_caller.py",
+                root_cause="first caller trusts the required contract",
+                context_files=["src/helper.py"],
+                context_symbols=["required_contract"],
+            ),
+            _candidate(
+                relevant_file="src/second_caller.py",
+                root_cause="second caller trusts the required contract",
+                context_files=["src/helper.py"],
+                context_symbols=["required_contract"],
+            ),
+        ),
+        [first_diff, second_diff, helper_diff],
+        [],
+        3,
+    )
+    provider = MagicMock()
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=0,
+            max_lines_per_file=3,
+            max_total_lines=9,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[first_diff, second_diff, helper_diff],
+    )
+
+    helper_evidence = [item for item in evidence if item["path"] == "src/helper.py"]
+    helper_requests = [
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/helper.py"
+    ]
+    expected_evidence_id = candidate_verification._retrieval_evidence_id(
+        "candidate-1", "src/helper.py", "changed_context_head"
+    )
+
+    provider.get_repo_file_content.assert_not_called()
+    assert artifact["lines_retrieved"] == 9
+    assert len(helper_evidence) == 1
+    assert helper_evidence[0]["candidate_ids"] == ["candidate-1", "candidate-2"]
+    assert helper_evidence[0]["evidence_id"] == expected_evidence_id
+    assert helper_evidence[0]["content"].count("\n") + 1 == 3
+    assert "required_contract" in helper_evidence[0]["content"]
+    assert [request["status"] for request in helper_requests] == [
+        "satisfied_by_changed_head",
+        "satisfied_by_changed_head",
+    ]
+    assert [request["evidence_id"] for request in helper_requests] == [
+        expected_evidence_id,
+        expected_evidence_id,
+    ]
+    assert [request["_required_context_symbols"] for request in helper_requests] == [
+        ["required_contract"],
+        ["required_contract"],
+    ]
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"]) == {
+        "status": "complete",
+        "candidate_count": 2,
+        "complete_candidate_count": 2,
+        "missing_changed_candidate_count": 0,
+        "missing_required_request_count": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_incomplete_modified_head_uses_patch_and_repository_instead_of_untrusted_head():
+    service_diff = _diff_file("src/service.py")
+    helper_diff = _diff_file(
+        "src/helper.py",
+        base_file="def required_contract(): return base_behavior\nold_guard = False",
+        head_file="UNTRUSTED_PARTIAL_HEAD\nnew_guard = True",
+        edit_type=EDIT_TYPE.MODIFIED,
+    )
+    helper_diff.head_file_is_complete = False
+    helper_diff.patch = "@@ -2,1 +2,1 @@\n-old_guard = False\n+new_guard = True"
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/helper.py"],
+            context_symbols=["required_contract"],
+        )),
+        [service_diff, helper_diff],
+        [],
+        3,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = helper_diff.base_file
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=3,
+            max_lines_per_file=4,
+            max_total_lines=10,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[service_diff, helper_diff],
+    )
+
+    request = next(
+        request for request in artifact["requests"] if request.get("path") == "src/helper.py"
+    )
+    helper_evidence = [item for item in evidence if item.get("path") == "src/helper.py"]
+    expected_evidence_id = candidate_verification._retrieval_evidence_id(
+        "candidate-1", "src/helper.py", "repository_file"
+    )
+    provider.get_repo_file_content.assert_called_once_with("src/helper.py", False)
+    assert request["status"] == "retrieved"
+    assert request["source"] == "repository_file"
+    assert request["evidence_id"] == expected_evidence_id
+    assert {item["source"] for item in helper_evidence} == {
+        "changed_context_patch",
+        "repository_file",
+    }
+    assert "required_contract" in "\n".join(item["content"] for item in helper_evidence)
+    assert "UNTRUSTED_PARTIAL_HEAD" not in json.dumps(helper_evidence)
+    assert sum(item["content"].count("\n") + 1 for item in helper_evidence) <= 4
+
+
+@pytest.mark.asyncio
+async def test_incomplete_modified_head_fails_closed_when_patch_consumes_context_budget():
+    service_diff = _diff_file("src/service.py", head_file="")
+    service_diff.head_file_is_complete = False
+    helper_diff = _diff_file(
+        "src/helper.py",
+        base_file="def required_contract(): return base_behavior\nold_guard = False",
+        head_file="UNTRUSTED_PARTIAL_HEAD\nnew_guard = True",
+        edit_type=EDIT_TYPE.MODIFIED,
+    )
+    helper_diff.head_file_is_complete = False
+    helper_diff.patch = "@@ -2,1 +2,1 @@\n-old_guard = False\n+new_guard = True"
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=["src/helper.py"],
+            context_symbols=["required_contract"],
+        )),
+        [service_diff, helper_diff],
+        [],
+        3,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = helper_diff.base_file
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=3,
+            max_lines_per_file=1,
+            max_total_lines=2,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[service_diff, helper_diff],
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py", "src/helper.py"],
+    }]}}
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    request = next(
+        request for request in artifact["requests"] if request.get("path") == "src/helper.py"
+    )
+    assert request["status"] == "context_budget_exhausted"
+    assert "UNTRUSTED_PARTIAL_HEAD" not in json.dumps(evidence)
+    assert findings == []
+    assert decisions[0]["reason"] == "required_context_unavailable"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("patch_text", ["", "@@ -1,1 +1,1 @@"])
 async def test_incomplete_modified_context_without_visible_ranges_rejects_base_only_proof(patch_text):
     service_diff = _diff_file("src/service.py")
@@ -2578,7 +3951,10 @@ async def test_added_required_context_uses_complete_head_and_can_publish():
     )
     dependency_diff.patch = "@@ -0,0 +1,1 @@\n+def new_contract(): return True"
     candidates, _ = prepare_candidates(
-        _review_data(_candidate(context_files=["src/new_dependency.py"])),
+        _review_data(_candidate(
+            context_files=["src/new_dependency.py"],
+            context_symbols=["new_contract"],
+        )),
         [service_diff, dependency_diff],
         [],
         3,
@@ -2629,7 +4005,10 @@ async def test_patch_only_added_required_context_satisfies_request_and_can_publi
     dependency_diff.patch_is_complete = True
     dependency_diff.patch = "@@ -0,0 +1,1 @@\n+def new_contract(): return True"
     candidates, _ = prepare_candidates(
-        _review_data(_candidate(context_files=["src/new_dependency.py"])),
+        _review_data(_candidate(
+            context_files=["src/new_dependency.py"],
+            context_symbols=["new_contract"],
+        )),
         [service_diff, dependency_diff],
         [],
         3,
@@ -2802,6 +4181,7 @@ async def test_renamed_required_context_fetches_old_path_but_keeps_new_evidence_
         "-def required_contract(): return old_behavior\n"
         "+def required_contract(): return new_behavior"
     )
+    dependency_diff.head_file_is_complete = False
     candidates, _ = prepare_candidates(
         _review_data(_candidate(
             context_files=["src/new_dependency.py"],
@@ -2852,7 +4232,7 @@ async def test_renamed_required_context_fetches_old_path_but_keeps_new_evidence_
 async def test_missing_specialist_context_hint_cannot_suppress_verified_candidate():
     diff_file = _diff_file(head_file="\n".join(f"line {line}" for line in range(1, 30)))
     candidates, _ = prepare_candidates(
-        _review_data(_candidate(context_files=[])), [diff_file], [], 3
+        _review_data(_candidate(context_files=[], context_symbols=[])), [diff_file], [], 3
     )
     specialist_input = _specialist_input()
     candidates, _ = apply_specialist_prioritization(
@@ -2991,7 +4371,7 @@ async def test_timed_out_repository_fetches_cannot_accumulate_unbounded_threads(
     provider = MagicMock()
     provider.get_repo_file_content.side_effect = blocking_fetch
     candidates, _ = prepare_candidates(
-        _review_data(_candidate(context_files=[])), [_diff_file()], [], 3
+        _review_data(_candidate(context_files=[], context_symbols=[])), [_diff_file()], [], 3
     )
     statuses = []
     try:
@@ -3733,6 +5113,19 @@ async def test_orchestration_exposes_verifier_failure_and_does_not_publish_candi
         ("non-string context file", _candidate(context_files=[{"path": "src/caller.py"}])),
         ("non-string context symbol", _candidate(context_symbols=[12])),
         (
+            "too many context symbols",
+            _candidate(context_symbols=[
+                f"symbol_{index}"
+                for index in range(candidate_verification._MAX_CONTEXT_SYMBOLS_PER_CANDIDATE + 1)
+            ]),
+        ),
+        (
+            "overlong context symbol",
+            _candidate(context_symbols=[
+                "s" * (candidate_verification._MAX_CONTEXT_SYMBOL_CHARACTERS + 1)
+            ]),
+        ),
+        (
             "missing context files",
             {key: value for key, value in _candidate().items() if key != "context_files"},
         ),
@@ -4007,6 +5400,7 @@ async def test_model_candidate_budget_has_exact_fail_closed_boundary(
             end_line=12 + index,
             root_cause=f"distinct root cause {index}",
             context_files=[],
+            context_symbols=[],
         )
         for index in range(candidate_count)
     ]))
@@ -4096,6 +5490,7 @@ async def test_semantic_rejection_after_full_candidate_budget_does_not_create_co
             end_line=12 + index,
             root_cause=f"distinct root cause {index}",
             context_files=[],
+            context_symbols=[],
         )
         for index in range(3)
     ]
@@ -4560,7 +5955,10 @@ async def test_orchestration_clipped_required_proof_suppresses_false_clean_publi
     reviewer = _reviewer_for_orchestration(provider)
     reviewer.patches_diff = "+small changed diff"
     reviewer._parse_review_prediction = MagicMock(return_value=_review_data(
-        _candidate(context_files=[] if missing_kind == "changed_anchor" else ["src/caller.py"])
+        _candidate(
+            context_files=[] if missing_kind == "changed_anchor" else ["src/caller.py"],
+            context_symbols=[] if missing_kind == "changed_anchor" else ["call_service"],
+        )
     ))
     reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
         _rejected_verification_response("candidate-1"),
@@ -4628,6 +6026,7 @@ async def test_orchestration_retains_a_bounded_cross_file_diff_when_it_fits():
     provider = MagicMock()
     provider.supports_repo_file_fetching.return_value = True
     dependency_diff = _diff_file("src/dependency.py")
+    dependency_diff.head_file_is_complete = False
     dependency_diff.patch = "@@ -20,0 +20,1 @@\n+dependency_new_contract_ONLY_IN_DIFF"
     provider.get_diff_files.return_value = [_diff_file(), dependency_diff]
     provider.get_repo_file_content.return_value = "def required_contract(): return blocks_bug"
@@ -4635,7 +6034,10 @@ async def test_orchestration_retains_a_bounded_cross_file_diff_when_it_fits():
     cross_file_change = "+dependency_new_contract_ONLY_IN_DIFF"
     reviewer.patches_diff = "+unrelated_filler\n" * 2_000 + cross_file_change
     reviewer._parse_review_prediction = MagicMock(return_value=_review_data(
-        _candidate(context_files=["src/dependency.py"])
+        _candidate(
+            context_files=["src/dependency.py"],
+            context_symbols=["required_contract"],
+        )
     ))
     reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
         "verification:\n  decisions:\n    - candidate_id: candidate-1\n"

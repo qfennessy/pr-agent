@@ -47,6 +47,8 @@ _ATOMIC_CHANGED_EVIDENCE_SOURCES = frozenset({
 })
 _PATCH_CHANGED_EVIDENCE_SOURCES = frozenset({"changed_patch", "changed_context_patch"})
 _CHANGED_EVIDENCE_SOURCES = _ATOMIC_CHANGED_EVIDENCE_SOURCES | {"changed_context_head"}
+_MAX_CONTEXT_SYMBOLS_PER_CANDIDATE = 32
+_MAX_CONTEXT_SYMBOL_CHARACTERS = 256
 
 
 def _is_atomic_prompt_evidence(item: Mapping) -> bool:
@@ -138,6 +140,43 @@ def retrieval_request_is_complete(request: dict) -> bool:
     )
 
 
+def _request_prompt_evidence(request: dict, evidence: list[dict]) -> list[dict]:
+    """Return prompt-visible evidence bound to one candidate context request."""
+    candidate_id = request.get("candidate_id")
+    evidence_id = request.get("evidence_id")
+    path = request.get("path")
+    if not evidence_id:
+        return []
+    matches = []
+    for item in evidence:
+        candidate_ids = item.get("candidate_ids")
+        if not isinstance(candidate_ids, list):
+            candidate_ids = [item.get("candidate_id")]
+        if (
+            candidate_id in candidate_ids
+            and item.get("evidence_id") == evidence_id
+            and item.get("path") == path
+            and str(item.get("content") or "").strip()
+        ):
+            matches.append(item)
+    return matches
+
+
+def _request_has_prompt_visible_symbols(request: dict, evidence: list[dict]) -> bool:
+    """Require every symbol assigned to a request to survive final prompt clipping."""
+    required_symbols = request.get("_required_context_symbols") or []
+    if not required_symbols:
+        return True
+    visible_content = [
+        str(item.get("content") or "")
+        for item in _request_prompt_evidence(request, evidence)
+    ]
+    return all(
+        any(symbol in content for content in visible_content)
+        for symbol in required_symbols
+    )
+
+
 def telemetry_safe_artifact(artifact: dict) -> dict:
     """Return provider-neutral telemetry without repository or model-generated text."""
     safe = {}
@@ -212,7 +251,7 @@ def telemetry_safe_artifact(artifact: dict) -> dict:
                     key: item[key]
                     for key in (
                         "candidate_id", "path", "status", "error", "required", "source",
-                        "start_line", "end_line",
+                        "start_line", "end_line", "excerpt_count",
                     )
                     if key in item and isinstance(item[key], (str, int, float, bool, type(None)))
                 }
@@ -696,7 +735,13 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
         context_symbols_valid = (
             context_symbols_present
             and isinstance(context_symbols, list)
-            and all(isinstance(value, str) and value.strip() for value in context_symbols)
+            and len(context_symbols) <= _MAX_CONTEXT_SYMBOLS_PER_CANDIDATE
+            and all(
+                isinstance(value, str)
+                and value.strip()
+                and len(value.strip()) <= _MAX_CONTEXT_SYMBOL_CHARACTERS
+                for value in context_symbols
+            )
         )
         candidate["side"] = "new"
         candidate["relevant_file"] = safe_repo_path(candidate.get("relevant_file"))
@@ -841,10 +886,15 @@ def _append_context_hint(candidate: dict, kind: str, target: str) -> bool:
         current = []
     if value in current:
         return False
+    if len(current) >= _MAX_CONTEXT_SYMBOLS_PER_CANDIDATE:
+        return False
     candidate[key] = [*current, value]
     if key == "context_files":
         optional = candidate.get("_specialist_optional_context_files") or []
         candidate["_specialist_optional_context_files"] = [*optional, value]
+    else:
+        optional = candidate.get("_specialist_optional_context_symbols") or []
+        candidate["_specialist_optional_context_symbols"] = [*optional, value]
     return True
 
 
@@ -956,15 +1006,154 @@ def _excerpt_anchor_line(content: str, candidate: dict, path: str) -> int:
     return max(1, min(len(lines), int(center or 1)))
 
 
-def _select_excerpt(content: str, candidate: dict, path: str, max_lines: int) -> tuple[str, int, int]:
+def _requested_context_symbols(candidate: dict) -> list[str]:
+    """Return unique, ordered symbol hints from a validated candidate."""
+    symbols = candidate.get("context_symbols") or []
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    normalized = []
+    seen = set()
+    for value in symbols if isinstance(symbols, list) else []:
+        symbol = str(value).strip()
+        if symbol and symbol not in seen:
+            normalized.append(symbol)
+            seen.add(symbol)
+    return normalized
+
+
+def _required_context_symbols(candidate: dict) -> list[str]:
+    """Return model-requested symbols, excluding optional specialist hints."""
+    optional = {
+        str(value).strip()
+        for value in (candidate.get("_specialist_optional_context_symbols") or [])
+        if isinstance(value, str) and value.strip()
+    }
+    return [
+        symbol for symbol in _requested_context_symbols(candidate)
+        if symbol not in optional
+    ]
+
+
+def _context_symbol_anchor_groups(
+    content: str,
+    candidate: dict,
+    path: str,
+    *,
+    symbols: Optional[list[str]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
+    content_lines: Optional[list[str]] = None,
+) -> list[tuple[int, list[str]]]:
+    """Return one ordered anchor per line while scanning source at most once."""
+    lines = content_lines if content_lines is not None else split_git_file_lines(content)
+    if not lines:
+        return []
+    requested = list(symbols if symbols is not None else _requested_context_symbols(candidate))
+    if len(requested) > _MAX_CONTEXT_SYMBOLS_PER_CANDIDATE:
+        return []
+    unmatched = dict.fromkeys(requested)
+    groups: dict[int, list[str]] = {}
+    if path == candidate.get("relevant_file"):
+        try:
+            candidate_anchor = int(candidate.get("start_line"))
+        except (TypeError, ValueError):
+            candidate_anchor = 1
+        groups[max(1, min(len(lines), candidate_anchor))] = []
+    for index, line in enumerate(lines, start=1):
+        if stop_requested is not None and stop_requested():
+            return []
+        for symbol in tuple(unmatched):
+            if symbol in line:
+                groups.setdefault(index, []).append(symbol)
+                unmatched.pop(symbol, None)
+        if not unmatched:
+            break
+    if not groups:
+        return [(1, [])]
+    return [(line, groups[line]) for line in sorted(groups)]
+
+
+def _coalesce_context_anchor_groups(
+    anchor_groups: list[tuple[int, list[str]]],
+    line_budget: int,
+    line_count: int,
+) -> list[tuple[int, int, list[str]]]:
+    """Merge nearby anchors until their actual bounded excerpts cannot overlap."""
+    groups = [(line, line, list(symbols)) for line, symbols in anchor_groups]
+    while len(groups) > 1:
+        line_limits = _balanced_context_line_limits(groups, line_budget)
+        if not line_limits:
+            break
+        selected_ranges = [
+            _excerpt_bounds(
+                line_count,
+                (start_line + end_line + 1) // 2,
+                line_limit,
+            )
+            for (start_line, end_line, _), line_limit in zip(
+                groups, line_limits, strict=True
+            )
+        ]
+        merged = []
+        changed = False
+        for index, (start_line, end_line, symbols) in enumerate(groups):
+            overlaps_previous = bool(
+                merged
+                and selected_ranges[index][0] <= selected_ranges[index - 1][1]
+            )
+            if overlaps_previous:
+                previous_start, _, previous_symbols = merged[-1]
+                merged[-1] = (
+                    previous_start,
+                    end_line,
+                    [*previous_symbols, *symbols],
+                )
+                changed = True
+            else:
+                merged.append((start_line, end_line, symbols))
+        groups = merged
+        if not changed:
+            break
+    return groups
+
+
+def _balanced_context_line_limits(
+    groups: list[tuple[int, int, list[str]]],
+    line_budget: int,
+) -> list[int]:
+    minimum_lines = [end_line - start_line + 1 for start_line, end_line, _ in groups]
+    if sum(minimum_lines) > line_budget:
+        return []
+    remaining = line_budget
+    limits = []
+    for index, minimum in enumerate(minimum_lines):
+        groups_left = len(groups) - index
+        later_minimum = sum(minimum_lines[index + 1:])
+        line_limit = max(minimum, remaining // groups_left)
+        line_limit = min(line_limit, remaining - later_minimum)
+        limits.append(line_limit)
+        remaining -= line_limit
+    return limits
+
+
+def _excerpt_bounds(line_count: int, center: int, max_lines: int) -> tuple[int, int]:
+    before = max_lines // 2
+    start = max(1, center - before)
+    end = min(line_count, start + max_lines - 1)
+    start = max(1, end - max_lines + 1)
+    return start, end
+
+
+def _select_excerpt(
+    content: str,
+    candidate: dict,
+    path: str,
+    max_lines: int,
+) -> tuple[str, int, int]:
     lines = split_git_file_lines(content)
     if not lines or max_lines < 1:
         return "", 0, 0
     center = _excerpt_anchor_line(content, candidate, path)
-    before = max_lines // 2
-    start = max(1, center - before)
-    end = min(len(lines), start + max_lines - 1)
-    start = max(1, end - max_lines + 1)
+    start, end = _excerpt_bounds(len(lines), center, max_lines)
     return "\n".join(lines[start - 1:end]), start, end
 
 
@@ -1300,8 +1489,9 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
     changed_evidence_count = 0
     changed_context_head_available = {}
     changed_context_patch_available = {}
-    incomplete_changed_context = set()
+    changed_context_failure_status = {}
     shared_repo_evidence = {}
+    claimed_required_symbols: dict[str, set[str]] = {}
     diff_by_file = {
         path: diff_file
         for diff_file in (diff_files or [])
@@ -1314,7 +1504,10 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             budgets.max_total_lines - total_lines,
         ))
 
-    def append_evidence(item: dict, candidate: dict, path: str) -> bool:
+    def append_evidence(item: dict, candidate: dict, path: str,
+                        max_lines: Optional[int] = None,
+                        max_tokens: Optional[int] = None,
+                        prepared_excerpt: Optional[tuple[str, int, int]] = None) -> bool:
         nonlocal budget_exhausted, changed_evidence_count, time_budget_exhausted, total_lines, total_tokens
         if time.monotonic() >= deadline:
             budget_exhausted = True
@@ -1322,11 +1515,20 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             return False
         content = str(item.get("content") or "")
         line_budget = remaining_lines(path)
+        if max_lines is not None:
+            line_budget = min(line_budget, max(0, int(max_lines)))
         token_budget = budgets.max_context_tokens - total_tokens
+        if max_tokens is not None:
+            token_budget = min(token_budget, max(0, int(max_tokens)))
         if line_budget < 1 or token_budget < 1:
             budget_exhausted = True
             return False
-        if item.get("source") in _PATCH_CHANGED_EVIDENCE_SOURCES:
+        if prepared_excerpt is not None:
+            excerpt, start_line, end_line = prepared_excerpt
+            if excerpt.count("\n") + 1 > line_budget:
+                budget_exhausted = True
+                return False
+        elif item.get("source") in _PATCH_CHANGED_EVIDENCE_SOURCES:
             if content.count("\n") + 1 > line_budget:
                 budget_exhausted = True
                 return False
@@ -1391,24 +1593,325 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             changed_evidence_count += 1
         return True
 
+    def context_symbols_for_request(
+        candidate: dict,
+        candidate_id: str,
+        request_spec: dict,
+    ) -> list[str]:
+        symbols = (
+            _required_context_symbols(candidate)
+            if request_spec.get("required")
+            else _requested_context_symbols(candidate)
+        )
+        claimed = claimed_required_symbols.setdefault(candidate_id, set())
+        return [symbol for symbol in symbols if symbol not in claimed]
+
+    def find_shared_evidence_group(
+        candidate: dict,
+        candidate_id: str,
+        request_spec: dict,
+        path: str,
+        source: str,
+        content: str,
+    ) -> tuple[Optional[list[dict]], list[str], list[str]]:
+        symbols = context_symbols_for_request(candidate, candidate_id, request_spec)
+        best_group = None
+        best_matches: list[str] = []
+        best_score = (-1, -1, -1)
+        for existing_group in shared_repo_evidence.get((source, path), ()):
+            combined_content = "\n".join(
+                str(existing.get("content") or "")
+                for existing in existing_group
+            )
+            if not combined_content.strip():
+                continue
+            anchor_content = []
+            reclaimable_lines = 0
+            for existing in existing_group:
+                existing_content = str(existing.get("content") or "")
+                existing_lines = split_git_file_lines(existing_content)
+                try:
+                    excerpt_start = int(existing.get("start_line"))
+                    anchor_start = int(existing.get("anchor_start_line"))
+                    anchor_end = int(existing.get("anchor_end_line"))
+                except (TypeError, ValueError):
+                    continue
+                relative_start = anchor_start - excerpt_start
+                relative_end = anchor_end - excerpt_start
+                if (
+                    relative_start < 0
+                    or relative_end < relative_start
+                    or relative_end >= len(existing_lines)
+                ):
+                    continue
+                durable_lines = existing_lines[relative_start:relative_end + 1]
+                anchor_content.append("\n".join(durable_lines))
+                reclaimable_lines += len(existing_lines) - len(durable_lines)
+            durable_content = "\n".join(anchor_content)
+            discoverable_symbols = [
+                symbol for symbol in symbols if symbol in combined_content
+            ]
+            matched_symbols = [
+                symbol for symbol in symbols if symbol in durable_content
+            ]
+            if path == candidate.get("relevant_file") and not symbols:
+                source_lines = split_git_file_lines(content)
+                resolved_anchor = candidate.get("start_line")
+                matching_anchor = False
+                for existing in existing_group:
+                    try:
+                        visible_start = int(existing.get("start_line"))
+                        visible_end = int(existing.get("end_line"))
+                    except (TypeError, ValueError):
+                        continue
+                    visible_lines = split_git_file_lines(str(existing.get("content") or ""))
+                    visible_anchor_index = resolved_anchor - visible_start
+                    if (
+                        isinstance(resolved_anchor, int)
+                        and visible_start <= resolved_anchor <= visible_end
+                        and 0 <= visible_anchor_index < len(visible_lines)
+                        and resolved_anchor <= len(source_lines)
+                        and visible_lines[visible_anchor_index]
+                        == source_lines[resolved_anchor - 1]
+                    ):
+                        matching_anchor = True
+                        break
+                if not matching_anchor:
+                    continue
+            score = (
+                len(matched_symbols),
+                len(discoverable_symbols),
+                reclaimable_lines,
+            )
+            if best_group is None or score > best_score:
+                best_group = existing_group
+                best_matches = matched_symbols
+                best_score = score
+            if len(matched_symbols) == len(symbols):
+                break
+        remaining_symbols = [symbol for symbol in symbols if symbol not in best_matches]
+        return best_group, best_matches, remaining_symbols
+
+    def bind_shared_evidence_group(
+        shared_items: list[dict],
+        candidate_id: str,
+        request_spec: dict,
+        symbols: list[str],
+    ) -> None:
+        for shared_item in shared_items:
+            candidate_ids = shared_item.get("candidate_ids")
+            if not isinstance(candidate_ids, list):
+                candidate_ids = [shared_item.pop("candidate_id")]
+                shared_item["candidate_ids"] = candidate_ids
+            if candidate_id not in candidate_ids:
+                candidate_ids.append(candidate_id)
+            shared_item["required_evidence"] = bool(
+                shared_item.get("required_evidence") or request_spec.get("required")
+            )
+        claimed_required_symbols.setdefault(candidate_id, set()).update(symbols)
+
+    def set_request_excerpt_metadata(request: dict, shared_items: list[dict]) -> None:
+        for key in ("start_line", "end_line", "excerpt_ranges"):
+            request.pop(key, None)
+        request["excerpt_count"] = len(shared_items)
+        if len(shared_items) == 1:
+            request.update({
+                "start_line": shared_items[0]["start_line"],
+                "end_line": shared_items[0]["end_line"],
+            })
+        else:
+            request["excerpt_ranges"] = [
+                {
+                    "start_line": item["start_line"],
+                    "end_line": item["end_line"],
+                }
+                for item in shared_items
+            ]
+
+    def compact_shared_evidence_group(shared_items: list[dict], path: str) -> None:
+        """Reclaim surrounding lines while retaining every shared anchor range."""
+        nonlocal total_lines, total_tokens
+        for item in shared_items:
+            content = str(item.get("content") or "")
+            lines = split_git_file_lines(content)
+            try:
+                excerpt_start = int(item.get("start_line"))
+                anchor_start = int(item.get("anchor_start_line"))
+                anchor_end = int(item.get("anchor_end_line"))
+            except (TypeError, ValueError):
+                continue
+            relative_start = anchor_start - excerpt_start
+            relative_end = anchor_end - excerpt_start
+            if relative_start < 0 or relative_end < relative_start or relative_end >= len(lines):
+                continue
+            compacted = "\n".join(lines[relative_start:relative_end + 1])
+            if not compacted or compacted == content:
+                continue
+            old_line_count = content.count("\n") + 1
+            new_line_count = compacted.count("\n") + 1
+            lines_by_path[path] = max(
+                0,
+                lines_by_path.get(path, 0) - (old_line_count - new_line_count),
+            )
+            total_lines -= old_line_count - new_line_count
+            total_tokens -= count_tokens(content) - count_tokens(compacted)
+            item.update({
+                "content": compacted,
+                "start_line": anchor_start,
+                "end_line": anchor_end,
+                "content_truncated": True,
+            })
+        evidence_id = shared_items[0].get("evidence_id") if shared_items else None
+        for request in requests:
+            if request.get("path") == path and request.get("evidence_id") == evidence_id:
+                candidate_id = request.get("candidate_id")
+                request_items = [
+                    item
+                    for item in shared_items
+                    if candidate_id in (
+                        item.get("candidate_ids")
+                        if isinstance(item.get("candidate_ids"), list)
+                        else [item.get("candidate_id")]
+                    )
+                ]
+                if request_items:
+                    set_request_excerpt_metadata(request, request_items)
+
+    def append_context_excerpts(candidate: dict, candidate_id: str, context_path: str,
+                                request_spec: dict, content: str, source: str,
+                                evidence_id: str) -> bool:
+        """Append bounded, prompt-visible excerpts around every symbol found in a file."""
+        nonlocal budget_exhausted, changed_evidence_count, time_budget_exhausted
+        nonlocal total_lines, total_tokens
+        already_claimed = claimed_required_symbols.setdefault(candidate_id, set())
+        symbols = context_symbols_for_request(candidate, candidate_id, request_spec)
+        content_lines = split_git_file_lines(content)
+        anchor_groups = _context_symbol_anchor_groups(
+            content,
+            candidate,
+            context_path,
+            symbols=symbols,
+            stop_requested=lambda: time.monotonic() >= deadline,
+            content_lines=content_lines,
+        )
+        if not anchor_groups:
+            budget_exhausted = True
+            if time.monotonic() >= deadline:
+                time_budget_exhausted = True
+            return False
+        anchor_ranges = _coalesce_context_anchor_groups(
+            anchor_groups,
+            remaining_lines(context_path),
+            len(content_lines),
+        )
+        line_limits = _balanced_context_line_limits(
+            anchor_ranges,
+            remaining_lines(context_path),
+        )
+        if not line_limits:
+            budget_exhausted = True
+            return False
+        evidence_start = len(evidence)
+        previous_path_lines = lines_by_path.get(context_path)
+        previous_total_lines = total_lines
+        previous_total_tokens = total_tokens
+        previous_changed_count = changed_evidence_count
+
+        def rollback() -> None:
+            nonlocal changed_evidence_count, total_lines, total_tokens
+            del evidence[evidence_start:]
+            if previous_path_lines is None:
+                lines_by_path.pop(context_path, None)
+            else:
+                lines_by_path[context_path] = previous_path_lines
+            total_lines = previous_total_lines
+            total_tokens = previous_total_tokens
+            changed_evidence_count = previous_changed_count
+
+        for index, (anchor_start_line, anchor_end_line, _) in enumerate(anchor_ranges):
+            groups_left = len(anchor_ranges) - index
+            line_share = line_limits[index]
+            token_share = (budgets.max_context_tokens - total_tokens) // groups_left
+            if line_share < 1 or token_share < 1:
+                budget_exhausted = True
+                rollback()
+                return False
+            resolved_anchor_line = (anchor_start_line + anchor_end_line + 1) // 2
+            excerpt_start, excerpt_end = _excerpt_bounds(
+                len(content_lines), resolved_anchor_line, line_share
+            )
+            prepared_excerpt = (
+                "\n".join(content_lines[excerpt_start - 1:excerpt_end]),
+                excerpt_start,
+                excerpt_end,
+            )
+            if not append_evidence({
+                "candidate_id": candidate_id,
+                "source": source,
+                "content": str(content),
+                "evidence_id": evidence_id,
+                "required_evidence": bool(request_spec.get("required")),
+                "anchor_start_line": anchor_start_line,
+                "anchor_end_line": anchor_end_line,
+            }, candidate, context_path, max_lines=line_share, max_tokens=token_share,
+                prepared_excerpt=prepared_excerpt):
+                rollback()
+                return False
+        already_claimed.update(
+            symbol
+            for _, _, anchor_symbols in anchor_ranges
+            for symbol in anchor_symbols
+        )
+        return True
+
     def append_complete_context_head(candidate: dict, candidate_id: str, context_path: str,
                                      request_spec: dict, context_diff) -> bool:
         head_file = getattr(context_diff, "head_file", "")
         if not head_file or not getattr(context_diff, "head_file_is_complete", True):
             return False
         source = "changed_context_head"
-        evidence_id = _retrieval_evidence_id(candidate_id, context_path, source)
-        anchor_line = _excerpt_anchor_line(str(head_file), candidate, context_path)
-        if not append_evidence({
-            "candidate_id": candidate_id,
-            "source": source,
-            "content": str(head_file),
-            "evidence_id": evidence_id,
-            "required_evidence": bool(request_spec.get("required")),
-            "anchor_start_line": anchor_line,
-            "anchor_end_line": anchor_line,
-        }, candidate, context_path):
+        shared_items, matched_symbols, remaining_symbols = find_shared_evidence_group(
+            candidate,
+            candidate_id,
+            request_spec,
+            context_path,
+            source,
+            str(head_file),
+        )
+        if shared_items is not None:
+            if matched_symbols or not remaining_symbols:
+                bind_shared_evidence_group(
+                    shared_items,
+                    candidate_id,
+                    request_spec,
+                    matched_symbols,
+                )
+            if not remaining_symbols:
+                changed_context_head_available[(candidate_id, context_path)] = shared_items[0][
+                    "evidence_id"
+                ]
+                return True
+            compact_shared_evidence_group(shared_items, context_path)
+        evidence_id = (
+            shared_items[0]["evidence_id"]
+            if shared_items is not None
+            else _retrieval_evidence_id(candidate_id, context_path, source)
+        )
+        before = len(evidence)
+        if not append_context_excerpts(
+            candidate,
+            candidate_id,
+            context_path,
+            request_spec,
+            str(head_file),
+            source,
+            evidence_id,
+        ):
             return False
+        if shared_items is not None:
+            shared_items.extend(evidence[before:])
+        else:
+            shared_repo_evidence.setdefault((source, context_path), []).append(evidence[before:])
         changed_context_head_available[(candidate_id, context_path)] = evidence_id
         return True
 
@@ -1470,14 +1973,17 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             if context_diff is None:
                 continue
             if (
-                getattr(context_diff, "edit_type", None) == EDIT_TYPE.ADDED
-                and getattr(context_diff, "head_file", "")
+                getattr(context_diff, "head_file", "")
                 and getattr(context_diff, "head_file_is_complete", True)
             ):
                 if not append_complete_context_head(
                     candidate, candidate_id, context_path, request_spec, context_diff
                 ):
-                    incomplete_changed_context.add(context_key)
+                    changed_context_failure_status[context_key] = (
+                        "time_budget_exhausted"
+                        if time_budget_exhausted
+                        else "context_budget_exhausted"
+                    )
                 continue
             context_item_count = 0
             context_collection_status = {}
@@ -1537,7 +2043,11 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             ):
                 changed_context_patch_available[context_key] = complete_added_patch_evidence_id
             if not appended_all:
-                incomplete_changed_context.add(context_key)
+                changed_context_failure_status[context_key] = (
+                    "time_budget_exhausted"
+                    if time_budget_exhausted
+                    else "context_budget_exhausted"
+                )
 
     for candidate in candidates:
         candidate_id = candidate["candidate_id"]
@@ -1545,6 +2055,7 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         diff_file = diff_by_file.get(candidate.get("relevant_file"))
         head_file = getattr(diff_file, "head_file", "") if diff_file is not None else ""
         changed_head_available = False
+        changed_head_failure_status = None
         changed_head_evidence_id = _retrieval_evidence_id(
             candidate_id, relevant_file, "changed_head"
         )
@@ -1554,12 +2065,55 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             append_evidence(evidence_item, candidate, static_path)
         if (candidate.get("side", "new") == "new" and head_file
                 and getattr(diff_file, "head_file_is_complete", True)):
-            changed_head_available = append_evidence({
-                "candidate_id": candidate_id,
-                "source": "changed_head",
-                "content": str(head_file),
-                "evidence_id": changed_head_evidence_id,
-            }, candidate, relevant_file)
+            head_request = {"required": False}
+            shared_items, matched_symbols, remaining_symbols = find_shared_evidence_group(
+                candidate,
+                candidate_id,
+                head_request,
+                relevant_file,
+                "changed_head",
+                str(head_file),
+            )
+            if shared_items is not None:
+                if matched_symbols or not remaining_symbols:
+                    bind_shared_evidence_group(
+                        shared_items,
+                        candidate_id,
+                        head_request,
+                        matched_symbols,
+                    )
+                changed_head_evidence_id = shared_items[0]["evidence_id"]
+                changed_head_available = not remaining_symbols
+                if remaining_symbols:
+                    compact_shared_evidence_group(shared_items, relevant_file)
+            if not changed_head_available:
+                if shared_items is None:
+                    changed_head_evidence_id = _retrieval_evidence_id(
+                        candidate_id, relevant_file, "changed_head"
+                    )
+                before = len(evidence)
+                changed_head_available = append_context_excerpts(
+                    candidate,
+                    candidate_id,
+                    relevant_file,
+                    head_request,
+                    str(head_file),
+                    "changed_head",
+                    changed_head_evidence_id,
+                )
+                if changed_head_available:
+                    if shared_items is not None:
+                        shared_items.extend(evidence[before:])
+                    else:
+                        shared_repo_evidence.setdefault(
+                            ("changed_head", relevant_file), []
+                        ).append(evidence[before:])
+                else:
+                    changed_head_failure_status = (
+                        "time_budget_exhausted"
+                        if time_budget_exhausted
+                        else "context_budget_exhausted"
+                    )
         for request_spec in _requested_path_specs(candidate):
             request = {"candidate_id": candidate_id, **request_spec}
             if request.get("status") == "unsafe_path":
@@ -1573,6 +2127,14 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 request["source"] = "changed_head"
                 request["evidence_id"] = changed_head_evidence_id
                 continue
+            if path == relevant_file and changed_head_failure_status:
+                # A complete diff head is the authoritative version of a
+                # modified candidate file. If its required evidence cannot fit,
+                # substituting the base repository file can make stale symbols
+                # appear current and incorrectly complete the request.
+                request["status"] = changed_head_failure_status
+                budget_exhausted = True
+                continue
             context_key = (candidate_id, path)
             if context_key in changed_context_head_available:
                 request["status"] = "satisfied_by_changed_head"
@@ -1584,58 +2146,41 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 request["source"] = "changed_context_patch"
                 request["evidence_id"] = changed_context_patch_available[context_key]
                 continue
-            if context_key in incomplete_changed_context:
-                request["status"] = "context_budget_exhausted"
+            if context_key in changed_context_failure_status:
+                request["status"] = changed_context_failure_status[context_key]
                 budget_exhausted = True
                 continue
             source = "pr_head_file" if prefer_pr_head else "repository_file"
             fetch_path = path if prefer_pr_head else _base_fetch_path(path, diff_by_file.get(path))
             cache_key = ("pr_head" if prefer_pr_head else "base", fetch_path)
-            shared_item = None
             cached_content = cache.get(cache_key)
             if isinstance(cached_content, bytes):
                 cached_content = cached_content.decode("utf-8", errors="replace")
-            resolved_anchor = _excerpt_anchor_line(
-                str(cached_content or ""), candidate, path
+            shared_items, matched_symbols, remaining_symbols = find_shared_evidence_group(
+                candidate,
+                candidate_id,
+                request,
+                path,
+                source,
+                str(cached_content or ""),
             )
-            for existing in shared_repo_evidence.get((source, path), ()):
-                try:
-                    visible_start = int(existing.get("start_line"))
-                    visible_end = int(existing.get("end_line"))
-                except (TypeError, ValueError):
+            if shared_items is not None:
+                if matched_symbols or not remaining_symbols:
+                    bind_shared_evidence_group(
+                        shared_items,
+                        candidate_id,
+                        request,
+                        matched_symbols,
+                    )
+                if not remaining_symbols:
+                    request.update({
+                        "status": "retrieved",
+                        "source": source,
+                        "evidence_id": shared_items[0]["evidence_id"],
+                    })
+                    set_request_excerpt_metadata(request, shared_items)
                     continue
-                visible_lines = split_git_file_lines(str(existing.get("content") or ""))
-                source_lines = split_git_file_lines(str(cached_content or ""))
-                visible_anchor_index = resolved_anchor - visible_start
-                if (
-                    resolved_anchor > 0
-                    and resolved_anchor == existing.get("anchor_start_line")
-                    and resolved_anchor == existing.get("anchor_end_line")
-                    and visible_start <= resolved_anchor <= visible_end
-                    and 0 <= visible_anchor_index < len(visible_lines)
-                    and resolved_anchor <= len(source_lines)
-                    and visible_lines[visible_anchor_index] == source_lines[resolved_anchor - 1]
-                ):
-                    shared_item = existing
-                    break
-            if shared_item is not None:
-                candidate_ids = shared_item.get("candidate_ids")
-                if not isinstance(candidate_ids, list):
-                    candidate_ids = [shared_item.pop("candidate_id")]
-                    shared_item["candidate_ids"] = candidate_ids
-                if candidate_id not in candidate_ids:
-                    candidate_ids.append(candidate_id)
-                shared_item["required_evidence"] = bool(
-                    shared_item.get("required_evidence") or request.get("required")
-                )
-                request.update({
-                    "status": "retrieved",
-                    "source": source,
-                    "start_line": shared_item["start_line"],
-                    "end_line": shared_item["end_line"],
-                    "evidence_id": shared_item["evidence_id"],
-                })
-                continue
+                compact_shared_evidence_group(shared_items, path)
             if path not in unique_files and len(unique_files) >= budgets.max_files:
                 request["status"] = "file_budget_exhausted"
                 budget_exhausted = True
@@ -1674,33 +2219,86 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
                 continue
             if isinstance(content, bytes):
                 content = content.decode("utf-8", errors="replace")
-            evidence_id = _retrieval_evidence_id(candidate_id, path, source)
-            anchor_line = _excerpt_anchor_line(str(content), candidate, path)
-            evidence_item = {
-                "candidate_id": candidate_id,
-                "source": source,
-                "path": path,
-                "content": str(content),
-                "evidence_id": evidence_id,
-                "required_evidence": bool(request.get("required")),
-                "anchor_start_line": anchor_line,
-                "anchor_end_line": anchor_line,
-            }
+            evidence_id = (
+                shared_items[0]["evidence_id"]
+                if shared_items is not None
+                else _retrieval_evidence_id(candidate_id, path, source)
+            )
             before = len(evidence)
-            if not append_evidence(evidence_item, candidate, path):
+            if not append_context_excerpts(
+                candidate,
+                candidate_id,
+                path,
+                request,
+                str(content),
+                source,
+                evidence_id,
+            ):
                 request["status"] = (
                     "time_budget_exhausted" if time_budget_exhausted else "context_budget_exhausted"
                 )
                 continue
-            appended = evidence[before]
-            shared_repo_evidence.setdefault((source, path), []).append(appended)
+            appended_items = evidence[before:]
+            if shared_items is not None:
+                shared_items.extend(appended_items)
+                request_items = [
+                    item
+                    for item in shared_items
+                    if candidate_id in (
+                        item.get("candidate_ids")
+                        if isinstance(item.get("candidate_ids"), list)
+                        else [item.get("candidate_id")]
+                    )
+                ]
+            else:
+                shared_repo_evidence.setdefault((source, path), []).append(appended_items)
+                request_items = appended_items
             request.update({
                 "status": "retrieved",
                 "source": source,
-                "start_line": appended["start_line"],
-                "end_line": appended["end_line"],
                 "evidence_id": evidence_id,
             })
+            set_request_excerpt_metadata(request, request_items)
+
+    # Assign each original model-requested symbol to the first request whose
+    # prompt evidence contains it. Missing symbols fall back to a required
+    # external request, or to the candidate file request when no external
+    # context was requested, so every original symbol remains fail-closed after
+    # whole-prompt clipping.
+    for candidate in candidates:
+        candidate_id = candidate["candidate_id"]
+        symbols = _required_context_symbols(candidate)
+        candidate_requests = [
+            request
+            for request in requests
+            if request.get("candidate_id") == candidate_id
+        ]
+        if not symbols or not candidate_requests:
+            continue
+        required_requests = [
+            request for request in candidate_requests if request.get("required")
+        ]
+        fallback_request = required_requests[0] if required_requests else candidate_requests[0]
+        for symbol in symbols:
+            assigned_request = next(
+                (
+                    request
+                    for request in candidate_requests
+                    if any(
+                        symbol in str(item.get("content") or "")
+                        for item in _request_prompt_evidence(request, evidence)
+                    )
+                ),
+                fallback_request,
+            )
+            assigned_request.setdefault("_required_context_symbols", []).append(symbol)
+        for request in candidate_requests:
+            if (
+                request.get("_required_context_symbols")
+                and request.get("status") in _COMPLETE_RETRIEVAL_REQUEST_STATUSES
+                and not _request_has_prompt_visible_symbols(request, evidence)
+            ):
+                request["status"] = "context_symbol_missing"
 
     artifact = {
         "requests": requests,
@@ -1803,19 +2401,15 @@ def _candidate_prompt_evidence_gaps(
     retrieval_requests: list[dict],
 ) -> tuple[bool, int]:
     """Report changed-anchor and required-context gaps in prompt-visible evidence."""
-    visible_evidence_ids = {
-        item.get("evidence_id") for item in available_evidence
-        if str(item.get("content") or "").strip() and item.get("evidence_id")
-    }
     missing_required_request_count = sum(
         1 for request in retrieval_requests
         if (
             not retrieval_request_is_complete(request)
             or (
-                request.get("required")
+                (request.get("required") or request.get("_required_context_symbols"))
                 and (
-                    not request.get("evidence_id")
-                    or request.get("evidence_id") not in visible_evidence_ids
+                    not _request_prompt_evidence(request, available_evidence)
+                    or not _request_has_prompt_visible_symbols(request, available_evidence)
                 )
             )
         )
