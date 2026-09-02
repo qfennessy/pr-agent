@@ -546,6 +546,7 @@ class ReviewThreadMutationProvider(Protocol):
         body: str,
         expected_head_sha: str,
         expected_thread: ReviewThreadSnapshot,
+        expected_finding_threads: Optional[tuple[ReviewThreadSnapshot, ...]] = None,
     ) -> ReviewThreadActionOutcome:
         raise NotImplementedError
 
@@ -751,6 +752,7 @@ def plan_review_thread_actions(
                     root_comment_id=root.database_id if root else None,
                     body=desired.marked_body,
                     expected_thread=current,
+                    expected_threads=tuple(matches),
                 )
 
             for duplicate in active_matches:
@@ -870,6 +872,7 @@ def plan_review_thread_actions(
                         root_comment_id=root.database_id,
                         body=marked_body,
                         expected_thread=thread,
+                        expected_threads=tuple(matches),
                     )
                     add(
                         ReviewThreadActionKind.RESOLVE,
@@ -974,6 +977,7 @@ def execute_review_thread_action_plan(
                 action.body,
                 action.expected_head_sha,
                 action.expected_thread,
+                action.expected_threads,
             )
         elif action.kind == ReviewThreadActionKind.RESOLVE and action.thread_id and action.expected_thread:
             outcome = provider.resolve_review_thread(

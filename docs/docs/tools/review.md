@@ -102,8 +102,10 @@ same-host service workers. Unrelated findings retain worker concurrency. If cros
 unsafe, the mutation fails closed. Create revalidation requires the complete planned same-finding thread set to remain
 unchanged, including bot-resolved recurrence history, while holding that lock through publication. A post-create inventory
 selects the oldest identical safe Bot-owned copy and resolves only duplicate copies with no replies; disagreement or unsafe
-ownership fails closed for a fresh inventory instead of deleting discussion. A bot-resolved historical thread is also
-preserved when it gains a reply or first appears after recurrence was planned.
+ownership fails closed for a fresh inventory instead of deleting discussion. Updates additionally require the complete
+planned same-finding set to remain unchanged, so an older update plan cannot modify an obsolete thread between replacement
+creation and cleanup. A bot-resolved historical thread is also preserved when it gains a reply or first appears after
+recurrence was planned.
 
 The foundation also models invalid or rejected inline locations as de-duplicated summary fallbacks. It returns those
 fallback entries to its caller rather than publishing them itself. Runtime publication remains disconnected until

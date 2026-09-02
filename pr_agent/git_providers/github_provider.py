@@ -1333,6 +1333,7 @@ class GithubProvider(GitProvider):
         expected_thread: ReviewThreadSnapshot,
         *,
         comment_id: Optional[int] = None,
+        expected_finding_threads: Optional[tuple[ReviewThreadSnapshot, ...]] = None,
     ) -> tuple[Optional[str], Optional[ReviewThreadActionOutcome]]:
         """Fail closed unless the exact planned thread inventory is still current."""
         current_head_sha, blocked = self._check_review_thread_head(kind, expected_head_sha)
@@ -1359,9 +1360,10 @@ class GithubProvider(GitProvider):
                 reason="planned_thread_precondition_is_not_safe",
             )
         try:
+            snapshots = self.get_review_thread_snapshots()
             matches = [
                 thread
-                for thread in self.get_review_thread_snapshots()
+                for thread in snapshots
                 if thread.thread_id == expected_thread.thread_id
             ]
         except Exception as e:
@@ -1375,6 +1377,27 @@ class GithubProvider(GitProvider):
                 reason=f"thread_revalidation_failed: {e}",
                 **_review_thread_failure_details(e),
             )
+        if expected_finding_threads is not None:
+            expected_by_id = {thread.thread_id: thread for thread in expected_finding_threads}
+            current_finding_threads = [
+                thread for thread in snapshots
+                if thread.finding_id == expected_thread.finding_id
+            ]
+            current_by_id = {thread.thread_id: thread for thread in current_finding_threads}
+            if (
+                len(expected_by_id) != len(expected_finding_threads)
+                or len(current_by_id) != len(current_finding_threads)
+                or current_by_id != expected_by_id
+            ):
+                return current_head_sha, ReviewThreadActionOutcome(
+                    kind=kind,
+                    state=ReviewThreadActionState.STALE_INVENTORY,
+                    expected_head_sha=expected_head_sha,
+                    current_head_sha=current_head_sha,
+                    thread_id=expected_thread.thread_id,
+                    comment_id=comment_id,
+                    reason="finding_thread_set_changed_since_inventory",
+                )
         if len(matches) != 1 or matches[0] != expected_thread:
             return current_head_sha, ReviewThreadActionOutcome(
                 kind=kind,
@@ -1720,6 +1743,7 @@ class GithubProvider(GitProvider):
         body: str,
         expected_head_sha: str,
         expected_thread: ReviewThreadSnapshot,
+        expected_finding_threads: Optional[tuple[ReviewThreadSnapshot, ...]] = None,
     ) -> ReviewThreadActionOutcome:
         if not expected_thread.finding_id:
             return ReviewThreadActionOutcome(
@@ -1730,6 +1754,8 @@ class GithubProvider(GitProvider):
                 comment_id=comment_id,
                 reason="planned_thread_finding_id_is_missing",
             )
+        if expected_finding_threads is None:
+            expected_finding_threads = (expected_thread,)
         try:
             with _review_thread_mutation_lock(self.repo, self.pr_num, expected_thread.finding_id):
                 return self._update_review_thread_locked(
@@ -1737,6 +1763,7 @@ class GithubProvider(GitProvider):
                     body,
                     expected_head_sha,
                     expected_thread,
+                    expected_finding_threads,
                 )
         except _ReviewThreadMutationLockError as error:
             return ReviewThreadActionOutcome(
@@ -1755,12 +1782,14 @@ class GithubProvider(GitProvider):
         body: str,
         expected_head_sha: str,
         expected_thread: ReviewThreadSnapshot,
+        expected_finding_threads: Optional[tuple[ReviewThreadSnapshot, ...]],
     ) -> ReviewThreadActionOutcome:
         current_head_sha, blocked = self._revalidate_review_thread_mutation(
             ReviewThreadActionKind.UPDATE,
             expected_head_sha,
             expected_thread,
             comment_id=comment_id,
+            expected_finding_threads=expected_finding_threads,
         )
         if blocked:
             return blocked

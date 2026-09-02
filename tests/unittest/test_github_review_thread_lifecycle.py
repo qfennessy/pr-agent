@@ -923,7 +923,11 @@ def test_destructive_mutation_aborts_when_human_reply_arrives_after_planning(ope
         outcome = provider.resolve_review_thread("thread-1", "head-1", expected_thread)
 
     assert outcome.state == ReviewThreadActionState.STALE_INVENTORY
-    assert outcome.reason == "review_thread_changed_since_inventory"
+    assert outcome.reason == (
+        "finding_thread_set_changed_since_inventory"
+        if operation == "update"
+        else "review_thread_changed_since_inventory"
+    )
     assert outcome.mutation_attempted is False
     assert outcome.requires_fresh_inventory is True
     assert not any(
@@ -931,6 +935,35 @@ def test_destructive_mutation_aborts_when_human_reply_arrives_after_planning(ope
         or (call[0] == "graphql" and "mutation(" in call[3]["query"])
         for call in requester.calls
     )
+
+
+def test_update_aborts_when_replacement_thread_appears_after_planning():
+    expected_thread, _ = _owned_thread_state()
+    body = expected_thread.root_comment.body
+    current = _thread("thread-1", [_comment(body, database_id=77)])
+    replacement = _thread(
+        "thread-2",
+        [_comment(body, node_id="comment-2", database_id=78)],
+        line=20,
+        original_line=20,
+    )
+    requester = _Requester(
+        graphql=[_inventory_page([current, replacement])],
+        rest=[{"head": {"sha": "head-1"}}],
+    )
+
+    outcome = _provider(requester).update_review_thread(
+        77,
+        "new body",
+        "head-1",
+        expected_thread,
+        (expected_thread,),
+    )
+
+    assert outcome.state == ReviewThreadActionState.STALE_INVENTORY
+    assert outcome.reason == "finding_thread_set_changed_since_inventory"
+    assert outcome.mutation_attempted is False
+    assert not any(call[0] == "rest" and call[1] == "PATCH" for call in requester.calls)
 
 
 @pytest.mark.parametrize(

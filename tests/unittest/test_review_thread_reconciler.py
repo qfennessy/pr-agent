@@ -138,8 +138,17 @@ class _MutationProvider:
         self.calls.append(("create", comment, expected_head_sha, expected_threads))
         return self._outcome(ReviewThreadActionKind.CREATE)
 
-    def update_review_thread(self, comment_id, body, expected_head_sha, expected_thread):
-        self.calls.append(("update", comment_id, body, expected_head_sha, expected_thread))
+    def update_review_thread(
+        self,
+        comment_id,
+        body,
+        expected_head_sha,
+        expected_thread,
+        expected_finding_threads=None,
+    ):
+        self.calls.append(
+            ("update", comment_id, body, expected_head_sha, expected_thread, expected_finding_threads)
+        )
         return self._outcome(ReviewThreadActionKind.UPDATE)
 
     def resolve_review_thread(self, thread_id, expected_head_sha, expected_thread):
@@ -596,13 +605,15 @@ def test_versioned_finding_marker_keeps_legacy_markers_readable():
 
 def test_same_anchor_changed_wording_updates_root_comment():
     identity = _identity()
+    existing = _snapshot(identity)
     desired = DesiredReviewThread(identity, ReviewThreadAnchor(identity.path, 10), "new wording")
 
-    plan = plan_review_thread_actions((desired,), (_snapshot(identity),), "head-1")
+    plan = plan_review_thread_actions((desired,), (existing,), "head-1")
 
     assert [action.kind for action in plan.actions] == [ReviewThreadActionKind.UPDATE]
     assert plan.actions[0].root_comment_id == 10
     assert identity.finding_id in plan.actions[0].body
+    assert plan.actions[0].expected_threads == (existing,)
 
 
 def test_visible_body_comparison_ignores_legacy_and_lifecycle_markers():
