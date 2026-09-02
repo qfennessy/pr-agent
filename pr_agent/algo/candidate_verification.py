@@ -2380,11 +2380,25 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         required_requests = [
             request for request in candidate_requests if request.get("required")
         ]
+        optional_context_paths = {
+            path
+            for value in (candidate.get("_specialist_optional_context_files") or [])
+            if (path := safe_repo_path(value))
+        }
         # When external context is required, bind every original symbol only
         # to evidence from that required path set. Candidate-file evidence is
         # independently required for the changed anchor, but cannot satisfy a
-        # same-named helper/caller/interface request.
-        symbol_requests = required_requests or candidate_requests
+        # same-named helper/caller/interface request. Specialist-added paths
+        # remain optional even when they happen to contain the same symbol;
+        # without required external context, retain the candidate-file proof.
+        symbol_requests = [
+            request
+            for request in (required_requests or candidate_requests)
+            if (
+                request.get("path") == candidate.get("relevant_file")
+                or request.get("path") not in optional_context_paths
+            )
+        ]
         fallback_request = symbol_requests[0]
         for symbol in symbols:
             matched_requests = [

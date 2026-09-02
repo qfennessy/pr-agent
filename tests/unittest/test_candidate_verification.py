@@ -3602,6 +3602,73 @@ async def test_specialist_symbol_hint_is_optional_but_original_model_symbol_rema
 
 
 @pytest.mark.asyncio
+async def test_specialist_optional_path_does_not_require_model_symbol_after_prompt_clipping():
+    head_lines = [f"head line {line} " + "x" * 100 for line in range(1, 31)]
+    head_lines[11] = "required_local_contract"
+    helper_lines = [f"helper line {line} " + "y" * 100 for line in range(1, 31)]
+    helper_lines[19] = "def required_local_contract(payload): return payload"
+    service_diff = _diff_file("src/service.py", head_file="\n".join(head_lines))
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            context_files=[],
+            context_symbols=["required_local_contract"],
+        )),
+        [service_diff],
+        [],
+        3,
+    )
+    candidates, prioritization = apply_specialist_prioritization(
+        candidates,
+        {
+            "ranked_hunks": [],
+            "context_requests": [{
+                "kind": "caller",
+                "target": "src/helper.py",
+                "anchor_path": "src/service.py",
+                "anchor_hunk_id": "hunk-1",
+            }],
+        },
+        _specialist_input(),
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = "\n".join(helper_lines)
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=2,
+            max_lines_per_file=6,
+            max_total_lines=12,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[service_diff],
+    )
+    requests_by_path = {
+        request["path"]: request for request in artifact["requests"]
+    }
+    clipped_evidence = bounded_verification_evidence(evidence, 0.25)
+    clipped_content_by_path = {
+        item["path"]: item["content"] for item in clipped_evidence
+    }
+
+    assert prioritization["context_hints_added"] == 1
+    assert candidates[0]["_specialist_optional_context_files"] == ["src/helper.py"]
+    assert requests_by_path["src/service.py"]["_required_context_symbols"] == [
+        "required_local_contract"
+    ]
+    assert "_required_context_symbols" not in requests_by_path["src/helper.py"]
+    assert "required_local_contract" in clipped_content_by_path["src/service.py"]
+    assert "required_local_contract" not in clipped_content_by_path["src/helper.py"]
+    assert prompt_evidence_coverage(
+        candidates,
+        clipped_evidence,
+        artifact["requests"],
+    )["status"] == "complete"
+
+
+@pytest.mark.asyncio
 async def test_two_symbol_required_context_fails_closed_when_excerpt_budget_is_too_small():
     service_diff = _diff_file("src/service.py", head_file="")
     service_diff.head_file_is_complete = False
