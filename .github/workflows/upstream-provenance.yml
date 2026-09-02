@@ -1,7 +1,9 @@
 name: Upstream provenance
 
+# pull_request_target loads this workflow from the protected base branch. The job
+# must never check out or execute pull-request-authored code.
 on:
-  pull_request:
+  pull_request_target:
     branches:
       - main
     types:
@@ -30,18 +32,39 @@ jobs:
             echo "Ordinary pull request; no upstream pin to verify."
           fi
 
-      # The workflow definition comes from the protected base branch. Do not invoke a
-      # verifier from the checked-out PR, because upstream-authored code could replace it.
-      - name: Check out merge candidate
+      - name: Check out protected verifier
         if: steps.classify.outputs.is_sync == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha }}
 
-      - name: Verify pinned upstream commit
+      - name: Fetch candidate and upstream history
         if: steps.classify.outputs.is_sync == 'true'
         env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          git fetch origin "+refs/pull/${PR_NUMBER}/head:refs/upstream-sync/candidate" --no-tags --quiet
+          if [[ "$(git rev-parse refs/upstream-sync/candidate)" != "$HEAD_SHA" ]]; then
+            echo "::error::Fetched pull-request head does not match the event head SHA."
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$BASE_SHA" ]]; then
+            echo "::error::Protected verifier checkout does not match the event base SHA."
+            exit 1
+          fi
+          git fetch https://github.com/The-PR-Agent/pr-agent.git \
+            "+refs/heads/main:refs/upstream-sync/upstream-main" --no-tags --quiet
+
+      - name: Verify immutable upstream candidate
+        if: steps.classify.outputs.is_sync == 'true'
+        env:
+          BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -49,52 +72,13 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           set -euo pipefail
-
-          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Pull request head is not a canonical 40-character commit SHA."
-            exit 1
-          fi
-
-          if [[ ! "$HEAD_REF" =~ ^sync/upstream-[0-9]{8}-([0-9a-f]{8})$ ]]; then
-            echo "::error::Sync branch must be named sync/upstream-YYYYMMDD-<8-char-sha>."
-            exit 1
-          fi
-          SHORT_SHA="${BASH_REMATCH[1]}"
-
-          if [[ "$SHORT_SHA" != "${HEAD_SHA:0:8}" ]]; then
-            echo "::error::Sync branch suffix does not match the pull request head."
-            exit 1
-          fi
-
-          if [[ "$HEAD_REPO" != "qfennessy/pr-agent" ]]; then
-            echo "::error::Sync branches must be owned by qfennessy/pr-agent."
-            exit 1
-          fi
-
-          if [[ "$PR_TITLE" != "sync: upstream @ $SHORT_SHA" ]]; then
-            echo "::error::Sync pull request title does not match the pinned head."
-            exit 1
-          fi
-
-          mapfile -t PINS < <(printf '%s\n' "$PR_BODY" | sed -n \
-            's/^Pinned upstream sync: `The-PR-Agent\/pr-agent@\([0-9a-f]\{40\}\)`$/\1/p')
-          if [[ "${#PINS[@]}" -ne 1 || "${PINS[0]}" != "$HEAD_SHA" ]]; then
-            echo "::error::Pull request body must contain exactly one pin matching the head SHA."
-            exit 1
-          fi
-
-          git fetch https://github.com/The-PR-Agent/pr-agent.git main --no-tags --quiet
-          UPSTREAM_MAIN=$(git rev-parse FETCH_HEAD)
-
-          RESOLVED_SHA=$(git rev-parse --verify "${HEAD_SHA}^{commit}")
-          if [[ "$RESOLVED_SHA" != "$HEAD_SHA" ]]; then
-            echo "::error::Pull request head did not resolve to the pinned commit."
-            exit 1
-          fi
-
-          if ! git merge-base --is-ancestor "$HEAD_SHA" "$UPSTREAM_MAIN"; then
-            echo "::error::Pinned commit is not part of upstream main."
-            exit 1
-          fi
-
-          echo "Verified The-PR-Agent/pr-agent@$HEAD_SHA."
+          python -m pr_agent.upstream_provenance \
+            --repository . \
+            --head-ref "$HEAD_REF" \
+            --head-repo "$HEAD_REPO" \
+            --head-sha "$HEAD_SHA" \
+            --base-repo "$BASE_REPO" \
+            --base-sha "$BASE_SHA" \
+            --title "$PR_TITLE" \
+            --body "$PR_BODY" \
+            --upstream-main-sha "$(git rev-parse refs/upstream-sync/upstream-main)"
