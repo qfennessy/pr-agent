@@ -877,6 +877,50 @@ def test_shadow_journal_final_seal_failure_stops_the_writer_and_fails_close(tmp_
     assert writer._thread is not None and not writer._thread.is_alive()
 
 
+def test_shadow_journal_shutdown_cannot_acknowledge_a_late_submission(tmp_path):
+    case = _case("case", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
+    manifest = _manifest((case,), (_arm("deterministic", EvaluationArmKind.DETERMINISTIC),))
+    entry = ShadowJournalEntry.from_run_record(
+        _record(manifest, case, "deterministic"),
+        arm=manifest.arms[0],
+        event=case.event,
+        policy_hash=manifest.policy_hash,
+        configuration_hash=manifest.configuration_hash,
+    )
+    writer = ShadowJournalWriter(tmp_path / "shutdown-race.ndjson", enabled=True)
+    submit_waiting = threading.Event()
+    release_submit = threading.Event()
+    lock = threading.Lock()
+
+    class GateSubmitLock:
+        def __enter__(self):
+            if threading.current_thread().name == "shadow-submit-test":
+                submit_waiting.set()
+                assert release_submit.wait(2)
+            lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            lock.release()
+
+    writer._submit_lock = GateSubmitLock()
+    statuses = []
+    submitter = threading.Thread(
+        target=lambda: statuses.append(writer.submit(entry)),
+        name="shadow-submit-test",
+    )
+    submitter.start()
+    assert submit_waiting.wait(1)
+
+    writer_closed = writer.close()
+    release_submit.set()
+    submitter.join(1)
+
+    assert writer_closed is True
+    assert statuses == [ShadowSubmitStatus.CLOSED]
+    assert not (tmp_path / "shutdown-race.ndjson").exists()
+
+
 def test_scorer_reports_lineage_lifecycle_events_stages_cohorts_and_paired_uncertainty():
     root = _case("root", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
     child = _case("child", EvaluationCohort.HOLDOUT, ReviewEvent.WORKTREE_IDLE, 30, parent="root")
@@ -1387,7 +1431,20 @@ def test_cocos_adapter_reads_external_locked_corpus_without_copying(tmp_path, ca
         duplicate_controls = json.loads(json.dumps(checkpoint_payload))
         duplicate_controls["entries"][1][duplicate_field] = duplicate_controls["entries"][0][duplicate_field]
         _write_json(checkpoint_controls, duplicate_controls)
-        with pytest.raises(EvaluationValidationError, match=f"{duplicate_field} values must be unique"):
+        with pytest.raises(EvaluationValidationError, match="identity hashes must be unique across roles"):
+            validate_cocos_story_corpus(
+                corpus,
+                lock,
+                checkpoint_controls_path=checkpoint_controls,
+            )
+    for first_field, second_field in (
+        ("snapshot_artifact_hash", "adjudication_hash"),
+        ("snapshot_id", "snapshot_artifact_hash"),
+    ):
+        duplicate_controls = json.loads(json.dumps(checkpoint_payload))
+        duplicate_controls["entries"][1][second_field] = duplicate_controls["entries"][0][first_field]
+        _write_json(checkpoint_controls, duplicate_controls)
+        with pytest.raises(EvaluationValidationError, match="identity hashes must be unique across roles"):
             validate_cocos_story_corpus(
                 corpus,
                 lock,

@@ -326,9 +326,7 @@ def _validate_checkpoint_controls(path: Optional[str | Path]) -> tuple[Optional[
     if not 15 <= len(entries) <= 20:
         raise EvaluationValidationError("checkpoint controls must contain 15 to 20 independently adjudicated cases")
     ids: set[str] = set()
-    snapshot_ids: set[str] = set()
-    snapshot_artifact_hashes: set[str] = set()
-    adjudication_hashes: set[str] = set()
+    all_identity_hashes: set[str] = set()
     scenarios: set[str] = set()
     parents: dict[str, Optional[str]] = {}
     for entry in entries:
@@ -353,17 +351,20 @@ def _validate_checkpoint_controls(path: Optional[str | Path]) -> tuple[Optional[
             raise EvaluationValidationError("checkpoint control parent_id must name a different checkpoint")
         parents[identifier] = parent_id
         snapshot_id = entry.get("snapshot_id")
-        if not isinstance(snapshot_id, str) or not _SHA256.fullmatch(snapshot_id) or snapshot_id in snapshot_ids:
+        if (
+            not isinstance(snapshot_id, str)
+            or not _SHA256.fullmatch(snapshot_id)
+            or snapshot_id in all_identity_hashes
+        ):
             raise EvaluationValidationError("checkpoint controls require unique immutable snapshot ids")
-        snapshot_ids.add(snapshot_id)
+        all_identity_hashes.add(snapshot_id)
         for field_name in ("snapshot_artifact_hash", "adjudication_hash"):
             value = entry.get(field_name)
             if not isinstance(value, str) or not _SHA256.fullmatch(value):
                 raise EvaluationValidationError(f"checkpoint control {field_name} must be a sha256 identity")
-            identities = snapshot_artifact_hashes if field_name == "snapshot_artifact_hash" else adjudication_hashes
-            if value in identities:
-                raise EvaluationValidationError(f"checkpoint control {field_name} values must be unique")
-            identities.add(value)
+            if value in all_identity_hashes:
+                raise EvaluationValidationError("checkpoint control identity hashes must be unique across roles")
+            all_identity_hashes.add(value)
         if entry.get("is_clean") is not True:
             raise EvaluationValidationError("checkpoint controls must be independently adjudicated as clean")
         withdrawn = entry.get("expected_withdrawn_fingerprints", [])

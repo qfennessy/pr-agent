@@ -548,9 +548,9 @@ class ShadowJournalWriter:
             raise EvaluationValidationError("shadow journal accepts only validated ShadowJournalEntry values")
         if not self.enabled:
             return ShadowSubmitStatus.DISABLED
-        if self._closed.is_set():
-            return ShadowSubmitStatus.CLOSED
         with self._submit_lock:
+            if self._closed.is_set():
+                return ShadowSubmitStatus.CLOSED
             self._submitted_entry_count += 1
             if self._failed.is_set():
                 self._dropped_entry_count += 1
@@ -626,19 +626,21 @@ class ShadowJournalWriter:
 
     def close(self, timeout_seconds: float = 5.0) -> bool:
         """Flush only during explicit shutdown; ``submit`` remains non-blocking."""
-        self._closed.set()
         if not self.enabled:
+            self._closed.set()
             return not self._failed.is_set()
         assert self._thread is not None
         with self._close_lock:
+            with self._submit_lock:
+                self._closed.set()
+                if self._thread.is_alive() and not self._stop_enqueued.is_set():
+                    try:
+                        self._queue.put(self._STOP, timeout=timeout_seconds)
+                    except queue.Full:
+                        return False
+                    self._stop_enqueued.set()
             if not self._thread.is_alive():
                 return not self._failed.is_set() and self._dropped_entry_count == 0
-            if not self._stop_enqueued.is_set():
-                try:
-                    self._queue.put(self._STOP, timeout=timeout_seconds)
-                except queue.Full:
-                    return False
-                self._stop_enqueued.set()
             self._thread.join(timeout_seconds)
             return (
                 not self._thread.is_alive()
