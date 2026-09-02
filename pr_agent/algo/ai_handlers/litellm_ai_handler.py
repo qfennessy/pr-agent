@@ -22,6 +22,7 @@ from pr_agent.algo import (
 )
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_helpers import (
+    _IncompleteStreamingResponseError,
     _get_azure_ad_token,
     _handle_streaming_response,
     _process_litellm_extra_body,
@@ -1491,7 +1492,15 @@ class LiteLLMAIHandler(BaseAiHandler):
                 get_logger().info(f"Using streaming mode for model {model}")
             record_provider_request_attempt()
             response = await acompletion(**kwargs)
-            return await _handle_streaming_response(response, model=model)
+            try:
+                return await _handle_streaming_response(response, model=model)
+            except _IncompleteStreamingResponseError as exc:
+                self._record_completion_metadata(
+                    exc.completed_response,
+                    model=model,
+                    display_model=display_model,
+                )
+                raise
         else:
             record_provider_request_attempt()
             response = await acompletion(**kwargs)

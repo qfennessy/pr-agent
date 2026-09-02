@@ -1952,6 +1952,7 @@ class PRReviewer:
             matching_candidates = candidates_by_identity.get(identity, [])
             if len(matching_candidates) != 1:
                 artifact["results"].append({
+                    "stable_finding_id": finding.get("trusted_stable_key"),
                     "state": "unavailable",
                     "failure_reason": "trusted_candidate_identity_unavailable",
                     "publication_safe": False,

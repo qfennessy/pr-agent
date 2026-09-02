@@ -272,6 +272,11 @@ async def _async_chunks(*chunks):
         yield chunk
 
 
+async def _failing_stream_before_usage(chunk):
+    yield chunk
+    raise ValueError("stream interrupted before finalized usage")
+
+
 @pytest.mark.asyncio
 async def test_streamed_completion_preserves_finalized_usage_and_collects_known_cost(monkeypatch):
     usage = {
@@ -461,6 +466,137 @@ async def test_frontier_retry_accounts_for_metered_empty_response(monkeypatch):
     assert adjudication.total_cost_usd == Decimal("0.010")
     assert adjudication.known_usage_call_count == 2
     assert adjudication.known_cost_call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_frontier_retry_accounts_for_metered_empty_stream(monkeypatch):
+    handler = _bare_handler()
+    handler.streaming_required_models = ["streaming-model"]
+    handler.force_streaming_provider = ""
+    handler.force_streaming_api_base_substrings = []
+    failed_content = SimpleNamespace(
+        choices=[SimpleNamespace(delta=SimpleNamespace(content=""), finish_reason="stop")],
+        usage=None,
+        model="revision-a",
+        _hidden_params={"custom_llm_provider": "provider-a"},
+    )
+    failed_usage = SimpleNamespace(
+        choices=[],
+        usage={
+            "prompt_tokens": 80,
+            "completion_tokens": 4,
+            "total_tokens": 84,
+            "response_cost": 0.003,
+        },
+    )
+    successful_content = SimpleNamespace(
+        choices=[SimpleNamespace(delta=SimpleNamespace(content="resp"), finish_reason="stop")],
+        usage=None,
+        model="revision-a",
+        _hidden_params={"custom_llm_provider": "provider-a"},
+    )
+    successful_usage = SimpleNamespace(
+        choices=[],
+        usage={
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "total_tokens": 110,
+            "response_cost": 0.007,
+        },
+    )
+    route = AIModelRoute(
+        models=("streaming-model",),
+        deployments=("deployment-a",),
+        timeout_seconds=1,
+        model_retries=2,
+        provider_retries=0,
+        attribution="frontier_adjudication:sha256:finding",
+        collect_cost=True,
+    )
+    init_run_details()
+
+    with patch(
+        "pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion",
+        new_callable=AsyncMock,
+    ) as completion:
+        completion.side_effect = [
+            _async_chunks(failed_content, failed_usage),
+            _async_chunks(successful_content, successful_usage),
+        ]
+        result = await retry_with_fallback_models(
+            lambda model: handler.chat_completion(model=model, system="sys", user="usr"),
+            model_route=route,
+        )
+
+    assert result == ("resp", "stop")
+    adjudication = get_run_details().adjudication_runs["sha256:finding"]
+    assert adjudication.model_attempts == 2
+    assert adjudication.provider_attempts == 2
+    assert adjudication.num_ai_calls == 2
+    assert adjudication.total_tokens == 194
+    assert adjudication.total_cost_usd == Decimal("0.010")
+    assert adjudication.known_usage_call_count == 2
+    assert adjudication.known_cost_call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_frontier_retry_keeps_unmetered_stream_failure_incomplete(monkeypatch):
+    handler = _bare_handler()
+    handler.streaming_required_models = ["streaming-model"]
+    handler.force_streaming_provider = ""
+    handler.force_streaming_api_base_substrings = []
+    interrupted_content = SimpleNamespace(
+        choices=[SimpleNamespace(delta=SimpleNamespace(content="partial"), finish_reason=None)],
+        usage=None,
+        model="revision-a",
+        _hidden_params={"custom_llm_provider": "provider-a"},
+    )
+    successful_content = SimpleNamespace(
+        choices=[SimpleNamespace(delta=SimpleNamespace(content="resp"), finish_reason="stop")],
+        usage=None,
+        model="revision-a",
+        _hidden_params={"custom_llm_provider": "provider-a"},
+    )
+    successful_usage = SimpleNamespace(
+        choices=[],
+        usage={
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "total_tokens": 110,
+            "response_cost": 0.007,
+        },
+    )
+    route = AIModelRoute(
+        models=("streaming-model",),
+        deployments=("deployment-a",),
+        timeout_seconds=1,
+        model_retries=2,
+        provider_retries=0,
+        attribution="frontier_adjudication:sha256:finding",
+        collect_cost=True,
+    )
+    init_run_details()
+
+    with patch(
+        "pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion",
+        new_callable=AsyncMock,
+    ) as completion:
+        completion.side_effect = [
+            _failing_stream_before_usage(interrupted_content),
+            _async_chunks(successful_content, successful_usage),
+        ]
+        result = await retry_with_fallback_models(
+            lambda model: handler.chat_completion(model=model, system="sys", user="usr"),
+            model_route=route,
+        )
+
+    assert result == ("resp", "stop")
+    adjudication = get_run_details().adjudication_runs["sha256:finding"]
+    assert adjudication.model_attempts == 2
+    assert adjudication.provider_attempts == 2
+    assert adjudication.num_ai_calls == 1
+    assert adjudication.known_usage_call_count == 1
+    assert adjudication.known_cost_call_count == 1
 
 
 @pytest.mark.asyncio

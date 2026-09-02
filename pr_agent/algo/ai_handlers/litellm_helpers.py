@@ -60,6 +60,14 @@ def _stream_usage(chunk):
     return None
 
 
+class _IncompleteStreamingResponseError(RuntimeError):
+    """Carry a completed but unusable stream response into retry accounting."""
+
+    def __init__(self, message, completed_response):
+        super().__init__(message)
+        self.completed_response = completed_response
+
+
 async def _handle_streaming_response(response, model=None):
     """
     Handle streaming response from acompletion and collect the full response.
@@ -101,23 +109,28 @@ async def _handle_streaming_response(response, model=None):
         get_logger().error(f"Error handling streaming response: {e}")
         raise
 
-    if not full_response and finish_reason is None:
-        get_logger().warning("Streaming response resulted in empty content with no finish reason")
-        raise openai.APIError("Empty streaming response received without proper completion")
-    elif not full_response and finish_reason:
-        get_logger().debug(
-            f"Streaming response resulted in empty content but completed with finish_reason: {finish_reason}"
-        )
-        raise openai.APIError(
-            f"Streaming response completed with finish_reason '{finish_reason}' but no content received"
-        )
-    return full_response, finish_reason, MockResponse(
+    completed_response = MockResponse(
         full_response,
         finish_reason,
         finalized_usage,
         model=completion_model,
         provider=completion_provider,
     )
+    if not full_response and finish_reason is None:
+        get_logger().warning("Streaming response resulted in empty content with no finish reason")
+        raise _IncompleteStreamingResponseError(
+            "Empty streaming response received without proper completion",
+            completed_response,
+        )
+    elif not full_response and finish_reason:
+        get_logger().debug(
+            f"Streaming response resulted in empty content but completed with finish_reason: {finish_reason}"
+        )
+        raise _IncompleteStreamingResponseError(
+            f"Streaming response completed with finish_reason '{finish_reason}' but no content received",
+            completed_response,
+        )
+    return full_response, finish_reason, completed_response
 
 
 class MockResponse:

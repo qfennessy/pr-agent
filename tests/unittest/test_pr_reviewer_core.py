@@ -1754,6 +1754,7 @@ async def test_frontier_adjudication_reports_partial_when_verified_finding_has_n
         "enabled": True,
         "status": "partial",
         "results": [{
+            "stable_finding_id": "sha256:finding",
             "state": "unavailable",
             "failure_reason": "trusted_candidate_identity_unavailable",
             "publication_safe": False,
