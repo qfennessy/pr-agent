@@ -785,10 +785,10 @@ def test_stale_head_aborts_before_mutation(operation):
 @pytest.mark.parametrize("operation", ["create", "update", "resolve"])
 def test_head_change_after_mutation_requires_fresh_inventory(operation):
     expected_thread, inventory = _owned_thread_state()
+    comment = _create_comment("x")
     rest = [{"head": {"sha": "head-1"}}]
     graphql = []
     if operation == "create":
-        comment = _create_comment("x")
         rest.extend([
             {"head": {"sha": "head-1"}},
             {"id": 77, "node_id": "comment-node-77"},
