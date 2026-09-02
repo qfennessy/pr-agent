@@ -523,7 +523,8 @@ def test_shadow_journal_writer_stamps_contiguous_time_evidence_and_loader_reject
     writer = ShadowJournalWriter(path, enabled=True)
     assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
     assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
-    assert writer.close()
+    writer_closed = writer.close()
+    assert writer_closed
     records = load_shadow_journal(path)
 
     assert [record.sequence for record in records] == [1, 2]
