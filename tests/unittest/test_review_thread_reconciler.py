@@ -185,6 +185,7 @@ def test_verified_finding_identity_consumes_exact_upstream_hashes_without_derivi
         "issue_content": "Mutable wording is not identity input.",
         "_trusted_anchor_shape_id": f"sha256:{'c' * 64}",
         "_trusted_anchor_shape_occurrence_count": 1,
+        "_trusted_same_anchor_candidate_count": 1,
         "side": "new",
         "start_line": 12,
     }], repository="owner/repo", pull_request_number=7)[0]
@@ -205,6 +206,8 @@ def test_verified_finding_identity_consumes_exact_upstream_hashes_without_derivi
         ({"_trusted_anchor_shape_id": None}, "trusted anchor shape id"),
         ({"_trusted_anchor_shape_occurrence_count": None}, "occurrence count"),
         ({"_trusted_anchor_shape_occurrence_count": True}, "occurrence count"),
+        ({"_trusted_same_anchor_candidate_count": None}, "same-anchor candidate count"),
+        ({"_trusted_same_anchor_candidate_count": True}, "same-anchor candidate count"),
     ],
 )
 def test_verified_finding_identity_fails_closed_on_untrusted_or_malformed_identity(replacement, error):
@@ -214,6 +217,7 @@ def test_verified_finding_identity_fails_closed_on_untrusted_or_malformed_identi
         "trusted_stable_key": f"sha256:{'b' * 64}",
         "_trusted_anchor_shape_id": f"sha256:{'c' * 64}",
         "_trusted_anchor_shape_occurrence_count": 1,
+        "_trusted_same_anchor_candidate_count": 1,
         "side": "new",
         "start_line": 12,
     }
@@ -241,6 +245,7 @@ def test_verified_finding_identity_accepts_actual_verification_output():
         "_changed_anchor_ordinal": 1,
         "_changed_anchor_occurrence_count": 1,
         "_trusted_defect_ordinal": 1,
+        "_trusted_same_anchor_candidate_count": 1,
         "_trusted_lineage_key": "file:src/service.py",
         "_trusted_side_line_count": 20,
     }
@@ -282,7 +287,8 @@ def test_verified_finding_identity_accepts_actual_verification_output():
 
 
 def test_same_anchor_v2_identity_reordering_fails_closed_without_swapping_thread_mapping():
-    def verified_findings(labels):
+    def verified_findings(labels, verified_labels=None):
+        verified_labels = set(labels if verified_labels is None else verified_labels)
         candidates = []
         evidence = []
         decisions = []
@@ -303,6 +309,7 @@ def test_same_anchor_v2_identity_reordering_fails_closed_without_swapping_thread
                 "_changed_anchor_ordinal": 1,
                 "_changed_anchor_occurrence_count": 1,
                 "_trusted_defect_ordinal": ordinal,
+                "_trusted_same_anchor_candidate_count": len(labels),
                 "_trusted_lineage_key": "file:src/service.py",
                 "_trusted_side_line_count": 20,
             })
@@ -317,7 +324,7 @@ def test_same_anchor_v2_identity_reordering_fails_closed_without_swapping_thread
             })
             decisions.append({
                 "candidate_id": candidate_id,
-                "verdict": "verified",
+                "verdict": "verified" if label in verified_labels else "rejected",
                 "issue_header": label,
                 "issue_content": f"Verified {label}",
                 "trigger": f"{label} trigger",
@@ -335,13 +342,19 @@ def test_same_anchor_v2_identity_reordering_fails_closed_without_swapping_thread
 
     forward = verified_findings(("authentication bypass", "unbounded retry"))
     reversed_order = verified_findings(("unbounded retry", "authentication bypass"))
+    single_survivor = verified_findings(
+        ("authentication bypass", "unbounded retry"),
+        verified_labels={"unbounded retry"},
+    )
     forward_ids = {finding["issue_header"]: finding["root_cause_id"] for finding in forward}
     reversed_ids = {finding["issue_header"]: finding["root_cause_id"] for finding in reversed_order}
     persisted_mapping = dict(forward_ids)
 
     assert forward_ids["authentication bypass"] == reversed_ids["unbounded retry"]
-    for findings in (forward, reversed_order):
-        with pytest.raises(ValueError, match="trusted semantic discriminator"):
+    assert len(single_survivor) == 1
+    assert single_survivor[0]["_trusted_same_anchor_candidate_count"] == 2
+    for findings in (forward, reversed_order, single_survivor):
+        with pytest.raises(ValueError, match="ambiguous same-anchor candidate set"):
             finding_identities_from_verified_findings(
                 tuple(findings), repository="owner/repo", pull_request_number=7
             )
@@ -370,6 +383,7 @@ def test_equal_shape_v2_occurrence_shift_after_deletion_fails_closed_before_mapp
                 "_changed_anchor_ordinal": anchor_ordinal,
                 "_changed_anchor_occurrence_count": len(specs),
                 "_trusted_defect_ordinal": 1,
+                "_trusted_same_anchor_candidate_count": 1,
                 "_trusted_lineage_key": "file:src/service.py",
                 "_trusted_side_line_count": 30,
             })
@@ -426,6 +440,7 @@ def test_distinct_trusted_anchor_shapes_in_one_file_remain_eligible():
             "trusted_stable_key": f"sha256:{str(index + 2) * 64}",
             "_trusted_anchor_shape_id": f"sha256:{shape_id * 64}",
             "_trusted_anchor_shape_occurrence_count": 1,
+            "_trusted_same_anchor_candidate_count": 1,
             "side": "new",
             "start_line": index * 10,
         })
@@ -462,6 +477,7 @@ def test_single_verified_finding_with_a_patch_repeated_anchor_shape_fails_closed
         "_changed_anchor_ordinal": anchor_ordinal,
         "_changed_anchor_occurrence_count": anchor_occurrence_count,
         "_trusted_defect_ordinal": 1,
+        "_trusted_same_anchor_candidate_count": 1,
         "_trusted_lineage_key": "file:src/service.py",
         "_trusted_side_line_count": 20,
     }

@@ -1407,10 +1407,10 @@ class GithubProvider(GitProvider):
         if blocked:
             return blocked
         try:
-            existing = [
+            same_finding = [
                 thread
                 for thread in self.get_review_thread_snapshots()
-                if not thread.is_resolved and thread.finding_id == finding_id and thread.anchor == anchor
+                if thread.finding_id == finding_id
             ]
         except Exception as e:
             return ReviewThreadActionOutcome(
@@ -1421,10 +1421,23 @@ class GithubProvider(GitProvider):
                 reason=f"create_inventory_failed: {e}",
                 **_review_thread_failure_details(e),
             )
+        if any(
+            thread.is_resolved and not thread.resolved_by_viewer_bot
+            for thread in same_finding
+        ):
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.CREATE,
+                state=ReviewThreadActionState.STALE_INVENTORY,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                reason="finding_thread_authoritatively_resolved_since_planning",
+            )
+        existing = [thread for thread in same_finding if not thread.is_resolved]
         if existing:
             root = existing[0].root_comment if len(existing) == 1 else None
             if (
                 len(existing) == 1
+                and existing[0].anchor == anchor
                 and existing[0].bot_owned
                 and not existing[0].has_replies
                 and root

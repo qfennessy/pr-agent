@@ -831,11 +831,14 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
         )
         if candidate.get("candidate_type") == "sensitive_path_audit":
             candidate["_trusted_defect_ordinal"] = 1
+            candidate["_trusted_same_anchor_candidate_count"] = 1
             continue
         model_candidates_by_anchor.setdefault(anchor_key, []).append(candidate)
     for anchor_candidates in model_candidates_by_anchor.values():
+        same_anchor_candidate_count = len(anchor_candidates)
         for defect_ordinal, candidate in enumerate(anchor_candidates, start=1):
             candidate["_trusted_defect_ordinal"] = defect_ordinal
+            candidate["_trusted_same_anchor_candidate_count"] = same_anchor_candidate_count
     return candidates, rejected
 
 
@@ -2802,11 +2805,15 @@ def apply_verification_decisions(
             continue
         anchor_shape_id = _verified_anchor_shape_id(candidate)
         anchor_occurrence_count = candidate.get("_changed_anchor_occurrence_count")
+        same_anchor_candidate_count = candidate.get("_trusted_same_anchor_candidate_count")
         if (
             anchor_shape_id is None
             or isinstance(anchor_occurrence_count, bool)
             or not isinstance(anchor_occurrence_count, int)
             or anchor_occurrence_count < 1
+            or isinstance(same_anchor_candidate_count, bool)
+            or not isinstance(same_anchor_candidate_count, int)
+            or same_anchor_candidate_count < 1
         ):
             record["verdict"] = "rejected"
             record["reason"] = "trusted_identity_unavailable"
@@ -2815,6 +2822,7 @@ def apply_verification_decisions(
         finding["root_cause_id"], finding["trusted_stable_key"] = identity
         finding["_trusted_anchor_shape_id"] = anchor_shape_id
         finding["_trusted_anchor_shape_occurrence_count"] = anchor_occurrence_count
+        finding["_trusted_same_anchor_candidate_count"] = same_anchor_candidate_count
         if identity in seen_identities:
             record["verdict"] = "rejected"
             record["reason"] = "trusted_identity_collision"

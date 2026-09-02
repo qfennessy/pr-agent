@@ -516,6 +516,34 @@ def test_create_review_thread_is_idempotent_when_same_finding_appears_after_plan
     assert not any(call[0] == "rest" and call[1] == "POST" for call in requester.calls)
 
 
+@pytest.mark.parametrize(
+    "resolved_by",
+    [
+        None,
+        {"id": "USER-1", "login": "human", "__typename": "User"},
+    ],
+)
+def test_create_preserves_same_finding_thread_resolved_by_human_or_unknown_actor(resolved_by):
+    comment = _create_comment()
+    resolved_thread = _thread(
+        "thread-1",
+        [_comment(comment["body"], database_id=77)],
+        resolved=True,
+        resolved_by=resolved_by,
+    )
+    requester = _Requester(
+        graphql=[_inventory_page([resolved_thread])],
+        rest=[{"head": {"sha": "head-1"}}],
+    )
+
+    outcome = _provider(requester).create_review_thread(comment, "head-1")
+
+    assert outcome.state == ReviewThreadActionState.STALE_INVENTORY
+    assert outcome.reason == "finding_thread_authoritatively_resolved_since_planning"
+    assert outcome.mutation_attempted is False
+    assert not any(call[0] == "rest" and call[1] == "POST" for call in requester.calls)
+
+
 def test_concurrent_create_review_thread_calls_publish_once_for_one_finding():
     comment = _create_comment()
     _, created_inventory = _owned_thread_state(body=comment["body"])

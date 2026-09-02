@@ -183,6 +183,15 @@ def finding_identities_from_verified_findings(
             raise ValueError("verified finding requires a trusted anchor shape occurrence count")
         if shape_occurrence_count != 1:
             raise ValueError("verified finding anchor shape is not unique in the patch")
+        same_anchor_candidate_count = finding.get("_trusted_same_anchor_candidate_count")
+        if (
+            isinstance(same_anchor_candidate_count, bool)
+            or not isinstance(same_anchor_candidate_count, int)
+            or same_anchor_candidate_count < 1
+        ):
+            raise ValueError("verified finding requires a trusted same-anchor candidate count")
+        if same_anchor_candidate_count != 1:
+            raise ValueError("verified finding has an ambiguous same-anchor candidate set")
         shape_ids_by_file_side.setdefault(anchor[:2], []).append(
             shape_id.strip()
         )

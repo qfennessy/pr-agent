@@ -1596,6 +1596,7 @@ def test_distinct_verified_defects_on_the_same_changed_range_do_not_collide():
 
     assert rejected == []
     assert [candidate["_trusted_defect_ordinal"] for candidate in candidates] == [1, 2]
+    assert [candidate["_trusted_same_anchor_candidate_count"] for candidate in candidates] == [2, 2]
     assert len(findings) == 2
     assert len({finding["root_cause_id"] for finding in findings}) == 2
     assert len({finding["trusted_stable_key"] for finding in findings}) == 2
