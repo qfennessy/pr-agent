@@ -1,5 +1,7 @@
 import asyncio
 import json
+import threading
+import time
 from decimal import Decimal
 
 import pytest
@@ -431,6 +433,133 @@ async def test_timeout_fails_unavailable():
     )
     assert result.state is FrontierState.TIMEOUT
     assert result.failure_reason == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_slow_synchronous_pre_call_identity_refresh_times_out_promptly():
+    init_run_details()
+    stage_config = config(stage_timeout=0.05)
+    handler = FakeHandler([output()])
+    release_refresh = threading.Event()
+
+    def slow_identity_refresh():
+        release_refresh.wait(timeout=1)
+        return "head-1"
+
+    started_at = time.monotonic()
+    try:
+        result = await run_frontier_adjudication(
+            request(stage_config),
+            stage_config,
+            handler,
+            current_identity=slow_identity_refresh,
+            deadline_monotonic=started_at + 1,
+        )
+        elapsed = time.monotonic() - started_at
+    finally:
+        release_refresh.set()
+
+    assert elapsed < 0.5
+    assert result.state is FrontierState.TIMEOUT
+    assert result.failure_reason == "timeout"
+    assert result.telemetry["state"] == "timeout"
+    assert handler.calls == []
+    serialized = json.dumps(result.to_telemetry_dict())
+    assert "src/auth.py" not in serialized
+    assert "object_by_id" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_slow_synchronous_post_call_identity_refresh_times_out_promptly():
+    init_run_details()
+    stage_config = config(stage_timeout=0.1)
+    handler = FakeHandler([output()])
+    release_refresh = threading.Event()
+    refresh_count = 0
+
+    def slow_second_identity_refresh():
+        nonlocal refresh_count
+        refresh_count += 1
+        if refresh_count == 1:
+            return "head-1"
+        release_refresh.wait(timeout=1)
+        return "head-1"
+
+    started_at = time.monotonic()
+    try:
+        result = await run_frontier_adjudication(
+            request(stage_config),
+            stage_config,
+            handler,
+            current_identity=slow_second_identity_refresh,
+        )
+        elapsed = time.monotonic() - started_at
+    finally:
+        release_refresh.set()
+
+    assert elapsed < 0.5
+    assert refresh_count == 2
+    assert handler.calls == ["frontier-primary"]
+    assert result.state is FrontierState.TIMEOUT
+    assert result.failure_reason == "timeout"
+    assert result.normalized_finding is None
+    serialized = json.dumps(result.to_telemetry_dict())
+    assert "src/auth.py" not in serialized
+    assert "object_by_id" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_slow_async_identity_refresh_times_out_and_is_cancelled():
+    init_run_details()
+    stage_config = config(stage_timeout=0.02)
+    handler = FakeHandler([output()])
+    cancelled = asyncio.Event()
+
+    async def slow_async_identity_refresh():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    started_at = time.monotonic()
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        handler,
+        current_identity=slow_async_identity_refresh,
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.2
+    assert cancelled.is_set()
+    assert handler.calls == []
+    assert result.state is FrontierState.TIMEOUT
+    serialized = json.dumps(result.to_telemetry_dict())
+    assert "src/auth.py" not in serialized
+    assert "object_by_id" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_async_identity_refresh_remains_supported():
+    init_run_details()
+    stage_config = config()
+    refresh_count = 0
+
+    async def async_identity_refresh():
+        nonlocal refresh_count
+        refresh_count += 1
+        await asyncio.sleep(0)
+        return "head-1"
+
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([output()]),
+        current_identity=async_identity_refresh,
+    )
+
+    assert refresh_count == 2
+    assert result.state is FrontierState.CONFIRMED
 
 
 @pytest.mark.asyncio

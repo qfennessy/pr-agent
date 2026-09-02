@@ -2073,6 +2073,134 @@ async def test_frontier_adjudication_prioritizes_deterministic_risk_before_call_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("candidate_count", [2, 3, 5])
+async def test_frontier_batch_timeout_cannot_multiply_across_hanging_findings(
+    monkeypatch,
+    candidate_count,
+):
+    candidates = []
+    findings = []
+    evidence = []
+    decisions = []
+    for ordinal in range(1, candidate_count + 1):
+        candidate_id = f"candidate-{ordinal}"
+        root_cause_id = f"sha256:root-{ordinal}"
+        stable_finding_id = f"sha256:finding-{ordinal}"
+        path = f"services/auth/guard-{ordinal}.py"
+        candidates.append({
+            "candidate_id": candidate_id,
+            "sensitive_path": True,
+            "relevant_file": path,
+            "normalized_severity": "medium",
+        })
+        findings.append({
+            "root_cause_id": root_cause_id,
+            "trusted_stable_key": stable_finding_id,
+            "relevant_file": path,
+            "issue_header": f"Hanging finding {ordinal}",
+            "issue_content": "The frontier request does not return before its timeout.",
+            "trigger": "The changed authorization path is reviewed.",
+            "impact": "The frontier stage could exceed its configured bound.",
+            "start_line": ordinal,
+            "end_line": ordinal,
+            "side": "new",
+        })
+        evidence.append({
+            "candidate_id": candidate_id,
+            "evidence_id": f"evidence-{ordinal}",
+            "source": "changed_head",
+            "path": path,
+            "side": "new",
+            "start_line": ordinal,
+            "end_line": ordinal,
+            "content": f"changed guard {ordinal}",
+        })
+        decisions.append({
+            "candidate_id": candidate_id,
+            "verdict": "verified",
+            "normalized_severity": "medium",
+            "disputed": False,
+        })
+
+    config = SimpleNamespace(
+        max_calls=candidate_count,
+        stage_timeout_seconds=5.0,
+        configuration_hash="sha256:configuration",
+        prompt_hash="sha256:prompt",
+        policy_version="frontier-policy-v1",
+    )
+    clock = {"now": 100.0}
+    observed_calls = []
+
+    async def exhaust_remaining_budget(request, *_args, deadline_monotonic, **_kwargs):
+        observed_calls.append((request.candidate.stable_finding_id, deadline_monotonic))
+        clock["now"] = deadline_monotonic
+        result = MagicMock()
+        result.to_telemetry_dict.return_value = {
+            "stable_finding_id": request.candidate.stable_finding_id,
+            "state": "timeout",
+            "failure_reason": "timeout",
+            "publication_safe": False,
+        }
+        return result
+
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.time.monotonic",
+        lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.load_frontier_adjudication_config",
+        lambda *args, **kwargs: config,
+    )
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.get_specialist_snapshot_context",
+        lambda: SimpleNamespace(
+            snapshot=SimpleNamespace(snapshot_id="head-sha"),
+            current_snapshot_id=MagicMock(return_value="head-sha"),
+        ),
+    )
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.verified_finding_identity",
+        lambda candidate: (
+            f"sha256:root-{candidate['candidate_id'].removeprefix('candidate-')}",
+            f"sha256:finding-{candidate['candidate_id'].removeprefix('candidate-')}",
+        ),
+    )
+    run_frontier = AsyncMock(side_effect=exhaust_remaining_budget)
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.run_frontier_adjudication",
+        run_frontier,
+    )
+    reviewer = _make_reviewer()
+    reviewer.ai_handler = SimpleNamespace(azure=False)
+    reviewer.review_route_decision = None
+
+    await reviewer._run_frontier_adjudications(
+        findings,
+        candidates,
+        evidence,
+        decisions,
+    )
+
+    assert clock["now"] == 105.0
+    assert observed_calls == [("sha256:finding-1", 105.0)]
+    assert [result["stable_finding_id"] for result in reviewer.frontier_adjudication_artifact["results"]] == [
+        f"sha256:finding-{ordinal}"
+        for ordinal in range(1, candidate_count + 1)
+    ]
+    assert [result["state"] for result in reviewer.frontier_adjudication_artifact["results"]] == [
+        "timeout",
+        *(["timeout"] * (candidate_count - 1)),
+    ]
+    assert [
+        result["failure_reason"]
+        for result in reviewer.frontier_adjudication_artifact["results"]
+    ] == ["timeout", *(["stage_timeout_exhausted"] * (candidate_count - 1))]
+    assert reviewer.frontier_adjudication_artifact["status"] == "partial"
+    assert run_frontier.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_frontier_adjudication_reports_partial_when_verified_finding_has_no_candidate(
         monkeypatch):
     config = SimpleNamespace(

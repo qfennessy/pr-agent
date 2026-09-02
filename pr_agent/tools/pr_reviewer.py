@@ -2045,19 +2045,19 @@ class PRReviewer:
             ),
         ))
         for finding, candidate, severity, signals in eligible_findings:
-            if time.monotonic() >= batch_deadline:
-                artifact["results"].append({
-                    "stable_finding_id": finding.get("trusted_stable_key"),
-                    "state": "unavailable",
-                    "failure_reason": "stage_timeout_exhausted",
-                    "publication_safe": False,
-                })
-                continue
             if call_count >= max_calls:
                 artifact["results"].append({
                     "stable_finding_id": finding.get("trusted_stable_key"),
                     "state": "unavailable",
                     "failure_reason": "call_budget_exhausted",
+                    "publication_safe": False,
+                })
+                continue
+            if time.monotonic() >= batch_deadline:
+                artifact["results"].append({
+                    "stable_finding_id": finding.get("trusted_stable_key"),
+                    "state": "timeout",
+                    "failure_reason": "stage_timeout_exhausted",
                     "publication_safe": False,
                 })
                 continue

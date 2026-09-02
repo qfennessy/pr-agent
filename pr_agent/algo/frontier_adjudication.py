@@ -853,15 +853,32 @@ async def run_frontier_adjudication(
         return _unavailable(request, FrontierState.UNAVAILABLE, "configuration_identity_mismatch")
     if request.policy_version != config.policy_version:
         return _unavailable(request, FrontierState.UNAVAILABLE, "policy_identity_mismatch")
+    finding_id = request.candidate.stable_finding_id
     started_at = time.monotonic()
+    per_call_deadline = started_at + config.stage_timeout_seconds
     if deadline_monotonic is None:
-        deadline_monotonic = started_at + config.stage_timeout_seconds
+        deadline_monotonic = per_call_deadline
+    else:
+        deadline_monotonic = min(deadline_monotonic, per_call_deadline)
     try:
         current_snapshot_id = await _refresh_identity_before(
             current_identity,
             deadline_monotonic,
         )
     except asyncio.TimeoutError:
+        record_adjudication_result(
+            finding_id,
+            provider=None,
+            model_revision=None,
+            model_attempts_configured=config.route.model_retries,
+            provider_retries_configured=config.route.provider_retries,
+            prompt_version=config.prompt_version,
+            input_schema_version=config.input_schema_version,
+            schema_version=config.output_schema_version,
+            state=FrontierState.TIMEOUT.value,
+            latency_seconds=time.monotonic() - started_at,
+            failure_reason="timeout",
+        )
         return _unavailable(request, FrontierState.TIMEOUT, "timeout")
     if current_snapshot_id != request.snapshot_id:
         return _unavailable(request, FrontierState.STALE, "stale_snapshot")
@@ -872,7 +889,6 @@ async def run_frontier_adjudication(
             "handler_telemetry_unsupported",
         )
 
-    finding_id = request.candidate.stable_finding_id
     attribution = f"frontier_adjudication:{finding_id}"
     route = replace(config.route, attribution=attribution)
     variables = {
@@ -975,7 +991,7 @@ async def run_frontier_adjudication(
             input_schema_version=config.input_schema_version,
             schema_version=config.output_schema_version,
             state=FrontierState.STALE.value,
-            latency_seconds=elapsed,
+            latency_seconds=time.monotonic() - started_at,
             failure_reason="stale_snapshot",
         )
         return _unavailable(request, FrontierState.STALE, "stale_snapshot")
