@@ -470,6 +470,16 @@ class BitbucketServerProvider(GitProvider):
     def get_pr_branch(self):
         return self.pr.fromRef['displayId']
 
+    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
+        if refresh:
+            self.pr = self._get_pr()
+
+        from_ref = getattr(self.pr, "fromRef", None) or {}
+        head_sha = from_ref.get("latestCommit")
+        if not isinstance(head_sha, str) or not head_sha.strip():
+            return None
+        return head_sha.strip()
+
     def get_pr_owner_id(self) -> str | None:
         return self.workspace_slug
 
