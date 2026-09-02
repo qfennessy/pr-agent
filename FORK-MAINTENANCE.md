@@ -1,6 +1,6 @@
 # Fork Maintenance
 
-Created: 2026-08-07. Last edited: 2026-08-29.
+Created: 2026-08-07. Last edited: 2026-09-02.
 
 This repository (`qfennessy/pr-agent`) is a deliberately conservative fork of
 [`The-PR-Agent/pr-agent`](https://github.com/The-PR-Agent/pr-agent). PR-Agent
@@ -19,6 +19,22 @@ The `Upstream sync PR` workflow (`.github/workflows/upstream-sync.yml`, weekly
 plus manual dispatch) automates this: it pins the current upstream `main` SHA,
 pushes a `sync/upstream-<date>-<sha>` branch, and opens a PR whose body lists
 the new commits, a diffstat, and any high-scrutiny paths touched.
+
+### Automation credential
+
+The workflow uses the protected `upstream-sync` Actions environment. That
+environment allows only the `main` branch and contains a secret named
+`UPSTREAM_SYNC_DEPLOY_KEY`. Its value is the private half of a write-enabled
+deploy key attached only to `qfennessy/pr-agent`. Git uses that key to push the
+pinned sync branch; the built-in `GITHUB_TOKEN` handles pull-request API calls.
+
+The deploy key is essential: GitHub's built-in Actions token cannot push an
+upstream commit that changes `.github/workflows/**`. If the secret is absent,
+the workflow stops before checkout with a setup error instead of failing later
+while pushing the pinned branch. Never allow `sync/upstream-*` branches to use
+the environment: imported workflow code must not receive this credential.
+Rotate the key according to the fork maintainer's normal credential schedule
+and update only the deploy key and environment secret, never this workflow.
 
 ### Review gates for every sync PR
 
