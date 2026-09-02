@@ -5,11 +5,13 @@ import itertools
 import json
 import os
 import re
+import threading
 import time
 import traceback
 from datetime import datetime
 from typing import Optional, Tuple
 from urllib.parse import urlparse
+from weakref import WeakValueDictionary
 
 from github import AppAuthentication, Auth, Github, GithubException
 from github.Issue import Issue
@@ -46,6 +48,21 @@ from ..servers.utils import RateLimitExceeded
 from .git_provider import (MAX_FILES_ALLOWED_FULL, FilePatchInfo, GitProvider,
                            IncrementalPR, get_cached_global_settings,
                            is_own_persistent_comment_for_identities)
+
+
+_REVIEW_THREAD_CREATE_LOCKS_GUARD = threading.Lock()
+_REVIEW_THREAD_CREATE_LOCKS = WeakValueDictionary()
+
+
+def _review_thread_create_lock(repository: str, pull_request_number: int, finding_id: str):
+    """Serialize same-process creates without retaining unbounded per-finding locks."""
+    key = f"{repository.casefold()}#{pull_request_number}:{finding_id}"
+    with _REVIEW_THREAD_CREATE_LOCKS_GUARD:
+        lock = _REVIEW_THREAD_CREATE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _REVIEW_THREAD_CREATE_LOCKS[key] = lock
+        return lock
 
 
 def _next_page_url(headers: dict) -> str:
@@ -1352,7 +1369,59 @@ class GithubProvider(GitProvider):
             mutation_result_ambiguous=bool(force_refresh_reason),
         )
 
-    def create_review_thread(self, comment: dict, expected_head_sha: str) -> ReviewThreadActionOutcome:
+    def _create_review_thread_locked(
+        self,
+        comment: dict,
+        expected_head_sha: str,
+        finding_id: str,
+        anchor: ReviewThreadAnchor,
+    ) -> ReviewThreadActionOutcome:
+        current_head_sha, blocked = self._check_review_thread_head(
+            ReviewThreadActionKind.CREATE, expected_head_sha
+        )
+        if blocked:
+            return blocked
+        try:
+            existing = [
+                thread
+                for thread in self.get_review_thread_snapshots()
+                if not thread.is_resolved and thread.finding_id == finding_id and thread.anchor == anchor
+            ]
+        except Exception as e:
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.CREATE,
+                state=ReviewThreadActionState.STALE_INVENTORY,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                reason=f"create_inventory_failed: {e}",
+                **_review_thread_failure_details(e),
+            )
+        if existing:
+            root = existing[0].root_comment if len(existing) == 1 else None
+            if (
+                len(existing) == 1
+                and existing[0].bot_owned
+                and not existing[0].has_replies
+                and root
+                and root.body == comment.get("body")
+            ):
+                return ReviewThreadActionOutcome(
+                    kind=ReviewThreadActionKind.CREATE,
+                    state=ReviewThreadActionState.ALREADY_APPLIED,
+                    expected_head_sha=expected_head_sha,
+                    current_head_sha=current_head_sha,
+                    thread_id=existing[0].thread_id,
+                    comment_id=root.database_id,
+                    comment_node_id=root.node_id,
+                    reason="finding_thread_already_created",
+                )
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.CREATE,
+                state=ReviewThreadActionState.STALE_INVENTORY,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                reason="finding_thread_appeared_since_planning",
+            )
         current_head_sha, blocked = self._check_review_thread_head(
             ReviewThreadActionKind.CREATE, expected_head_sha
         )
@@ -1366,14 +1435,89 @@ class GithubProvider(GitProvider):
             )
             comment_id = data.get("id") if isinstance(data, dict) else None
             comment_node_id = data.get("node_id") if isinstance(data, dict) else None
+            if not comment_id or not comment_node_id:
+                return self._review_thread_post_mutation_outcome(
+                    ReviewThreadActionKind.CREATE,
+                    expected_head_sha,
+                    comment_id=comment_id,
+                    comment_node_id=comment_node_id,
+                    force_refresh_reason="created_comment_identity_incomplete",
+                )
+            try:
+                active = [
+                    thread
+                    for thread in self.get_review_thread_snapshots()
+                    if not thread.is_resolved and thread.finding_id == finding_id and thread.anchor == anchor
+                ]
+            except Exception as e:
+                return self._review_thread_post_mutation_outcome(
+                    ReviewThreadActionKind.CREATE,
+                    expected_head_sha,
+                    comment_id=comment_id,
+                    comment_node_id=comment_node_id,
+                    force_refresh_reason=f"post_create_inventory_failed: {e}",
+                )
+            if not active:
+                return self._review_thread_post_mutation_outcome(
+                    ReviewThreadActionKind.CREATE,
+                    expected_head_sha,
+                    comment_id=comment_id,
+                    comment_node_id=comment_node_id,
+                    force_refresh_reason="created_finding_thread_not_observed",
+                )
+            canonical = min(
+                active,
+                key=lambda thread: (
+                    thread.root_comment.database_id
+                    if thread.root_comment and thread.root_comment.database_id
+                    else 2**63,
+                    thread.thread_id,
+                ),
+            )
+            if len(active) > 1:
+                if any(
+                    not thread.bot_owned
+                    or thread.has_replies
+                    or not thread.viewer_can_resolve
+                    or not thread.root_comment
+                    or thread.root_comment.body != comment.get("body")
+                    for thread in active
+                ):
+                    return self._review_thread_post_mutation_outcome(
+                        ReviewThreadActionKind.CREATE,
+                        expected_head_sha,
+                        comment_id=comment_id,
+                        comment_node_id=comment_node_id,
+                        force_refresh_reason="concurrent_finding_thread_not_safe_to_converge",
+                    )
+                for duplicate in active:
+                    if duplicate.thread_id == canonical.thread_id:
+                        continue
+                    resolved = self.resolve_review_thread(
+                        duplicate.thread_id,
+                        expected_head_sha,
+                        duplicate,
+                    )
+                    if not resolved.succeeded:
+                        return self._review_thread_post_mutation_outcome(
+                            ReviewThreadActionKind.CREATE,
+                            expected_head_sha,
+                            comment_id=comment_id,
+                            comment_node_id=comment_node_id,
+                            force_refresh_reason="concurrent_finding_thread_convergence_failed",
+                        )
+            canonical_root = canonical.root_comment
+            canonical_comment_id = canonical_root.database_id if canonical_root else None
+            canonical_comment_node_id = canonical_root.node_id if canonical_root else None
             return self._review_thread_post_mutation_outcome(
                 ReviewThreadActionKind.CREATE,
                 expected_head_sha,
-                comment_id=comment_id,
-                comment_node_id=comment_node_id,
+                thread_id=canonical.thread_id,
+                comment_id=canonical_comment_id or comment_id,
+                comment_node_id=canonical_comment_node_id or comment_node_id,
                 force_refresh_reason=(
-                    "created_comment_identity_incomplete"
-                    if not comment_id or not comment_node_id
+                    "canonical_comment_identity_incomplete"
+                    if not canonical_comment_id or not canonical_comment_node_id
                     else None
                 ),
             )
@@ -1392,6 +1536,37 @@ class GithubProvider(GitProvider):
                 },
                 **failure_details,
             )
+
+    def create_review_thread(self, comment: dict, expected_head_sha: str) -> ReviewThreadActionOutcome:
+        marker_values = finding_identity_markers(comment.get("body") if isinstance(comment, dict) else "")
+        marker_ids = {
+            finding_id
+            for marker_version, finding_id in marker_values
+            if marker_version == FINDING_IDENTITY_MARKER_VERSION
+        }
+        anchor = ReviewThreadAnchor.from_github(
+            comment.get("path") if isinstance(comment, dict) else None,
+            comment.get("line") if isinstance(comment, dict) else None,
+            comment.get("start_line") if isinstance(comment, dict) else None,
+            comment.get("side", "RIGHT") if isinstance(comment, dict) else "RIGHT",
+            comment.get("start_side") if isinstance(comment, dict) else None,
+        )
+        if (
+            len(marker_values) != 1
+            or len(marker_ids) != 1
+            or anchor is None
+        ):
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.CREATE,
+                state=ReviewThreadActionState.FAILED,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=None,
+                reason="create_requires_one_supported_finding_marker_and_anchor",
+                failure_kind=ReviewThreadFailureKind.PROVIDER_FAILURE,
+            )
+        finding_id = next(iter(marker_ids))
+        with _review_thread_create_lock(self.repo, self.pr_num, finding_id):
+            return self._create_review_thread_locked(comment, expected_head_sha, finding_id, anchor)
 
     def update_review_thread(
         self,

@@ -93,6 +93,10 @@ instead of looping. A changed or unverifiable post-mutation head stops the rest 
 inventory. Rate limits are reported separately from permission failures with available `Retry-After` or rate-limit-reset
 evidence; a rate-limited create is never blindly retried because GitHub may already have accepted it.
 
+Creates for one repository, pull request, and finding identity are serialized within a worker and re-inventory immediately
+before publishing. A post-create inventory selects the oldest identical safe Bot-owned copy and resolves only duplicate
+copies with no replies; disagreement or unsafe ownership fails closed for a fresh inventory instead of deleting discussion.
+
 The foundation also models invalid or rejected inline locations as de-duplicated summary fallbacks. It returns those
 fallback entries to its caller rather than publishing them itself. Runtime publication remains disconnected until
 the gated integration is implemented and the evaluation/rollout gate from #27 provides its evidence.

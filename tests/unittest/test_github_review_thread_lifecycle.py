@@ -1,4 +1,5 @@
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -56,6 +57,15 @@ def _identity():
         "run",
         root_cause_id_schema=VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
     )
+
+
+def _create_comment(body="finding"):
+    return {
+        "body": body_with_finding_identity_marker(body, _identity().finding_id),
+        "path": "src/app.py",
+        "line": 10,
+        "side": "RIGHT",
+    }
 
 
 def _comment(
@@ -458,8 +468,14 @@ def test_inventory_failure_is_distinct_from_empty_inventory():
 
 
 def test_create_review_thread_uses_exact_head_and_returns_structured_outcome():
+    comment = _create_comment()
     requester = _Requester(
+        graphql=[
+            _inventory_page([]),
+            _inventory_page([_thread("thread-1", [_comment(comment["body"], database_id=77)])]),
+        ],
         rest=[
+            {"head": {"sha": "head-1"}},
             {"head": {"sha": "head-1"}},
             {"id": 77, "node_id": "comment-node-77"},
             {"head": {"sha": "head-1"}},
@@ -468,7 +484,7 @@ def test_create_review_thread_uses_exact_head_and_returns_structured_outcome():
     provider = _provider(requester)
 
     outcome = provider.create_review_thread(
-        {"body": "finding", "path": "src/app.py", "line": 10, "side": "RIGHT"},
+        comment,
         "head-1",
     )
 
@@ -477,11 +493,123 @@ def test_create_review_thread_uses_exact_head_and_returns_structured_outcome():
     assert outcome.comment_id == 77
     assert outcome.mutation_attempted is True
     assert outcome.mutation_result_ambiguous is False
-    assert requester.calls[1][1:3] == (
+    assert requester.calls[3][1:3] == (
         "POST",
         "https://api.github.com/repos/owner/repo/pulls/42/comments",
     )
-    assert requester.calls[1][3]["commit_id"] == "head-1"
+    assert requester.calls[3][3]["commit_id"] == "head-1"
+
+
+def test_create_review_thread_is_idempotent_when_same_finding_appears_after_planning():
+    comment = _create_comment()
+    _, inventory = _owned_thread_state(body=comment["body"])
+    requester = _Requester(
+        graphql=[inventory],
+        rest=[{"head": {"sha": "head-1"}}],
+    )
+
+    outcome = _provider(requester).create_review_thread(comment, "head-1")
+
+    assert outcome.state == ReviewThreadActionState.ALREADY_APPLIED
+    assert outcome.thread_id == "thread-1"
+    assert outcome.comment_id == 77
+    assert not any(call[0] == "rest" and call[1] == "POST" for call in requester.calls)
+
+
+def test_concurrent_create_review_thread_calls_publish_once_for_one_finding():
+    comment = _create_comment()
+    _, created_inventory = _owned_thread_state(body=comment["body"])
+    requester = _Requester(
+        graphql=[_inventory_page([]), created_inventory, created_inventory],
+        rest=[
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+            {"id": 77, "node_id": "comment-node-77"},
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+        ],
+    )
+    barrier = threading.Barrier(3)
+    outcomes = []
+
+    def create():
+        barrier.wait()
+        outcomes.append(_provider(requester).create_review_thread(comment, "head-1"))
+
+    workers = [threading.Thread(target=create) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join(timeout=2)
+
+    assert not any(worker.is_alive() for worker in workers)
+    assert {outcome.state for outcome in outcomes} == {
+        ReviewThreadActionState.APPLIED,
+        ReviewThreadActionState.ALREADY_APPLIED,
+    }
+    assert len([call for call in requester.calls if call[0] == "rest" and call[1] == "POST"]) == 1
+
+
+def test_create_review_thread_converges_safe_concurrent_duplicates_to_oldest_thread():
+    comment = _create_comment()
+    first_thread = _thread("thread-1", [_comment(comment["body"], database_id=77)])
+    second_thread = _thread(
+        "thread-2",
+        [_comment(comment["body"], node_id="comment-2", database_id=78)],
+    )
+    duplicate_inventory = _inventory_page([first_thread, second_thread])
+    requester = _Requester(
+        graphql=[
+            _inventory_page([]),
+            duplicate_inventory,
+            duplicate_inventory,
+            _graphql({"resolveReviewThread": {"thread": {"id": "thread-2", "isResolved": True}}}),
+        ],
+        rest=[
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+            {"id": 78, "node_id": "comment-2"},
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+        ],
+    )
+
+    outcome = _provider(requester).create_review_thread(comment, "head-1")
+
+    assert outcome.state == ReviewThreadActionState.APPLIED
+    assert outcome.thread_id == "thread-1"
+    assert outcome.comment_id == 77
+    resolve_calls = [call for call in requester.calls if "resolveReviewThread" in str(call[3])]
+    assert len(resolve_calls) == 1
+    assert resolve_calls[0][3]["variables"] == {"threadId": "thread-2"}
+
+
+def test_create_review_thread_preserves_concurrent_duplicate_with_different_content():
+    comment = _create_comment()
+    first_thread = _thread("thread-1", [_comment(comment["body"], database_id=77)])
+    different_body = body_with_finding_identity_marker("changed finding", _identity().finding_id)
+    second_thread = _thread(
+        "thread-2",
+        [_comment(different_body, node_id="comment-2", database_id=78)],
+    )
+    requester = _Requester(
+        graphql=[_inventory_page([]), _inventory_page([first_thread, second_thread])],
+        rest=[
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+            {"id": 78, "node_id": "comment-2"},
+            {"head": {"sha": "head-1"}},
+        ],
+    )
+
+    outcome = _provider(requester).create_review_thread(comment, "head-1")
+
+    assert outcome.state == ReviewThreadActionState.APPLIED_REQUIRES_REFRESH
+    assert outcome.reason == "concurrent_finding_thread_not_safe_to_converge"
+    assert not any("resolveReviewThread" in str(call[3]) for call in requester.calls)
 
 
 @pytest.mark.parametrize(
@@ -494,14 +622,16 @@ def test_create_review_thread_uses_exact_head_and_returns_structured_outcome():
 )
 def test_create_with_incomplete_returned_identity_forces_inventory_refresh(created_comment):
     requester = _Requester(
+        graphql=[_inventory_page([])],
         rest=[
+            {"head": {"sha": "head-1"}},
             {"head": {"sha": "head-1"}},
             created_comment,
             {"head": {"sha": "head-1"}},
         ]
     )
 
-    outcome = _provider(requester).create_review_thread({"body": "finding"}, "head-1")
+    outcome = _provider(requester).create_review_thread(_create_comment(), "head-1")
 
     assert outcome.state == ReviewThreadActionState.APPLIED_REQUIRES_REFRESH
     assert outcome.reason == "created_comment_identity_incomplete"
@@ -641,7 +771,7 @@ def test_stale_head_aborts_before_mutation(operation):
     provider = _provider(requester)
 
     if operation == "create":
-        outcome = provider.create_review_thread({"body": "x"}, "head-1")
+        outcome = provider.create_review_thread(_create_comment("x"), "head-1")
     elif operation == "update":
         outcome = provider.update_review_thread(77, "x", "head-1", expected_thread)
     else:
@@ -658,7 +788,16 @@ def test_head_change_after_mutation_requires_fresh_inventory(operation):
     rest = [{"head": {"sha": "head-1"}}]
     graphql = []
     if operation == "create":
-        rest.extend([{"id": 77, "node_id": "comment-node-77"}, {"head": {"sha": "head-2"}}])
+        comment = _create_comment("x")
+        rest.extend([
+            {"head": {"sha": "head-1"}},
+            {"id": 77, "node_id": "comment-node-77"},
+            {"head": {"sha": "head-2"}},
+        ])
+        graphql.extend([
+            _inventory_page([]),
+            _inventory_page([_thread("thread-1", [_comment(comment["body"], database_id=77)])]),
+        ])
     elif operation == "update":
         rest.extend([
             {"head": {"sha": "head-1"}},
@@ -676,7 +815,7 @@ def test_head_change_after_mutation_requires_fresh_inventory(operation):
     provider = _provider(requester)
 
     if operation == "create":
-        outcome = provider.create_review_thread({"body": "x"}, "head-1")
+        outcome = provider.create_review_thread(comment, "head-1")
     elif operation == "update":
         outcome = provider.update_review_thread(77, "x", "head-1", expected_thread)
     else:
@@ -694,16 +833,25 @@ def test_head_change_after_mutation_requires_fresh_inventory(operation):
 def test_post_mutation_head_check_failure_records_applied_but_requires_refresh():
     class _PostCheckFailureRequester(_Requester):
         def requestJsonAndCheck(self, method, url, input=None):
-            if method == "GET" and len([call for call in self.calls if call[1] == "GET"]) == 1:
+            if method == "GET" and len([call for call in self.calls if call[1] == "GET"]) == 2:
                 self.calls.append(("rest", method, url, input))
                 raise RuntimeError("head unavailable")
             return super().requestJsonAndCheck(method, url, input=input)
 
+    comment = _create_comment("x")
     requester = _PostCheckFailureRequester(
-        rest=[{"head": {"sha": "head-1"}}, {"id": 77, "node_id": "comment-node-77"}]
+        graphql=[
+            _inventory_page([]),
+            _inventory_page([_thread("thread-1", [_comment(comment["body"], database_id=77)])]),
+        ],
+        rest=[
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+            {"id": 77, "node_id": "comment-node-77"},
+        ],
     )
 
-    outcome = _provider(requester).create_review_thread({"body": "x"}, "head-1")
+    outcome = _provider(requester).create_review_thread(comment, "head-1")
 
     assert outcome.state == ReviewThreadActionState.APPLIED_REQUIRES_REFRESH
     assert outcome.current_head_sha is None
@@ -787,9 +935,12 @@ def test_rate_limit_failures_are_distinct_and_keep_retry_evidence(
                 raise failure
             return super().requestJsonAndCheck(method, url, input=input)
 
-    requester = _RateLimitedRequester(rest=[{"head": {"sha": "head-1"}}])
+    requester = _RateLimitedRequester(
+        graphql=[_inventory_page([])],
+        rest=[{"head": {"sha": "head-1"}}, {"head": {"sha": "head-1"}}],
+    )
 
-    outcome = _provider(requester).create_review_thread({"body": "finding"}, "head-1")
+    outcome = _provider(requester).create_review_thread(_create_comment(), "head-1")
 
     assert outcome.state == ReviewThreadActionState.FAILED
     assert outcome.failure_kind == ReviewThreadFailureKind.RATE_LIMITED
@@ -810,8 +961,11 @@ def test_ambiguous_create_transport_failure_requires_inventory_before_retry():
                 raise RuntimeError("connection closed after request was sent")
             return super().requestJsonAndCheck(method, url, input=input)
 
-    outcome = _provider(_AmbiguousRequester(rest=[{"head": {"sha": "head-1"}}])).create_review_thread(
-        {"body": "finding"}, "head-1"
+    outcome = _provider(_AmbiguousRequester(
+        graphql=[_inventory_page([])],
+        rest=[{"head": {"sha": "head-1"}}, {"head": {"sha": "head-1"}}],
+    )).create_review_thread(
+        _create_comment(), "head-1"
     )
 
     assert outcome.state == ReviewThreadActionState.FAILED
@@ -881,10 +1035,13 @@ def test_create_422_is_classified_as_invalid_inline_location_with_details():
                 raise _ValidationFailure("invalid review comment location")
             return super().requestJsonAndCheck(method, url, input=input)
 
-    requester = _InvalidLocationRequester(rest=[{"head": {"sha": "head-1"}}])
+    requester = _InvalidLocationRequester(
+        graphql=[_inventory_page([])],
+        rest=[{"head": {"sha": "head-1"}}, {"head": {"sha": "head-1"}}],
+    )
 
     outcome = _provider(requester).create_review_thread(
-        {"body": "finding", "path": "src/app.py", "line": 10, "side": "RIGHT"},
+        _create_comment(),
         "head-1",
     )
 
