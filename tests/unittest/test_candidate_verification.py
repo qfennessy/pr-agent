@@ -2765,6 +2765,177 @@ async def test_same_file_candidates_keep_distinct_head_anchors_for_external_only
 
 
 @pytest.mark.asyncio
+async def test_shared_head_requires_complete_later_candidate_range():
+    head_lines = [f"service filler {line} " + ("x" * 40) for line in range(1, 31)]
+    head_lines[11] = "return first_value"
+    head_lines[13] = "begin second_range"
+    head_lines[14] = "continue second_range"
+    head_lines[15] = "finish second_range"
+    diff_file = _diff_file(head_file="\n".join(head_lines))
+    # The provider patch exposes the second candidate's changed start but is
+    # truncated before the rest of its range, so the head must prove all of it.
+    diff_file.patch = (
+        "@@ -10,0 +12,1 @@\n+return first_value\n"
+        "@@ -12,0 +14,1 @@\n+begin second_range"
+    )
+    candidates, rejected = prepare_candidates(
+        _review_data(
+            _candidate(
+                context_files=["src/helper.py"],
+                context_symbols=["external_contract"],
+                root_cause="first branch violates the external contract",
+            ),
+            _candidate(
+                context_files=["src/helper.py"],
+                context_symbols=["external_contract"],
+                root_cause="second range violates the external contract",
+                start_line=14,
+                end_line=16,
+            ),
+        ),
+        [diff_file],
+        [],
+        3,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = (
+        "helper prelude\ndef external_contract(): return True\nhelper tail"
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=1,
+            max_lines_per_file=8,
+            max_total_lines=14,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[diff_file],
+    )
+
+    later_head = next(
+        item
+        for item in evidence
+        if item.get("source") == "changed_head"
+        and item.get("anchor_start_line") == 14
+        and item.get("anchor_end_line") == 16
+    )
+    later_lines = later_head["content"].splitlines()
+    offset = 14 - later_head["start_line"]
+    assert later_lines[offset:offset + 3] == [
+        "begin second_range",
+        "continue second_range",
+        "finish second_range",
+    ]
+    assert later_head["start_line"] <= 14
+    assert later_head["end_line"] >= 16
+    assert [
+        item["candidate_id"]
+        for item in evidence
+        if item.get("source") == "changed_patch"
+    ] == ["candidate-1"]
+    relevant_requests = [
+        request
+        for request in artifact["requests"]
+        if request.get("path") == "src/service.py"
+    ]
+    assert rejected == []
+    assert [request["status"] for request in relevant_requests] == [
+        "satisfied_by_changed_head",
+        "satisfied_by_changed_head",
+    ]
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"])[
+        "status"
+    ] == "complete"
+
+    clipped_evidence = bounded_verification_evidence(evidence, 0.5)
+    clipped_later_head = next(
+        item
+        for item in clipped_evidence
+        if item.get("source") == "changed_head"
+        and item.get("anchor_start_line") == 14
+        and item.get("anchor_end_line") == 16
+    )
+    clipped_lines = clipped_later_head["content"].splitlines()
+    clipped_offset = 14 - clipped_later_head["start_line"]
+    assert clipped_lines[clipped_offset:clipped_offset + 3] == [
+        "begin second_range",
+        "continue second_range",
+        "finish second_range",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_later_candidate_range_fails_closed_when_head_budget_cannot_fit_it():
+    head_lines = [f"service line {line}" for line in range(1, 31)]
+    head_lines[11] = "return first_value"
+    head_lines[13] = "begin second_range"
+    head_lines[14] = "continue second_range"
+    head_lines[15] = "finish second_range"
+    diff_file = _diff_file(head_file="\n".join(head_lines))
+    diff_file.patch = (
+        "@@ -10,0 +12,1 @@\n+return first_value\n"
+        "@@ -12,0 +14,1 @@\n+begin second_range"
+    )
+    candidates, rejected = prepare_candidates(
+        _review_data(
+            _candidate(
+                context_files=["src/helper.py"],
+                context_symbols=["external_contract"],
+                root_cause="first branch violates the external contract",
+            ),
+            _candidate(
+                context_files=["src/helper.py"],
+                context_symbols=["external_contract"],
+                root_cause="second range violates the external contract",
+                start_line=14,
+                end_line=16,
+            ),
+        ),
+        [diff_file],
+        [],
+        3,
+    )
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = (
+        "helper prelude\ndef external_contract(): return True\nhelper tail"
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=1,
+            max_lines_per_file=2,
+            max_total_lines=8,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[diff_file],
+    )
+
+    later_request = next(
+        request
+        for request in artifact["requests"]
+        if request.get("candidate_id") == "candidate-2"
+        and request.get("path") == "src/service.py"
+    )
+    assert rejected == []
+    assert later_request["status"] == "context_budget_exhausted"
+    assert not any(
+        item.get("source") == "changed_head"
+        and item.get("anchor_start_line", 0) <= 14
+        and item.get("anchor_end_line", 0) >= 16
+        for item in evidence
+    )
+    assert prompt_evidence_coverage(candidates, evidence, artifact["requests"])[
+        "status"
+    ] == "incomplete"
+
+
+@pytest.mark.asyncio
 async def test_all_candidate_anchors_are_reserved_before_changed_context_patches():
     diff_a = _diff_file("src/a.py")
     diff_b = _diff_file("src/b.py")

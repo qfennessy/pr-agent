@@ -1116,6 +1116,46 @@ def _coalesce_context_anchor_groups(
     return groups
 
 
+def _preserve_relevant_candidate_range(
+    groups: list[tuple[int, int, list[str]]],
+    candidate: dict,
+    path: str,
+    line_count: int,
+) -> list[tuple[int, int, list[str]]]:
+    """Make the full changed candidate range atomic for clipping and reuse."""
+    if path != candidate.get("relevant_file"):
+        return groups
+    candidate_start = candidate.get("start_line")
+    candidate_end = candidate.get("end_line")
+    if (
+        not isinstance(candidate_start, int)
+        or isinstance(candidate_start, bool)
+        or not isinstance(candidate_end, int)
+        or isinstance(candidate_end, bool)
+        or candidate_start < 1
+        or candidate_end < candidate_start
+        or candidate_end > line_count
+    ):
+        return groups
+
+    ordered = sorted([
+        *groups,
+        (candidate_start, candidate_end, []),
+    ])
+    merged: list[tuple[int, int, list[str]]] = []
+    for start_line, end_line, symbols in ordered:
+        if merged and start_line <= merged[-1][1]:
+            previous_start, previous_end, previous_symbols = merged[-1]
+            merged[-1] = (
+                previous_start,
+                max(previous_end, end_line),
+                [*previous_symbols, *symbols],
+            )
+        else:
+            merged.append((start_line, end_line, list(symbols)))
+    return merged
+
+
 def _balanced_context_line_limits(
     groups: list[tuple[int, int, list[str]]],
     line_budget: int,
@@ -1661,23 +1701,42 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
             anchor_compatible = True
             if path == candidate.get("relevant_file"):
                 source_lines = split_git_file_lines(content)
-                resolved_anchor = candidate.get("start_line")
+                candidate_start = candidate.get("start_line")
+                candidate_end = candidate.get("end_line")
                 anchor_compatible = False
                 for existing in existing_group:
                     try:
                         visible_start = int(existing.get("start_line"))
                         visible_end = int(existing.get("end_line"))
+                        preserved_start = int(existing.get("anchor_start_line"))
+                        preserved_end = int(existing.get("anchor_end_line"))
                     except (TypeError, ValueError):
                         continue
                     visible_lines = split_git_file_lines(str(existing.get("content") or ""))
-                    visible_anchor_index = resolved_anchor - visible_start
                     if (
-                        isinstance(resolved_anchor, int)
-                        and visible_start <= resolved_anchor <= visible_end
-                        and 0 <= visible_anchor_index < len(visible_lines)
-                        and resolved_anchor <= len(source_lines)
-                        and visible_lines[visible_anchor_index]
-                        == source_lines[resolved_anchor - 1]
+                        not isinstance(candidate_start, int)
+                        or isinstance(candidate_start, bool)
+                        or not isinstance(candidate_end, int)
+                        or isinstance(candidate_end, bool)
+                        or candidate_start < 1
+                        or candidate_end < candidate_start
+                        or candidate_end > len(source_lines)
+                        or visible_start > candidate_start
+                        or candidate_end > visible_end
+                        or preserved_start > candidate_start
+                        or candidate_end > preserved_end
+                    ):
+                        continue
+                    relative_start = candidate_start - visible_start
+                    relative_end = candidate_end - visible_start
+                    if (
+                        relative_start < 0
+                        or relative_end >= len(visible_lines)
+                    ):
+                        continue
+                    if (
+                        visible_lines[relative_start:relative_end + 1]
+                        == source_lines[candidate_start - 1:candidate_end]
                     ):
                         anchor_compatible = True
                         break
@@ -1820,6 +1879,12 @@ async def retrieve_evidence(git_provider, candidates: list[dict], budgets: Verif
         anchor_ranges = _coalesce_context_anchor_groups(
             anchor_groups,
             remaining_lines(context_path),
+            len(content_lines),
+        )
+        anchor_ranges = _preserve_relevant_candidate_range(
+            anchor_ranges,
+            candidate,
+            context_path,
             len(content_lines),
         )
         line_limits = _balanced_context_line_limits(
