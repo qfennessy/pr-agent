@@ -421,8 +421,8 @@ class ReviewThreadReconciliationOutcome:
                 f"{kind.value}.{state.value}": sum(
                     1 for outcome in self.action_outcomes if outcome.kind == kind and outcome.state == state
                 )
-                for kind in ReviewThreadActionKind
-                for state in ReviewThreadActionState
+                for kind in ReviewThreadActionKind.__members__.values()
+                for state in ReviewThreadActionState.__members__.values()
             },
             "states": self.counts,
             "summary_fallbacks": {
@@ -443,16 +443,19 @@ class ReviewThreadReconciliationOutcome:
 class ReviewThreadMutationProvider(Protocol):
     """Provider surface required by the disabled lifecycle executor."""
 
-    def create_review_thread(self, comment: dict, expected_head_sha: str) -> ReviewThreadActionOutcome: ...
+    def create_review_thread(self, comment: dict, expected_head_sha: str) -> ReviewThreadActionOutcome:
+        raise NotImplementedError
 
     def update_review_thread(
         self,
         comment_id: int,
         body: str,
         expected_head_sha: str,
-    ) -> ReviewThreadActionOutcome: ...
+    ) -> ReviewThreadActionOutcome:
+        raise NotImplementedError
 
-    def resolve_review_thread(self, thread_id: str, expected_head_sha: str) -> ReviewThreadActionOutcome: ...
+    def resolve_review_thread(self, thread_id: str, expected_head_sha: str) -> ReviewThreadActionOutcome:
+        raise NotImplementedError
 
 
 def body_with_fixed_thread_notice(body: str) -> str:

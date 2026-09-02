@@ -102,6 +102,7 @@ def _review_thread_failure_details(error: Exception) -> dict:
             try:
                 retry_after_seconds = max(0.0, float(retry_after))
             except (TypeError, ValueError, OverflowError):
+                # Ignore malformed optional retry metadata from the provider.
                 pass
         rate_limit_reset_at = None
         reset_at = headers.get("x-ratelimit-reset")
@@ -109,6 +110,7 @@ def _review_thread_failure_details(error: Exception) -> dict:
             try:
                 rate_limit_reset_at = int(reset_at)
             except (TypeError, ValueError, OverflowError):
+                # Ignore malformed optional reset metadata from the provider.
                 pass
         retry_source = (
             "retry-after"
