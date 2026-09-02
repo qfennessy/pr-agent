@@ -111,9 +111,13 @@ secret is missing instead of falling back. Never permit `sync/upstream-*` branch
 contain unreviewed upstream workflow code.
 
 `upstream-provenance.yml` uses `pull_request_target` with read-only contents permission so GitHub loads the workflow
-from the protected base branch. It checks out the event's exact base SHA, fetches the PR head as a Git object without
-checking it out, and runs only the packaged `pr_agent.upstream_provenance` module from that protected base. It never
+from the protected base branch. It checks out `github.sha`, the exact protected base head assigned to that
+`pull_request_target` run, fetches the PR head as a Git object without checking it out, and runs only the packaged
+`pr_agent.upstream_provenance` module from that protected base. It never
 executes a script, action, hook, or configuration from the PR candidate.
+
+The workflow deliberately does not use `pull_request.base.sha`: GitHub can retain that historical value for an older
+open PR even after the protected base advances, which would select a trusted but obsolete verifier.
 
 The verifier binds the branch suffix, title, and exactly one PR-body pin to the immutable upstream SHA; verifies the
 pin is on upstream `main`; and requires exactly one declared fork baseline that remains an ancestor of the PR base.
@@ -211,7 +215,8 @@ Before treating all CI as comprehensive, account for these boundaries:
 - The self-review workflow trusts the moving `qfennessy/pr-agent@main` ref. That is consistent with the fork policy
   only while `main` remains protected and reviewed.
 - The upstream provenance workflow deliberately uses `pull_request_target`. It has read-only permission and runs
-  only the verifier checked out from the exact protected base SHA; never add a PR-head checkout or execution step.
+  only the verifier checked out from that run's exact `github.sha` protected base head; never add a PR-head checkout
+  or execution step.
 - The publish workflow intentionally permits Docker/repository finalization when PyPI fails. Release operators must
   treat the warning as a partial release and complete the missing registry publication.
 - `.github/release-drafter.yml` still contains categories and version-resolution rules, but no active workflow invokes
