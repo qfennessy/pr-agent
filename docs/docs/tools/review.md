@@ -58,11 +58,12 @@ It defines versioned finding identities, paginated thread inventory, explicit cr
 fail-closed action plan tied to one pull-request head commit. Existing persistent inline comments still use the
 simpler duplicate-suppression behavior described in the [improve tool](./improve.md#persistent-inline-comments).
 
-The lifecycle foundation is not connected to `/review` publication yet. Its integration boundary accepts only a
-versioned verified-finding contract with precomputed SHA-256 root-cause and stable-key identities; it never derives a
-substitute identity from finding prose, candidate order, or a line number. Enabling it before issue #9 supplies that
-contract and rollout evidence exists could update the wrong discussion, so the reserved setting remains off and has
-no runtime effect:
+The lifecycle foundation is not connected to `/review` publication yet. Its integration boundary consumes the
+`root_cause_id`, `trusted_stable_key`, and `relevant_file` emitted by the issue #9 `apply_verification_decisions` path,
+scopes them to the current repository and pull request, and never derives a substitute identity from finding prose or
+line numbers. The root-cause contract is `verified-root-cause-v2`; verifier-supplied identity fields are ignored before
+the finding reaches this boundary. The reserved setting remains off and has no runtime effect until the publication
+integration is implemented and rollout evidence exists:
 
 ```toml
 [review_thread_lifecycle]
@@ -88,7 +89,7 @@ blindly retried because GitHub may already have accepted it.
 
 The foundation also models invalid or rejected inline locations as de-duplicated summary fallbacks. It returns those
 fallback entries to its caller rather than publishing them itself. Runtime publication remains disconnected until
-verified findings from #9 and the evaluation/rollout gate from #27 provide their final contracts.
+the gated integration is implemented and the evaluation/rollout gate from #27 provides its evidence.
 
 If you want to edit [configurations](#configuration-options), add the relevant ones to the command:
 

@@ -2,19 +2,19 @@ import hashlib
 
 import pytest
 
+from pr_agent.algo.candidate_verification import apply_verification_decisions
 from pr_agent.algo.inline_comment_dedup import (
     body_fingerprint, body_with_finding_identity_marker,
     build_summary_fallback_marker, finding_identity_markers, has_marker,
     marker_fingerprints)
 from pr_agent.algo.review_thread_reconciler import (
     FIXED_THREAD_NOTICE, FIXED_THREAD_STATE_MARKER,
-    VERIFIED_FINDING_IDENTITY_CONTRACT_VERSION,
     VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION, DesiredReviewThread,
     FindingIdentity, ReviewThreadActionKind, ReviewThreadActionOutcome,
     ReviewThreadActionState, ReviewThreadAnchor, ReviewThreadCommentSnapshot,
     ReviewThreadFailureKind, ReviewThreadReconciliationOutcome,
     ReviewThreadSnapshot, SummaryFallbackReason,
-    execute_review_thread_action_plan, finding_identity_from_verified_contract,
+    execute_review_thread_action_plan, finding_identity_from_verified_finding,
     plan_review_thread_actions)
 
 
@@ -173,20 +173,16 @@ def test_trusted_stable_key_preserves_identity_across_file_move():
     assert unrelated.finding_id != before.finding_id
 
 
-def test_verified_identity_contract_consumes_exact_upstream_hashes_without_deriving_a_substitute():
+def test_verified_finding_identity_consumes_exact_upstream_hashes_without_deriving_a_substitute():
     root_cause_id = f"sha256:{'a' * 64}"
     trusted_stable_key = f"sha256:{'b' * 64}"
 
-    identity = finding_identity_from_verified_contract({
-        "schema_version": VERIFIED_FINDING_IDENTITY_CONTRACT_VERSION,
-        "root_cause_id_schema": VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
-        "repository": "owner/repo",
-        "pull_request_number": 7,
+    identity = finding_identity_from_verified_finding({
         "root_cause_id": root_cause_id,
-        "path": "src/app.py",
-        "symbol": "run",
+        "relevant_file": "src/app.py",
         "trusted_stable_key": trusted_stable_key,
-    })
+        "issue_content": "Mutable wording is not identity input.",
+    }, repository="owner/repo", pull_request_number=7)
 
     assert identity.root_cause_id == root_cause_id
     assert identity.trusted_stable_key == trusted_stable_key
@@ -196,29 +192,80 @@ def test_verified_identity_contract_consumes_exact_upstream_hashes_without_deriv
 @pytest.mark.parametrize(
     "replacement,error",
     [
-        ({"schema_version": "unknown-v1"}, "schema_version"),
         ({"root_cause_id": "model prose"}, "sha256 identity"),
         ({"root_cause_id": None}, "root_cause_id"),
-        ({"root_cause_id_schema": "unversioned"}, "root_cause_id_schema"),
-        ({"root_cause_id_schema": "verified-root-cause-v2"}, "root_cause_id_schema"),
         ({"trusted_stable_key": "candidate-1"}, "trusted_stable_key"),
-        ({"mutable_finding_prose": "model wording"}, "unsupported fields"),
+        ({"trusted_stable_key": None}, "trusted_stable_key"),
+        ({"relevant_file": None}, "relevant_file"),
     ],
 )
-def test_verified_identity_contract_fails_closed_on_untrusted_or_malformed_identity(replacement, error):
-    contract = {
-        "schema_version": VERIFIED_FINDING_IDENTITY_CONTRACT_VERSION,
-        "root_cause_id_schema": VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
-        "repository": "owner/repo",
-        "pull_request_number": 7,
+def test_verified_finding_identity_fails_closed_on_untrusted_or_malformed_identity(replacement, error):
+    finding = {
         "root_cause_id": f"sha256:{'a' * 64}",
-        "path": "src/app.py",
+        "relevant_file": "src/app.py",
         "trusted_stable_key": f"sha256:{'b' * 64}",
     }
-    contract.update(replacement)
+    finding.update(replacement)
 
     with pytest.raises(ValueError, match=error):
-        finding_identity_from_verified_contract(contract)
+        finding_identity_from_verified_finding(
+            finding, repository="owner/repo", pull_request_number=7
+        )
+
+
+def test_verified_finding_identity_accepts_actual_verification_output():
+    candidate = {
+        "candidate_id": "candidate-1",
+        "relevant_file": "src/service.py",
+        "issue_header": "Potential bug",
+        "issue_content": "Original candidate wording.",
+        "start_line": 12,
+        "end_line": 12,
+        "side": "new",
+        "trigger": "The changed branch receives an empty value.",
+        "impact": "The request fails instead of using the fallback.",
+        "_changed_line_ranges": [(12, 12)],
+        "_changed_anchor_shape": "return <id> ( <id> )",
+        "_changed_anchor_ordinal": 1,
+        "_trusted_defect_ordinal": 1,
+        "_trusted_lineage_key": "file:src/service.py",
+        "_trusted_side_line_count": 20,
+    }
+    evidence = [{
+        "candidate_id": "candidate-1",
+        "source": "changed_head",
+        "path": "src/service.py",
+        "content": "return fallback(value)",
+        "start_line": 12,
+        "end_line": 12,
+        "side": "new",
+    }]
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "root_cause_id": "model-invented-id",
+        "trusted_stable_key": "model-invented-key",
+        "issue_content": "Verified wording can change.",
+        "trigger": "An empty value reaches this branch.",
+        "impact": "The request fails.",
+        "relevant_file": "src/service.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/service.py"],
+    }]}}
+
+    findings, decisions = apply_verification_decisions([candidate], evidence, verification)
+    identity = finding_identity_from_verified_finding(
+        findings[0], repository="owner/repo", pull_request_number=7
+    )
+
+    assert decisions[0]["verdict"] == "verified"
+    assert findings[0]["root_cause_id"].startswith("sha256:")
+    assert findings[0]["trusted_stable_key"].startswith("sha256:")
+    assert "model-invented" not in identity.root_cause_id
+    assert identity.trusted_stable_key == findings[0]["trusted_stable_key"]
+    assert identity.path == findings[0]["relevant_file"]
+    assert identity.root_cause_id_schema == "verified-root-cause-v2"
 
 
 @pytest.mark.parametrize(
@@ -226,7 +273,7 @@ def test_verified_identity_contract_fails_closed_on_untrusted_or_malformed_ident
     [
         ({"root_cause_id": "model prose"}, "sha256 identity"),
         ({"root_cause_id_schema": None}, "root_cause_id_schema"),
-        ({"root_cause_id_schema": "verified-root-cause-v2"}, "root_cause_id_schema"),
+        ({"root_cause_id_schema": "verified-root-cause-v1"}, "root_cause_id_schema"),
         ({"trusted_stable_key": "candidate-1"}, "trusted_stable_key"),
         ({"schema_version": "untrusted-lifecycle-v2"}, "schema_version"),
         ({"pull_request_number": True}, "pull_request_number"),

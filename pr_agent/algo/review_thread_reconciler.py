@@ -19,8 +19,7 @@ from pr_agent.algo.inline_comment_dedup import (
     strip_inline_comment_markers, summary_fallback_markers)
 
 REVIEW_THREAD_LIFECYCLE_SCHEMA_VERSION = "review-thread-lifecycle-v1"
-VERIFIED_FINDING_IDENTITY_CONTRACT_VERSION = "verified-finding-identity-v1"
-VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION = "verified-root-cause-v1"
+VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION = "verified-root-cause-v2"
 FIXED_THREAD_NOTICE = "> ✅ **PR-Agent status:** Fixed or obsolete in the latest revision."
 FIXED_THREAD_STATE_MARKER = "<!-- pr-agent-thread-state:v1 state=fixed -->"
 
@@ -99,59 +98,39 @@ class FindingIdentity:
         return asdict(self)
 
 
-def finding_identity_from_verified_contract(contract: Mapping[str, Any]) -> FindingIdentity:
-    """Build an identity only from a versioned upstream verified-finding contract.
+def finding_identity_from_verified_finding(
+    finding: Mapping[str, Any],
+    *,
+    repository: str,
+    pull_request_number: int,
+) -> FindingIdentity:
+    """Build an identity from the actual issue #9 verified-finding output.
 
-    Issue #9 owns the deterministic ``root_cause_id`` algorithm. This boundary
-    deliberately validates and consumes that identifier without deriving a
-    replacement from mutable finding prose, severity, or line numbers.
+    ``apply_verification_decisions`` derives both identity hashes from trusted
+    diff structure and exposes them beside ``relevant_file``. Repository and PR
+    scope come from the publication caller; mutable finding prose and model
+    fields are deliberately ignored.
     """
-    if not isinstance(contract, Mapping):
-        raise TypeError("verified finding identity contract must be a mapping")
-    if contract.get("schema_version") != VERIFIED_FINDING_IDENTITY_CONTRACT_VERSION:
-        raise ValueError(
-            f"schema_version must be {VERIFIED_FINDING_IDENTITY_CONTRACT_VERSION!r}"
-        )
-    allowed_fields = {
-        "schema_version",
-        "root_cause_id_schema",
-        "repository",
-        "pull_request_number",
-        "root_cause_id",
-        "path",
-        "symbol",
-        "trusted_stable_key",
-    }
-    unexpected_fields = sorted(set(contract) - allowed_fields)
-    if unexpected_fields:
-        raise ValueError(f"verified finding identity contract has unsupported fields: {unexpected_fields}")
-    root_cause_id = contract.get("root_cause_id")
-    root_cause_id_schema = contract.get("root_cause_id_schema")
+    if not isinstance(finding, Mapping):
+        raise TypeError("verified finding must be a mapping")
+    root_cause_id = finding.get("root_cause_id")
     if not isinstance(root_cause_id, str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", root_cause_id.strip()):
-        raise ValueError("verified finding contract root_cause_id must be a sha256 identity")
-    if root_cause_id_schema != VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION:
-        raise ValueError(f"root_cause_id_schema must be {VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION!r}")
-    pull_request_number = contract.get("pull_request_number")
-    if isinstance(pull_request_number, bool) or not isinstance(pull_request_number, int):
-        raise ValueError("verified finding contract requires an integer pull_request_number")
-    for field_name in ("repository", "path"):
-        if not isinstance(contract.get(field_name), str) or not contract[field_name].strip():
-            raise ValueError(f"verified finding contract requires {field_name}")
-    for optional_name in ("symbol", "trusted_stable_key"):
-        value = contract.get(optional_name)
-        if value is not None and not isinstance(value, str):
-            raise ValueError(f"verified finding contract {optional_name} must be a string when supplied")
-    trusted_stable_key = contract.get("trusted_stable_key")
-    if trusted_stable_key is not None and not re.fullmatch(r"sha256:[a-f0-9]{64}", trusted_stable_key.strip()):
-        raise ValueError("verified finding contract trusted_stable_key must be a sha256 identity")
+        raise ValueError("verified finding root_cause_id must be a sha256 identity")
+    trusted_stable_key = finding.get("trusted_stable_key")
+    if not isinstance(trusted_stable_key, str) or not re.fullmatch(
+        r"sha256:[a-f0-9]{64}", trusted_stable_key.strip()
+    ):
+        raise ValueError("verified finding trusted_stable_key must be a sha256 identity")
+    relevant_file = finding.get("relevant_file")
+    if not isinstance(relevant_file, str) or not relevant_file.strip():
+        raise ValueError("verified finding requires relevant_file")
     return FindingIdentity(
-        repository=contract["repository"],
+        repository=repository,
         pull_request_number=pull_request_number,
         root_cause_id=root_cause_id,
-        path=contract["path"],
-        symbol=contract.get("symbol"),
+        path=relevant_file,
         trusted_stable_key=trusted_stable_key,
-        root_cause_id_schema=root_cause_id_schema.strip(),
+        root_cause_id_schema=VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
     )
 
 
@@ -801,7 +780,8 @@ def execute_review_thread_action_plan(
 
     Callers remain responsible for publishing returned ``summary_fallbacks`` as
     one de-duplicated PR summary. Production publication intentionally remains
-    disconnected until issues #9 and #27 provide their upstream contracts.
+    disconnected until issue #27 provides rollout evidence and the gated
+    publication integration is implemented.
     """
     outcomes: list[ReviewThreadActionOutcome] = []
     outcomes_by_action_id: dict[str, ReviewThreadActionOutcome] = {}
