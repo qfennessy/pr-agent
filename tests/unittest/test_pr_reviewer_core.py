@@ -1490,6 +1490,7 @@ async def test_frontier_without_candidate_verification_reports_invalid_configura
     reviewer._should_publish_review_no_suggestions = MagicMock(return_value=False)
     reviewer._clear_stale_persistent_bugs_only_review = MagicMock()
     reviewer._run_candidate_verification = AsyncMock()
+    reviewer.ai_handler = SimpleNamespace(chat_completion=AsyncMock())
 
     retry = AsyncMock()
     extract_tickets = AsyncMock()
@@ -1518,6 +1519,10 @@ async def test_frontier_without_candidate_verification_reports_invalid_configura
     retry.assert_not_awaited()
     extract_tickets.assert_not_awaited()
     reviewer._prepare_pr_review.assert_not_called()
+    reviewer.ai_handler.chat_completion.assert_not_awaited()
+    provider.publish_structured_review.assert_not_called()
+    provider.publish_comment.assert_not_called()
+    provider.publish_persistent_comment.assert_not_called()
     assert artifact == ""
     assert reviewer.frontier_adjudication_artifact == {
         "enabled": True,
@@ -1526,6 +1531,83 @@ async def test_frontier_without_candidate_verification_reports_invalid_configura
         "results": [],
         "publication_safe": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_frontier_without_verification_publishes_one_source_free_preflight_artifact(
+    monkeypatch,
+):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.get_files.return_value = ["src/PRIVATE_SERVICE.py"]
+    provider.get_diff_files.return_value = [_route_file("src/PRIVATE_SERVICE.py")]
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {"private_source": "PRIVATE_SOURCE_TEXT"}
+    reviewer.review_routing_configuration = load_review_routing_configuration(
+        {"enabled": False}
+    )
+    reviewer._prepare_review_route = MagicMock()
+    reviewer._review_shadow_only = False
+    reviewer._prepare_pr_review = MagicMock(return_value="must not render")
+    reviewer._run_candidate_verification = AsyncMock()
+    reviewer.ai_handler = SimpleNamespace(chat_completion=AsyncMock())
+    retry = AsyncMock()
+    extract_tickets = AsyncMock()
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", retry)
+    monkeypatch.setattr(
+        pr_reviewer_module, "extract_and_cache_pr_tickets", extract_tickets
+    )
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.publish_output",
+        "pr_reviewer.enable_candidate_verification",
+        "pr_reviewer.enable_frontier_adjudication",
+    ))
+    try:
+        settings.config.publish_output = True
+        settings.pr_reviewer.enable_candidate_verification = False
+        settings.pr_reviewer.enable_frontier_adjudication = True
+
+        await reviewer.run()
+    finally:
+        restore_settings(snapshot)
+
+    failure = {
+        "enabled": True,
+        "status": "configuration_invalid",
+        "failure": "candidate_verification_required",
+        "results": [],
+        "publication_safe": False,
+    }
+    provider.publish_structured_review.assert_called_once_with({
+        "review": {"key_issues_to_review": []},
+        "usage": {},
+        "metadata": {
+            "review_profile": "full",
+            "omitted_files": [],
+            "deleted_files": [],
+        },
+        "frontier_adjudication": failure,
+    })
+    structured = provider.publish_structured_review.call_args.args[0]
+    assert "PRIVATE_SOURCE_TEXT" not in repr(structured)
+    assert "PRIVATE_SERVICE" not in repr(structured)
+    retry.assert_not_awaited()
+    extract_tickets.assert_not_awaited()
+    reviewer._run_candidate_verification.assert_not_awaited()
+    reviewer.ai_handler.chat_completion.assert_not_awaited()
+    reviewer._prepare_pr_review.assert_not_called()
+    for method_name in (
+        "publish_comment",
+        "publish_persistent_comment",
+        "publish_code_suggestions",
+        "publish_inline_comments",
+        "publish_labels",
+    ):
+        getattr(provider, method_name).assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1598,6 +1680,9 @@ async def test_invalid_frontier_identity_configuration_fails_before_every_model_
     verifier.assert_not_awaited()
     frontier.assert_not_awaited()
     reviewer.ai_handler.chat_completion.assert_not_awaited()
+    provider.publish_structured_review.assert_not_called()
+    provider.publish_comment.assert_not_called()
+    provider.publish_persistent_comment.assert_not_called()
     assert artifact == ""
     assert reviewer.frontier_adjudication_artifact == {
         "enabled": True,
@@ -1606,6 +1691,105 @@ async def test_invalid_frontier_identity_configuration_fails_before_every_model_
         "results": [],
         "publication_safe": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_invalid_frontier_preflight_publishes_one_source_free_failure_artifact(
+    monkeypatch,
+):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.get_files.return_value = ["src/PRIVATE_SERVICE.py"]
+    provider.get_diff_files.return_value = [_route_file("src/PRIVATE_SERVICE.py")]
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {"private_source": "PRIVATE_SOURCE_TEXT"}
+    reviewer.review_routing_configuration = load_review_routing_configuration(
+        {"enabled": False}
+    )
+    reviewer.ai_handler = SimpleNamespace(azure=False, chat_completion=AsyncMock())
+    reviewer._prepare_review_route = MagicMock()
+    reviewer._review_shadow_only = False
+    reviewer._prepare_pr_review = MagicMock(return_value="must not render")
+    reviewer._run_guarded_specialist_escalation = AsyncMock()
+    reviewer._run_candidate_verification = AsyncMock()
+    retry = AsyncMock()
+    extract_tickets = AsyncMock()
+    frontier = AsyncMock()
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", retry)
+    monkeypatch.setattr(
+        pr_reviewer_module, "extract_and_cache_pr_tickets", extract_tickets
+    )
+    monkeypatch.setattr(pr_reviewer_module, "run_frontier_adjudication", frontier)
+
+    settings = get_settings()
+    keys = (
+        "config.publish_output",
+        "pr_reviewer.enable_candidate_verification",
+        "pr_reviewer.enable_frontier_adjudication",
+        "pr_reviewer.frontier_adjudication_model",
+        "pr_reviewer.frontier_adjudication_deployment",
+        "pr_reviewer.frontier_adjudication_provider",
+        "pr_reviewer.frontier_adjudication_revision",
+        "pr_reviewer.frontier_adjudication_fallback_models",
+        "pr_reviewer.frontier_adjudication_fallback_deployments",
+        "pr_reviewer.frontier_adjudication_fallback_providers",
+        "pr_reviewer.frontier_adjudication_fallback_revisions",
+    )
+    snapshot = snapshot_settings(keys)
+    try:
+        settings.config.publish_output = True
+        settings.pr_reviewer.enable_candidate_verification = True
+        settings.pr_reviewer.enable_frontier_adjudication = True
+        settings.pr_reviewer.frontier_adjudication_model = "frontier-primary"
+        settings.pr_reviewer.frontier_adjudication_deployment = "deployment-primary"
+        settings.pr_reviewer.frontier_adjudication_provider = [True]
+        settings.pr_reviewer.frontier_adjudication_revision = "revision-primary"
+        settings.pr_reviewer.frontier_adjudication_fallback_models = []
+        settings.pr_reviewer.frontier_adjudication_fallback_deployments = []
+        settings.pr_reviewer.frontier_adjudication_fallback_providers = []
+        settings.pr_reviewer.frontier_adjudication_fallback_revisions = []
+
+        await reviewer.run()
+    finally:
+        restore_settings(snapshot)
+
+    failure = {
+        "enabled": True,
+        "status": "configuration_invalid",
+        "failure": "invalid_configuration",
+        "results": [],
+        "publication_safe": False,
+    }
+    provider.publish_structured_review.assert_called_once_with({
+        "review": {"key_issues_to_review": []},
+        "usage": {},
+        "metadata": {
+            "review_profile": "full",
+            "omitted_files": [],
+            "deleted_files": [],
+        },
+        "frontier_adjudication": failure,
+    })
+    structured = provider.publish_structured_review.call_args.args[0]
+    assert "PRIVATE_SOURCE_TEXT" not in repr(structured)
+    assert "PRIVATE_SERVICE" not in repr(structured)
+    retry.assert_not_awaited()
+    extract_tickets.assert_not_awaited()
+    reviewer._run_guarded_specialist_escalation.assert_not_awaited()
+    reviewer._run_candidate_verification.assert_not_awaited()
+    frontier.assert_not_awaited()
+    reviewer.ai_handler.chat_completion.assert_not_awaited()
+    reviewer._prepare_pr_review.assert_not_called()
+    for method_name in (
+        "publish_comment",
+        "publish_persistent_comment",
+        "publish_code_suggestions",
+        "publish_inline_comments",
+        "publish_labels",
+    ):
+        getattr(provider, method_name).assert_not_called()
 
 
 @pytest.mark.asyncio

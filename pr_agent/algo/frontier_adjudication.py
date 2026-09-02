@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import inspect
 import json
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -27,6 +29,10 @@ FRONTIER_INPUT_SCHEMA_VERSION = "frontier-adjudication-input-v1"
 FRONTIER_OUTPUT_SCHEMA_VERSION = "frontier-adjudication-output-v1"
 FRONTIER_PROMPT_VERSION = "frontier-adjudication-prompt-v1"
 FRONTIER_POLICY_VERSION = "frontier-adjudication-policy-v1"
+_SYNC_IDENTITY_REFRESH_WORKER_LIMIT = 4
+_SYNC_IDENTITY_REFRESH_SLOTS = threading.BoundedSemaphore(
+    _SYNC_IDENTITY_REFRESH_WORKER_LIMIT
+)
 
 
 class FrontierDecision(str, Enum):
@@ -518,6 +524,12 @@ def load_frontier_adjudication_config(
                 f"{key} must be a non-boolean number"
             ) from exc
 
+    def prompt_string(key: str) -> str:
+        raw = prompt.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            raise FrontierContractError(f"frontier prompt {key} must be a non-blank string")
+        return raw
+
     primary_model = strings("frontier_adjudication_model", required=True)
     if len(primary_model) != 1:
         raise FrontierContractError("frontier_adjudication_model requires one model")
@@ -552,6 +564,11 @@ def load_frontier_adjudication_config(
     provider_retries = integer("frontier_adjudication_provider_retries", 0)
     max_output_tokens = integer("frontier_adjudication_max_output_tokens", 2048)
     max_calls = integer("frontier_adjudication_max_calls", 3)
+    system_prompt = prompt_string("system")
+    user_prompt = prompt_string("user")
+    prompt_version = prompt_string("prompt_version")
+    input_schema_version = prompt_string("input_schema_version")
+    output_schema_version = prompt_string("schema_version")
     route = AIModelRoute(
         models=models,
         deployments=route_deployments,
@@ -565,11 +582,11 @@ def load_frontier_adjudication_config(
         enabled=enabled,
         route=route,
         model_identities=identities,
-        system_prompt=str(prompt.get("system") or ""),
-        user_prompt=str(prompt.get("user") or ""),
-        prompt_version=str(prompt.get("prompt_version") or ""),
-        input_schema_version=str(prompt.get("input_schema_version") or ""),
-        output_schema_version=str(prompt.get("schema_version") or ""),
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        prompt_version=prompt_version,
+        input_schema_version=input_schema_version,
+        output_schema_version=output_schema_version,
         stage_timeout_seconds=stage_timeout,
         minimum_confidence=minimum_confidence,
         max_calls=max_calls,
@@ -620,15 +637,70 @@ class _FrontierIdentityRefreshError(RuntimeError):
     """The identity callback failed independently of the stage deadline."""
 
 
+class _FrontierIdentityRefreshCapacityError(RuntimeError):
+    """No isolated synchronous identity-refresh worker is available."""
+
+
+async def _run_sync_identity_refresh(current_identity: Callable[[], Any]) -> Any:
+    """Run one synchronous refresh without consuming the event-loop executor."""
+
+    worker_slots = _SYNC_IDENTITY_REFRESH_SLOTS
+    if not worker_slots.acquire(blocking=False):
+        raise _FrontierIdentityRefreshCapacityError
+
+    loop = asyncio.get_running_loop()
+    result_future = loop.create_future()
+    context = contextvars.copy_context()
+
+    def complete(value: Any = None, error: BaseException | None = None) -> None:
+        if result_future.done():
+            return
+        if error is not None:
+            result_future.set_exception(error)
+        else:
+            result_future.set_result(value)
+
+    def worker() -> None:
+        try:
+            value = context.run(current_identity)
+        except BaseException as exc:
+            completion = (None, exc)
+        else:
+            completion = (value, None)
+        try:
+            loop.call_soon_threadsafe(complete, *completion)
+        except RuntimeError:
+            # The request loop may already have closed after a timed-out refresh.
+            pass
+        finally:
+            # A timeout cannot stop the callback. Keep its slot charged until it
+            # actually exits so abandoned refreshes can never exceed the hard cap.
+            worker_slots.release()
+
+    thread = threading.Thread(
+        target=worker,
+        name="frontier-identity-refresh",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except Exception:
+        worker_slots.release()
+        raise
+    return await result_future
+
+
 async def _refresh_identity(current_identity: Callable[[], Any]) -> Optional[str]:
     try:
         if inspect.iscoroutinefunction(current_identity):
             value = await current_identity()
         else:
-            value = await asyncio.to_thread(current_identity)
+            value = await _run_sync_identity_refresh(current_identity)
         if inspect.isawaitable(value):
             value = await value
         return str(value) if value else None
+    except _FrontierIdentityRefreshCapacityError:
+        raise
     except Exception as exc:
         raise _FrontierIdentityRefreshError from exc
 
@@ -669,8 +741,16 @@ def _validate_output(
     request: FrontierAdjudicationRequest,
     config: FrontierAdjudicationConfig,
 ) -> dict[str, Any]:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise FrontierContractError("frontier response contains duplicate object keys")
+            value[key] = item
+        return value
+
     try:
-        output = json.loads(raw)
+        output = json.loads(raw, object_pairs_hook=unique_object)
     except (TypeError, json.JSONDecodeError) as exc:
         raise FrontierContractError("frontier response is not valid JSON") from exc
     if not isinstance(output, Mapping):
@@ -873,6 +953,25 @@ async def run_frontier_adjudication(
             current_identity,
             deadline_monotonic,
         )
+    except _FrontierIdentityRefreshCapacityError:
+        record_adjudication_result(
+            finding_id,
+            provider=None,
+            model_revision=None,
+            model_attempts_configured=config.route.model_retries,
+            provider_retries_configured=config.route.provider_retries,
+            prompt_version=config.prompt_version,
+            input_schema_version=config.input_schema_version,
+            schema_version=config.output_schema_version,
+            state=FrontierState.UNAVAILABLE.value,
+            latency_seconds=time.monotonic() - started_at,
+            failure_reason="identity_refresh_capacity_exhausted",
+        )
+        return _unavailable(
+            request,
+            FrontierState.UNAVAILABLE,
+            "identity_refresh_capacity_exhausted",
+        )
     except _FrontierIdentityRefreshError:
         record_adjudication_result(
             finding_id,
@@ -1017,6 +1116,25 @@ async def run_frontier_adjudication(
         current_snapshot_id = await _refresh_identity_before(
             current_identity,
             deadline_monotonic,
+        )
+    except _FrontierIdentityRefreshCapacityError:
+        record_adjudication_result(
+            finding_id,
+            provider=actual_provider,
+            model_revision=actual_revision,
+            model_attempts_configured=config.route.model_retries,
+            provider_retries_configured=config.route.provider_retries,
+            prompt_version=config.prompt_version,
+            input_schema_version=config.input_schema_version,
+            schema_version=config.output_schema_version,
+            state=FrontierState.UNAVAILABLE.value,
+            latency_seconds=time.monotonic() - started_at,
+            failure_reason="identity_refresh_capacity_exhausted",
+        )
+        return _unavailable(
+            request,
+            FrontierState.UNAVAILABLE,
+            "identity_refresh_capacity_exhausted",
         )
     except asyncio.TimeoutError:
         record_adjudication_result(

@@ -431,6 +431,50 @@ async def test_malformed_output_fails_unavailable():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw_output",
+    [
+        (
+            f'{{"schema_version":"{FRONTIER_OUTPUT_SCHEMA_VERSION}",'
+            '"decision":"confirm","decision":"reject",'
+            '"normalized_severity":null,"confidence":0.9,'
+            '"evidence_citations":["evidence-1"],"unresolved_questions":[]}'
+        ),
+        (
+            f'{{"schema_version":"{FRONTIER_OUTPUT_SCHEMA_VERSION}",'
+            '"decision":"confirm","normalized_severity":"high","confidence":0.9,'
+            '"evidence_citations":["evidence-1"],'
+            '"unresolved_questions":[{"decision":"confirm","decision":"reject"}]}'
+        ),
+    ],
+    ids=["conflicting-top-level-decision", "nested-duplicate"],
+)
+async def test_duplicate_json_object_keys_are_rejected_as_malformed(raw_output):
+    from pr_agent.algo import frontier_adjudication as frontier_module
+
+    init_run_details()
+    stage_config = config()
+    adjudication_request = request(stage_config)
+    with pytest.raises(ValueError, match="duplicate object keys"):
+        frontier_module._validate_output(
+            raw_output,
+            adjudication_request,
+            stage_config,
+        )
+
+    result = await run_frontier_adjudication(
+        adjudication_request,
+        stage_config,
+        FakeHandler([raw_output]),
+        current_identity=lambda: "head-1",
+    )
+
+    assert result.decision is FrontierDecision.UNAVAILABLE
+    assert result.state is FrontierState.MALFORMED_OUTPUT
+    assert result.failure_reason == "malformed_output"
+
+
+@pytest.mark.asyncio
 async def test_timeout_fails_unavailable():
     init_run_details()
     stage_config = config(stage_timeout=0.01)
@@ -549,10 +593,113 @@ async def test_slow_async_identity_refresh_times_out_and_is_cancelled():
 
 
 @pytest.mark.asyncio
-async def test_async_identity_refresh_remains_supported():
+async def test_synchronous_identity_refresh_capacity_is_bounded_and_isolated(monkeypatch):
+    from pr_agent.algo import frontier_adjudication as frontier_module
+
+    init_run_details()
+    assert frontier_module._SYNC_IDENTITY_REFRESH_WORKER_LIMIT == 4
+    worker_limit = 2
+    monkeypatch.setattr(
+        frontier_module,
+        "_SYNC_IDENTITY_REFRESH_SLOTS",
+        threading.BoundedSemaphore(worker_limit),
+    )
+    loop = asyncio.get_running_loop()
+    default_executor_calls = []
+
+    def reject_default_executor(*args, **kwargs):
+        default_executor_calls.append((args, kwargs))
+        raise AssertionError("identity refresh used the event-loop executor")
+
+    monkeypatch.setattr(loop, "run_in_executor", reject_default_executor)
+    stage_config = config(stage_timeout=0.1)
+    release_refresh = threading.Event()
+    state_lock = threading.Lock()
+    active_workers = 0
+    peak_workers = 0
+    worker_names = []
+
+    def never_returning_identity_refresh():
+        nonlocal active_workers, peak_workers
+        with state_lock:
+            active_workers += 1
+            peak_workers = max(peak_workers, active_workers)
+            worker_names.append(threading.current_thread().name)
+        try:
+            release_refresh.wait(timeout=1)
+            return "head-1"
+        finally:
+            with state_lock:
+                active_workers -= 1
+
+    blocking_handlers = [FakeHandler([output()]) for _ in range(worker_limit)]
+    try:
+        blocking_results = await asyncio.gather(*(
+            run_frontier_adjudication(
+                request(stage_config),
+                stage_config,
+                handler,
+                current_identity=never_returning_identity_refresh,
+            )
+            for handler in blocking_handlers
+        ))
+        with state_lock:
+            assert active_workers == worker_limit
+            assert peak_workers == worker_limit
+
+        later_handlers = [FakeHandler([output()]) for _ in range(worker_limit * 3)]
+        later_started_at = time.monotonic()
+        later_results = await asyncio.gather(*(
+            run_frontier_adjudication(
+                request(stage_config),
+                stage_config,
+                handler,
+                current_identity=never_returning_identity_refresh,
+            )
+            for handler in later_handlers
+        ))
+        later_elapsed = time.monotonic() - later_started_at
+    finally:
+        release_refresh.set()
+
+    for _ in range(100):
+        with state_lock:
+            if active_workers == 0:
+                break
+        await asyncio.sleep(0.01)
+
+    assert all(result.state is FrontierState.TIMEOUT for result in blocking_results)
+    assert all(result.failure_reason == "timeout" for result in blocking_results)
+    assert all(handler.calls == [] for handler in blocking_handlers)
+    assert later_elapsed < stage_config.stage_timeout_seconds
+    assert all(result.state is FrontierState.UNAVAILABLE for result in later_results)
+    assert all(
+        result.failure_reason == "identity_refresh_capacity_exhausted"
+        for result in later_results
+    )
+    assert all(handler.calls == [] for handler in later_handlers)
+    assert peak_workers == worker_limit
+    assert set(worker_names) == {"frontier-identity-refresh"}
+    assert active_workers == 0
+    assert default_executor_calls == []
+    serialized = json.dumps([result.to_telemetry_dict() for result in later_results])
+    assert "src/auth.py" not in serialized
+    assert "object_by_id" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_async_identity_refresh_remains_supported_without_worker_dispatch(monkeypatch):
     init_run_details()
     stage_config = config()
     refresh_count = 0
+    loop = asyncio.get_running_loop()
+    executor_calls = []
+
+    def reject_executor_dispatch(*args, **kwargs):
+        executor_calls.append((args, kwargs))
+        raise AssertionError("async identity refresh dispatched a worker")
+
+    monkeypatch.setattr(loop, "run_in_executor", reject_executor_dispatch)
 
     async def async_identity_refresh():
         nonlocal refresh_count
@@ -569,6 +716,7 @@ async def test_async_identity_refresh_remains_supported():
 
     assert refresh_count == 2
     assert result.state is FrontierState.CONFIRMED
+    assert executor_calls == []
 
 
 @pytest.mark.asyncio
@@ -893,33 +1041,30 @@ async def test_snapshot_that_changes_during_call_discards_confirmation():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("blocked_refresh", [1, 2])
-async def test_snapshot_refreshes_are_covered_by_stage_deadline(
-    monkeypatch,
-    blocked_refresh,
-):
+async def test_snapshot_refreshes_are_covered_by_stage_deadline(blocked_refresh):
     init_run_details()
     refresh_count = 0
+    release_refresh = threading.Event()
 
-    async def delayed_to_thread(callback, *args, **kwargs):
+    def delayed_identity_refresh():
         nonlocal refresh_count
         refresh_count += 1
         if refresh_count == blocked_refresh:
-            await asyncio.sleep(0.02)
-        return callback(*args, **kwargs)
+            release_refresh.wait(timeout=1)
+        return "head-1"
 
-    monkeypatch.setattr(
-        "pr_agent.algo.frontier_adjudication.asyncio.to_thread",
-        delayed_to_thread,
-    )
     stage_config = config(stage_timeout=0.005)
     handler = FakeHandler([output()])
 
-    result = await run_frontier_adjudication(
-        request(stage_config),
-        stage_config,
-        handler,
-        current_identity=lambda: "head-1",
-    )
+    try:
+        result = await run_frontier_adjudication(
+            request(stage_config),
+            stage_config,
+            handler,
+            current_identity=delayed_identity_refresh,
+        )
+    finally:
+        release_refresh.set()
 
     assert result.state is FrontierState.TIMEOUT
     assert result.failure_reason == "timeout"
@@ -1004,6 +1149,87 @@ def test_frontier_route_rejects_duplicate_model_deployment_identity():
             system_prompt=SYSTEM_PROMPT,
             user_prompt=USER_PROMPT,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prompt_field",
+    ["system", "user", "prompt_version", "input_schema_version", "schema_version"],
+)
+@pytest.mark.parametrize(
+    "invalid_value",
+    [True, 7, {"unexpected": "mapping"}],
+    ids=["boolean", "number", "non-string"],
+)
+async def test_loader_rejects_non_string_prompt_contract_before_model_call(
+    prompt_field,
+    invalid_value,
+):
+    section = {
+        "enable_frontier_adjudication": True,
+        "enable_candidate_verification": True,
+        "frontier_adjudication_model": "frontier-primary",
+        "frontier_adjudication_provider": "provider-primary",
+        "frontier_adjudication_revision": "revision-primary",
+    }
+    prompt = {
+        "system": SYSTEM_PROMPT,
+        "user": USER_PROMPT,
+        "prompt_version": "frontier-adjudication-prompt-v1",
+        "input_schema_version": FRONTIER_INPUT_SCHEMA_VERSION,
+        "schema_version": FRONTIER_OUTPUT_SCHEMA_VERSION,
+        prompt_field: invalid_value,
+    }
+    handler = FakeHandler([output()])
+
+    with pytest.raises(
+        ValueError,
+        match=rf"frontier prompt {prompt_field} must be a non-blank string",
+    ):
+        stage_config = load_frontier_adjudication_config(section, prompt)
+        await run_frontier_adjudication(
+            request(stage_config),
+            stage_config,
+            handler,
+            current_identity=lambda: "head-1",
+        )
+    assert handler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_loader_accepts_string_prompt_contract_fields():
+    section = {
+        "enable_frontier_adjudication": True,
+        "enable_candidate_verification": True,
+        "frontier_adjudication_model": "frontier-primary",
+        "frontier_adjudication_provider": "provider-primary",
+        "frontier_adjudication_revision": "revision-primary",
+    }
+    prompt = {
+        "system": SYSTEM_PROMPT,
+        "user": USER_PROMPT,
+        "prompt_version": "frontier-adjudication-prompt-v1",
+        "input_schema_version": FRONTIER_INPUT_SCHEMA_VERSION,
+        "schema_version": FRONTIER_OUTPUT_SCHEMA_VERSION,
+    }
+    stage_config = load_frontier_adjudication_config(section, prompt)
+    handler = FakeHandler([output()])
+    init_run_details()
+
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        handler,
+        current_identity=lambda: "head-1",
+    )
+
+    assert stage_config.system_prompt == SYSTEM_PROMPT
+    assert stage_config.user_prompt == USER_PROMPT
+    assert stage_config.prompt_version == "frontier-adjudication-prompt-v1"
+    assert stage_config.input_schema_version == FRONTIER_INPUT_SCHEMA_VERSION
+    assert stage_config.output_schema_version == FRONTIER_OUTPUT_SCHEMA_VERSION
+    assert result.state is FrontierState.CONFIRMED
+    assert handler.calls == ["frontier-primary"]
 
 
 def test_loader_requires_exact_fallback_identities():

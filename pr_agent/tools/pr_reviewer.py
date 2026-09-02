@@ -368,10 +368,16 @@ class PRReviewer:
                         "results": [],
                         "publication_safe": False,
                     }
+                    self._publish_structured_review_data({
+                        "review": {"key_issues_to_review": []},
+                    })
                     if getattr(self, "_review_shadow_only", False):
                         get_settings().data = {"artifact": ""}
                     return None
                 if not self._prepare_frontier_adjudication_config():
+                    self._publish_structured_review_data({
+                        "review": {"key_issues_to_review": []},
+                    })
                     if getattr(self, "_review_shadow_only", False):
                         get_settings().data = {"artifact": ""}
                     get_logger().error(
@@ -2686,6 +2692,51 @@ class PRReviewer:
                     }
             get_logger().info("Candidate verification finished", artifact=telemetry_safe_artifact(artifact))
 
+    def _publish_structured_review_data(self, data: Mapping[str, Any]) -> None:
+        """Publish one isolated, provider-neutral review snapshot."""
+
+        structured_publisher = getattr(self.git_provider, "publish_structured_review", None)
+        if not self._provider_mutations_allowed() or not callable(structured_publisher):
+            return
+        # Deep-copy the data: dict(data) is shallow, so structured_data["review"]
+        # would alias data["review"], which _prepare_pr_review mutates later.
+        # Hand implementers an isolated snapshot, since the hook is provider-neutral
+        # and a provider that defers serialization would observe the mutation.
+        structured_data = copy.deepcopy(data)
+        details = get_run_details()
+        usage = {}
+        if details is not None and details.has_token_usage:
+            usage = {
+                "prompt_tokens": details.prompt_tokens,
+                "completion_tokens": details.completion_tokens,
+                "total_tokens": details.total_tokens,
+            }
+        structured_data["usage"] = usage
+        structured_data["metadata"] = {
+            "review_profile": self._review_profile(),
+            "omitted_files": sorted(set(self.remaining_files_list)),
+            "deleted_files": sorted(set(getattr(self, "deleted_files_list", []))),
+        }
+        if getattr(self, "candidate_verification_artifact", None) is not None:
+            structured_data["candidate_verification"] = telemetry_safe_artifact(
+                self.candidate_verification_artifact
+            )
+        frontier_artifact = getattr(self, "frontier_adjudication_artifact", None)
+        if frontier_artifact is not None:
+            structured_data["frontier_adjudication"] = copy.deepcopy(frontier_artifact)
+        adjudication_runs = adjudication_runs_to_dict(details)
+        if adjudication_runs:
+            structured_data["adjudication_runs"] = adjudication_runs
+        review_route_decision = getattr(self, "review_route_decision", None)
+        if review_route_decision is not None and review_route_decision.routing_enabled:
+            structured_data["metadata"]["review_route"] = review_route_decision_to_dict(
+                review_route_decision
+            )
+        specialist_shadow_result = getattr(self, "specialist_shadow_result", None)
+        if specialist_shadow_result is not None:
+            structured_data["metadata"]["specialist_shadow"] = specialist_shadow_result.to_dict()
+        structured_publisher(structured_data)
+
     def _prepare_pr_review(self) -> str:
         """
         Prepare the PR review by processing the AI prediction and generating a markdown-formatted text that summarizes
@@ -2704,46 +2755,7 @@ class PRReviewer:
             data
         )
 
-        structured_publisher = getattr(self.git_provider, "publish_structured_review", None)
-        if self._provider_mutations_allowed() and callable(structured_publisher):
-            # Deep-copy the data: dict(data) is shallow, so structured_data["review"]
-            # would alias data["review"], which is mutated right below (key reordering).
-            # Hand implementers an isolated snapshot, since the hook is provider-neutral
-            # and a provider that defers serialization would observe the mutation.
-            structured_data = copy.deepcopy(data)
-            details = get_run_details()
-            usage = {}
-            if details is not None and details.has_token_usage:
-                usage = {
-                    "prompt_tokens": details.prompt_tokens,
-                    "completion_tokens": details.completion_tokens,
-                    "total_tokens": details.total_tokens,
-                }
-            structured_data["usage"] = usage
-            structured_data["metadata"] = {
-                "review_profile": self._review_profile(),
-                "omitted_files": sorted(set(self.remaining_files_list)),
-                "deleted_files": sorted(set(getattr(self, "deleted_files_list", []))),
-            }
-            if getattr(self, "candidate_verification_artifact", None) is not None:
-                structured_data["candidate_verification"] = telemetry_safe_artifact(
-                    self.candidate_verification_artifact
-                )
-            frontier_artifact = getattr(self, "frontier_adjudication_artifact", None)
-            if frontier_artifact is not None:
-                structured_data["frontier_adjudication"] = copy.deepcopy(frontier_artifact)
-            adjudication_runs = adjudication_runs_to_dict(details)
-            if adjudication_runs:
-                structured_data["adjudication_runs"] = adjudication_runs
-            review_route_decision = getattr(self, "review_route_decision", None)
-            if review_route_decision is not None and review_route_decision.routing_enabled:
-                structured_data["metadata"]["review_route"] = review_route_decision_to_dict(
-                    review_route_decision
-                )
-            specialist_shadow_result = getattr(self, "specialist_shadow_result", None)
-            if specialist_shadow_result is not None:
-                structured_data["metadata"]["specialist_shadow"] = specialist_shadow_result.to_dict()
-            structured_publisher(structured_data)
+        self._publish_structured_review_data(data)
 
         if candidate_verification_blocked:
             return ""
