@@ -2992,6 +2992,201 @@ async def test_required_context_keeps_every_far_apart_symbol_prompt_visible():
 
 
 @pytest.mark.asyncio
+async def test_required_helper_symbol_is_not_consumed_by_same_named_caller_occurrence():
+    caller_lines = [f"caller line {line}" for line in range(1, 31)]
+    caller_lines[11] = "return validate(payload)"
+    helper_lines = [f"helper line {line}" for line in range(1, 101)]
+    helper_lines[94] = "def validate(payload): return payload is not None"
+    caller_diff = _diff_file("src/caller.py", head_file="\n".join(caller_lines))
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = "\n".join(helper_lines)
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            relevant_file="src/caller.py",
+            context_files=["src/helper.py"],
+            context_symbols=["validate"],
+        )),
+        [caller_diff],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=2,
+            max_lines_per_file=6,
+            max_total_lines=12,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[caller_diff],
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/caller.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/caller.py", "src/helper.py"],
+    }]}}
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    caller_request = next(
+        request for request in artifact["requests"]
+        if request.get("path") == "src/caller.py"
+    )
+    helper_request = next(
+        request for request in artifact["requests"]
+        if request.get("path") == "src/helper.py"
+    )
+    helper_evidence = [
+        item for item in evidence if item.get("path") == "src/helper.py"
+    ]
+
+    assert "_required_context_symbols" not in caller_request
+    assert helper_request["status"] == "retrieved"
+    assert helper_request["_required_context_symbols"] == ["validate"]
+    assert helper_request["start_line"] <= 95 <= helper_request["end_line"]
+    assert len(helper_evidence) == 1
+    assert "def validate" in helper_evidence[0]["content"]
+    assert artifact["lines_retrieved"] <= 12
+    assert prompt_evidence_coverage(
+        candidates, evidence, artifact["requests"]
+    )["status"] == "complete"
+    assert len(findings) == 1
+    assert decisions[0]["verdict"] == "verified"
+
+
+@pytest.mark.asyncio
+async def test_same_symbol_is_retrieved_and_validated_for_each_required_path():
+    caller_lines = [f"caller line {line}" for line in range(1, 31)]
+    caller_lines[11] = "return validate(payload)"
+    first_helper_lines = [f"first helper line {line}" for line in range(1, 41)]
+    first_helper_lines[9] = "return validate(payload)"
+    second_helper_lines = [f"second helper line {line}" for line in range(1, 101)]
+    second_helper_lines[94] = "def validate(payload): return payload is not None"
+    caller_diff = _diff_file("src/caller.py", head_file="\n".join(caller_lines))
+    provider = MagicMock()
+    provider.get_repo_file_content.side_effect = lambda path, _base: {
+        "src/first_helper.py": "\n".join(first_helper_lines),
+        "src/second_helper.py": "\n".join(second_helper_lines),
+    }[path]
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            relevant_file="src/caller.py",
+            context_files=["src/first_helper.py", "src/second_helper.py"],
+            context_symbols=["validate"],
+        )),
+        [caller_diff],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(
+            max_files=2,
+            max_lines_per_file=6,
+            max_total_lines=18,
+            max_context_tokens=10_000,
+        ),
+        [],
+        diff_files=[caller_diff],
+    )
+
+    requests_by_path = {
+        request["path"]: request for request in artifact["requests"]
+    }
+    assert "_required_context_symbols" not in requests_by_path["src/caller.py"]
+    for path, symbol_line in (
+        ("src/first_helper.py", 10),
+        ("src/second_helper.py", 95),
+    ):
+        request = requests_by_path[path]
+        path_evidence = [item for item in evidence if item.get("path") == path]
+        assert request["status"] == "retrieved"
+        assert request["_required_context_symbols"] == ["validate"]
+        assert request["start_line"] <= symbol_line <= request["end_line"]
+        assert len(path_evidence) == 1
+        assert "validate" in path_evidence[0]["content"]
+    assert artifact["lines_retrieved"] <= 18
+    assert prompt_evidence_coverage(
+        candidates, evidence, artifact["requests"]
+    )["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_same_named_caller_cannot_cover_missing_required_helper_symbol():
+    caller_lines = [f"caller line {line}" for line in range(1, 31)]
+    caller_lines[11] = "return validate(payload)"
+    caller_diff = _diff_file("src/caller.py", head_file="\n".join(caller_lines))
+    provider = MagicMock()
+    provider.get_repo_file_content.return_value = "\n".join(
+        f"unrelated helper line {line}" for line in range(1, 31)
+    )
+    candidates, _ = prepare_candidates(
+        _review_data(_candidate(
+            relevant_file="src/caller.py",
+            context_files=["src/helper.py"],
+            context_symbols=["validate"],
+        )),
+        [caller_diff],
+        [],
+        3,
+    )
+
+    evidence, artifact = await retrieve_evidence(
+        provider,
+        candidates,
+        VerificationBudgets(),
+        [],
+        diff_files=[caller_diff],
+    )
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "relevant_file": "src/caller.py",
+        "start_line": 12,
+        "end_line": 12,
+        "evidence_paths": ["src/caller.py", "src/helper.py"],
+    }]}}
+    findings, decisions = apply_verification_decisions(
+        candidates,
+        evidence,
+        verification,
+        retrieval_requests=artifact["requests"],
+    )
+
+    caller_request = next(
+        request for request in artifact["requests"]
+        if request.get("path") == "src/caller.py"
+    )
+    helper_request = next(
+        request for request in artifact["requests"]
+        if request.get("path") == "src/helper.py"
+    )
+    assert "_required_context_symbols" not in caller_request
+    assert helper_request["_required_context_symbols"] == ["validate"]
+    assert (
+        helper_request["status"]
+        not in candidate_verification._COMPLETE_RETRIEVAL_REQUEST_STATUSES
+    )
+    assert prompt_evidence_coverage(
+        candidates, evidence, artifact["requests"]
+    )["status"] == "incomplete"
+    assert findings == []
+    assert decisions[0]["reason"] == "required_context_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_same_line_and_duplicate_context_symbols_share_one_bounded_excerpt():
     service_diff = _diff_file("src/service.py")
     helper_lines = [f"helper line {line}" for line in range(1, 51)]
@@ -5249,12 +5444,37 @@ async def test_genuinely_empty_first_pass_candidate_list_is_a_safe_no_candidate_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("second_candidate", [
-    _candidate(start_line=99, end_line=99, root_cause="different invalid cause"),
-    _candidate(),
-])
+@pytest.mark.parametrize(
+    (
+        "second_candidate",
+        "expected_status",
+        "expected_publication_safe",
+        "expected_coverage_status",
+        "expected_rejection_reason",
+    ),
+    [
+        (
+            _candidate(start_line=99, end_line=99, root_cause="different invalid cause"),
+            "candidate_validation_incomplete",
+            False,
+            "incomplete",
+            "invalid_candidate",
+        ),
+        (
+            _candidate(),
+            "complete",
+            True,
+            "partial",
+            "duplicate_candidate",
+        ),
+    ],
+)
 async def test_mixed_or_duplicate_candidate_rejection_keeps_valid_candidate_verifiable(
-    second_candidate
+    second_candidate,
+    expected_status,
+    expected_publication_safe,
+    expected_coverage_status,
+    expected_rejection_reason,
 ):
     provider = MagicMock()
     provider.supports_repo_file_fetching.return_value = True
@@ -5275,20 +5495,18 @@ async def test_mixed_or_duplicate_candidate_rejection_keeps_valid_candidate_veri
         await reviewer._run_candidate_verification()
 
     artifact = reviewer.candidate_verification_artifact
-    assert artifact["status"] == "complete"
-    assert artifact["publication_safe"] is True
+    assert artifact["status"] == expected_status
+    assert artifact["publication_safe"] is expected_publication_safe
     assert artifact["proposed_candidate_count"] == 2
     assert artifact["accepted_model_candidate_count"] == 1
     assert artifact["candidate_rejection_count"] == 1
     assert artifact["model_candidate_coverage"] == {
-        "status": "partial",
+        "status": expected_coverage_status,
         "proposed_count": 2,
         "accepted_count": 1,
         "rejected_count": 1,
     }
-    assert artifact["candidate_rejections"][0]["reason"] in {
-        "invalid_candidate", "duplicate_candidate"
-    }
+    assert artifact["candidate_rejections"][0]["reason"] == expected_rejection_reason
     reviewer.ai_handler.chat_completion.assert_awaited_once()
 
 
@@ -5476,7 +5694,7 @@ async def test_model_candidate_budget_has_exact_fail_closed_boundary(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("final_candidate_kind", ["duplicate", "invalid"])
-async def test_semantic_rejection_after_full_candidate_budget_does_not_create_coverage_loss(
+async def test_full_candidate_budget_distinguishes_duplicate_from_invalid_coverage_loss(
     final_candidate_kind
 ):
     provider = MagicMock()
@@ -5521,12 +5739,17 @@ async def test_semantic_rejection_after_full_candidate_budget_does_not_create_co
     assert artifact["proposed_candidate_count"] == 4
     assert artifact["accepted_model_candidate_count"] == 3
     assert artifact["candidate_rejection_count"] == 1
-    assert artifact["model_candidate_coverage"]["status"] == "partial"
-    assert artifact["status"] == "complete"
-    assert artifact["publication_safe"] is True
-    assert artifact["candidate_rejections"][0]["reason"] in {
-        "duplicate_candidate", "invalid_candidate"
-    }
+    invalid_candidate = final_candidate_kind == "invalid"
+    assert artifact["model_candidate_coverage"]["status"] == (
+        "incomplete" if invalid_candidate else "partial"
+    )
+    assert artifact["status"] == (
+        "candidate_validation_incomplete" if invalid_candidate else "complete"
+    )
+    assert artifact["publication_safe"] is (not invalid_candidate)
+    assert artifact["candidate_rejections"][0]["reason"] == (
+        "invalid_candidate" if invalid_candidate else "duplicate_candidate"
+    )
 
 
 @pytest.mark.asyncio
