@@ -1042,6 +1042,7 @@ class GithubProvider(GitProvider):
         }
         """
         cursor = None
+        seen_thread_cursors = set()
         viewer_identity = None
         raw_threads = []
         while True:
@@ -1076,6 +1077,9 @@ class GithubProvider(GitProvider):
             cursor = page_info.get("endCursor")
             if not cursor:
                 raise RuntimeError("GitHub omitted the next review-thread cursor")
+            if cursor in seen_thread_cursors:
+                raise RuntimeError("GitHub repeated a review-thread cursor")
+            seen_thread_cursors.add(cursor)
 
         snapshots = []
         for thread in raw_threads:
@@ -1092,7 +1096,11 @@ class GithubProvider(GitProvider):
             comment_cursor = comment_page_info.get("endCursor") if comment_page_info.get("hasNextPage") else ""
             if comment_page_info.get("hasNextPage") and not comment_cursor:
                 raise RuntimeError(f"GitHub omitted the next comment cursor for review thread {thread['id']}")
+            seen_comment_cursors = set()
             while comment_cursor:
+                if comment_cursor in seen_comment_cursors:
+                    raise RuntimeError(f"GitHub repeated a comment cursor for review thread {thread['id']}")
+                seen_comment_cursors.add(comment_cursor)
                 page, comment_cursor = self._get_additional_review_thread_comments(thread["id"], comment_cursor)
                 raw_comments.extend(page)
 
@@ -1114,11 +1122,14 @@ class GithubProvider(GitProvider):
 
             root = comments[0] if comments else None
             marker_values = finding_identity_markers(root.body if root else "")
-            marker_ids = {
-                finding_id
-                for marker_version, finding_id in marker_values
-                if marker_version == FINDING_IDENTITY_MARKER_VERSION
-            }
+            marker_ids = (
+                {finding_id for _, finding_id in marker_values}
+                if marker_values and all(
+                    marker_version == FINDING_IDENTITY_MARKER_VERSION
+                    for marker_version, _ in marker_values
+                )
+                else set()
+            )
             finding_id = next(iter(marker_ids)) if len(marker_ids) == 1 else None
             root_actor = {
                 "id": root.author_id if root else None,
@@ -1221,6 +1232,69 @@ class GithubProvider(GitProvider):
             )
         return current_head_sha, None
 
+    def _revalidate_review_thread_mutation(
+        self,
+        kind: ReviewThreadActionKind,
+        expected_head_sha: str,
+        expected_thread: ReviewThreadSnapshot,
+        *,
+        comment_id: Optional[int] = None,
+    ) -> tuple[Optional[str], Optional[ReviewThreadActionOutcome]]:
+        """Fail closed unless the exact planned thread inventory is still current."""
+        current_head_sha, blocked = self._check_review_thread_head(kind, expected_head_sha)
+        if blocked:
+            return current_head_sha, blocked
+        root = expected_thread.root_comment
+        expected_is_safe = bool(
+            expected_thread.finding_id
+            and expected_thread.bot_owned
+            and not expected_thread.has_replies
+            and not expected_thread.is_resolved
+            and root
+            and (comment_id is None or root.database_id == comment_id)
+            and (kind != ReviewThreadActionKind.RESOLVE or expected_thread.viewer_can_resolve)
+        )
+        if not expected_is_safe:
+            return current_head_sha, ReviewThreadActionOutcome(
+                kind=kind,
+                state=ReviewThreadActionState.STALE_INVENTORY,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                thread_id=expected_thread.thread_id,
+                comment_id=comment_id,
+                reason="planned_thread_precondition_is_not_safe",
+            )
+        try:
+            matches = [
+                thread
+                for thread in self.get_review_thread_snapshots()
+                if thread.thread_id == expected_thread.thread_id
+            ]
+        except Exception as e:
+            return current_head_sha, ReviewThreadActionOutcome(
+                kind=kind,
+                state=ReviewThreadActionState.STALE_INVENTORY,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                thread_id=expected_thread.thread_id,
+                comment_id=comment_id,
+                reason=f"thread_revalidation_failed: {e}",
+                **_review_thread_failure_details(e),
+            )
+        if len(matches) != 1 or matches[0] != expected_thread:
+            return current_head_sha, ReviewThreadActionOutcome(
+                kind=kind,
+                state=ReviewThreadActionState.STALE_INVENTORY,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                thread_id=expected_thread.thread_id,
+                comment_id=comment_id,
+                reason="review_thread_changed_since_inventory",
+            )
+        # Inventory retrieval is paginated and can race with a force-push. Check
+        # the head once more immediately before the destructive mutation.
+        return self._check_review_thread_head(kind, expected_head_sha)
+
     def _review_thread_post_mutation_outcome(
         self,
         kind: ReviewThreadActionKind,
@@ -1319,10 +1393,18 @@ class GithubProvider(GitProvider):
                 **failure_details,
             )
 
-    def update_review_thread(self, comment_id: int, body: str,
-                             expected_head_sha: str) -> ReviewThreadActionOutcome:
-        current_head_sha, blocked = self._check_review_thread_head(
-            ReviewThreadActionKind.UPDATE, expected_head_sha
+    def update_review_thread(
+        self,
+        comment_id: int,
+        body: str,
+        expected_head_sha: str,
+        expected_thread: ReviewThreadSnapshot,
+    ) -> ReviewThreadActionOutcome:
+        current_head_sha, blocked = self._revalidate_review_thread_mutation(
+            ReviewThreadActionKind.UPDATE,
+            expected_head_sha,
+            expected_thread,
+            comment_id=comment_id,
         )
         if blocked:
             return blocked
@@ -1348,9 +1430,25 @@ class GithubProvider(GitProvider):
                 **_review_thread_failure_details(e),
             )
 
-    def resolve_review_thread(self, thread_id: str, expected_head_sha: str) -> ReviewThreadActionOutcome:
-        current_head_sha, blocked = self._check_review_thread_head(
-            ReviewThreadActionKind.RESOLVE, expected_head_sha
+    def resolve_review_thread(
+        self,
+        thread_id: str,
+        expected_head_sha: str,
+        expected_thread: ReviewThreadSnapshot,
+    ) -> ReviewThreadActionOutcome:
+        if thread_id != expected_thread.thread_id:
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.RESOLVE,
+                state=ReviewThreadActionState.STALE_INVENTORY,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=None,
+                thread_id=thread_id,
+                reason="planned_thread_id_mismatch",
+            )
+        current_head_sha, blocked = self._revalidate_review_thread_mutation(
+            ReviewThreadActionKind.RESOLVE,
+            expected_head_sha,
+            expected_thread,
         )
         if blocked:
             return blocked

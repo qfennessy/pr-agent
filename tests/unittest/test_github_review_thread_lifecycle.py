@@ -8,7 +8,9 @@ from pr_agent.algo.inline_comment_dedup import \
 from pr_agent.algo.review_thread_reconciler import (
     FIXED_THREAD_STATE_MARKER, VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
     FindingIdentity, ReviewThreadActionKind, ReviewThreadActionState,
-    ReviewThreadFailureKind)
+    ReviewThreadAnchor, ReviewThreadCommentSnapshot, ReviewThreadFailureKind,
+    ReviewThreadSnapshot, execute_review_thread_action_plan,
+    plan_review_thread_actions)
 from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.servers.utils import RateLimitExceeded
 
@@ -139,6 +141,43 @@ def _inventory_page(
     )
 
 
+def _owned_thread_state(body=None, *, replies=(), resolved=False, viewer_can_resolve=True):
+    identity = _identity()
+    body = body or body_with_finding_identity_marker("finding", identity.finding_id)
+    raw_comments = [_comment(body, database_id=77), *replies]
+    comments = tuple(ReviewThreadCommentSnapshot(
+        node_id=comment["id"],
+        database_id=comment.get("databaseId"),
+        author_id=comment["author"].get("id"),
+        author_login=comment["author"].get("login"),
+        author_type=comment["author"].get("__typename"),
+        body=comment.get("body") or "",
+        created_at=comment.get("createdAt"),
+        url=comment.get("url"),
+    ) for comment in raw_comments)
+    snapshot = ReviewThreadSnapshot(
+        thread_id="thread-1",
+        finding_id=identity.finding_id,
+        anchor=ReviewThreadAnchor("src/app.py", 10),
+        original_anchor=ReviewThreadAnchor("src/app.py", 10),
+        is_resolved=resolved,
+        is_outdated=False,
+        bot_owned=True,
+        has_replies=bool(replies),
+        reviewed_head_sha="head-1",
+        comments=comments,
+        subject_type="LINE",
+        viewer_can_resolve=viewer_can_resolve,
+    )
+    raw_thread = _thread(
+        "thread-1",
+        raw_comments,
+        resolved=resolved,
+        viewer_can_resolve=viewer_can_resolve,
+    )
+    return snapshot, _inventory_page([raw_thread])
+
+
 def test_inventory_parses_identity_ownership_anchor_and_reviewed_head():
     identity = _identity()
     body = body_with_finding_identity_marker("finding", identity.finding_id)
@@ -170,6 +209,18 @@ def test_inventory_parses_identity_ownership_anchor_and_reviewed_head():
 def test_inventory_leaves_future_identity_marker_versions_unowned():
     identity = _identity()
     body = body_with_finding_identity_marker("future finding", identity.finding_id, marker_version="v2")
+    requester = _Requester(graphql=[_inventory_page([_thread("thread-1", [_comment(body)])])])
+
+    snapshot = _provider(requester).get_review_thread_snapshots()[0]
+
+    assert snapshot.finding_id is None
+    assert snapshot.bot_owned is False
+
+
+def test_inventory_leaves_mixed_supported_and_future_marker_versions_unowned():
+    identity = _identity()
+    body = body_with_finding_identity_marker("finding", identity.finding_id)
+    body = body_with_finding_identity_marker(body, f"sha256:{'b' * 64}", marker_version="v2")
     requester = _Requester(graphql=[_inventory_page([_thread("thread-1", [_comment(body)])])])
 
     snapshot = _provider(requester).get_review_thread_snapshots()[0]
@@ -217,6 +268,38 @@ def test_inventory_paginates_threads_and_comments():
         "threadId": "thread-1",
         "after": "comment-cursor",
     }
+
+
+def test_inventory_fails_closed_when_review_thread_cursor_repeats():
+    requester = _Requester(graphql=[
+        _inventory_page([], has_next=True, cursor="repeated-cursor"),
+        _inventory_page([], has_next=True, cursor="repeated-cursor"),
+    ])
+
+    with pytest.raises(RuntimeError, match="repeated a review-thread cursor"):
+        _provider(requester).get_review_thread_snapshots()
+
+
+def test_inventory_fails_closed_when_comment_cursor_repeats():
+    identity = _identity()
+    body = body_with_finding_identity_marker("finding", identity.finding_id)
+    thread = _thread(
+        "thread-1",
+        [_comment(body)],
+        page_info={"hasNextPage": True, "endCursor": "repeated-cursor"},
+    )
+    repeated_page = _graphql({
+        "node": {
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "repeated-cursor"},
+                "nodes": [],
+            }
+        }
+    })
+    requester = _Requester(graphql=[_inventory_page([thread]), repeated_page])
+
+    with pytest.raises(RuntimeError, match="repeated a comment cursor"):
+        _provider(requester).get_review_thread_snapshots()
 
 
 def test_inventory_keeps_current_and_original_multiline_anchors_distinct():
@@ -429,8 +512,11 @@ def test_create_with_incomplete_returned_identity_forces_inventory_refresh(creat
 
 
 def test_update_review_thread_uses_review_comment_endpoint():
+    expected_thread, inventory = _owned_thread_state()
     requester = _Requester(
+        graphql=[inventory],
         rest=[
+            {"head": {"sha": "head-1"}},
             {"head": {"sha": "head-1"}},
             {"id": 77, "node_id": "comment-node-77"},
             {"head": {"sha": "head-1"}},
@@ -438,10 +524,10 @@ def test_update_review_thread_uses_review_comment_endpoint():
     )
     provider = _provider(requester)
 
-    outcome = provider.update_review_thread(77, "new body", "head-1")
+    outcome = provider.update_review_thread(77, "new body", "head-1", expected_thread)
 
     assert outcome.state == ReviewThreadActionState.APPLIED
-    assert requester.calls[1][1:4] == (
+    assert requester.calls[3][1:4] == (
         "PATCH",
         "https://api.github.com/repos/owner/repo/pulls/comments/77",
         {"body": "new body"},
@@ -449,9 +535,15 @@ def test_update_review_thread_uses_review_comment_endpoint():
 
 
 def test_resolve_review_thread_uses_thread_node_id():
+    expected_thread, inventory = _owned_thread_state()
     requester = _Requester(
-        rest=[{"head": {"sha": "head-1"}}, {"head": {"sha": "head-1"}}],
+        rest=[
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+        ],
         graphql=[
+            inventory,
             _graphql(
                 {
                     "resolveReviewThread": {"thread": {"id": "thread-1", "isResolved": True}},
@@ -461,24 +553,99 @@ def test_resolve_review_thread_uses_thread_node_id():
     )
     provider = _provider(requester)
 
-    outcome = provider.resolve_review_thread("thread-1", "head-1")
+    outcome = provider.resolve_review_thread("thread-1", "head-1", expected_thread)
 
     assert outcome.state == ReviewThreadActionState.APPLIED
     assert outcome.thread_id == "thread-1"
-    assert requester.calls[1][3]["variables"] == {"threadId": "thread-1"}
+    assert requester.calls[3][3]["variables"] == {"threadId": "thread-1"}
+
+
+@pytest.mark.parametrize("operation", ["update", "resolve"])
+def test_destructive_mutation_aborts_when_human_reply_arrives_after_planning(operation):
+    expected_thread, _ = _owned_thread_state()
+    human_reply = _comment("do not mutate", node_id="reply-1", database_id=78, author="human")
+    _, changed_inventory = _owned_thread_state(replies=(human_reply,))
+    requester = _Requester(rest=[{"head": {"sha": "head-1"}}], graphql=[changed_inventory])
+    provider = _provider(requester)
+
+    if operation == "update":
+        outcome = provider.update_review_thread(77, "new body", "head-1", expected_thread)
+    else:
+        outcome = provider.resolve_review_thread("thread-1", "head-1", expected_thread)
+
+    assert outcome.state == ReviewThreadActionState.STALE_INVENTORY
+    assert outcome.reason == "review_thread_changed_since_inventory"
+    assert outcome.mutation_attempted is False
+    assert outcome.requires_fresh_inventory is True
+    assert not any(
+        (call[0] == "rest" and call[1] in {"PATCH", "POST"})
+        or (call[0] == "graphql" and "mutation(" in call[3]["query"])
+        for call in requester.calls
+    )
+
+
+@pytest.mark.parametrize(
+    "changed_body,resolved",
+    [
+        ("marker removed", False),
+        (None, True),
+    ],
+)
+def test_update_aborts_when_marker_or_resolution_state_changes(changed_body, resolved):
+    expected_thread, _ = _owned_thread_state()
+    _, changed_inventory = _owned_thread_state(body=changed_body, resolved=resolved)
+    requester = _Requester(rest=[{"head": {"sha": "head-1"}}], graphql=[changed_inventory])
+
+    outcome = _provider(requester).update_review_thread(77, "new body", "head-1", expected_thread)
+
+    assert outcome.state == ReviewThreadActionState.STALE_INVENTORY
+    assert outcome.mutation_attempted is False
+
+
+def test_mark_fixed_revalidates_again_before_resolve_and_preserves_new_human_reply():
+    expected_thread, first_inventory = _owned_thread_state()
+    plan = plan_review_thread_actions(
+        (),
+        (expected_thread,),
+        "head-1",
+        obsolete_policy="mark_fixed",
+        authoritative_absence=True,
+    )
+    marked_body = plan.actions[0].body
+    human_reply = _comment("I am investigating", node_id="reply-1", database_id=78, author="human")
+    _, second_inventory = _owned_thread_state(body=marked_body, replies=(human_reply,))
+    requester = _Requester(
+        graphql=[first_inventory, second_inventory],
+        rest=[
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+            {"id": 77, "node_id": "comment-1"},
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+        ],
+    )
+
+    outcome = execute_review_thread_action_plan(plan, _provider(requester))
+
+    assert [item.state for item in outcome.action_outcomes] == [
+        ReviewThreadActionState.APPLIED,
+        ReviewThreadActionState.STALE_INVENTORY,
+    ]
+    assert len([call for call in requester.calls if "resolveReviewThread" in str(call[3])]) == 0
 
 
 @pytest.mark.parametrize("operation", ["create", "update", "resolve"])
 def test_stale_head_aborts_before_mutation(operation):
+    expected_thread, _ = _owned_thread_state()
     requester = _Requester(rest=[{"head": {"sha": "head-2"}}])
     provider = _provider(requester)
 
     if operation == "create":
         outcome = provider.create_review_thread({"body": "x"}, "head-1")
     elif operation == "update":
-        outcome = provider.update_review_thread(77, "x", "head-1")
+        outcome = provider.update_review_thread(77, "x", "head-1", expected_thread)
     else:
-        outcome = provider.resolve_review_thread("thread-1", "head-1")
+        outcome = provider.resolve_review_thread("thread-1", "head-1", expected_thread)
 
     assert outcome.state == ReviewThreadActionState.STALE_HEAD
     assert outcome.current_head_sha == "head-2"
@@ -487,24 +654,33 @@ def test_stale_head_aborts_before_mutation(operation):
 
 @pytest.mark.parametrize("operation", ["create", "update", "resolve"])
 def test_head_change_after_mutation_requires_fresh_inventory(operation):
+    expected_thread, inventory = _owned_thread_state()
     rest = [{"head": {"sha": "head-1"}}]
     graphql = []
     if operation == "create":
         rest.extend([{"id": 77, "node_id": "comment-node-77"}, {"head": {"sha": "head-2"}}])
     elif operation == "update":
-        rest.extend([{"id": 77, "node_id": "comment-node-77"}, {"head": {"sha": "head-2"}}])
+        rest.extend([
+            {"head": {"sha": "head-1"}},
+            {"id": 77, "node_id": "comment-node-77"},
+            {"head": {"sha": "head-2"}},
+        ])
+        graphql.append(inventory)
     else:
-        rest.append({"head": {"sha": "head-2"}})
-        graphql.append(_graphql({"resolveReviewThread": {"thread": {"id": "thread-1", "isResolved": True}}}))
+        rest.extend([{"head": {"sha": "head-1"}}, {"head": {"sha": "head-2"}}])
+        graphql.extend([
+            inventory,
+            _graphql({"resolveReviewThread": {"thread": {"id": "thread-1", "isResolved": True}}}),
+        ])
     requester = _Requester(rest=rest, graphql=graphql)
     provider = _provider(requester)
 
     if operation == "create":
         outcome = provider.create_review_thread({"body": "x"}, "head-1")
     elif operation == "update":
-        outcome = provider.update_review_thread(77, "x", "head-1")
+        outcome = provider.update_review_thread(77, "x", "head-1", expected_thread)
     else:
-        outcome = provider.resolve_review_thread("thread-1", "head-1")
+        outcome = provider.resolve_review_thread("thread-1", "head-1", expected_thread)
 
     assert outcome.state == ReviewThreadActionState.APPLIED_REQUIRES_REFRESH
     assert outcome.current_head_sha == "head-2"
@@ -546,9 +722,13 @@ def test_permission_failure_is_reported_not_raised_or_counted_as_success():
                 raise RuntimeError("permission denied")
             return super().requestJsonAndCheck(method, url, input=input)
 
-    requester = _ForbiddenRequester(rest=[{"head": {"sha": "head-1"}}])
+    expected_thread, inventory = _owned_thread_state()
+    requester = _ForbiddenRequester(
+        graphql=[inventory],
+        rest=[{"head": {"sha": "head-1"}}, {"head": {"sha": "head-1"}}],
+    )
 
-    outcome = _provider(requester).update_review_thread(77, "new body", "head-1")
+    outcome = _provider(requester).update_review_thread(77, "new body", "head-1", expected_thread)
 
     assert outcome.state == ReviewThreadActionState.FAILED
     assert outcome.failure_kind == ReviewThreadFailureKind.PERMISSION_DENIED
@@ -654,8 +834,13 @@ def test_ordinary_403_remains_permission_denied_without_retry_evidence():
                 raise _PermissionFailure("forbidden")
             return super().requestJsonAndCheck(method, url, input=input)
 
-    outcome = _provider(_ForbiddenRequester(rest=[{"head": {"sha": "head-1"}}])).update_review_thread(
-        77, "new body", "head-1"
+    expected_thread, inventory = _owned_thread_state()
+    requester = _ForbiddenRequester(
+        graphql=[inventory],
+        rest=[{"head": {"sha": "head-1"}}, {"head": {"sha": "head-1"}}],
+    )
+    outcome = _provider(requester).update_review_thread(
+        77, "new body", "head-1", expected_thread
     )
 
     assert outcome.failure_kind == ReviewThreadFailureKind.PERMISSION_DENIED
@@ -664,9 +849,11 @@ def test_ordinary_403_remains_permission_denied_without_retry_evidence():
 
 
 def test_graphql_rate_limit_preserves_headers_for_retry_evidence():
+    expected_thread, inventory = _owned_thread_state()
     requester = _Requester(
-        rest=[{"head": {"sha": "head-1"}}],
+        rest=[{"head": {"sha": "head-1"}}, {"head": {"sha": "head-1"}}],
         graphql=[
+            inventory,
             _graphql(
                 {},
                 errors=[{"message": "secondary rate limit"}],
@@ -676,7 +863,7 @@ def test_graphql_rate_limit_preserves_headers_for_retry_evidence():
         ],
     )
 
-    outcome = _provider(requester).resolve_review_thread("thread-1", "head-1")
+    outcome = _provider(requester).resolve_review_thread("thread-1", "head-1", expected_thread)
 
     assert outcome.failure_kind == ReviewThreadFailureKind.RATE_LIMITED
     assert outcome.retry_after_seconds == 45.0

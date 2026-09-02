@@ -14,7 +14,7 @@ from pr_agent.algo.review_thread_reconciler import (
     ReviewThreadActionState, ReviewThreadAnchor, ReviewThreadCommentSnapshot,
     ReviewThreadFailureKind, ReviewThreadReconciliationOutcome,
     ReviewThreadSnapshot, SummaryFallbackReason,
-    execute_review_thread_action_plan, finding_identity_from_verified_finding,
+    execute_review_thread_action_plan, finding_identities_from_verified_findings,
     plan_review_thread_actions)
 
 
@@ -124,12 +124,12 @@ class _MutationProvider:
         self.calls.append(("create", comment, expected_head_sha))
         return self._outcome(ReviewThreadActionKind.CREATE)
 
-    def update_review_thread(self, comment_id, body, expected_head_sha):
-        self.calls.append(("update", comment_id, body, expected_head_sha))
+    def update_review_thread(self, comment_id, body, expected_head_sha, expected_thread):
+        self.calls.append(("update", comment_id, body, expected_head_sha, expected_thread))
         return self._outcome(ReviewThreadActionKind.UPDATE)
 
-    def resolve_review_thread(self, thread_id, expected_head_sha):
-        self.calls.append(("resolve", thread_id, expected_head_sha))
+    def resolve_review_thread(self, thread_id, expected_head_sha, expected_thread):
+        self.calls.append(("resolve", thread_id, expected_head_sha, expected_thread))
         return self._outcome(ReviewThreadActionKind.RESOLVE)
 
 
@@ -177,12 +177,14 @@ def test_verified_finding_identity_consumes_exact_upstream_hashes_without_derivi
     root_cause_id = f"sha256:{'a' * 64}"
     trusted_stable_key = f"sha256:{'b' * 64}"
 
-    identity = finding_identity_from_verified_finding({
+    identity = finding_identities_from_verified_findings([{
         "root_cause_id": root_cause_id,
         "relevant_file": "src/app.py",
         "trusted_stable_key": trusted_stable_key,
         "issue_content": "Mutable wording is not identity input.",
-    }, repository="owner/repo", pull_request_number=7)
+        "side": "new",
+        "start_line": 12,
+    }], repository="owner/repo", pull_request_number=7)[0]
 
     assert identity.root_cause_id == root_cause_id
     assert identity.trusted_stable_key == trusted_stable_key
@@ -196,7 +198,7 @@ def test_verified_finding_identity_consumes_exact_upstream_hashes_without_derivi
         ({"root_cause_id": None}, "root_cause_id"),
         ({"trusted_stable_key": "candidate-1"}, "trusted_stable_key"),
         ({"trusted_stable_key": None}, "trusted_stable_key"),
-        ({"relevant_file": None}, "relevant_file"),
+        ({"relevant_file": None}, "publication anchor"),
     ],
 )
 def test_verified_finding_identity_fails_closed_on_untrusted_or_malformed_identity(replacement, error):
@@ -204,12 +206,14 @@ def test_verified_finding_identity_fails_closed_on_untrusted_or_malformed_identi
         "root_cause_id": f"sha256:{'a' * 64}",
         "relevant_file": "src/app.py",
         "trusted_stable_key": f"sha256:{'b' * 64}",
+        "side": "new",
+        "start_line": 12,
     }
     finding.update(replacement)
 
     with pytest.raises(ValueError, match=error):
-        finding_identity_from_verified_finding(
-            finding, repository="owner/repo", pull_request_number=7
+        finding_identities_from_verified_findings(
+            [finding], repository="owner/repo", pull_request_number=7
         )
 
 
@@ -255,9 +259,9 @@ def test_verified_finding_identity_accepts_actual_verification_output():
     }]}}
 
     findings, decisions = apply_verification_decisions([candidate], evidence, verification)
-    identity = finding_identity_from_verified_finding(
-        findings[0], repository="owner/repo", pull_request_number=7
-    )
+    identity = finding_identities_from_verified_findings(
+        tuple(findings), repository="owner/repo", pull_request_number=7
+    )[0]
 
     assert decisions[0]["verdict"] == "verified"
     assert findings[0]["root_cause_id"].startswith("sha256:")
@@ -266,6 +270,72 @@ def test_verified_finding_identity_accepts_actual_verification_output():
     assert identity.trusted_stable_key == findings[0]["trusted_stable_key"]
     assert identity.path == findings[0]["relevant_file"]
     assert identity.root_cause_id_schema == "verified-root-cause-v2"
+
+
+def test_same_anchor_v2_identity_reordering_fails_closed_without_swapping_thread_mapping():
+    def verified_findings(labels):
+        candidates = []
+        evidence = []
+        decisions = []
+        for ordinal, label in enumerate(labels, start=1):
+            candidate_id = f"candidate-{ordinal}"
+            candidates.append({
+                "candidate_id": candidate_id,
+                "relevant_file": "src/service.py",
+                "issue_header": label,
+                "issue_content": f"{label} candidate",
+                "start_line": 12,
+                "end_line": 12,
+                "side": "new",
+                "trigger": f"{label} trigger",
+                "impact": f"{label} impact",
+                "_changed_line_ranges": [(12, 12)],
+                "_changed_anchor_shape": "return <id> ( <id> )",
+                "_changed_anchor_ordinal": 1,
+                "_trusted_defect_ordinal": ordinal,
+                "_trusted_lineage_key": "file:src/service.py",
+                "_trusted_side_line_count": 20,
+            })
+            evidence.append({
+                "candidate_id": candidate_id,
+                "source": "changed_head",
+                "path": "src/service.py",
+                "content": "return fallback(value)",
+                "start_line": 12,
+                "end_line": 12,
+                "side": "new",
+            })
+            decisions.append({
+                "candidate_id": candidate_id,
+                "verdict": "verified",
+                "issue_header": label,
+                "issue_content": f"Verified {label}",
+                "trigger": f"{label} trigger",
+                "impact": f"{label} impact",
+                "relevant_file": "src/service.py",
+                "start_line": 12,
+                "end_line": 12,
+                "evidence_paths": ["src/service.py"],
+            })
+        return apply_verification_decisions(
+            candidates,
+            evidence,
+            {"verification": {"decisions": decisions}},
+        )[0]
+
+    forward = verified_findings(("authentication bypass", "unbounded retry"))
+    reversed_order = verified_findings(("unbounded retry", "authentication bypass"))
+    forward_ids = {finding["issue_header"]: finding["root_cause_id"] for finding in forward}
+    reversed_ids = {finding["issue_header"]: finding["root_cause_id"] for finding in reversed_order}
+    persisted_mapping = dict(forward_ids)
+
+    assert forward_ids["authentication bypass"] == reversed_ids["unbounded retry"]
+    for findings in (forward, reversed_order):
+        with pytest.raises(ValueError, match="trusted semantic discriminator"):
+            finding_identities_from_verified_findings(
+                tuple(findings), repository="owner/repo", pull_request_number=7
+            )
+    assert persisted_mapping == forward_ids
 
 
 @pytest.mark.parametrize(

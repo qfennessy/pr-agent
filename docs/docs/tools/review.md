@@ -62,8 +62,11 @@ The lifecycle foundation is not connected to `/review` publication yet. Its inte
 `root_cause_id`, `trusted_stable_key`, and `relevant_file` emitted by the issue #9 `apply_verification_decisions` path,
 scopes them to the current repository and pull request, and never derives a substitute identity from finding prose or
 line numbers. The root-cause contract is `verified-root-cause-v2`; verifier-supplied identity fields are ignored before
-the finding reaches this boundary. The reserved setting remains off and has no runtime effect until the publication
-integration is implemented and rollout evidence exists:
+the finding reaches this boundary. Because v2 uses an occurrence ordinal to distinguish multiple defects at one exact
+anchor, the batch adapter rejects such a batch until an order-independent trusted semantic discriminator is available.
+This leaves any persisted thread mapping untouched instead of swapping content when candidates reorder. The reserved
+setting remains off and has no runtime effect until the publication integration is implemented and rollout evidence
+exists:
 
 ```toml
 [review_thread_lifecycle]
@@ -82,10 +85,13 @@ resolves safe older Bot-owned copies. Two live copies at the same current anchor
 A resolved finding can recur only when GitHub attributes the earlier resolution to the exact authenticated PR-Agent
 Bot; human, other-Bot, and unknown resolutions remain authoritative.
 
-Every mutation checks the pull-request head both before and after its side effect. A changed or unverifiable
-post-mutation head stops the rest of the plan and requires a fresh paginated inventory. Rate limits are reported separately
-from permission failures with available `Retry-After` or rate-limit-reset evidence; a rate-limited create is never
-blindly retried because GitHub may already have accepted it.
+Every update or resolution refetches the exact thread immediately before its side effect and requires the planned Bot
+ownership, supported marker, root comment, reply authors/count, and resolution state to remain unchanged. It checks the
+pull-request head before and after inventory as well as after mutation. `mark_fixed` repeats this revalidation between
+its visible update and resolution, so a newly arrived human reply stops cleanup. Repeated pagination cursors fail closed
+instead of looping. A changed or unverifiable post-mutation head stops the rest of the plan and requires a fresh paginated
+inventory. Rate limits are reported separately from permission failures with available `Retry-After` or rate-limit-reset
+evidence; a rate-limited create is never blindly retried because GitHub may already have accepted it.
 
 The foundation also models invalid or rejected inline locations as de-duplicated summary fallbacks. It returns those
 fallback entries to its caller rather than publishing them itself. Runtime publication remains disconnected until

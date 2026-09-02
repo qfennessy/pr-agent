@@ -10,9 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
-from typing import Any, Mapping, Optional, Protocol
+from typing import Any, Mapping, Optional, Protocol, Sequence
 
 from pr_agent.algo.inline_comment_dedup import (
     body_with_finding_identity_marker, build_summary_fallback_marker,
@@ -98,7 +98,7 @@ class FindingIdentity:
         return asdict(self)
 
 
-def finding_identity_from_verified_finding(
+def _finding_identity_from_verified_finding(
     finding: Mapping[str, Any],
     *,
     repository: str,
@@ -131,6 +131,52 @@ def finding_identity_from_verified_finding(
         path=relevant_file,
         trusted_stable_key=trusted_stable_key,
         root_cause_id_schema=VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
+    )
+
+
+def finding_identities_from_verified_findings(
+    findings: Sequence[Mapping[str, Any]],
+    *,
+    repository: str,
+    pull_request_number: int,
+) -> tuple[FindingIdentity, ...]:
+    """Adapt one verified batch, rejecting order-ambiguous same-anchor identities.
+
+    Issue #9's v2 hashes distinguish multiple defects at one anchor with an
+    order-derived ordinal. Until that contract supplies a trusted semantic
+    discriminator, accepting two such findings would let candidate reordering
+    swap persisted thread identities. Refuse the whole batch so publication
+    leaves existing mappings untouched.
+    """
+    anchor_counts: dict[tuple[str, str, int], int] = {}
+    for finding in findings:
+        if not isinstance(finding, Mapping):
+            raise TypeError("verified finding must be a mapping")
+        relevant_file = finding.get("relevant_file")
+        side = finding.get("side", "new")
+        start_line = finding.get("start_line")
+        if (
+            not isinstance(relevant_file, str)
+            or not relevant_file.strip()
+            or side not in {"new", "old"}
+            or isinstance(start_line, bool)
+            or not isinstance(start_line, int)
+            or start_line < 1
+        ):
+            raise ValueError("verified finding requires a valid publication anchor")
+        anchor = (relevant_file.strip().lstrip("/"), side, start_line)
+        anchor_counts[anchor] = anchor_counts.get(anchor, 0) + 1
+    if any(count > 1 for count in anchor_counts.values()):
+        raise ValueError(
+            "multiple verified findings share one anchor without a trusted semantic discriminator"
+        )
+    return tuple(
+        _finding_identity_from_verified_finding(
+            finding,
+            repository=repository,
+            pull_request_number=pull_request_number,
+        )
+        for finding in findings
     )
 
 
@@ -280,6 +326,7 @@ class ReviewThreadAction:
     anchor: Optional[ReviewThreadAnchor] = None
     body: Optional[str] = None
     depends_on_action_id: Optional[str] = None
+    expected_thread: Optional[ReviewThreadSnapshot] = None
     schema_version: str = REVIEW_THREAD_LIFECYCLE_SCHEMA_VERSION
 
 
@@ -304,6 +351,7 @@ class ReviewThreadActionState(str, Enum):
     APPLIED = "applied"
     ALREADY_APPLIED = "already_applied"
     STALE_HEAD = "stale_head"
+    STALE_INVENTORY = "stale_inventory"
     FAILED = "failed"
     NOT_EXECUTED = "not_executed"
     SKIPPED = "skipped"
@@ -347,6 +395,7 @@ class ReviewThreadActionOutcome:
     def requires_fresh_inventory(self) -> bool:
         return self.state in {
             ReviewThreadActionState.STALE_HEAD,
+            ReviewThreadActionState.STALE_INVENTORY,
             ReviewThreadActionState.APPLIED_REQUIRES_REFRESH,
         } or (
             self.kind == ReviewThreadActionKind.CREATE
@@ -451,10 +500,16 @@ class ReviewThreadMutationProvider(Protocol):
         comment_id: int,
         body: str,
         expected_head_sha: str,
+        expected_thread: ReviewThreadSnapshot,
     ) -> ReviewThreadActionOutcome:
         raise NotImplementedError
 
-    def resolve_review_thread(self, thread_id: str, expected_head_sha: str) -> ReviewThreadActionOutcome:
+    def resolve_review_thread(
+        self,
+        thread_id: str,
+        expected_head_sha: str,
+        expected_thread: ReviewThreadSnapshot,
+    ) -> ReviewThreadActionOutcome:
         raise NotImplementedError
 
 
@@ -493,6 +548,14 @@ def _thread_history_key(thread: ReviewThreadSnapshot) -> tuple[str, int, str]:
         root.database_id or -1 if root else -1,
         thread.thread_id,
     )
+
+
+def _thread_with_root_body(thread: ReviewThreadSnapshot, body: str) -> ReviewThreadSnapshot:
+    """Project the exact inventory expected after updating a root comment."""
+    root = thread.root_comment
+    if root is None:
+        raise ValueError("thread root comment is required")
+    return replace(thread, comments=(replace(root, body=body), *thread.comments[1:]))
 
 
 def plan_review_thread_actions(
@@ -635,6 +698,7 @@ def plan_review_thread_actions(
                     thread_id=current.thread_id,
                     root_comment_id=root.database_id if root else None,
                     body=desired.marked_body,
+                    expected_thread=current,
                 )
 
             for duplicate in active_matches:
@@ -649,6 +713,7 @@ def plan_review_thread_actions(
                         thread_id=duplicate.thread_id,
                         root_comment_id=root.database_id if root else None,
                         depends_on_action_id=canonical.action_id,
+                        expected_thread=duplicate,
                     )
                 else:
                     add(
@@ -706,6 +771,7 @@ def plan_review_thread_actions(
                 thread_id=previous.thread_id,
                 root_comment_id=root.database_id if root else None,
                 depends_on_action_id=create.action_id,
+                expected_thread=previous,
             )
     for finding_id, matches in existing_by_id.items():
         if finding_id in desired_by_id:
@@ -729,6 +795,7 @@ def plan_review_thread_actions(
                     "finding_no_longer_present",
                     thread_id=thread.thread_id,
                     root_comment_id=root.database_id if root else None,
+                    expected_thread=thread,
                 )
             elif obsolete_policy == "mark_fixed" and safe_to_mutate and root and root.database_id:
                 marked_body = body_with_fixed_thread_notice(root.body)
@@ -739,6 +806,7 @@ def plan_review_thread_actions(
                         "visible_fixed_state_already_present",
                         thread_id=thread.thread_id,
                         root_comment_id=root.database_id,
+                        expected_thread=thread,
                     )
                 else:
                     update = add(
@@ -748,6 +816,7 @@ def plan_review_thread_actions(
                         thread_id=thread.thread_id,
                         root_comment_id=root.database_id,
                         body=marked_body,
+                        expected_thread=thread,
                     )
                     add(
                         ReviewThreadActionKind.RESOLVE,
@@ -756,6 +825,7 @@ def plan_review_thread_actions(
                         thread_id=thread.thread_id,
                         root_comment_id=root.database_id,
                         depends_on_action_id=update.action_id,
+                        expected_thread=_thread_with_root_body(thread, marked_body),
                     )
             else:
                 add(ReviewThreadActionKind.SKIP, finding_id, "obsolete_thread_preserved", thread_id=thread.thread_id)
@@ -838,10 +908,24 @@ def execute_review_thread_action_plan(
             outcome = provider.create_review_thread(
                 action.anchor.to_github_comment(action.body), action.expected_head_sha
             )
-        elif action.kind == ReviewThreadActionKind.UPDATE and action.root_comment_id and action.body:
-            outcome = provider.update_review_thread(action.root_comment_id, action.body, action.expected_head_sha)
-        elif action.kind == ReviewThreadActionKind.RESOLVE and action.thread_id:
-            outcome = provider.resolve_review_thread(action.thread_id, action.expected_head_sha)
+        elif (
+            action.kind == ReviewThreadActionKind.UPDATE
+            and action.root_comment_id
+            and action.body
+            and action.expected_thread
+        ):
+            outcome = provider.update_review_thread(
+                action.root_comment_id,
+                action.body,
+                action.expected_head_sha,
+                action.expected_thread,
+            )
+        elif action.kind == ReviewThreadActionKind.RESOLVE and action.thread_id and action.expected_thread:
+            outcome = provider.resolve_review_thread(
+                action.thread_id,
+                action.expected_head_sha,
+                action.expected_thread,
+            )
         else:
             outcome = local_outcome(
                 action,
