@@ -1586,7 +1586,6 @@ async def test_invalid_frontier_identity_configuration_fails_before_every_model_
     retry.assert_not_awaited()
     extract_tickets.assert_not_awaited()
     specialists.assert_not_awaited()
-    retry.assert_not_awaited()
     verifier.assert_not_awaited()
     frontier.assert_not_awaited()
     reviewer.ai_handler.chat_completion.assert_not_awaited()
@@ -1600,7 +1599,8 @@ async def test_invalid_frontier_identity_configuration_fails_before_every_model_
 
 
 @pytest.mark.asyncio
-async def test_frontier_adjudication_reuses_the_preflight_configuration(monkeypatch):
+async def test_frontier_adjudication_reuses_preflight_config_after_first_pass(monkeypatch):
+    events = []
     config = SimpleNamespace(
         max_calls=1,
         stage_timeout_seconds=1,
@@ -1608,33 +1608,119 @@ async def test_frontier_adjudication_reuses_the_preflight_configuration(monkeypa
         prompt_hash="sha256:prompt",
         policy_version="frontier-policy-v1",
     )
-    loader = MagicMock(return_value=config)
+    def load_frontier_config(*_args, **_kwargs):
+        events.append("preflight")
+        return config
+
+    loader = MagicMock(side_effect=load_frontier_config)
+    provider = MagicMock()
+    provider.get_files.return_value = ["src/service.py"]
+    provider.get_pr_head_sha.return_value = "head-sha"
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
+    reviewer.ai_handler = SimpleNamespace(azure=False)
+    reviewer._prepare_pr_review = MagicMock(return_value="review")
+    reviewer._should_publish_review_no_suggestions = MagicMock(return_value=False)
+    reviewer._clear_stale_persistent_bugs_only_review = MagicMock()
+
+    async def run_first_pass(*_args, **_kwargs):
+        events.append("first_pass")
+        reviewer.prediction = VALID_PREDICTION
+
+    async def run_verification():
+        events.append("verification")
+        await reviewer._run_frontier_adjudications([], [], [], [])
+
+    reviewer._run_candidate_verification = AsyncMock(side_effect=run_verification)
+    retry = AsyncMock(side_effect=run_first_pass)
+    frontier = AsyncMock()
     monkeypatch.setattr(
-        "pr_agent.tools.pr_reviewer.load_frontier_adjudication_config",
-        loader,
+        "pr_agent.tools.pr_reviewer.load_frontier_adjudication_config", loader
     )
     monkeypatch.setattr(
         "pr_agent.tools.pr_reviewer.get_specialist_snapshot_context",
-        lambda: SimpleNamespace(
-            snapshot=SimpleNamespace(snapshot_id="head-sha"),
-            current_snapshot_id=MagicMock(return_value="head-sha"),
-        ),
+        lambda: None,
     )
-    reviewer = _make_reviewer()
-    reviewer.ai_handler = SimpleNamespace(azure=False)
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets", AsyncMock()
+    )
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.retry_with_fallback_models", retry)
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.run_frontier_adjudication", frontier)
 
-    assert reviewer._prepare_frontier_adjudication_config() is True
-    loader.side_effect = AssertionError("frontier configuration was loaded twice")
-    await reviewer._run_frontier_adjudications([], [], [], [])
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.publish_output",
+        "pr_reviewer.enable_candidate_verification",
+        "pr_reviewer.enable_frontier_adjudication",
+    ))
+    try:
+        settings.config.publish_output = False
+        settings.pr_reviewer.enable_candidate_verification = True
+        settings.pr_reviewer.enable_frontier_adjudication = True
+        await reviewer.run()
+    finally:
+        restore_settings(snapshot)
 
+    assert events == ["preflight", "first_pass", "verification"]
     loader.assert_called_once()
     assert reviewer._frontier_adjudication_config is config
+    retry.assert_awaited_once()
+    reviewer._run_candidate_verification.assert_awaited_once_with()
+    frontier.assert_not_awaited()
     assert reviewer.frontier_adjudication_artifact == {
         "enabled": True,
         "status": "not_required",
         "results": [],
         "publication_safe": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_disabled_frontier_skips_preflight_and_preserves_first_pass(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.get_files.return_value = ["src/service.py"]
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
+    reviewer._prepare_pr_review = MagicMock(return_value="review")
+    reviewer._should_publish_review_no_suggestions = MagicMock(return_value=False)
+    reviewer._clear_stale_persistent_bugs_only_review = MagicMock()
+    reviewer._run_candidate_verification = AsyncMock()
+
+    async def run_first_pass(*_args, **_kwargs):
+        reviewer.prediction = VALID_PREDICTION
+
+    retry = AsyncMock(side_effect=run_first_pass)
+    loader = MagicMock(side_effect=AssertionError("disabled frontier was loaded"))
+    monkeypatch.setattr(pr_reviewer_module, "load_frontier_adjudication_config", loader)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", AsyncMock())
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", retry)
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.publish_output",
+        "pr_reviewer.enable_candidate_verification",
+        "pr_reviewer.enable_frontier_adjudication",
+        "pr_reviewer.frontier_adjudication_model",
+    ))
+    try:
+        settings.config.publish_output = False
+        settings.pr_reviewer.enable_candidate_verification = False
+        settings.pr_reviewer.enable_frontier_adjudication = False
+        settings.pr_reviewer.frontier_adjudication_model = [True]
+        await reviewer.run()
+    finally:
+        restore_settings(snapshot)
+
+    loader.assert_not_called()
+    retry.assert_awaited_once()
+    reviewer._run_candidate_verification.assert_not_awaited()
+    reviewer._prepare_pr_review.assert_called_once_with()
 
 
 @pytest.mark.parametrize("file_count", [1, 12, 13])
