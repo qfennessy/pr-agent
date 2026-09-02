@@ -1,7 +1,8 @@
-# Fork-only workflow (qfennessy/pr-agent). Opens a review PR that pins upstream
-# main at a fixed SHA, so the diff under review cannot change after review
-# starts (upstream pushes to main otherwise silently join an open sync PR whose
-# head is upstream's main). See FORK-MAINTENANCE.md.
+# Fork-only workflow (qfennessy/pr-agent). Opens a review PR bound to an
+# immutable upstream SHA. When Git can combine the fork and upstream cleanly,
+# the PR head is a constrained two-parent integration merge; otherwise the raw
+# pin is published with instructions for producing that merge after resolving
+# conflicts. See FORK-MAINTENANCE.md.
 name: Upstream sync PR
 
 on:
@@ -87,13 +88,30 @@ jobs:
           SHA: ${{ steps.pin.outputs.sha }}
           SHORT: ${{ steps.pin.outputs.short }}
         run: |
+          set -euo pipefail
           BRANCH="sync/upstream-$(date -u +%Y%m%d)-${SHORT}"
-          git branch "$BRANCH" "$SHA"
+          BASELINE=$(git rev-parse origin/main)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git switch --detach "$BASELINE"
+          if git merge --no-ff --no-edit "$SHA"; then
+            TOPOLOGY="resolved merge"
+            RESOLUTION_REQUIRED=false
+          else
+            git merge --abort
+            git switch --detach "$SHA"
+            TOPOLOGY="raw pin (manual conflict resolution required)"
+            RESOLUTION_REQUIRED=true
+          fi
+          git branch "$BRANCH" HEAD
           git push origin "$BRANCH"
 
-          BASE=$(git merge-base origin/main "$SHA")
+          BASE=$(git merge-base "$BASELINE" "$SHA")
           {
             echo "Pinned upstream sync: \`The-PR-Agent/pr-agent@${SHA}\`"
+            echo "Fork integration baseline: \`qfennessy/pr-agent@${BASELINE}\`"
+            echo "Candidate topology: \`${TOPOLOGY}\`"
             echo
             echo "New upstream commits:"
             echo '```'
@@ -116,8 +134,49 @@ jobs:
               echo "No high-scrutiny paths (workflows, deps, prompts, secrets/config, docker) changed."
             fi
             echo
+            if [ "$RESOLUTION_REQUIRED" = true ]; then
+              echo "### Conflict resolution required"
+              echo
+              echo "The immutable upstream pin conflicts with the fork baseline. From a trusted fork checkout,"
+              echo "choose a new absolute worktree path and build the reviewed candidate there. Do not add"
+              echo "commits before or after the integration merge:"
+              echo '```bash'
+              echo "git fetch origin main \"$BRANCH\""
+              echo "git fetch https://github.com/The-PR-Agent/pr-agent.git main"
+              echo "WORKTREE_PATH=/absolute/path/you/choose/pr-agent-upstream-${SHORT}"
+              echo "git worktree add --detach \"\$WORKTREE_PATH\" \"$BASELINE\""
+              echo 'cd "$WORKTREE_PATH"'
+              echo "git merge --no-ff --no-commit \"$SHA\""
+              echo "# Resolve conflicts, then stage only the intended resolutions."
+              echo "git add <resolved-paths>"
+              echo "git commit -m \"sync: integrate upstream @ $SHORT\""
+              printf 'EXPECTED_REMOTE_HEAD=$(git ls-remote --exit-code origin "refs/heads/%s" | cut -f1)\n' \
+                "$BRANCH"
+              echo 'test "${#EXPECTED_REMOTE_HEAD}" -eq 40'
+              printf 'git push --force-with-lease=refs/heads/%s:$EXPECTED_REMOTE_HEAD origin HEAD:refs/heads/%s\n' \
+                "$BRANCH" "$BRANCH"
+              echo '```'
+              echo
+              echo "If \`main\` moves and the PR conflicts again, rebuild the same two-parent candidate on the"
+              echo "new baseline and update the single \`Fork integration baseline\` line in this body. The"
+              echo "remote-head lookup makes the lease bind to the current candidate rather than the original pin."
+              echo
+              echo "After GitHub shows the PR merged, return to the trusted checkout, confirm"
+              echo "\`git -C \"\$WORKTREE_PATH\" status --short\` is empty, then run:"
+              echo '```bash'
+              echo 'set -euo pipefail'
+              echo 'TRUSTED_CHECKOUT=/absolute/path/to/your/trusted/pr-agent-checkout'
+              echo "WORKTREE_PATH=/absolute/path/you/choose/pr-agent-upstream-${SHORT}"
+              echo 'cd "$TRUSTED_CHECKOUT"'
+              echo "test \"\$(gh pr view \"$BRANCH\" --json state --jq .state)\" = MERGED"
+              echo 'test -z "$(git -C "$WORKTREE_PATH" status --short)"'
+              echo 'git worktree remove "$WORKTREE_PATH"'
+              echo '```'
+              echo
+            fi
             echo "Review checklist: run /review against this PR before merging;"
-            echo "after merging, confirm the merge parent equals \`$SHA\`."
+            echo "wait for Upstream provenance; after merging, verify the PR candidate's parent topology"
+            echo "and confirm that one candidate parent is the pinned upstream SHA \`$SHA\`."
             echo
             echo "_Generated by the upstream-sync workflow._"
           } > body.md
