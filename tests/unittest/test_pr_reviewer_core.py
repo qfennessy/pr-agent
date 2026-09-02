@@ -1903,6 +1903,7 @@ async def test_frontier_adjudication_binds_the_accepted_sensitive_candidate_on_i
     originals = copy.deepcopy((finding, candidates, evidence, decisions))
     config = SimpleNamespace(
         max_calls=1,
+        stage_timeout_seconds=1,
         configuration_hash="sha256:configuration",
         prompt_hash="sha256:prompt",
         policy_version="frontier-policy-v1",
@@ -2021,6 +2022,7 @@ async def test_frontier_adjudication_prioritizes_deterministic_risk_before_call_
 
     config = SimpleNamespace(
         max_calls=2,
+        stage_timeout_seconds=1,
         configuration_hash="sha256:configuration",
         prompt_hash="sha256:prompt",
         policy_version="frontier-policy-v1",
@@ -2058,6 +2060,11 @@ async def test_frontier_adjudication_prioritizes_deterministic_risk_before_call_
     assert [
         call.args[0].candidate.title for call in run_frontier.await_args_list
     ] == ["sensitive-first", "sensitive-second"]
+    deadlines = [
+        call.kwargs["deadline_monotonic"]
+        for call in run_frontier.await_args_list
+    ]
+    assert len(set(deadlines)) == 1
     assert [
         result.get("failure_reason")
         for result in reviewer.frontier_adjudication_artifact["results"]
@@ -2070,6 +2077,7 @@ async def test_frontier_adjudication_reports_partial_when_verified_finding_has_n
         monkeypatch):
     config = SimpleNamespace(
         max_calls=1,
+        stage_timeout_seconds=1,
         configuration_hash="sha256:configuration",
         prompt_hash="sha256:prompt",
         policy_version="frontier-policy-v1",

@@ -643,6 +643,41 @@ async def test_snapshot_that_changes_during_call_discards_confirmation():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_refresh", [1, 2])
+async def test_snapshot_refreshes_are_covered_by_stage_deadline(
+    monkeypatch,
+    blocked_refresh,
+):
+    init_run_details()
+    refresh_count = 0
+
+    async def delayed_to_thread(callback, *args, **kwargs):
+        nonlocal refresh_count
+        refresh_count += 1
+        if refresh_count == blocked_refresh:
+            await asyncio.sleep(0.02)
+        return callback(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "pr_agent.algo.frontier_adjudication.asyncio.to_thread",
+        delayed_to_thread,
+    )
+    stage_config = config(stage_timeout=0.005)
+    handler = FakeHandler([output()])
+
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        handler,
+        current_identity=lambda: "head-1",
+    )
+
+    assert result.state is FrontierState.TIMEOUT
+    assert result.failure_reason == "timeout"
+    assert handler.calls == ([] if blocked_refresh == 1 else ["frontier-primary"])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("telemetry_gap", ["usage", "cost"])
 async def test_missing_usage_or_cost_fails_unavailable(telemetry_gap):
     init_run_details()

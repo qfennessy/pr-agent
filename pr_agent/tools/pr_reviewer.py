@@ -1949,6 +1949,7 @@ class PRReviewer:
         except (FrontierContractError, TypeError, ValueError):
             artifact.update({"status": "configuration_invalid", "failure": "invalid_configuration"})
             return
+        batch_deadline = time.monotonic() + config.stage_timeout_seconds
 
         snapshot_context = get_specialist_snapshot_context()
         if snapshot_context is not None:
@@ -1956,7 +1957,16 @@ class PRReviewer:
             current_identity = snapshot_context.current_snapshot_id
         else:
             try:
-                snapshot_id = self.git_provider.get_pr_head_sha(refresh=False)
+                snapshot_id = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.git_provider.get_pr_head_sha,
+                        refresh=False,
+                    ),
+                    timeout=max(0, batch_deadline - time.monotonic()),
+                )
+            except asyncio.TimeoutError:
+                artifact.update({"status": "unavailable", "failure": "stage_timeout"})
+                return
             except Exception:
                 snapshot_id = None
 
@@ -2035,6 +2045,14 @@ class PRReviewer:
             ),
         ))
         for finding, candidate, severity, signals in eligible_findings:
+            if time.monotonic() >= batch_deadline:
+                artifact["results"].append({
+                    "stable_finding_id": finding.get("trusted_stable_key"),
+                    "state": "unavailable",
+                    "failure_reason": "stage_timeout_exhausted",
+                    "publication_safe": False,
+                })
+                continue
             if call_count >= max_calls:
                 artifact["results"].append({
                     "stable_finding_id": finding.get("trusted_stable_key"),
@@ -2083,6 +2101,7 @@ class PRReviewer:
                 config,
                 self.ai_handler,
                 current_identity=current_identity,
+                deadline_monotonic=batch_deadline,
             )
             call_count += 1
             artifact["results"].append(result.to_telemetry_dict())

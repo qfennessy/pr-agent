@@ -614,12 +614,28 @@ def _hash_json(value: Any) -> str:
 
 async def _refresh_identity(current_identity: Callable[[], Any]) -> Optional[str]:
     try:
-        value = current_identity()
+        if inspect.iscoroutinefunction(current_identity):
+            value = await current_identity()
+        else:
+            value = await asyncio.to_thread(current_identity)
         if inspect.isawaitable(value):
             value = await value
         return str(value) if value else None
     except Exception:
         return None
+
+
+async def _refresh_identity_before(
+    current_identity: Callable[[], Any],
+    deadline_monotonic: float,
+) -> Optional[str]:
+    remaining_seconds = deadline_monotonic - time.monotonic()
+    if remaining_seconds <= 0:
+        raise asyncio.TimeoutError
+    return await asyncio.wait_for(
+        _refresh_identity(current_identity),
+        timeout=remaining_seconds,
+    )
 
 
 def _unavailable(
@@ -827,6 +843,7 @@ async def run_frontier_adjudication(
     ai_handler: BaseAiHandler,
     *,
     current_identity: Callable[[], Any],
+    deadline_monotonic: Optional[float] = None,
 ) -> FrontierAdjudicationResult:
     """Adjudicate one verified finding without publishing or mutating review output."""
 
@@ -836,7 +853,17 @@ async def run_frontier_adjudication(
         return _unavailable(request, FrontierState.UNAVAILABLE, "configuration_identity_mismatch")
     if request.policy_version != config.policy_version:
         return _unavailable(request, FrontierState.UNAVAILABLE, "policy_identity_mismatch")
-    if await _refresh_identity(current_identity) != request.snapshot_id:
+    started_at = time.monotonic()
+    if deadline_monotonic is None:
+        deadline_monotonic = started_at + config.stage_timeout_seconds
+    try:
+        current_snapshot_id = await _refresh_identity_before(
+            current_identity,
+            deadline_monotonic,
+        )
+    except asyncio.TimeoutError:
+        return _unavailable(request, FrontierState.TIMEOUT, "timeout")
+    if current_snapshot_id != request.snapshot_id:
         return _unavailable(request, FrontierState.STALE, "stale_snapshot")
     if getattr(ai_handler, "supports_frontier_adjudication_telemetry", False) is not True:
         return _unavailable(
@@ -848,7 +875,6 @@ async def run_frontier_adjudication(
     finding_id = request.candidate.stable_finding_id
     attribution = f"frontier_adjudication:{finding_id}"
     route = replace(config.route, attribution=attribution)
-    started_at = time.monotonic()
     variables = {
         "input_schema_version": request.schema_version,
         "output_schema_version": config.output_schema_version,
@@ -871,7 +897,7 @@ async def run_frontier_adjudication(
 
         raw = await asyncio.wait_for(
             retry_with_fallback_models(attempt, model_route=route),
-            timeout=config.stage_timeout_seconds,
+            timeout=max(0, deadline_monotonic - time.monotonic()),
         )
         parsed = _validate_output(raw, request, config)
     except asyncio.TimeoutError:
@@ -918,7 +944,27 @@ async def run_frontier_adjudication(
         confidence=parsed["confidence"] if parsed is not None else None,
         failure_reason=failure_reason,
     )
-    if await _refresh_identity(current_identity) != request.snapshot_id:
+    try:
+        current_snapshot_id = await _refresh_identity_before(
+            current_identity,
+            deadline_monotonic,
+        )
+    except asyncio.TimeoutError:
+        record_adjudication_result(
+            finding_id,
+            provider=actual_provider,
+            model_revision=actual_revision,
+            model_attempts_configured=config.route.model_retries,
+            provider_retries_configured=config.route.provider_retries,
+            prompt_version=config.prompt_version,
+            input_schema_version=config.input_schema_version,
+            schema_version=config.output_schema_version,
+            state=FrontierState.TIMEOUT.value,
+            latency_seconds=time.monotonic() - started_at,
+            failure_reason="timeout",
+        )
+        return _unavailable(request, FrontierState.TIMEOUT, "timeout")
+    if current_snapshot_id != request.snapshot_id:
         record_adjudication_result(
             finding_id,
             provider=actual_provider,
