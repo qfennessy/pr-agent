@@ -184,6 +184,7 @@ class PRReviewer:
         self.prediction = None
         self.candidate_verification_artifact = None
         self.frontier_adjudication_artifact = None
+        self._frontier_adjudication_config = None
         self._candidate_verification_published_finding_count = None
         self.verified_review_data = None
         self.specialist_shadow_input = None
@@ -358,6 +359,26 @@ class PRReviewer:
 
             if not route_prepared:
                 self._prepare_review_route()
+            if self._frontier_adjudication_enabled():
+                if not self._candidate_verification_enabled():
+                    self.frontier_adjudication_artifact = {
+                        "enabled": True,
+                        "status": "configuration_invalid",
+                        "failure": "candidate_verification_required",
+                        "results": [],
+                        "publication_safe": False,
+                    }
+                    if getattr(self, "_review_shadow_only", False):
+                        get_settings().data = {"artifact": ""}
+                    return None
+                if not self._prepare_frontier_adjudication_config():
+                    if getattr(self, "_review_shadow_only", False):
+                        get_settings().data = {"artifact": ""}
+                    get_logger().error(
+                        "Frontier adjudication configuration is invalid",
+                        artifact=self.frontier_adjudication_artifact,
+                    )
+                    return None
             if self._specialist_escalation_consumption_enabled():
                 await self._run_guarded_specialist_escalation()
             if getattr(self, "_review_shadow_only", False):
@@ -1817,6 +1838,28 @@ class PRReviewer:
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
 
+    def _prepare_frontier_adjudication_config(self) -> bool:
+        """Validate and freeze frontier configuration before any model dispatch."""
+
+        try:
+            config = load_frontier_adjudication_config(
+                get_settings().pr_reviewer,
+                get_settings().frontier_adjudication_prompt,
+                azure=getattr(getattr(self, "ai_handler", None), "azure", False) is True,
+            )
+        except (FrontierContractError, TypeError, ValueError):
+            self._frontier_adjudication_config = None
+            self.frontier_adjudication_artifact = {
+                "enabled": True,
+                "status": "configuration_invalid",
+                "failure": "invalid_configuration",
+                "results": [],
+                "publication_safe": False,
+            }
+            return False
+        self._frontier_adjudication_config = config
+        return True
+
     @staticmethod
     def _frontier_candidate_severity(candidate: Mapping[str, Any], decision: Mapping[str, Any]):
         explicit = decision.get("normalized_severity") or candidate.get("normalized_severity")
@@ -1940,15 +1983,10 @@ class PRReviewer:
             "publication_safe": False,
         }
         self.frontier_adjudication_artifact = artifact
-        try:
-            config = load_frontier_adjudication_config(
-                get_settings().pr_reviewer,
-                get_settings().frontier_adjudication_prompt,
-                azure=getattr(self.ai_handler, "azure", False) is True,
-            )
-        except (FrontierContractError, TypeError, ValueError):
-            artifact.update({"status": "configuration_invalid", "failure": "invalid_configuration"})
+        config = getattr(self, "_frontier_adjudication_config", None)
+        if config is None and not self._prepare_frontier_adjudication_config():
             return
+        config = self._frontier_adjudication_config
         batch_deadline = time.monotonic() + config.stage_timeout_seconds
 
         snapshot_context = get_specialist_snapshot_context()

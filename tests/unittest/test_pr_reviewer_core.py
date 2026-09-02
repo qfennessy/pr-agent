@@ -1489,11 +1489,10 @@ async def test_frontier_without_candidate_verification_reports_invalid_configura
     reviewer._clear_stale_persistent_bugs_only_review = MagicMock()
     reviewer._run_candidate_verification = AsyncMock()
 
-    async def fake_retry(*_args, **_kwargs):
-        reviewer.prediction = VALID_PREDICTION
-
-    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
-    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", AsyncMock())
+    retry = AsyncMock()
+    extract_tickets = AsyncMock()
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", extract_tickets)
 
     settings = get_settings()
     snapshot = snapshot_settings((
@@ -1513,10 +1512,126 @@ async def test_frontier_without_candidate_verification_reports_invalid_configura
         restore_settings(snapshot)
 
     reviewer._run_candidate_verification.assert_not_awaited()
+    retry.assert_not_awaited()
+    extract_tickets.assert_not_awaited()
+    reviewer._prepare_pr_review.assert_not_called()
     assert reviewer.frontier_adjudication_artifact == {
         "enabled": True,
         "status": "configuration_invalid",
         "failure": "candidate_verification_required",
+        "results": [],
+        "publication_safe": False,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_identity", [True, 7], ids=["boolean", "number"])
+async def test_invalid_frontier_identity_configuration_fails_before_every_model_call(
+    monkeypatch,
+    invalid_identity,
+):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.get_files.return_value = ["src/service.py"]
+    provider.get_diff_files.return_value = [_route_file("src/service.py")]
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
+    reviewer.ai_handler = SimpleNamespace(azure=False, chat_completion=AsyncMock())
+    retry = AsyncMock()
+    extract_tickets = AsyncMock()
+    specialists = AsyncMock()
+    verifier = AsyncMock()
+    frontier = AsyncMock()
+    reviewer._run_guarded_specialist_escalation = specialists
+    reviewer._run_candidate_verification = verifier
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", extract_tickets)
+    monkeypatch.setattr(pr_reviewer_module, "run_frontier_adjudication", frontier)
+
+    settings = get_settings()
+    keys = (
+        "config.publish_output",
+        "pr_reviewer.enable_candidate_verification",
+        "pr_reviewer.enable_frontier_adjudication",
+        "pr_reviewer.frontier_adjudication_model",
+        "pr_reviewer.frontier_adjudication_deployment",
+        "pr_reviewer.frontier_adjudication_provider",
+        "pr_reviewer.frontier_adjudication_revision",
+        "pr_reviewer.frontier_adjudication_fallback_models",
+        "pr_reviewer.frontier_adjudication_fallback_deployments",
+        "pr_reviewer.frontier_adjudication_fallback_providers",
+        "pr_reviewer.frontier_adjudication_fallback_revisions",
+    )
+    snapshot = snapshot_settings(keys)
+    try:
+        settings.config.publish_output = False
+        settings.pr_reviewer.enable_candidate_verification = True
+        settings.pr_reviewer.enable_frontier_adjudication = True
+        settings.pr_reviewer.frontier_adjudication_model = "frontier-primary"
+        settings.pr_reviewer.frontier_adjudication_deployment = "deployment-primary"
+        settings.pr_reviewer.frontier_adjudication_provider = [invalid_identity]
+        settings.pr_reviewer.frontier_adjudication_revision = "revision-primary"
+        settings.pr_reviewer.frontier_adjudication_fallback_models = []
+        settings.pr_reviewer.frontier_adjudication_fallback_deployments = []
+        settings.pr_reviewer.frontier_adjudication_fallback_providers = []
+        settings.pr_reviewer.frontier_adjudication_fallback_revisions = []
+
+        await reviewer.run()
+    finally:
+        restore_settings(snapshot)
+
+    retry.assert_not_awaited()
+    extract_tickets.assert_not_awaited()
+    specialists.assert_not_awaited()
+    retry.assert_not_awaited()
+    verifier.assert_not_awaited()
+    frontier.assert_not_awaited()
+    reviewer.ai_handler.chat_completion.assert_not_awaited()
+    assert reviewer.frontier_adjudication_artifact == {
+        "enabled": True,
+        "status": "configuration_invalid",
+        "failure": "invalid_configuration",
+        "results": [],
+        "publication_safe": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_frontier_adjudication_reuses_the_preflight_configuration(monkeypatch):
+    config = SimpleNamespace(
+        max_calls=1,
+        stage_timeout_seconds=1,
+        configuration_hash="sha256:configuration",
+        prompt_hash="sha256:prompt",
+        policy_version="frontier-policy-v1",
+    )
+    loader = MagicMock(return_value=config)
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.load_frontier_adjudication_config",
+        loader,
+    )
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.get_specialist_snapshot_context",
+        lambda: SimpleNamespace(
+            snapshot=SimpleNamespace(snapshot_id="head-sha"),
+            current_snapshot_id=MagicMock(return_value="head-sha"),
+        ),
+    )
+    reviewer = _make_reviewer()
+    reviewer.ai_handler = SimpleNamespace(azure=False)
+
+    assert reviewer._prepare_frontier_adjudication_config() is True
+    loader.side_effect = AssertionError("frontier configuration was loaded twice")
+    await reviewer._run_frontier_adjudications([], [], [], [])
+
+    loader.assert_called_once()
+    assert reviewer._frontier_adjudication_config is config
+    assert reviewer.frontier_adjudication_artifact == {
+        "enabled": True,
+        "status": "not_required",
         "results": [],
         "publication_safe": False,
     }
