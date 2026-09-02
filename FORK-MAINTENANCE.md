@@ -10,15 +10,36 @@ treated as untrusted input until reviewed here.
 
 ## Syncing from upstream
 
-Upstream changes enter this fork only through a reviewed pull request pinned to
-a fixed upstream SHA. Never merge a PR whose head branch is upstream `main`
-itself: upstream pushes silently join such a PR after review starts (this
-happened on PR #1, 2026-08-07).
+Upstream changes enter this fork only through a reviewed pull request bound to
+a fixed upstream SHA and a fixed fork baseline. Never merge a PR whose head
+branch is upstream `main` itself: upstream pushes silently join such a PR after
+review starts (this happened on PR #1, 2026-08-07).
 
 The `Upstream sync PR` workflow (`.github/workflows/upstream-sync.yml`, weekly
-plus manual dispatch) automates this: it pins the current upstream `main` SHA,
-pushes a `sync/upstream-<date>-<sha>` branch, and opens a PR whose body lists
-the new commits, a diffstat, and any high-scrutiny paths touched.
+plus manual dispatch) automates this. It pins the current upstream `main` SHA
+and current fork `main` baseline, then tries to create an integration commit
+whose only parents are those two commits. If Git reports conflicts, the
+workflow publishes the raw upstream pin as a temporary PR head and includes
+the commands for replacing it with the required two-parent integration commit.
+The branch is named `sync/upstream-<date>-<upstream-sha>`; its suffix always
+identifies the upstream pin, not the integration commit.
+
+### Resolving an upstream conflict
+
+Use a dedicated worktree. Start from the exact `Fork integration baseline`
+listed in the PR body, merge the exact `Pinned upstream sync` commit, resolve
+the conflicts, and create one merge commit. Do not add preparation or cleanup
+commits to the sync branch: the resulting candidate must have exactly two
+parents, the fork baseline and the upstream pin (either parent order is valid).
+
+The generated PR body provides copyable commands with an exact
+`--force-with-lease` expectation for replacing the raw pin. Existing raw-pin
+PRs, including PR #35, can use the same protocol: add exactly one canonical
+`Fork integration baseline` line to the body, create the two-parent merge on
+that baseline, and replace the PR head. If `main` advances and the candidate
+then conflicts, rebuild the candidate directly on the new baseline and update
+that body line; do not merge `main` into the existing candidate because that
+would add an unverified commit layer.
 
 ### Automation credential
 
@@ -47,13 +68,20 @@ and update only the deploy key and environment secret, never this workflow.
    - `pr_agent/settings/*.toml` — prompts are executable in the LLM sense
    - `pr_agent/config_loader.py`, `pr_agent/secret_providers/**`, git-provider
      auth code — secret and token handling
-3. Wait for the required `Upstream provenance` check. It verifies that the PR
-   head, branch name, title, and body all identify the same canonical upstream
-   SHA and that the commit belongs to upstream `main`.
+3. Wait for the required `Upstream provenance` check. It runs the verifier from
+   the protected base branch, never the PR, and verifies that:
+   - branch, title, and body identify one canonical upstream pin;
+   - that pin belongs to upstream `main`;
+   - the declared fork baseline is an ancestor of the current PR base; and
+   - the PR head is either the raw pin or one merge commit whose two parents
+     are exactly the pin and baseline.
 4. Merge with a merge commit. The `main` ruleset rejects squash and rebase
-   merges so the reviewed upstream commit remains an immutable parent.
-5. After merging, confirm the merge commit's upstream parent equals the pinned
-   SHA that was reviewed (`git log -1 --format=%P <merge-commit>`).
+   merges so the reviewed PR candidate remains an immutable parent.
+5. After merging, inspect the repository merge commit's second parent (the PR
+   candidate) with `git log -1 --format=%P <merge-commit>`. For a raw pin it
+   equals the reviewed upstream SHA. For a resolved candidate, inspect that
+   commit with `git log -1 --format=%P <candidate>` and confirm its only
+   parents are the reviewed fork baseline and upstream pin.
 
 ## CI posture
 
