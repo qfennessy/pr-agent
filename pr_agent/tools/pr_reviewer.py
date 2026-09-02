@@ -1836,20 +1836,24 @@ class PRReviewer:
         candidate: Mapping[str, Any],
         route_decision: Optional[ReviewRouteDecision],
     ) -> tuple[str, ...]:
-        """Return deterministic sensitive categories bound to this candidate path."""
+        """Return deterministic candidate-local and PR-wide sensitive categories."""
 
         candidate_path = safe_repo_path(candidate.get("relevant_file"))
         categories = ["candidate_verification"] if candidate.get("sensitive_path") is True else []
-        if candidate_path and route_decision is not None:
+        if route_decision is not None:
             for reason in route_decision.reasons:
                 if not reason.code.startswith("sensitive_category:"):
                     continue
+                label_matched = any(
+                    isinstance(item, str) and item.startswith("label:")
+                    for item in reason.evidence
+                )
                 matched_paths = {
                     safe_repo_path(item.removeprefix("path:"))
                     for item in reason.evidence
                     if isinstance(item, str) and item.startswith("path:")
                 }
-                if candidate_path in matched_paths:
+                if label_matched or (candidate_path and candidate_path in matched_paths):
                     categories.append(reason.code.removeprefix("sensitive_category:"))
         return tuple(dict.fromkeys(categories))
 

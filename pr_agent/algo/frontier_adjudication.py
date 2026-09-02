@@ -79,7 +79,7 @@ class FrontierModelIdentity:
 
 @dataclass(frozen=True, slots=True)
 class FrontierEvidence:
-    """One bounded evidence excerpt already gathered by candidate verification."""
+    """One bounded excerpt in a candidate-verification citation group."""
 
     evidence_id: str
     source: str
@@ -91,7 +91,10 @@ class FrontierEvidence:
     content_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
-        if not self.evidence_id or not self.source or not self.path or not self.content.strip():
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (self.evidence_id, self.source, self.path, self.content)
+        ):
             raise FrontierContractError("frontier evidence is incomplete")
         if self.side not in {"old", "new"}:
             raise FrontierContractError("frontier evidence side must be old or new")
@@ -221,9 +224,28 @@ class FrontierAdjudicationRequest:
             self.risk_policy_version,
         )):
             raise FrontierContractError("frontier adjudication identity is incomplete")
-        evidence_ids = [item.evidence_id for item in self.evidence]
-        if len(evidence_ids) != len(set(evidence_ids)):
-            raise FrontierContractError("frontier evidence identities must be unique")
+        groups: dict[str, list[FrontierEvidence]] = {}
+        group_identities: dict[str, tuple[str, str, str]] = {}
+        for item in self.evidence:
+            identity = (item.source, item.path, item.side)
+            existing_identity = group_identities.setdefault(item.evidence_id, identity)
+            if existing_identity != identity:
+                raise FrontierContractError(
+                    "frontier evidence citation groups must share source, path, and side"
+                )
+            groups.setdefault(item.evidence_id, []).append(item)
+        for excerpts in groups.values():
+            ordered = sorted(
+                excerpts,
+                key=lambda item: (item.start_line, item.end_line, item.content_sha256),
+            )
+            if any(
+                current.start_line <= previous.end_line
+                for previous, current in zip(ordered, ordered[1:], strict=False)
+            ):
+                raise FrontierContractError(
+                    "frontier evidence citation group excerpts must not overlap"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {

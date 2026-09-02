@@ -156,7 +156,7 @@ def config(
     )
 
 
-def request(stage_config, *, signals=None, snapshot_id="head-1"):
+def request(stage_config, *, signals=None, snapshot_id="head-1", evidence=None):
     return FrontierAdjudicationRequest(
         candidate=FrontierCandidate(
             stable_finding_id="sha256:finding",
@@ -171,7 +171,7 @@ def request(stage_config, *, signals=None, snapshot_id="head-1"):
             impact="Another tenant's object is returned.",
             verified_severity=NormalizedSeverity.HIGH,
         ),
-        evidence=(FrontierEvidence(
+        evidence=evidence if evidence is not None else (FrontierEvidence(
             evidence_id="evidence-1",
             source="changed_patch",
             path="src/auth.py",
@@ -294,6 +294,114 @@ async def test_insufficient_evidence_signal_is_eligible():
         current_identity=lambda: "head-1",
     )
     assert handler.calls == ["frontier-primary"]
+
+
+@pytest.mark.asyncio
+async def test_grouped_evidence_id_is_one_valid_citation():
+    init_run_details()
+    stage_config = config()
+    evidence = (
+        FrontierEvidence(
+            evidence_id="context-request-1",
+            source="repository_context",
+            path="src/policy.py",
+            side="new",
+            start_line=30,
+            end_line=31,
+            content="def can_read(user, record):\n    return same_tenant(user, record)",
+        ),
+        FrontierEvidence(
+            evidence_id="context-request-1",
+            source="repository_context",
+            path="src/policy.py",
+            side="new",
+            start_line=10,
+            end_line=11,
+            content="def same_tenant(user, record):\n    return user.tenant == record.tenant",
+        ),
+    )
+    handler = FakeHandler([output(citations=["context-request-1"])])
+
+    adjudication_request = request(stage_config, evidence=evidence)
+    result = await run_frontier_adjudication(
+        adjudication_request,
+        stage_config,
+        handler,
+        current_identity=lambda: "head-1",
+    )
+
+    assert result.state is FrontierState.CONFIRMED
+    assert result.evidence_citations == ("context-request-1",)
+    assert handler.calls == ["frontier-primary"]
+    serialized_evidence = adjudication_request.to_dict()["evidence"]
+    assert [item["evidence_id"] for item in serialized_evidence] == [
+        "context-request-1",
+        "context-request-1",
+    ]
+    assert [item["start_line"] for item in serialized_evidence] == [30, 10]
+    assert all(item["content_sha256"].startswith("sha256:") for item in serialized_evidence)
+
+
+@pytest.mark.parametrize(
+    "conflicting_identity",
+    [
+        {"source": "changed_context_head"},
+        {"path": "src/other_policy.py"},
+        {"side": "old"},
+    ],
+)
+def test_grouped_evidence_id_requires_one_source_location_identity(conflicting_identity):
+    stage_config = config()
+    base = {
+        "evidence_id": "context-request-1",
+        "source": "repository_context",
+        "path": "src/policy.py",
+        "side": "new",
+    }
+    evidence = (
+        FrontierEvidence(
+            **base,
+            start_line=10,
+            end_line=11,
+            content="first excerpt",
+        ),
+        FrontierEvidence(
+            **{**base, **conflicting_identity},
+            start_line=30,
+            end_line=31,
+            content="second excerpt",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="citation groups must share source, path, and side"):
+        request(stage_config, evidence=evidence)
+
+
+def test_grouped_evidence_id_rejects_overlapping_excerpts():
+    stage_config = config()
+    evidence = (
+        FrontierEvidence(
+            evidence_id="context-request-1",
+            source="repository_context",
+            path="src/policy.py",
+            side="new",
+            start_line=10,
+            end_line=12,
+            content="first excerpt",
+        ),
+        FrontierEvidence(
+            evidence_id="context-request-1",
+            source="repository_context",
+            path="src/policy.py",
+            side="new",
+            start_line=12,
+            end_line=14,
+            content="overlapping excerpt",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="citation group excerpts must not overlap"):
+        request(stage_config, evidence=evidence)
 
 
 @pytest.mark.asyncio

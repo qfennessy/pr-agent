@@ -1648,6 +1648,47 @@ def test_incremental_sensitive_path_still_forces_deep_after_patch_mutation():
     assert candidate_sensitive_signals.deterministic_severity_floor.value == "high"
 
 
+def test_label_only_sensitive_route_applies_to_every_frontier_candidate():
+    raw_files = [
+        _incremental_raw_file("docs/guide.md"),
+        _incremental_raw_file("services/auth/guard.py"),
+    ]
+    provider = _MutatingIncrementalProvider(raw_files)
+    provider.get_pr_labels = MagicMock(return_value=["security-review"])
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = _routing_configuration(sensitive_categories=(
+        {
+            "name": "authorization",
+            "path_patterns": ["**/auth/**"],
+            "labels": [],
+        },
+        {
+            "name": "security_label",
+            "path_patterns": [],
+            "labels": ["security-review"],
+        },
+    ))
+    init_run_details()
+
+    decision = reviewer._prepare_review_route()
+
+    assert reviewer._frontier_sensitive_categories(
+        {"relevant_file": "services/auth/guard.py"}, decision
+    ) == ("authorization", "security_label")
+    assert reviewer._frontier_sensitive_categories(
+        {"relevant_file": "docs/guide.md"}, decision
+    ) == ("security_label",)
+    assert reviewer._frontier_sensitive_categories({}, decision) == ("security_label",)
+    _, unrelated_signals = reviewer._frontier_signals(
+        {"relevant_file": "docs/guide.md"}, {"normalized_severity": "medium"}, decision
+    )
+    assert unrelated_signals.sensitive is True
+    assert unrelated_signals.deterministic_forced is True
+    assert unrelated_signals.deterministic_severity_floor.value == "high"
+
+
 @pytest.mark.asyncio
 async def test_frontier_adjudication_binds_the_accepted_sensitive_candidate_on_identity_collision(
         monkeypatch):
