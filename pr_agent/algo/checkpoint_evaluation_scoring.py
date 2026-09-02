@@ -757,10 +757,19 @@ def _time_and_lineage_metrics(
         for observation in terminal.findings:
             key = (roots[case.case_id], observation.fingerprint)
             truth_instance = truth_instances.get(key)
+            withdrawal_case_id = withdrawals.get(key)
+            precedes_withdrawal = (
+                withdrawal_case_id is None
+                or (
+                    case.case_id != withdrawal_case_id
+                    and is_at_or_after(withdrawal_case_id, case.case_id)
+                )
+            )
             if (
                 observation.lifecycle_state is FindingLifecycleState.ACTIVE
                 and truth_instance is not None
                 and is_at_or_after(case.case_id, truth_instance[1])
+                and precedes_withdrawal
             ):
                 first_detection.setdefault(key, case)
 

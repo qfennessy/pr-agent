@@ -1059,6 +1059,9 @@ def test_stale_withdrawal_uses_lineage_ancestry_when_timing_is_missing():
     arm = score_matched_arms(manifest, truth, records).arms[0]
     assert arm.stale_finding_count == 1
     assert arm.metrics["stale_findings_withdrawn_rate"].value == 0
+    assert arm.metrics["incremental_recall_pre_commit"].value == 0
+    assert arm.metrics["time_to_first_valid_finding_p50_seconds"].status is MeasurementStatus.UNAVAILABLE
+    assert arm.metrics["cost_per_verified_finding"].status is MeasurementStatus.UNAVAILABLE
 
 
 def test_earliest_lineage_opportunity_is_independent_of_manifest_order_without_timing():
