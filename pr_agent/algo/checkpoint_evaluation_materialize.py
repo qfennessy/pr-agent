@@ -644,6 +644,7 @@ def _publish_single_file(path: Path, payload: bytes) -> None:
                 try:
                     os.fsync(parent_fd)
                 except OSError:
+                    # Best-effort cleanup durability must not hide the publication error.
                     pass
     finally:
         os.close(parent_fd)
@@ -688,6 +689,7 @@ def _publish_bundle(path: Path, payloads: Mapping[str, bytes]) -> None:
             try:
                 os.rmdir(staging_name, dir_fd=parent_fd)
             except OSError:
+                # Best-effort cleanup must not hide the original staging error.
                 pass
             raise
         published = False
@@ -719,6 +721,7 @@ def _publish_bundle(path: Path, payloads: Mapping[str, bytes]) -> None:
                 try:
                     os.fsync(parent_fd)
                 except OSError:
+                    # Best-effort cleanup durability must not hide the publication error.
                     pass
             os.close(staging_fd)
     finally:

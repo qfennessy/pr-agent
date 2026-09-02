@@ -9,13 +9,16 @@ import pr_agent.algo.checkpoint_evaluation_materialize as materialize_module
 from pr_agent.algo.checkpoint_evaluation import (EvaluationArm,
                                                  EvaluationArmKind,
                                                  EvaluationValidationError)
-from pr_agent.algo.checkpoint_evaluation_materialize import (
-    CHECKPOINT_CONTROL_MATERIALIZATION_SCHEMA_VERSION,
-    materialize_checkpoint_controls, write_review_snapshot_artifact)
 from pr_agent.algo.checkpoint_evaluation_snapshot import \
     load_review_snapshot_artifact
 from pr_agent.algo.review_snapshot import (CoverageIssue, ReviewEvent,
                                            ReviewSnapshot)
+
+CHECKPOINT_CONTROL_MATERIALIZATION_SCHEMA_VERSION = (
+    materialize_module.CHECKPOINT_CONTROL_MATERIALIZATION_SCHEMA_VERSION
+)
+materialize_checkpoint_controls = materialize_module.materialize_checkpoint_controls
+write_review_snapshot_artifact = materialize_module.write_review_snapshot_artifact
 
 
 def _hash(value: str) -> str:

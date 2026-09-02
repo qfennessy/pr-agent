@@ -1201,7 +1201,7 @@ def score_matched_arms(
                 overlap_metric.value,
                 overlap_metric.support,
             )
-        for event in ReviewEvent:
+        for event in (ReviewEvent.FILE_SAVE, ReviewEvent.WORKTREE_IDLE, ReviewEvent.PRE_COMMIT):
             event_case_count = sum(case.event is event for case in manifest.cases)
             event_records = [
                 record for case_id, record in terminals_by_case.items()

@@ -443,7 +443,8 @@ def test_shadow_journal_is_opt_in_source_free_and_non_blocking(tmp_path):
     path = tmp_path / "shadow.ndjson"
     writer = ShadowJournalWriter(path, enabled=True, max_queue_entries=4)
     assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
-    assert writer.close()
+    writer_closed = writer.close()
+    assert writer_closed
     payload = json.loads(path.read_text(encoding="utf-8"))
     serialized = json.dumps(payload)
     assert "raw-sensitive-fingerprint" not in serialized
@@ -524,7 +525,8 @@ def test_shadow_journal_preserves_and_revalidates_source_free_stage_telemetry(tm
         assert forbidden not in serialized
     writer = ShadowJournalWriter(tmp_path / "specialist-shadow.ndjson", enabled=True)
     assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
-    assert writer.close()
+    writer_closed = writer.close()
+    assert writer_closed
     persisted = json.loads((tmp_path / "specialist-shadow.ndjson").read_text(encoding="utf-8"))
     assert persisted["model_id"] is None
     assert persisted["stage_runs"][0]["model_id"] == arm.model_id
@@ -698,11 +700,13 @@ def test_shadow_journal_close_retries_when_the_bounded_queue_was_full(tmp_path, 
     assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
     assert worker_started.wait(1)
     assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
-    assert writer.close(timeout_seconds=0.01) is False
+    writer_closed = writer.close(timeout_seconds=0.01)
+    assert writer_closed is False
     assert writer.submit(entry) is ShadowSubmitStatus.CLOSED
 
     release_worker.set()
-    assert writer.close(timeout_seconds=1) is True
+    writer_closed = writer.close(timeout_seconds=1)
+    assert writer_closed is True
     assert writer._thread is not None and not writer._thread.is_alive()
 
 

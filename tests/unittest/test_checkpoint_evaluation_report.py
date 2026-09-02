@@ -26,17 +26,26 @@ from pr_agent.algo.checkpoint_evaluation import (CheckpointCase,
 from pr_agent.algo.checkpoint_evaluation_cocos import CocosCorpusInventory
 from pr_agent.algo.checkpoint_evaluation_execution import \
     EvaluationArtifactStore
-from pr_agent.algo.checkpoint_evaluation_report import (
-    DEFAULT_PAIR_REVIEW_GATE, LIVE_SHADOW_GATE, OFFLINE_REPLAY_GATE,
-    OPT_IN_PAIR_REVIEW_GATE, PR_PUBLICATION_GATE, PilotRolloutBudgets,
-    PilotRolloutEvidence, SettledCandidateRecord, ShadowJournalRecord,
-    build_checkpoint_pilot_report, build_cocos_pilot_acceptance,
-    build_replay_evidence_binding, build_settled_pilot_acceptance,
-    build_shadow_pilot_acceptance, canonical_rollout_gate_specs)
 from pr_agent.algo.checkpoint_evaluation_scoring import (ScoreMetric,
                                                          score_matched_arms)
 from pr_agent.algo.checkpoint_shadow_journal import ShadowJournalEntry
 from pr_agent.algo.review_snapshot import ReviewEvent
+
+DEFAULT_PAIR_REVIEW_GATE = report_module.DEFAULT_PAIR_REVIEW_GATE
+LIVE_SHADOW_GATE = report_module.LIVE_SHADOW_GATE
+OFFLINE_REPLAY_GATE = report_module.OFFLINE_REPLAY_GATE
+OPT_IN_PAIR_REVIEW_GATE = report_module.OPT_IN_PAIR_REVIEW_GATE
+PR_PUBLICATION_GATE = report_module.PR_PUBLICATION_GATE
+PilotRolloutBudgets = report_module.PilotRolloutBudgets
+PilotRolloutEvidence = report_module.PilotRolloutEvidence
+SettledCandidateRecord = report_module.SettledCandidateRecord
+ShadowJournalRecord = report_module.ShadowJournalRecord
+build_checkpoint_pilot_report = report_module.build_checkpoint_pilot_report
+build_cocos_pilot_acceptance = report_module.build_cocos_pilot_acceptance
+build_replay_evidence_binding = report_module.build_replay_evidence_binding
+build_settled_pilot_acceptance = report_module.build_settled_pilot_acceptance
+build_shadow_pilot_acceptance = report_module.build_shadow_pilot_acceptance
+canonical_rollout_gate_specs = report_module.canonical_rollout_gate_specs
 
 _PINNED_TEST_COCOS_ACCEPTANCE_ID = (
     "sha256:9ec1fe03abc2f789117761db1e76def38bc7d994c45df45d198572e9848dcf17"

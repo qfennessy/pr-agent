@@ -91,6 +91,8 @@ def run_evaluation_plan(inargs: Optional[Sequence[str]] = None) -> dict[str, Any
     """Validate and list a local plan without importing or invoking model clients."""
     parser = evaluation_plan_parser()
     args = parser.parse_args(inargs)
+    truth = None
+    external_corpus = None
     try:
         manifest = load_evaluation_manifest(args.manifest)
         truth = load_truth_artifact(args.truth, manifest) if args.truth else None
@@ -98,7 +100,6 @@ def run_evaluation_plan(inargs: Optional[Sequence[str]] = None) -> dict[str, Any
             raise EvaluationValidationError("--cocos-corpus-root and --cocos-lock must be supplied together")
         if args.checkpoint_controls and not args.cocos_corpus_root:
             raise EvaluationValidationError("--checkpoint-controls requires the Cocos external corpus adapter")
-        external_corpus = None
         if args.cocos_corpus_root:
             lock = CocosCorpusLock.from_dict(_load_json_object(args.cocos_lock, "--cocos-lock"))
             external_corpus = validate_cocos_story_corpus(
