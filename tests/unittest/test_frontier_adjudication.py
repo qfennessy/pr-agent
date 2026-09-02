@@ -3,6 +3,7 @@ import json
 import threading
 import time
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -563,24 +564,8 @@ async def test_async_identity_refresh_remains_supported():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failed_refresh", [1, 2])
-@pytest.mark.parametrize(
-    ("failure_value", "expected_state", "expected_reason"),
-    [
-        (None, FrontierState.UNAVAILABLE, "identity_refresh_unavailable"),
-        (
-            RuntimeError("provider unavailable"),
-            FrontierState.UNAVAILABLE,
-            "identity_refresh_failed",
-        ),
-    ],
-)
-async def test_identity_refresh_availability_is_distinct_from_stale_snapshot(
-    failed_refresh,
-    failure_value,
-    expected_state,
-    expected_reason,
-):
+@pytest.mark.parametrize("failed_refresh", [1, 2], ids=["pre", "post"])
+async def test_unavailable_identity_refresh_is_distinct_from_stale_snapshot(failed_refresh):
     init_run_details()
     stage_config = config()
     handler = FakeHandler([output()])
@@ -590,9 +575,7 @@ async def test_identity_refresh_availability_is_distinct_from_stale_snapshot(
         nonlocal refresh_count
         refresh_count += 1
         if refresh_count == failed_refresh:
-            if isinstance(failure_value, Exception):
-                raise failure_value
-            return failure_value
+            return None
         return "head-1"
 
     result = await run_frontier_adjudication(
@@ -602,24 +585,77 @@ async def test_identity_refresh_availability_is_distinct_from_stale_snapshot(
         current_identity=current_identity,
     )
 
-    assert result.state is expected_state
-    assert result.failure_reason == expected_reason
-    assert result.telemetry["state"] == expected_state.value
-    assert result.telemetry["failure_reason"] == expected_reason
+    assert result.state is FrontierState.UNAVAILABLE
+    assert result.failure_reason == "identity_refresh_unavailable"
+    assert result.telemetry["state"] == "unavailable"
+    assert result.telemetry["failure_reason"] == "identity_refresh_unavailable"
     assert handler.calls == ([] if failed_refresh == 1 else ["frontier-primary"])
 
 
 @pytest.mark.asyncio
-async def test_success_latency_includes_final_identity_refresh():
+@pytest.mark.parametrize("failed_refresh", [1, 2], ids=["pre", "post"])
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+async def test_identity_refresh_exception_is_source_free_provider_unavailable(
+    failed_refresh,
+    asynchronous,
+):
     init_run_details()
-    stage_config = config(stage_timeout=0.5)
+    stage_config = config()
+    handler = FakeHandler([output()])
     refresh_count = 0
+    private_error = "provider failed for src/auth.py object_by_id"
 
-    def delayed_final_identity_refresh():
+    def failing_identity_refresh():
+        nonlocal refresh_count
+        refresh_count += 1
+        if refresh_count == failed_refresh:
+            raise RuntimeError(private_error)
+        return "head-1"
+
+    async def failing_async_identity_refresh():
+        await asyncio.sleep(0)
+        return failing_identity_refresh()
+
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        handler,
+        current_identity=(
+            failing_async_identity_refresh if asynchronous else failing_identity_refresh
+        ),
+    )
+
+    assert refresh_count == failed_refresh
+    assert handler.calls == ([] if failed_refresh == 1 else ["frontier-primary"])
+    assert result.decision is FrontierDecision.UNAVAILABLE
+    assert result.state is FrontierState.UNAVAILABLE
+    assert result.failure_reason == "identity_refresh_failed"
+    assert result.normalized_finding is None
+    assert result.telemetry["state"] == "unavailable"
+    assert result.telemetry["failure_reason"] == "identity_refresh_failed"
+    serialized = json.dumps(result.to_telemetry_dict())
+    assert private_error not in serialized
+    assert "src/auth.py" not in serialized
+    assert "object_by_id" not in serialized
+    assert "stale_snapshot" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_success_latency_includes_final_identity_refresh(monkeypatch):
+    init_run_details()
+    stage_config = config(stage_timeout=1)
+    refresh_count = 0
+    clock = {"now": 0.0}
+    monkeypatch.setattr(
+        "pr_agent.algo.frontier_adjudication.time",
+        SimpleNamespace(monotonic=lambda: clock["now"]),
+    )
+
+    async def delayed_final_identity_refresh():
         nonlocal refresh_count
         refresh_count += 1
         if refresh_count == 2:
-            time.sleep(0.03)
+            clock["now"] += 0.75
         return "head-1"
 
     result = await run_frontier_adjudication(
@@ -631,7 +667,11 @@ async def test_success_latency_includes_final_identity_refresh():
 
     assert result.state is FrontierState.CONFIRMED
     assert refresh_count == 2
-    assert result.telemetry["latency_seconds"] >= 0.02
+    assert result.telemetry["latency_seconds"] == pytest.approx(0.75)
+    assert (
+        get_run_details().adjudication_runs["sha256:finding"].latency_seconds
+        == pytest.approx(0.75)
+    )
 
 
 @pytest.mark.asyncio
