@@ -86,6 +86,7 @@ from pr_agent.algo.review_specialists import (
     validate_specialist_output,
 )
 from pr_agent.algo.run_details import (
+    adjudication_runs_to_dict,
     get_run_details,
     init_run_details,
     record_review_profile,
@@ -1606,10 +1607,14 @@ class PRReviewer:
                 return "unknown_candidate"
             if candidate_id in seen_ids:
                 return "duplicate_decision"
-            if str(decision.get("verdict") or "").strip().lower() not in {"verified", "rejected"}:
+            verdict = str(decision.get("verdict") or "").strip().lower()
+            if verdict not in {"verified", "rejected"}:
                 return "invalid_verdict"
             severity = decision.get("normalized_severity")
-            if severity is not None and str(severity).strip().lower() not in {"low", "medium", "high", "critical"}:
+            normalized_severity = str(severity).strip().lower() if severity is not None else None
+            if verdict == "verified" and normalized_severity not in {"low", "medium", "high", "critical"}:
+                return "invalid_severity"
+            if severity is not None and normalized_severity not in {"low", "medium", "high", "critical"}:
                 return "invalid_severity"
             confidence = decision.get("confidence")
             if confidence is not None and (
@@ -1630,7 +1635,7 @@ class PRReviewer:
                 or any(not isinstance(question, str) or not question.strip() for question in unresolved_questions)
             ):
                 return "invalid_unresolved_questions"
-            if str(decision.get("verdict") or "").strip().lower() == "verified":
+            if verdict == "verified":
                 required_text = (
                     "issue_header", "issue_content", "trigger", "impact",
                 )
@@ -1805,6 +1810,59 @@ class PRReviewer:
             return NormalizedSeverity.LOW
         return NormalizedSeverity.MEDIUM
 
+    @staticmethod
+    def _frontier_sensitive_categories(
+        candidate: Mapping[str, Any],
+        route_decision: Optional[ReviewRouteDecision],
+    ) -> tuple[str, ...]:
+        """Return deterministic sensitive categories bound to this candidate path."""
+
+        candidate_path = safe_repo_path(candidate.get("relevant_file"))
+        categories = ["candidate_verification"] if candidate.get("sensitive_path") is True else []
+        if candidate_path and route_decision is not None:
+            for reason in route_decision.reasons:
+                if not reason.code.startswith("sensitive_category:"):
+                    continue
+                matched_paths = {
+                    safe_repo_path(item.removeprefix("path:"))
+                    for item in reason.evidence
+                    if isinstance(item, str) and item.startswith("path:")
+                }
+                if candidate_path in matched_paths:
+                    categories.append(reason.code.removeprefix("sensitive_category:"))
+        return tuple(dict.fromkeys(categories))
+
+    @classmethod
+    def _frontier_signals(
+        cls,
+        candidate: Mapping[str, Any],
+        decision: Mapping[str, Any],
+        route_decision: Optional[ReviewRouteDecision],
+    ) -> tuple[NormalizedSeverity, FrontierSignals]:
+        """Build per-finding escalation signals from verifier and deterministic routing evidence."""
+
+        severity = cls._frontier_candidate_severity(candidate, decision)
+        sensitive_categories = cls._frontier_sensitive_categories(candidate, route_decision)
+        questions = tuple(decision.get("_unresolved_questions") or ())
+        sensitive = bool(sensitive_categories)
+        return severity, FrontierSignals(
+            sensitive=sensitive,
+            severe=severity in {NormalizedSeverity.HIGH, NormalizedSeverity.CRITICAL},
+            disputed=decision.get("disputed") is True,
+            insufficient_evidence=(
+                decision.get("evidence_status") == "insufficient" or bool(questions)
+            ),
+            deterministic_forced=sensitive,
+            deterministic_severity_floor=(
+                NormalizedSeverity.HIGH if sensitive else NormalizedSeverity.LOW
+            ),
+            reasons=tuple(
+                f"deterministic_sensitive_route:{category}"
+                for category in sensitive_categories
+            ),
+            unresolved_questions=questions,
+        )
+
     async def _run_frontier_adjudications(
         self,
         verified_findings: list[dict],
@@ -1848,20 +1906,29 @@ class PRReviewer:
             artifact.update({"status": "unavailable", "failure": "stable_identity_unavailable"})
             return
 
-        candidate_by_identity = {}
+        accepted_candidate_ids = {
+            item.get("candidate_id")
+            for item in decisions
+            if (
+                isinstance(item, dict)
+                and item.get("candidate_id")
+                and item.get("verdict") == "verified"
+                and not item.get("reason")
+            )
+        }
+        candidates_by_identity = {}
         for candidate in candidates:
+            if candidate.get("candidate_id") not in accepted_candidate_ids:
+                continue
             identity = verified_finding_identity(candidate)
             if identity is not None:
-                candidate_by_identity[identity] = candidate
+                candidates_by_identity.setdefault(identity, []).append(candidate)
         decision_by_candidate = {
             item.get("candidate_id"): item
             for item in decisions
             if isinstance(item, dict) and item.get("candidate_id")
         }
         route_decision = getattr(self, "review_route_decision", None)
-        route_sensitive = bool(
-            route_decision is not None and route_decision.matched_sensitive_categories
-        )
         risk_policy_version = (
             route_decision.policy_version if route_decision is not None else "review-router-unavailable"
         )
@@ -1870,31 +1937,20 @@ class PRReviewer:
         call_count = 0
         for finding in verified_findings:
             identity = (finding.get("root_cause_id"), finding.get("trusted_stable_key"))
-            candidate = candidate_by_identity.get(identity)
-            if candidate is None:
+            matching_candidates = candidates_by_identity.get(identity, [])
+            if len(matching_candidates) != 1:
                 artifact["results"].append({
                     "state": "unavailable",
                     "failure_reason": "trusted_candidate_identity_unavailable",
                     "publication_safe": False,
                 })
                 continue
+            candidate = matching_candidates[0]
             decision = decision_by_candidate.get(candidate.get("candidate_id"), {})
-            severity = self._frontier_candidate_severity(candidate, decision)
-            sensitive = bool(candidate.get("sensitive_path")) or route_sensitive
-            questions = tuple(decision.get("_unresolved_questions") or ())
-            signals = FrontierSignals(
-                sensitive=sensitive,
-                severe=severity in {NormalizedSeverity.HIGH, NormalizedSeverity.CRITICAL},
-                disputed=decision.get("disputed") is True,
-                insufficient_evidence=(
-                    decision.get("evidence_status") == "insufficient" or bool(questions)
-                ),
-                deterministic_forced=sensitive,
-                deterministic_severity_floor=(
-                    NormalizedSeverity.HIGH if sensitive else NormalizedSeverity.LOW
-                ),
-                reasons=("deterministic_sensitive_route",) if sensitive else (),
-                unresolved_questions=questions,
+            severity, signals = self._frontier_signals(
+                candidate,
+                decision,
+                route_decision,
             )
             if not signals.requires_escalation:
                 continue
@@ -1950,13 +2006,13 @@ class PRReviewer:
             )
             call_count += 1
             artifact["results"].append(result.to_telemetry_dict())
-        if not eligible_count:
-            artifact["status"] = "not_required"
-        elif any(
+        if any(
             result.get("state") not in {"confirmed", "rejected"}
             for result in artifact["results"]
         ):
             artifact["status"] = "partial"
+        elif not eligible_count:
+            artifact["status"] = "not_required"
         else:
             artifact["status"] = "complete"
 
@@ -2524,6 +2580,12 @@ class PRReviewer:
                 structured_data["candidate_verification"] = telemetry_safe_artifact(
                     self.candidate_verification_artifact
                 )
+            frontier_artifact = getattr(self, "frontier_adjudication_artifact", None)
+            if frontier_artifact is not None:
+                structured_data["frontier_adjudication"] = copy.deepcopy(frontier_artifact)
+            adjudication_runs = adjudication_runs_to_dict(details)
+            if adjudication_runs:
+                structured_data["adjudication_runs"] = adjudication_runs
             review_route_decision = getattr(self, "review_route_decision", None)
             if review_route_decision is not None and review_route_decision.routing_enabled:
                 structured_data["metadata"]["review_route"] = review_route_decision_to_dict(

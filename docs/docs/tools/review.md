@@ -483,6 +483,8 @@ overflow priority, and removed ranges are selected before added ranges within th
 text is passed to the verifier as untrusted data. Structured review publishers receive a
 `candidate_verification` artifact containing candidate and decision counts, the verifier model and call count, retrieval
 statuses, budget usage, latency, and concise rejection or failure reasons.
+Every verified decision must include a normalized `low`, `medium`, `high`, or `critical` severity; a missing or invalid
+severity fails the verifier response closed instead of falling back to wording in the first-pass finding title.
 
 Verifier model/deployment pairs use an immutable request-local route. Azure deployments must be explicit when the verifier
 or any fallback differs from the primary reviewer model; missing or mismatched routes fail closed. Prompt clipping reserves
@@ -504,8 +506,9 @@ models, or budgets change.
 Frontier adjudication is a separate, default-off production stage after candidate verification. It receives only an
 already verified finding with its trusted stable and root-cause identities, bounded evidence that verification already
 gathered, upward-only risk signals, and the exact snapshot/head, configuration, prompt, and policy identities. It runs
-only for a sensitive, high/critical, disputed, or explicitly insufficient case. An ordinary finding does not make a
-frontier call.
+only for a sensitive, high/critical, disputed, or explicitly insufficient case. Sensitive-path routing is matched to
+the finding's own path, so an unrelated finding in a mixed pull request does not inherit another file's risk floor or
+make a frontier call.
 
 ```toml
 [pr_reviewer]
@@ -527,17 +530,31 @@ frontier_adjudication_minimum_confidence = 0.0
 frontier_adjudication_max_calls = 3
 ```
 
-Every primary and fallback entry needs an exact provider and revision identity. Fallback entries only recover from
-availability failures while performing the same adjudication; they are not another review vote. The output contract is
-versioned and allows only `confirm`, `reject`, or `unavailable`. Confirmed severity cannot fall below a deterministic
-risk floor. Unknown citations, malformed output, timeout, provider failure, a changed snapshot, missing model identity,
-missing usage, or incomplete pricing turns the result into `unavailable` rather than a clean result.
+Every primary and fallback entry needs a unique model/deployment route and an exact provider and immutable revision
+identity. The configured provider and revision must match identity metadata returned by the successful completion;
+missing metadata, rolling aliases, and mismatches remain unavailable. Fallback entries only recover from availability
+failures while performing the same adjudication; they are not another review vote. The output contract is versioned and
+allows only `confirm`, `reject`, or `unavailable`. Confirmed severity cannot fall below a deterministic risk floor.
+Unknown citations, malformed output, timeout, provider failure, a changed snapshot, missing model identity, missing
+usage, or incomplete pricing turns the result into `unavailable` rather than a clean result.
 
-The stage has its own `RunDetails.adjudication_runs` accounting for model/deployment/provider/revision, route attempts,
-fallback use, configured provider retries, latency, tokens, cost, cache state, confidence, and failure state. These
-records are telemetry only: the stage does not alter `verified_review_data`, publish comments, execute repository code,
-block a save, approve a pull request, or merge. Keep the flag off until the #27 replay and rollout gates pass. Roll back
-by setting `enable_frontier_adjudication = false`; no other review behavior needs to change.
+The stage has its own `RunDetails.adjudication_runs` accounting for model/deployment/provider/revision, exact route
+attempts, fallback use, configured model and provider retry policies, latency, tokens, cost, cache state, confidence,
+and failure state. `route_attempts` counts primary/fallback route entries invoked. `retries.model.attempts` counts every
+model-handler attempt across those routes, including each route's first attempt, while
+`retries.model.retry_attempts` counts only attempts after the first for a route. These model counts are required for a
+usable adjudication result; missing or inconsistent counts fail closed as incomplete telemetry. Provider-client retry
+attempts are not observable, so an enabled frontier route currently requires
+`frontier_adjudication_provider_retries = 0`. With SDK retries disabled, `retries.provider.attempts` is counted at the
+provider-call boundary, must match the observable model-attempt count, and `retry_attempts` is therefore zero. A
+positive provider retry budget is rejected before a paid call rather than inventing a zero or understating retries;
+the unavailable ledger form uses `unavailable_reason = provider_internal_attempts_not_exposed`. Frontier requests
+collect their attributed cost independently of the global `output_run_cost` display setting. The source-free
+aggregate is exported as `frontier_adjudication` and its per-finding ledger as `adjudication_runs` in structured review
+data for replay and rollout consumers. These records are telemetry only: the stage does not alter
+`verified_review_data`, publish comments, execute repository code, block a save, approve a pull request, or merge. Keep
+the flag off until the #27 replay and rollout gates pass. Roll back by setting `enable_frontier_adjudication = false`;
+no other review behavior needs to change.
 
 ## Usage Tips
 

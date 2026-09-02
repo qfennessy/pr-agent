@@ -28,7 +28,12 @@ from pr_agent.algo.ai_handlers.litellm_helpers import (
     _response_field,
 )
 from pr_agent.algo.ai_request_context import get_ai_request_options
-from pr_agent.algo.run_details import _as_decimal_cost, record_ai_call
+from pr_agent.algo.run_details import (
+    _as_decimal_cost,
+    record_ai_call,
+    record_model_request_attempt,
+    record_provider_request_attempt,
+)
 from pr_agent.algo.utils import ReasoningEffort, get_version
 from pr_agent.config_loader import get_settings, get_verbosity_level
 from pr_agent.log import get_logger
@@ -195,6 +200,13 @@ def _model_retries_stop(retry_state) -> bool:
         )
         attempts = MODEL_RETRIES
     return retry_state.attempt_number >= max(1, attempts)
+
+
+def _record_model_retry_attempt(retry_state) -> None:
+    """Record Tenacity attempts after the route's provider-neutral first attempt."""
+
+    if retry_state.attempt_number > 1:
+        record_model_request_attempt()
 
 
 class LiteLLMAIHandler(BaseAiHandler):
@@ -566,9 +578,13 @@ class LiteLLMAIHandler(BaseAiHandler):
     def _record_completion_metadata(response, model=None, display_model=None) -> None:
         """Count a successful call and synchronously collect usage-based cost when possible."""
         usage = _response_field(response, "usage")
+        request_options = get_ai_request_options()
 
         cost_usd = None
-        if get_settings().get("config.output_run_cost", False):
+        if (
+            get_settings().get("config.output_run_cost", False)
+            or (request_options is not None and request_options.collect_cost)
+        ):
             # The guard covers the whole cost block, not just completion_cost:
             # reading inline costs and probing usage call model_dump() on
             # provider-specific objects, and a cost estimate must never fail a
@@ -589,7 +605,27 @@ class LiteLLMAIHandler(BaseAiHandler):
                 get_logger().debug(f"Unable to estimate API cost for model {model}: {type(e).__name__}")
 
         recorded_model = display_model if display_model is not None else model
-        record_ai_call(usage, model=recorded_model, cost_usd=cost_usd)
+        provider, model_revision = LiteLLMAIHandler._read_completion_identity(response)
+        record_ai_call(
+            usage,
+            model=recorded_model,
+            cost_usd=cost_usd,
+            provider=provider,
+            model_revision=model_revision,
+        )
+
+    @staticmethod
+    def _read_completion_identity(response) -> tuple[str | None, str | None]:
+        """Read provider-issued identity metadata without trusting the requested alias."""
+
+        hidden_params = _response_field(response, "_hidden_params")
+        provider = _response_field(response, "provider")
+        if not provider and isinstance(hidden_params, dict):
+            provider = hidden_params.get("custom_llm_provider") or hidden_params.get("provider")
+        revision = _response_field(response, "model")
+        normalized_provider = str(provider).strip().casefold() if provider else None
+        normalized_revision = str(revision).strip() if revision else None
+        return normalized_provider or None, normalized_revision or None
 
     @staticmethod
     def _read_positive_response_cost(response, usage):
@@ -874,6 +910,7 @@ class LiteLLMAIHandler(BaseAiHandler):
     @retry(
         retry=retry_if_exception_type(openai.APIError) & retry_if_not_exception_type(openai.RateLimitError),
         stop=_model_retries_stop,
+        before=_record_model_retry_attempt,
         reraise=True,  # surface the provider's error; RetryError hides the reason
     )
     async def chat_completion(self, model: str, system: str, user: str, temperature: float = 0.2, img_path: str = None):
@@ -1444,9 +1481,11 @@ class LiteLLMAIHandler(BaseAiHandler):
                 )
             else:
                 get_logger().info(f"Using streaming mode for model {model}")
+            record_provider_request_attempt()
             response = await acompletion(**kwargs)
             return await _handle_streaming_response(response, model=model)
         else:
+            record_provider_request_attempt()
             response = await acompletion(**kwargs)
             if response is None or len(response["choices"]) == 0:
                 raise openai.APIError(

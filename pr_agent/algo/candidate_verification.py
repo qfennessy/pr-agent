@@ -2670,11 +2670,6 @@ def _verified_anchor_shape_id(candidate: dict) -> Optional[str]:
     return f"sha256:{digest}"
 
 
-# Preserve the private name for downstream imports while the production contract
-# moves to the public identity helper used by frontier adjudication.
-_verified_finding_identity = verified_finding_identity
-
-
 def apply_verification_decisions(
     candidates: list[dict],
     evidence: list[dict],

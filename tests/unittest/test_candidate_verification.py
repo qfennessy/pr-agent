@@ -519,13 +519,13 @@ def test_anchor_shape_preserves_line_partitions_to_avoid_root_identity_collision
     two_line_shape, two_line_ordinal = candidate_verification._changed_anchor_identity(
         patch_text, 2, 3
     )
-    one_line_identity = candidate_verification._verified_finding_identity({
+    one_line_identity = candidate_verification.verified_finding_identity({
         "_changed_anchor_shape": one_line_shape,
         "_changed_anchor_ordinal": one_line_ordinal,
         "_trusted_defect_ordinal": 1,
         "_trusted_lineage_key": "file:src/service.py",
     })
-    two_line_identity = candidate_verification._verified_finding_identity({
+    two_line_identity = candidate_verification.verified_finding_identity({
         "_changed_anchor_shape": two_line_shape,
         "_changed_anchor_ordinal": two_line_ordinal,
         "_trusted_defect_ordinal": 1,
@@ -1649,7 +1649,7 @@ def test_same_anchor_defect_identity_multiset_is_stable_when_candidates_reorder(
         )
         assert rejected == []
         return {
-            candidate_verification._verified_finding_identity(candidate)
+            candidate_verification.verified_finding_identity(candidate)
             for candidate in candidates
         }
 
@@ -5919,6 +5919,7 @@ async def test_verified_sensitive_finding_cannot_escape_an_all_invalid_model_can
         "      start_line: 12\n      end_line: 12\n"
         "      issue_header: Sensitive regression\n"
         "      issue_content: The changed policy permits unauthorized access.\n"
+        "      normalized_severity: high\n"
         "      trigger: A request reaches the changed policy.\n"
         "      impact: Unauthorized access is allowed.\n"
         "      evidence_paths: [auth/policy.py]\n",
@@ -5991,6 +5992,7 @@ async def test_model_candidate_budget_has_exact_fail_closed_boundary(
                 f"      end_line: {line}\n"
                 "      issue_header: Verified bug\n"
                 "      issue_content: The changed code has a verified defect.\n"
+                "      normalized_severity: high\n"
                 "      trigger: The changed branch executes.\n"
                 "      impact: The request fails.\n"
                 "      evidence_paths: [src/service.py]"
@@ -6153,7 +6155,8 @@ async def test_verification_failure_suppresses_false_clean_publication(
             "verification:\n"
             "  decisions:\n"
             "    - candidate_id: candidate-1\n"
-            "      verdict: verified",
+            "      verdict: verified\n"
+            "      normalized_severity: high",
             None,
         ))
     elif failure_mode == "wrong_verified_types":
@@ -6167,6 +6170,7 @@ async def test_verification_failure_suppresses_false_clean_publication(
             "      end_line: 12\n"
             "      issue_header: Bug\n"
             "      issue_content: Incorrect behavior.\n"
+            "      normalized_severity: high\n"
             "      trigger: Concrete trigger.\n"
             "      impact: Concrete impact.\n"
             "      evidence_paths: src/service.py",
@@ -6658,6 +6662,7 @@ async def test_orchestration_retains_deleted_candidate_patch_when_global_diff_is
         "      start_line: 10\n      end_line: 10\n"
         "      issue_header: Sensitive regression\n"
         "      issue_content: The deleted guard permits unauthorized access.\n"
+        "      normalized_severity: high\n"
         "      trigger: A request reaches the policy without the deleted guard.\n"
         "      impact: Unauthorized access is allowed.\n"
         "      evidence_paths: [auth/policy.py]\n",
@@ -6705,12 +6710,14 @@ async def test_orchestration_applies_global_finding_limit_after_verification():
         "    - candidate_id: candidate-1\n      verdict: verified\n"
         "      relevant_file: src/service.py\n      start_line: 12\n      end_line: 12\n"
         "      issue_header: First bug\n      issue_content: First verified defect.\n"
+        "      normalized_severity: high\n"
         "      trigger: The first changed branch runs.\n"
         "      impact: The first request fails.\n"
         "      evidence_paths: [src/service.py]\n"
         "    - candidate_id: candidate-2\n      verdict: verified\n"
         "      relevant_file: src/service.py\n      start_line: 13\n      end_line: 13\n"
         "      issue_header: Second bug\n      issue_content: Second verified defect.\n"
+        "      normalized_severity: high\n"
         "      trigger: The second changed branch runs.\n"
         "      impact: The second request fails.\n"
         "      evidence_paths: [src/service.py]\n",

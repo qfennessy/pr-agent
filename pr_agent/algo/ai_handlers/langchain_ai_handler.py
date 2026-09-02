@@ -14,11 +14,18 @@ from tenacity import retry, retry_if_exception_type, retry_if_not_exception_type
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_request_context import get_ai_request_options
-from pr_agent.algo.run_details import record_ai_call
+from pr_agent.algo.run_details import record_ai_call, record_model_request_attempt
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 
 OPENAI_RETRIES = 5
+
+
+def _record_model_retry_attempt(retry_state) -> None:
+    """Record attempts after the route's provider-neutral first attempt."""
+
+    if retry_state.attempt_number > 1:
+        record_model_request_attempt()
 
 
 class LangChainOpenAIHandler(BaseAiHandler):
@@ -70,6 +77,7 @@ class LangChainOpenAIHandler(BaseAiHandler):
     @retry(
         retry=retry_if_exception_type(openai.APIError) & retry_if_not_exception_type(openai.RateLimitError),
         stop=stop_after_attempt(OPENAI_RETRIES),
+        before=_record_model_retry_attempt,
     )
     async def chat_completion(self, model: str, system: str, user: str, temperature: float = 0.2, img_path: str = None):
         if img_path:

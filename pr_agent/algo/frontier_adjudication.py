@@ -261,6 +261,27 @@ class FrontierAdjudicationConfig:
     def __post_init__(self) -> None:
         if len(self.model_identities) != len(self.route.models):
             raise FrontierContractError("frontier model identities must match the availability route")
+        if self.route.collect_cost is not True:
+            raise FrontierContractError("frontier route must collect attributed cost telemetry")
+        if self.enabled and (
+            not isinstance(self.route.model_retries, int)
+            or isinstance(self.route.model_retries, bool)
+            or self.route.model_retries < 1
+        ):
+            raise FrontierContractError(
+                "enabled frontier route requires an explicit positive model-attempt limit"
+            )
+        if self.enabled and (
+            not isinstance(self.route.provider_retries, int)
+            or isinstance(self.route.provider_retries, bool)
+            or self.route.provider_retries != 0
+        ):
+            raise FrontierContractError(
+                "enabled frontier route requires provider retries to be disabled for exact telemetry"
+            )
+        route_keys = [(identity.model, identity.deployment) for identity in self.model_identities]
+        if len(route_keys) != len(set(route_keys)):
+            raise FrontierContractError("frontier model and deployment route identities must be unique")
         for index, identity in enumerate(self.model_identities):
             if identity.model != self.route.models[index] or identity.deployment != self.route.deployments[index]:
                 raise FrontierContractError("frontier model identity does not match its route entry")
@@ -301,6 +322,7 @@ class FrontierAdjudicationConfig:
             "model_retries": self.route.model_retries,
             "provider_retries": self.route.provider_retries,
             "max_output_tokens": self.route.max_output_tokens,
+            "collect_cost": self.route.collect_cost,
         }
         return _hash_json(payload)
 
@@ -463,6 +485,7 @@ def load_frontier_adjudication_config(
         model_retries=model_retries,
         provider_retries=provider_retries,
         max_output_tokens=max_output_tokens,
+        collect_cost=True,
     )
     enabled = section.get("enable_frontier_adjudication", False)
     if isinstance(enabled, str):
@@ -626,14 +649,99 @@ def _model_identity(
 def _telemetry_complete(telemetry: Mapping[str, Any]) -> bool:
     usage = telemetry.get("usage") if isinstance(telemetry, Mapping) else None
     cost = telemetry.get("cost") if isinstance(telemetry, Mapping) else None
+    retries = telemetry.get("retries") if isinstance(telemetry, Mapping) else None
+    model_retries = retries.get("model") if isinstance(retries, Mapping) else None
+    provider_retries = retries.get("provider") if isinstance(retries, Mapping) else None
+    route_attempts = telemetry.get("route_attempts")
+
+    route_attempts_complete = (
+        isinstance(route_attempts, int)
+        and not isinstance(route_attempts, bool)
+        and route_attempts >= 1
+    )
+    model_attempts = (
+        model_retries.get("attempts") if isinstance(model_retries, Mapping) else None
+    )
+    model_retry_attempts = (
+        model_retries.get("retry_attempts")
+        if isinstance(model_retries, Mapping)
+        else None
+    )
+    configured_model_attempts = (
+        model_retries.get("configured_attempts_per_model")
+        if isinstance(model_retries, Mapping)
+        else None
+    )
+    model_retry_telemetry_complete = bool(
+        isinstance(model_retries, Mapping)
+        and model_retries.get("status") == "complete"
+        and isinstance(configured_model_attempts, int)
+        and not isinstance(configured_model_attempts, bool)
+        and configured_model_attempts >= 1
+        and isinstance(model_attempts, int)
+        and not isinstance(model_attempts, bool)
+        and isinstance(model_retry_attempts, int)
+        and not isinstance(model_retry_attempts, bool)
+        and route_attempts_complete
+        and model_attempts >= route_attempts
+        and model_attempts <= route_attempts * configured_model_attempts
+        and model_retry_attempts == model_attempts - route_attempts
+    )
+    configured_provider_retries = (
+        provider_retries.get("configured_retries_per_model_attempt")
+        if isinstance(provider_retries, Mapping)
+        else None
+    )
+    provider_attempts = (
+        provider_retries.get("attempts")
+        if isinstance(provider_retries, Mapping)
+        else None
+    )
+    provider_retry_attempts = (
+        provider_retries.get("retry_attempts")
+        if isinstance(provider_retries, Mapping)
+        else None
+    )
+    provider_retry_telemetry_complete = bool(
+        isinstance(provider_retries, Mapping)
+        and provider_retries.get("status") == "complete"
+        and isinstance(configured_provider_retries, int)
+        and not isinstance(configured_provider_retries, bool)
+        and configured_provider_retries == 0
+        and isinstance(provider_attempts, int)
+        and not isinstance(provider_attempts, bool)
+        and isinstance(provider_retry_attempts, int)
+        and not isinstance(provider_retry_attempts, bool)
+        and isinstance(model_attempts, int)
+        and provider_attempts == model_attempts
+        and provider_retry_attempts == 0
+        and provider_retries.get("unavailable_reason") is None
+    )
     return bool(
         telemetry.get("model")
         and telemetry.get("provider")
         and telemetry.get("model_revision")
+        and route_attempts_complete
+        and model_retry_telemetry_complete
+        and provider_retry_telemetry_complete
         and isinstance(usage, Mapping)
         and usage.get("status") == "complete"
         and isinstance(cost, Mapping)
         and cost.get("status") == "complete"
+    )
+
+
+def _completion_identity_verified(
+    configured: Optional[FrontierModelIdentity],
+    telemetry: Mapping[str, Any],
+) -> bool:
+    """Require provider-issued completion identity to match the pinned route entry."""
+
+    return bool(
+        configured is not None
+        and telemetry.get("provider")
+        and str(telemetry["provider"]).casefold() == configured.provider.casefold()
+        and telemetry.get("model_revision") == configured.revision
     )
 
 
@@ -707,15 +815,18 @@ async def run_frontier_adjudication(
     elapsed = time.monotonic() - started_at
     details = get_run_details()
     existing = details.adjudication_runs.get(finding_id) if details is not None else None
-    identity = _model_identity(
+    configured_identity = _model_identity(
         config,
         existing.model_used if existing is not None else None,
         existing.deployment_id if existing is not None else None,
     )
+    actual_provider = existing.provider if existing is not None else None
+    actual_revision = existing.model_revision if existing is not None else None
     record_adjudication_result(
         finding_id,
-        provider=identity.provider if identity is not None else None,
-        model_revision=identity.revision if identity is not None else None,
+        provider=actual_provider,
+        model_revision=actual_revision,
+        model_attempts_configured=config.route.model_retries,
         provider_retries_configured=config.route.provider_retries,
         prompt_version=config.prompt_version,
         input_schema_version=config.input_schema_version,
@@ -728,8 +839,9 @@ async def run_frontier_adjudication(
     if await _refresh_identity(current_identity) != request.snapshot_id:
         record_adjudication_result(
             finding_id,
-            provider=identity.provider if identity is not None else None,
-            model_revision=identity.revision if identity is not None else None,
+            provider=actual_provider,
+            model_revision=actual_revision,
+            model_attempts_configured=config.route.model_retries,
             provider_retries_configured=config.route.provider_retries,
             prompt_version=config.prompt_version,
             input_schema_version=config.input_schema_version,
@@ -743,11 +855,27 @@ async def run_frontier_adjudication(
         return _unavailable(request, state, failure_reason or "unavailable")
 
     telemetry = adjudication_runs_to_dict().get(finding_id, {})
+    if not _completion_identity_verified(configured_identity, telemetry):
+        record_adjudication_result(
+            finding_id,
+            provider=actual_provider,
+            model_revision=actual_revision,
+            model_attempts_configured=config.route.model_retries,
+            provider_retries_configured=config.route.provider_retries,
+            prompt_version=config.prompt_version,
+            input_schema_version=config.input_schema_version,
+            schema_version=config.output_schema_version,
+            state=FrontierState.UNAVAILABLE.value,
+            latency_seconds=elapsed,
+            failure_reason="completion_identity_unverified",
+        )
+        return _unavailable(request, FrontierState.UNAVAILABLE, "completion_identity_unverified")
     if not _telemetry_complete(telemetry):
         record_adjudication_result(
             finding_id,
-            provider=identity.provider if identity is not None else None,
-            model_revision=identity.revision if identity is not None else None,
+            provider=actual_provider,
+            model_revision=actual_revision,
+            model_attempts_configured=config.route.model_retries,
             provider_retries_configured=config.route.provider_retries,
             prompt_version=config.prompt_version,
             input_schema_version=config.input_schema_version,

@@ -21,23 +21,47 @@ from pr_agent.algo.frontier_adjudication import (
     load_frontier_adjudication_config,
     run_frontier_adjudication,
 )
-from pr_agent.algo.run_details import get_run_details, init_run_details, record_ai_call
-
+from pr_agent.algo.run_details import (
+    get_run_details,
+    init_run_details,
+    record_ai_call,
+    record_model_request_attempt,
+    record_provider_request_attempt,
+)
 
 SYSTEM_PROMPT = "Adjudicate {{ input_schema_version }} into {{ output_schema_version }}."
 USER_PROMPT = "Evidence: {{ adjudication_input_json }}"
 
 
 class FakeHandler:
-    def __init__(self, responses, *, account=True, telemetry_gap=None, delay=0):
+    def __init__(
+        self,
+        responses,
+        *,
+        account=True,
+        telemetry_gap=None,
+        identity_gap=None,
+        provider_override=None,
+        revision_override=None,
+        model_attempts_per_call=1,
+        delay=0,
+    ):
         self.responses = list(responses)
         self.account = account
         self.telemetry_gap = telemetry_gap
+        self.identity_gap = identity_gap
+        self.provider_override = provider_override
+        self.revision_override = revision_override
+        self.model_attempts_per_call = model_attempts_per_call
         self.delay = delay
         self.calls = []
 
     async def chat_completion(self, model, system, user, temperature):
         self.calls.append(model)
+        for _ in range(max(0, self.model_attempts_per_call - 1)):
+            record_model_request_attempt()
+        for _ in range(self.model_attempts_per_call):
+            record_provider_request_attempt()
         if self.delay:
             await asyncio.sleep(self.delay)
         response = self.responses.pop(0)
@@ -51,7 +75,19 @@ class FakeHandler:
                 ),
                 model=model,
                 cost_usd=None if self.telemetry_gap == "cost" else Decimal("0.01"),
+                provider=(
+                    None if self.identity_gap == "provider" else self.provider_override
+                    or ("provider-fallback" if model == "frontier-fallback" else "provider-primary")
+                ),
+                model_revision=(
+                    None if self.identity_gap == "revision" else self.revision_override
+                    or ("revision-fallback" if model == "frontier-fallback" else "revision-primary")
+                ),
             )
+        if self.telemetry_gap == "model_attempts":
+            get_run_details().adjudication_runs["sha256:finding"].model_attempts = None
+        if self.telemetry_gap == "provider_attempts":
+            get_run_details().adjudication_runs["sha256:finding"].provider_attempts = None
         return response, "stop"
 
 
@@ -68,7 +104,16 @@ def output(decision="confirm", severity="medium", confidence=0.9, citations=None
     })
 
 
-def config(*, enabled=True, fallback=False, stage_timeout=1, minimum_confidence=0):
+def config(
+    *,
+    enabled=True,
+    fallback=False,
+    stage_timeout=1,
+    minimum_confidence=0,
+    collect_cost=True,
+    model_attempts_per_model=1,
+    provider_retries=0,
+):
     models = ("frontier-primary", "frontier-fallback") if fallback else ("frontier-primary",)
     deployments = (None,) * len(models)
     identities = tuple(
@@ -85,9 +130,10 @@ def config(*, enabled=True, fallback=False, stage_timeout=1, minimum_confidence=
             models=models,
             deployments=deployments,
             timeout_seconds=0.5,
-            model_retries=1,
-            provider_retries=0,
+            model_retries=model_attempts_per_model,
+            provider_retries=provider_retries,
             max_output_tokens=256,
+            collect_cost=collect_cost,
         ),
         model_identities=identities,
         system_prompt=SYSTEM_PROMPT,
@@ -166,6 +212,20 @@ async def test_deterministic_forced_escalation_preserves_severity_floor():
     assert result.telemetry["model_revision"] == "revision-primary"
     assert result.telemetry["usage"]["status"] == "complete"
     assert result.telemetry["cost"]["status"] == "complete"
+    assert result.telemetry["route_attempts"] == 1
+    assert result.telemetry["retries"]["model"] == {
+        "status": "complete",
+        "configured_attempts_per_model": 1,
+        "attempts": 1,
+        "retry_attempts": 0,
+    }
+    assert result.telemetry["retries"]["provider"] == {
+        "status": "complete",
+        "configured_retries_per_model_attempt": 0,
+        "attempts": 1,
+        "retry_attempts": 0,
+        "unavailable_reason": None,
+    }
     assert get_run_details().specialist_runs == {}
     assert "sha256:finding" in get_run_details().adjudication_runs
 
@@ -257,8 +317,127 @@ async def test_availability_fallback_remains_one_adjudication():
     assert result.decision is FrontierDecision.CONFIRM
     assert result.telemetry["fallback_used"] is True
     assert result.telemetry["route_attempts"] == 2
+    assert result.telemetry["retries"]["model"] == {
+        "status": "complete",
+        "configured_attempts_per_model": 1,
+        "attempts": 2,
+        "retry_attempts": 0,
+    }
+    assert result.telemetry["retries"]["provider"] == {
+        "status": "complete",
+        "configured_retries_per_model_attempt": 0,
+        "attempts": 2,
+        "retry_attempts": 0,
+        "unavailable_reason": None,
+    }
     assert result.telemetry["model"] == "frontier-fallback"
     assert result.telemetry["provider"] == "provider-fallback"
+
+
+@pytest.mark.asyncio
+async def test_model_retry_attempts_are_distinct_from_route_attempts():
+    init_run_details()
+    stage_config = config(model_attempts_per_model=2)
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([output()], model_attempts_per_call=2),
+        current_identity=lambda: "head-1",
+    )
+
+    assert result.decision is FrontierDecision.CONFIRM
+    assert result.telemetry["route_attempts"] == 1
+    assert result.telemetry["retries"]["model"] == {
+        "status": "complete",
+        "configured_attempts_per_model": 2,
+        "attempts": 2,
+        "retry_attempts": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_missing_model_attempt_observation_fails_telemetry_closed():
+    init_run_details()
+    stage_config = config()
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([output()], telemetry_gap="model_attempts"),
+        current_identity=lambda: "head-1",
+    )
+
+    assert result.decision is FrontierDecision.UNAVAILABLE
+    assert result.state is FrontierState.UNAVAILABLE
+    assert result.failure_reason == "telemetry_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_missing_provider_attempt_observation_fails_telemetry_closed():
+    init_run_details()
+    stage_config = config()
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([output()], telemetry_gap="provider_attempts"),
+        current_identity=lambda: "head-1",
+    )
+
+    assert result.decision is FrontierDecision.UNAVAILABLE
+    assert result.state is FrontierState.UNAVAILABLE
+    assert result.failure_reason == "telemetry_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_distinct_routes_may_share_pinned_completion_identity():
+    init_run_details()
+    shared_provider = "provider-shared"
+    shared_revision = "revision-shared"
+    stage_config = FrontierAdjudicationConfig(
+        enabled=True,
+        route=AIModelRoute(
+            models=("frontier-primary", "frontier-fallback"),
+            deployments=("deployment-primary", "deployment-fallback"),
+            timeout_seconds=0.5,
+            model_retries=1,
+            provider_retries=0,
+            max_output_tokens=256,
+            collect_cost=True,
+        ),
+        model_identities=(
+            FrontierModelIdentity(
+                model="frontier-primary",
+                provider=shared_provider,
+                revision=shared_revision,
+                deployment="deployment-primary",
+            ),
+            FrontierModelIdentity(
+                model="frontier-fallback",
+                provider=shared_provider,
+                revision=shared_revision,
+                deployment="deployment-fallback",
+            ),
+        ),
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt=USER_PROMPT,
+        stage_timeout_seconds=1,
+    )
+
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler(
+            [RuntimeError("primary down"), output()],
+            provider_override=shared_provider,
+            revision_override=shared_revision,
+        ),
+        current_identity=lambda: "head-1",
+    )
+
+    assert result.decision is FrontierDecision.CONFIRM
+    assert result.telemetry["model"] == "frontier-fallback"
+    assert result.telemetry["deployment"] == "deployment-fallback"
+    assert result.telemetry["provider"] == shared_provider
+    assert result.telemetry["model_revision"] == shared_revision
 
 
 @pytest.mark.asyncio
@@ -308,6 +487,67 @@ async def test_missing_usage_or_cost_fails_unavailable(telemetry_gap):
     expected_cost = "unavailable" if telemetry_gap == "cost" else "complete"
     assert result.telemetry["usage"]["status"] == expected_usage
     assert result.telemetry["cost"]["status"] == expected_cost
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity_gap", ["provider", "revision"])
+async def test_missing_completion_identity_fails_unavailable(identity_gap):
+    init_run_details()
+    stage_config = config()
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([output()], identity_gap=identity_gap),
+        current_identity=lambda: "head-1",
+    )
+    assert result.state is FrontierState.UNAVAILABLE
+    assert result.failure_reason == "completion_identity_unverified"
+
+
+@pytest.mark.asyncio
+async def test_mismatched_completion_identity_fails_unavailable():
+    init_run_details()
+    stage_config = config()
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([output()], revision_override="rolling-alias"),
+        current_identity=lambda: "head-1",
+    )
+    assert result.state is FrontierState.UNAVAILABLE
+    assert result.failure_reason == "completion_identity_unverified"
+
+
+def test_frontier_route_requires_attributed_cost_collection():
+    with pytest.raises(ValueError, match="collect attributed cost"):
+        config(collect_cost=False)
+
+
+def test_enabled_frontier_route_requires_zero_provider_retries():
+    with pytest.raises(ValueError, match="provider retries to be disabled"):
+        config(provider_retries=1)
+
+
+def test_frontier_route_rejects_duplicate_model_deployment_identity():
+    identity = FrontierModelIdentity(
+        model="frontier-primary",
+        provider="provider-primary",
+        revision="revision-primary",
+    )
+    with pytest.raises(ValueError, match="route identities must be unique"):
+        FrontierAdjudicationConfig(
+            enabled=True,
+            route=AIModelRoute(
+                models=("frontier-primary", "frontier-primary"),
+                deployments=(None, None),
+                model_retries=1,
+                provider_retries=0,
+                collect_cost=True,
+            ),
+            model_identities=(identity, identity),
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=USER_PROMPT,
+        )
 
 
 def test_loader_requires_exact_fallback_identities():

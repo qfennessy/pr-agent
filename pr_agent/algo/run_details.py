@@ -100,8 +100,10 @@ class AdjudicationRunDetails:
     deployment_id: Optional[str] = None
     fallback_used: bool = False
     route_attempts: int = 0
+    model_attempts: Optional[int] = None
+    model_attempts_configured: Optional[int] = None
+    provider_attempts: Optional[int] = None
     provider_retries_configured: Optional[int] = None
-    provider_retry_attempts: Optional[int] = None
     prompt_version: Optional[str] = None
     input_schema_version: Optional[str] = None
     schema_version: Optional[str] = None
@@ -134,6 +136,35 @@ class AdjudicationRunDetails:
             return "complete"
         return "partial"
 
+    @property
+    def model_retry_attempts(self) -> Optional[int]:
+        """Observed handler retries beyond the first attempt for each route entry."""
+
+        if self.model_attempts is None or self.model_attempts < self.route_attempts:
+            return None
+        return self.model_attempts - self.route_attempts
+
+    @property
+    def provider_retry_attempts(self) -> Optional[int]:
+        """Observed provider retries when SDK-internal retrying is disabled."""
+
+        if (
+            self.provider_retries_configured != 0
+            or self.provider_attempts is None
+            or self.model_attempts is None
+            or self.provider_attempts != self.model_attempts
+        ):
+            return None
+        return 0
+
+    @property
+    def provider_attempts_unavailable_reason(self) -> Optional[str]:
+        if self.provider_retry_attempts is not None:
+            return None
+        if self.provider_retries_configured == 0:
+            return "provider_attempts_not_observed"
+        return "provider_internal_attempts_not_exposed"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "finding_id": self.finding_id,
@@ -143,8 +174,23 @@ class AdjudicationRunDetails:
             "deployment": self.deployment_id,
             "fallback_used": self.fallback_used,
             "route_attempts": self.route_attempts,
-            "provider_retries_configured": self.provider_retries_configured,
-            "provider_retry_attempts": self.provider_retry_attempts,
+            "retries": {
+                "model": {
+                    "status": "complete" if self.model_retry_attempts is not None else "unavailable",
+                    "configured_attempts_per_model": self.model_attempts_configured,
+                    "attempts": self.model_attempts,
+                    "retry_attempts": self.model_retry_attempts,
+                },
+                "provider": {
+                    "status": "complete" if self.provider_retry_attempts is not None else "unavailable",
+                    "configured_retries_per_model_attempt": self.provider_retries_configured,
+                    "attempts": (
+                        self.provider_attempts if self.provider_retry_attempts is not None else None
+                    ),
+                    "retry_attempts": self.provider_retry_attempts,
+                    "unavailable_reason": self.provider_attempts_unavailable_reason,
+                },
+            },
             "prompt_version": self.prompt_version,
             "input_schema_version": self.input_schema_version,
             "schema_version": self.schema_version,
@@ -316,6 +362,8 @@ def record_specialist_model_attempt(
     attribution: Optional[str],
     deployment_id: Optional[str],
     is_fallback: bool,
+    model_attempts_configured: Optional[int] = None,
+    provider_retries_configured: Optional[int] = None,
 ) -> None:
     """Preserve the last attempted specialist route even when its output is rejected."""
 
@@ -326,6 +374,11 @@ def record_specialist_model_attempt(
         adjudication.model_used = model
         adjudication.deployment_id = deployment_id
         adjudication.route_attempts += 1
+        if adjudication.model_attempts is None:
+            adjudication.model_attempts = 0
+        adjudication.model_attempts += 1
+        adjudication.model_attempts_configured = model_attempts_configured
+        adjudication.provider_retries_configured = provider_retries_configured
         if is_fallback:
             adjudication.fallback_used = True
         return
@@ -336,6 +389,48 @@ def record_specialist_model_attempt(
     specialist.deployment_id = deployment_id
     if is_fallback:
         specialist.fallback_used = True
+
+
+def record_model_request_attempt(attribution: Optional[str] = None) -> None:
+    """Count one observable retry beyond a route entry's first model attempt.
+
+    ``retry_with_fallback_models`` records the first attempt for every selected
+    model/deployment route. Handler retry hooks call this function only before
+    subsequent invocations, so ``model_attempts - route_attempts`` is the exact
+    retry-attempt count.
+    """
+
+    request_options = get_ai_request_options()
+    attribution = attribution or (
+        request_options.attribution if request_options is not None else None
+    )
+    adjudication = _get_adjudication_details(attribution)
+    if adjudication is None:
+        return
+    if adjudication.model_attempts is None:
+        adjudication.model_attempts = 0
+    adjudication.model_attempts += 1
+
+
+def record_provider_request_attempt(attribution: Optional[str] = None) -> None:
+    """Count one exact provider request when SDK-internal retries are disabled.
+
+    A positive or unknown provider retry budget means the SDK may issue hidden
+    requests, so those counts remain unavailable rather than being understated.
+    """
+
+    request_options = get_ai_request_options()
+    attribution = attribution or (
+        request_options.attribution if request_options is not None else None
+    )
+    if request_options is None or request_options.provider_retries != 0:
+        return
+    adjudication = _get_adjudication_details(attribution)
+    if adjudication is None:
+        return
+    if adjudication.provider_attempts is None:
+        adjudication.provider_attempts = 0
+    adjudication.provider_attempts += 1
 
 
 def record_review_profile(profile: str) -> None:
@@ -404,6 +499,8 @@ def record_ai_call(
     model: Optional[str] = None,
     cost_usd=None,
     attribution: Optional[str] = None,
+    provider: Optional[str] = None,
+    model_revision: Optional[str] = None,
 ) -> None:
     """Count one successful AI call and accumulate usage and known cost."""
     details = get_run_details()
@@ -417,6 +514,9 @@ def record_ai_call(
         target = details
     if target is None:
         return
+    if isinstance(target, AdjudicationRunDetails):
+        target.provider = provider
+        target.model_revision = model_revision
     target.num_ai_calls += 1
     if usage is not None:
         _add_token_usage(target, usage)
@@ -484,6 +584,7 @@ def record_adjudication_result(
     *,
     provider: Optional[str],
     model_revision: Optional[str],
+    model_attempts_configured: Optional[int],
     provider_retries_configured: Optional[int],
     prompt_version: str,
     input_schema_version: str,
@@ -499,8 +600,11 @@ def record_adjudication_result(
     adjudication = _get_adjudication_details(f"{_FRONTIER_ATTRIBUTION_PREFIX}{finding_id}")
     if adjudication is None:
         return
-    adjudication.provider = provider
-    adjudication.model_revision = model_revision
+    if provider is not None:
+        adjudication.provider = provider
+    if model_revision is not None:
+        adjudication.model_revision = model_revision
+    adjudication.model_attempts_configured = model_attempts_configured
     adjudication.provider_retries_configured = provider_retries_configured
     adjudication.prompt_version = prompt_version
     adjudication.input_schema_version = input_schema_version

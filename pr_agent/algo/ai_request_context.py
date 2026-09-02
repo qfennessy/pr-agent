@@ -18,6 +18,7 @@ class AIRequestOptions:
     provider_retries: Optional[int] = None
     max_output_tokens: Optional[int] = None
     attribution: Optional[str] = None
+    collect_cost: bool = False
 
     def __post_init__(self) -> None:
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -30,6 +31,8 @@ class AIRequestOptions:
             raise ValueError("max_output_tokens must be at least 1")
         if self.attribution is not None and not self.attribution.strip():
             raise ValueError("attribution cannot be blank")
+        if not isinstance(self.collect_cost, bool):
+            raise ValueError("collect_cost must be a boolean")
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,7 @@ class AIModelRoute:
     provider_retries: Optional[int] = None
     max_output_tokens: Optional[int] = None
     attribution: Optional[str] = None
+    collect_cost: bool = False
 
     def __post_init__(self) -> None:
         if not self.models or any(not isinstance(model, str) or not model.strip() for model in self.models):
@@ -56,6 +60,7 @@ class AIModelRoute:
             provider_retries=self.provider_retries,
             max_output_tokens=self.max_output_tokens,
             attribution=self.attribution,
+            collect_cost=self.collect_cost,
         )
 
     def options_for_attempt(self, attempt: int) -> AIRequestOptions:
@@ -66,6 +71,7 @@ class AIModelRoute:
             provider_retries=self.provider_retries,
             max_output_tokens=self.max_output_tokens,
             attribution=self.attribution,
+            collect_cost=self.collect_cost,
         )
 
 
