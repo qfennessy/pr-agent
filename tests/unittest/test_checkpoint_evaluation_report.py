@@ -6,48 +6,35 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import pr_agent.algo.checkpoint_evaluation_report as report_module
-from pr_agent.algo.checkpoint_evaluation import (
-    CheckpointCase,
-    CheckpointTruth,
-    EvaluationArm,
-    EvaluationArmKind,
-    EvaluationCohort,
-    EvaluationManifest,
-    EvaluationRunRecord,
-    EvaluationRunState,
-    EvaluationStageModelIdentity,
-    EvaluationStagePlan,
-    EvaluationStageRun,
-    EvaluationValidationError,
-    FindingSeverity,
-    FindingTruth,
-    GateStatus,
-    MeasurementStatus,
-    NumericMeasurement,
-    ObservedFinding,
-    TruthArtifact,
-    content_hash,
-)
+from pr_agent.algo.checkpoint_evaluation import (CheckpointCase,
+                                                 CheckpointTruth,
+                                                 EvaluationArm,
+                                                 EvaluationArmKind,
+                                                 EvaluationCohort,
+                                                 EvaluationManifest,
+                                                 EvaluationRunRecord,
+                                                 EvaluationRunState,
+                                                 EvaluationStageModelIdentity,
+                                                 EvaluationStagePlan,
+                                                 EvaluationStageRun,
+                                                 EvaluationValidationError,
+                                                 FindingSeverity, FindingTruth,
+                                                 GateStatus, MeasurementStatus,
+                                                 NumericMeasurement,
+                                                 ObservedFinding,
+                                                 TruthArtifact, content_hash)
 from pr_agent.algo.checkpoint_evaluation_cocos import CocosCorpusInventory
-from pr_agent.algo.checkpoint_evaluation_execution import EvaluationArtifactStore
+from pr_agent.algo.checkpoint_evaluation_execution import \
+    EvaluationArtifactStore
 from pr_agent.algo.checkpoint_evaluation_report import (
-    DEFAULT_PAIR_REVIEW_GATE,
-    LIVE_SHADOW_GATE,
-    OFFLINE_REPLAY_GATE,
-    OPT_IN_PAIR_REVIEW_GATE,
-    PR_PUBLICATION_GATE,
-    PilotRolloutBudgets,
-    PilotRolloutEvidence,
-    SettledCandidateRecord,
-    ShadowJournalRecord,
-    build_checkpoint_pilot_report,
-    build_cocos_pilot_acceptance,
-    build_replay_evidence_binding,
-    build_settled_pilot_acceptance,
-    build_shadow_pilot_acceptance,
-    canonical_rollout_gate_specs,
-)
-from pr_agent.algo.checkpoint_evaluation_scoring import ScoreMetric, score_matched_arms
+    DEFAULT_PAIR_REVIEW_GATE, LIVE_SHADOW_GATE, OFFLINE_REPLAY_GATE,
+    OPT_IN_PAIR_REVIEW_GATE, PR_PUBLICATION_GATE, PilotRolloutBudgets,
+    PilotRolloutEvidence, SettledCandidateRecord, ShadowJournalRecord,
+    build_checkpoint_pilot_report, build_cocos_pilot_acceptance,
+    build_replay_evidence_binding, build_settled_pilot_acceptance,
+    build_shadow_pilot_acceptance, canonical_rollout_gate_specs)
+from pr_agent.algo.checkpoint_evaluation_scoring import (ScoreMetric,
+                                                         score_matched_arms)
 from pr_agent.algo.checkpoint_shadow_journal import ShadowJournalEntry
 from pr_agent.algo.review_snapshot import ReviewEvent
 

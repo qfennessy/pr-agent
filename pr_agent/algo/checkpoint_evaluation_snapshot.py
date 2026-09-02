@@ -12,18 +12,13 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from pr_agent.algo.checkpoint_evaluation import (
-    CheckpointCase,
-    EvaluationValidationError,
-    _answer_only_paths,
-)
+from pr_agent.algo.checkpoint_evaluation import (CheckpointCase,
+                                                 EvaluationValidationError,
+                                                 _answer_only_paths)
 from pr_agent.algo.local_artifact_io import read_regular_file_without_symlinks
-from pr_agent.algo.review_snapshot import (
-    SNAPSHOT_SCHEMA_VERSION,
-    CoverageIssue,
-    ReviewEvent,
-    ReviewSnapshot,
-)
+from pr_agent.algo.review_snapshot import (SNAPSHOT_SCHEMA_VERSION,
+                                           CoverageIssue, ReviewEvent,
+                                           ReviewSnapshot)
 
 MAX_REVIEW_SNAPSHOT_ARTIFACT_BYTES = 10_000_000
 _SNAPSHOT_FIELDS = {

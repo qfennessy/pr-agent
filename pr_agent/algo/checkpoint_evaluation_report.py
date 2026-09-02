@@ -15,37 +15,28 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
 
-from pr_agent.algo.checkpoint_evaluation import (
-    EvaluationArmKind,
-    EvaluationCohort,
-    EvaluationManifest,
-    EvaluationRunRecord,
-    EvaluationRunState,
-    EvaluationValidationError,
-    FindingLifecycleState,
-    FindingSeverity,
-    MeasurementStatus,
-    TruthArtifact,
-    content_hash,
-    validate_run_model_telemetry,
-)
+from pr_agent.algo.checkpoint_evaluation import (EvaluationArmKind,
+                                                 EvaluationCohort,
+                                                 EvaluationManifest,
+                                                 EvaluationRunRecord,
+                                                 EvaluationRunState,
+                                                 EvaluationValidationError,
+                                                 FindingLifecycleState,
+                                                 FindingSeverity,
+                                                 MeasurementStatus,
+                                                 TruthArtifact, content_hash,
+                                                 validate_run_model_telemetry)
 from pr_agent.algo.checkpoint_evaluation_cocos import (
-    COCOS_ADAPTER_SCHEMA_VERSION,
-    CocosCorpusInventory,
-)
+    COCOS_ADAPTER_SCHEMA_VERSION, CocosCorpusInventory)
 from pr_agent.algo.checkpoint_evaluation_execution import (
-    EvaluationArtifactInventory,
-    EvaluationArtifactStore,
-)
-from pr_agent.algo.checkpoint_evaluation_scoring import (
-    GateComparator,
-    GateRule,
-    MatchedArmScorecard,
-    RolloutGateDecision,
-    ScoreMetric,
-    evaluate_rollout_gate,
-    score_matched_arms,
-)
+    EvaluationArtifactInventory, EvaluationArtifactStore)
+from pr_agent.algo.checkpoint_evaluation_scoring import (GateComparator,
+                                                         GateRule,
+                                                         MatchedArmScorecard,
+                                                         RolloutGateDecision,
+                                                         ScoreMetric,
+                                                         evaluate_rollout_gate,
+                                                         score_matched_arms)
 from pr_agent.algo.checkpoint_shadow_journal import ShadowJournalEntry
 from pr_agent.algo.review_snapshot import ReviewEvent
 

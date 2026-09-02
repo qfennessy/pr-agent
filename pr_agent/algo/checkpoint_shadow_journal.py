@@ -13,19 +13,17 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
-from pr_agent.algo.checkpoint_evaluation import (
-    EVALUATION_SCHEMA_VERSION,
-    EvaluationArm,
-    EvaluationRunRecord,
-    EvaluationRunState,
-    EvaluationStageRun,
-    EvaluationValidationError,
-    FindingLifecycleState,
-    MeasurementStatus,
-    NumericMeasurement,
-    content_hash,
-    validate_run_model_telemetry,
-)
+from pr_agent.algo.checkpoint_evaluation import (EVALUATION_SCHEMA_VERSION,
+                                                 EvaluationArm,
+                                                 EvaluationRunRecord,
+                                                 EvaluationRunState,
+                                                 EvaluationStageRun,
+                                                 EvaluationValidationError,
+                                                 FindingLifecycleState,
+                                                 MeasurementStatus,
+                                                 NumericMeasurement,
+                                                 content_hash,
+                                                 validate_run_model_telemetry)
 from pr_agent.algo.review_snapshot import ReviewEvent
 
 _REASON_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")

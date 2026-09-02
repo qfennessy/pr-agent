@@ -21,26 +21,23 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Optional
 
-from pr_agent.algo.checkpoint_evaluation import (
-    CheckpointCase,
-    EvaluationArm,
-    EvaluationArmKind,
-    EvaluationManifest,
-    EvaluationRunRecord,
-    EvaluationRunState,
-    EvaluationStagePlan,
-    EvaluationValidationError,
-    NumericMeasurement,
-    ObservedFinding,
-)
+from pr_agent.algo.checkpoint_evaluation import (CheckpointCase, EvaluationArm,
+                                                 EvaluationArmKind,
+                                                 EvaluationManifest,
+                                                 EvaluationRunRecord,
+                                                 EvaluationRunState,
+                                                 EvaluationStagePlan,
+                                                 EvaluationValidationError,
+                                                 NumericMeasurement,
+                                                 ObservedFinding)
 from pr_agent.algo.checkpoint_evaluation_execution import (
-    EvaluationArtifactStore,
-    PaidExecutionDecision,
-    PaidExecutionRequest,
-    evaluate_paid_execution,
-)
-from pr_agent.algo.checkpoint_evaluation_snapshot import load_review_snapshot_artifact
-from pr_agent.algo.review_snapshot import CoverageIssue, ReviewResultState, ReviewSnapshot, ReviewSnapshotResult
+    EvaluationArtifactStore, PaidExecutionDecision, PaidExecutionRequest,
+    evaluate_paid_execution)
+from pr_agent.algo.checkpoint_evaluation_snapshot import \
+    load_review_snapshot_artifact
+from pr_agent.algo.review_snapshot import (CoverageIssue, ReviewResultState,
+                                           ReviewSnapshot,
+                                           ReviewSnapshotResult)
 from pr_agent.algo.run_details import RunDetails
 
 ModelIdentity = tuple[Optional[str], Optional[str], Optional[str]]

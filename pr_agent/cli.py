@@ -15,10 +15,8 @@ from time import monotonic
 
 from pr_agent.agent.pr_agent import PRAgent, commands
 from pr_agent.algo.ai_handlers.litellm_helpers import (
-    DEFAULT_CALLBACK_TIMEOUT_SECONDS,
-    drain_litellm_callbacks,
-    litellm_callbacks_registered,
-)
+    DEFAULT_CALLBACK_TIMEOUT_SECONDS, drain_litellm_callbacks,
+    litellm_callbacks_registered)
 from pr_agent.algo.checkpoint_evaluation_cli import run_evaluation_plan
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState
 from pr_agent.algo.review_specialists import use_specialist_snapshot_context
@@ -26,20 +24,13 @@ from pr_agent.algo.run_details import get_run_details
 from pr_agent.algo.skills_loader import get_skills_context, pin_skills_context
 from pr_agent.algo.utils import get_version
 from pr_agent.config_loader import get_settings
-from pr_agent.git_providers.utils import (
-    apply_local_repo_settings,
-    get_local_extra_config_path,
-)
+from pr_agent.git_providers.utils import (apply_local_repo_settings,
+                                          get_local_extra_config_path)
 from pr_agent.log import get_logger, setup_logger
 from pr_agent.tools.local_pair_review import (
-    LocalPairReview,
-    SnapshotCache,
-    SnapshotCaptureError,
-    build_snapshot_result,
-    find_repository_root,
-    is_snapshot_path_excluded,
-    validate_local_pair_review_limits,
-)
+    LocalPairReview, SnapshotCache, SnapshotCaptureError,
+    build_snapshot_result, find_repository_root, is_snapshot_path_excluded,
+    validate_local_pair_review_limits)
 
 log_level = os.environ.get("LOG_LEVEL", "INFO")
 setup_logger(log_level)

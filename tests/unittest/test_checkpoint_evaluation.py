@@ -4,37 +4,33 @@ from decimal import Decimal
 
 import pytest
 
-from pr_agent.algo.checkpoint_evaluation import (
-    CheckpointCase,
-    CheckpointTruth,
-    EvaluationArm,
-    EvaluationArmKind,
-    EvaluationCohort,
-    EvaluationManifest,
-    EvaluationRunRecord,
-    EvaluationRunState,
-    EvaluationStageModelIdentity,
-    EvaluationStagePlan,
-    EvaluationStageRun,
-    EvaluationValidationError,
-    FindingSeverity,
-    FindingTruth,
-    MeasurementStatus,
-    NumericMeasurement,
-    ObservedFinding,
-    TruthArtifact,
-    build_evaluation_plan,
-    content_hash,
-)
-from pr_agent.algo.checkpoint_evaluation_scoring import (
-    GateComparator,
-    GateRule,
-    MatchedArmScorecard,
-    RolloutGateDecision,
-    evaluate_rollout_gate,
-    score_matched_arms,
-)
-from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshotResult
+from pr_agent.algo.checkpoint_evaluation import (CheckpointCase,
+                                                 CheckpointTruth,
+                                                 EvaluationArm,
+                                                 EvaluationArmKind,
+                                                 EvaluationCohort,
+                                                 EvaluationManifest,
+                                                 EvaluationRunRecord,
+                                                 EvaluationRunState,
+                                                 EvaluationStageModelIdentity,
+                                                 EvaluationStagePlan,
+                                                 EvaluationStageRun,
+                                                 EvaluationValidationError,
+                                                 FindingSeverity, FindingTruth,
+                                                 MeasurementStatus,
+                                                 NumericMeasurement,
+                                                 ObservedFinding,
+                                                 TruthArtifact,
+                                                 build_evaluation_plan,
+                                                 content_hash)
+from pr_agent.algo.checkpoint_evaluation_scoring import (GateComparator,
+                                                         GateRule,
+                                                         MatchedArmScorecard,
+                                                         RolloutGateDecision,
+                                                         evaluate_rollout_gate,
+                                                         score_matched_arms)
+from pr_agent.algo.review_snapshot import (ReviewEvent, ReviewResultState,
+                                           ReviewSnapshotResult)
 from pr_agent.algo.run_details import RunDetails
 from pr_agent.cli import run
 

@@ -17,21 +17,18 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
-from pr_agent.algo.checkpoint_evaluation import (
-    EVALUATION_SCHEMA_VERSION,
-    EvaluationArmKind,
-    EvaluationManifest,
-    EvaluationPlanItem,
-    EvaluationRunRecord,
-    EvaluationRunState,
-    EvaluationValidationError,
-    GateStatus,
-    MeasurementStatus,
-    NumericMeasurement,
-    build_evaluation_plan,
-    content_hash,
-    validate_run_model_telemetry,
-)
+from pr_agent.algo.checkpoint_evaluation import (EVALUATION_SCHEMA_VERSION,
+                                                 EvaluationArmKind,
+                                                 EvaluationManifest,
+                                                 EvaluationPlanItem,
+                                                 EvaluationRunRecord,
+                                                 EvaluationRunState,
+                                                 EvaluationValidationError,
+                                                 GateStatus, MeasurementStatus,
+                                                 NumericMeasurement,
+                                                 build_evaluation_plan,
+                                                 content_hash,
+                                                 validate_run_model_telemetry)
 from pr_agent.algo.checkpoint_evaluation_scoring import RolloutGateDecision
 
 
