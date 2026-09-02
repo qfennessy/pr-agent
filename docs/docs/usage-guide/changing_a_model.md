@@ -97,6 +97,9 @@ api_type = "azure"
 api_version = '2023-05-15'  # Check Azure documentation for the current API version
 api_base = ""  # The base URL for your Azure OpenAI resource. e.g. "https://<your resource name>.openai.azure.com"
 deployment_id = ""  # The deployment name you chose when you deployed the engine
+deployment_id_weak = ""  # Optional deployment for config.model_weak review-depth routes
+deployment_id_reasoning = ""  # Optional deployment for config.model_reasoning review-depth routes
+fallback_deployments = ["..."]  # One deployment for each config.fallback_models entry
 ```
 
 and set in your configuration file:
@@ -104,6 +107,8 @@ and set in your configuration file:
 ```toml
 [config]
 model="" # the OpenAI model you've deployed on Azure (e.g. gpt-4o)
+model_weak="" # optional model for quick review-depth routes
+model_reasoning="" # optional model for deep review-depth routes
 fallback_models=["..."]
 ```
 

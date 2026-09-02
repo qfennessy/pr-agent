@@ -104,6 +104,9 @@ class RunDetails:
     model_used: Optional[str] = None
     # Review mode selected for this run. Other tools leave it unset.
     review_profile: Optional[str] = None
+    # Provider-neutral deterministic review-depth decision. Kept separate from
+    # specialist shadow records so observational model telemetry remains unchanged.
+    review_route: Optional[Mapping[str, Any]] = None
     # Sticky: once a fallback has won, a later success on the primary model must not
     # clear this, or the comment would hide that a fallback ran at all.
     fallback_used: bool = False
@@ -222,6 +225,14 @@ def record_review_profile(profile: str) -> None:
     details = get_run_details()
     if details is not None:
         details.review_profile = profile
+
+
+def record_review_route(route: Mapping[str, Any]) -> None:
+    """Record an isolated structured snapshot of the applied review route."""
+
+    details = get_run_details()
+    if details is not None:
+        details.review_route = deepcopy(dict(route))
 
 
 def _read_token_field(usage, name: str) -> int:

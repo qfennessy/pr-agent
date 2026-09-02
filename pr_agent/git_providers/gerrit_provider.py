@@ -314,6 +314,13 @@ class GerritProvider(GitProvider):
         diff_files = [item.a_path for item in diff_index]
         return diff_files
 
+    def get_files_for_routing(self):
+        """Return Gerrit's unfiltered rich diff so both rename paths remain visible."""
+        return list(self.repo.head.commit.diff(
+            self.repo.head.commit.parents[0],  # previous commit
+            R=True,
+        ))
+
     def get_languages(self):
         """
         Calculate percentage of languages in repository. Used for hunk

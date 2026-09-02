@@ -2607,6 +2607,122 @@ def test_partial_coverage_cannot_be_reported_as_clean():
     assert result.review is None
 
 
+@pytest.mark.parametrize(
+    ("candidate_verification", "review"),
+    [
+        (
+            {"status": "unsupported_provider", "publication_safe": False},
+            {"key_issues_to_review": []},
+        ),
+        (
+            {"status": "verifier_failed"},
+            {"key_issues_to_review": []},
+        ),
+        (
+            {"status": "verifier_failed", "publication_safe": True},
+            {"key_issues_to_review": []},
+        ),
+        (
+            {"status": "verifier_failed", "publication_safe": True},
+            {"key_issues_to_review": [{
+                "relevant_file": "x",
+                "issue_header": "Bug",
+                "issue_content": "This must not publish after verifier failure.",
+                "start_line": 1,
+                "end_line": 1,
+            }]},
+        ),
+        (
+            {"status": "no_candidates", "publication_safe": True},
+            {"key_issues_to_review": [{
+                "relevant_file": "x",
+                "issue_header": "Bug",
+                "issue_content": "No-candidate status contradicts this finding.",
+                "start_line": 1,
+                "end_line": 1,
+            }]},
+        ),
+        (
+            {"status": "partial", "publication_safe": True},
+            {"key_issues_to_review": []},
+        ),
+        ({"publication_safe": True}, {"key_issues_to_review": []}),
+        ({"status": 123, "publication_safe": True}, {"key_issues_to_review": []}),
+        ("malformed verifier artifact", {"key_issues_to_review": []}),
+    ],
+)
+def test_unsafe_candidate_verification_cannot_be_reported_or_cached_as_clean(
+    tmp_path,
+    candidate_verification,
+    review,
+):
+    repo = _repo(tmp_path, "unsafe-candidate-verification")
+    snapshot = _snapshot(str(repo))
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={
+            "review": review,
+            "candidate_verification": candidate_verification,
+        },
+        started_at=monotonic(),
+    )
+
+    assert result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert result.review is None
+    assert CoverageIssue(
+        reason="review_failed:CandidateVerificationUnsafe"
+    ) in result.coverage_issues
+    cache = SnapshotCache(repo)
+    cache.write(result)
+    assert cache.read(snapshot.snapshot_id) is None
+
+
+def test_safe_candidate_verification_preserves_a_clean_snapshot_result():
+    snapshot = _snapshot("/repo/one")
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={
+            "review": {"key_issues_to_review": []},
+            "candidate_verification": {
+                "status": "complete",
+                "publication_safe": True,
+            },
+        },
+        started_at=monotonic(),
+    )
+
+    assert result.state is ReviewResultState.NO_FINDINGS
+    assert result.review == {"key_issues_to_review": []}
+
+
+def test_safe_partial_candidate_verification_preserves_verified_findings():
+    snapshot = _snapshot("/repo/one")
+    review = {"key_issues_to_review": [{
+        "relevant_file": "x",
+        "issue_header": "Bug",
+        "issue_content": "This independently verified finding remains publishable.",
+        "start_line": 1,
+        "end_line": 1,
+    }]}
+    result = build_snapshot_result(
+        snapshot,
+        current_snapshot=snapshot,
+        structured_review={
+            "review": review,
+            "candidate_verification": {
+                "status": "partial",
+                "publication_safe": True,
+            },
+        },
+        started_at=monotonic(),
+    )
+
+    assert result.state is ReviewResultState.FINDINGS
+    assert result.review == review
+
+
 def test_token_budget_omissions_cannot_be_reported_as_clean():
     snapshot = _snapshot("/repo/one")
     result = build_snapshot_result(

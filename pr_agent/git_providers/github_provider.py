@@ -159,6 +159,7 @@ class GithubProvider(GitProvider):
         self.diff_files = None
         self.git_files = None
         self.incremental = IncrementalPR(False)
+        self._routing_incremental_files = None
         self._check_run_ids: dict = {}
         if pr_url and 'pull' in pr_url:
             self.set_pr(pr_url)
@@ -190,6 +191,7 @@ class GithubProvider(GitProvider):
 
     def get_incremental_commits(self, incremental=IncrementalPR(False)):
         self.incremental = incremental
+        self._routing_incremental_files = None
         if self.incremental.is_incremental:
             self.unreviewed_files_map = dict()
             self._get_incremental_commits()
@@ -274,16 +276,159 @@ class GithubProvider(GitProvider):
         )
         if self.previous_review:
             self.incremental.commits_range = self.get_commit_range()
-            # Get all files changed during the commit range
-
+            historical_files = {}
             for commit in self.incremental.commits_range:
                 if commit.commit.message.startswith(f"Merge branch '{self._get_repo().default_branch}'"):
                     get_logger().info(f"Skipping merge commit {commit.commit.message}")
                     continue
-                self.unreviewed_files_map.update({file.filename: file for file in commit.files})
+                historical_files.update({file.filename: file for file in commit.files})
+
+            net_files, incomplete = self._get_incremental_net_files()
+            self._routing_incremental_files = tuple(net_files)
+            if incomplete:
+                self._routing_incremental_files += (FilePatchInfo(
+                    base_file="",
+                    head_file="",
+                    patch="",
+                    filename="",
+                    edit_type=EDIT_TYPE.UNKNOWN,
+                ),)
+                # A partial/unavailable compare must not drop review input. Retain
+                # the historical union as a conservative fallback while routing
+                # consumes the known net evidence plus an UNKNOWN sentinel.
+                self.unreviewed_files_map.update(historical_files)
+                self.unreviewed_files_map.update({file.filename: file for file in net_files})
+            else:
+                self.unreviewed_files_map.update({file.filename: file for file in net_files})
         else:
             get_logger().info("No previous review found, will review the entire PR")
             self.incremental.is_incremental = False
+
+    @staticmethod
+    def _github_file_paths(file) -> set[str]:
+        """Return the trustworthy path endpoints exposed by one GitHub file record."""
+
+        filename = getattr(file, "filename", None)
+        if not isinstance(filename, str) or not filename.strip():
+            raise TypeError("GitHub changed file is missing filename")
+        paths = {filename.strip()}
+        previous_filename = getattr(file, "previous_filename", None)
+        if previous_filename is not None:
+            if not isinstance(previous_filename, str) or not previous_filename.strip():
+                raise TypeError("GitHub changed file has an invalid previous_filename")
+            paths.add(previous_filename.strip())
+        return paths
+
+    def _get_incremental_net_files(self) -> tuple[list, bool]:
+        """Return the unfiltered, PR-scoped baseline-to-head inventory."""
+
+        base_sha = self.incremental.last_seen_commit_sha
+        head_sha = getattr(getattr(self.pr, "head", None), "sha", None)
+        if not base_sha or not head_sha:
+            get_logger().warning(
+                "Cannot fetch GitHub incremental net diff without baseline and head commits."
+            )
+            return [], True
+
+        files = []
+        compare_incomplete = False
+        try:
+            comparison = self._get_repo().compare(base_sha, head_sha)
+            raw_files = getattr(comparison, "files", None)
+            if raw_files is None or isinstance(raw_files, (str, bytes, dict)):
+                raise TypeError("GitHub incremental compare files must be iterable")
+            for file in raw_files:
+                self._github_file_paths(file)
+                files.append(file)
+        except Exception as error:
+            get_logger().warning(
+                "Failed to fetch the complete GitHub incremental net diff; preserving "
+                f"known paths and marking routing evidence incomplete: {error}"
+            )
+            compare_incomplete = True
+
+        # GitHub's compare endpoint exposes at most 300 changed files. Reaching
+        # the documented cap cannot prove completeness, even when iteration ends.
+        compare_incomplete = compare_incomplete or len(files) >= 300
+
+        # A baseline-to-head comparison can include changes brought in by merging
+        # the target branch. Scope it to the pull request's own current inventory,
+        # retaining both sides of renames. When that inventory is incomplete, keep
+        # all known compare evidence and add the caller's UNKNOWN safety sentinel.
+        current_pr_files = []
+        current_pr_incomplete = False
+        try:
+            raw_current_pr_files = self.pr.get_files()
+            if raw_current_pr_files is None or isinstance(
+                raw_current_pr_files, (str, bytes, dict)
+            ):
+                raise TypeError("GitHub pull-request files must be iterable")
+            for file in raw_current_pr_files:
+                self._github_file_paths(file)
+                current_pr_files.append(file)
+        except Exception as error:
+            get_logger().warning(
+                "Failed to fetch the complete GitHub pull-request file inventory; "
+                f"preserving compare evidence and marking it incomplete: {error}"
+            )
+            current_pr_incomplete = True
+
+        try:
+            changed_files = getattr(self.pr, "changed_files", None)
+        except Exception as error:
+            get_logger().warning(
+                "Failed to read the GitHub pull-request changed-file count; "
+                f"marking routing evidence incomplete: {error}"
+            )
+            changed_files = None
+        if (
+            not isinstance(changed_files, int)
+            or isinstance(changed_files, bool)
+            or changed_files < 0
+            or changed_files != len(current_pr_files)
+        ):
+            current_pr_incomplete = True
+        current_pr_incomplete = current_pr_incomplete or len(current_pr_files) >= 3000
+        if current_pr_incomplete:
+            return files, True
+
+        current_pr_paths = set()
+        for file in current_pr_files:
+            current_pr_paths.update(self._github_file_paths(file))
+        files = [
+            file for file in files
+            if self._github_file_paths(file) & current_pr_paths
+        ]
+
+        return files, compare_incomplete
+
+    def get_files_for_routing(self):
+        """Return the unfiltered net incremental inventory instead of commit history."""
+
+        if self.incremental.is_incremental:
+            routing_files = getattr(self, "_routing_incremental_files", None)
+            if routing_files is None:
+                return [FilePatchInfo(
+                    base_file="",
+                    head_file="",
+                    patch="",
+                    filename="",
+                    edit_type=EDIT_TYPE.UNKNOWN,
+                )]
+            return list(routing_files)
+        return self.get_files()
+
+    def is_incremental_scope_empty(self) -> Optional[bool]:
+        empty = super().is_incremental_scope_empty()
+        if empty is not True:
+            return empty
+        routing_files = getattr(self, "_routing_incremental_files", None)
+        if routing_files is None or any(
+            getattr(file, "edit_type", None) is EDIT_TYPE.UNKNOWN
+            for file in routing_files
+        ):
+            return None
+        return not routing_files
 
     def get_commit_range(self):
         last_review_time = self.previous_review.created_at
@@ -1893,19 +2038,32 @@ class GithubProvider(GitProvider):
         except Exception as e:
             get_logger().warning(f"Failed to publish labels, error: {e}")
 
+    def _read_pr_labels(self, update=False):
+        if not update:
+            return [label.name for label in self.pr.labels]
+
+        _, labels = self.pr._requester.requestJsonAndCheck(
+            "GET", f"{self.pr.issue_url}/labels"
+        )
+        return [label["name"] for label in labels]
+
     def get_pr_labels(self, update=False):
         try:
-            if not update:
-                labels =self.pr.labels
-                return [label.name for label in labels]
-            else: # obtain the latest labels. Maybe they changed while the AI was running
-                headers, labels = self.pr._requester.requestJsonAndCheck(
-                    "GET", f"{self.pr.issue_url}/labels")
-                return [label['name'] for label in labels]
-
+            return self._read_pr_labels(update=update)
         except Exception as e:
             get_logger().exception(f"Failed to get labels, error: {e}")
+            # Preserve the provider's historical best-effort contract for callers
+            # that do not need to distinguish failure from a confirmed empty set.
             return []
+
+    def get_pr_labels_for_routing(self, update=False):
+        try:
+            return self._read_pr_labels(update=update)
+        except Exception as e:
+            get_logger().exception(f"Failed to get labels for review routing, error: {e}")
+            # Routing must distinguish unavailable evidence from a confirmed empty
+            # set so a metadata outage cannot select the quick profile.
+            return None
 
     def get_repo_labels(self):
         labels = self.repo_obj.get_labels()

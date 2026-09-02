@@ -110,6 +110,27 @@ branch_issue_regex = ""
 [pr_reviewer] # /review #
 # enable/disable features
 review_profile="full" # "full" preserves the standard review; "bugs_only" emits only qualifying defects.
+# Opt in to a bounded second pass that verifies review candidates against repository evidence.
+enable_candidate_verification=false
+# Consume only validated diff-prioritization output for the exact specialist input; keep off until rollout gates pass.
+candidate_verification_consume_specialist_prioritization=false
+candidate_verification_model="" # Empty uses config.model.
+candidate_verification_deployment="" # Required when an Azure verifier model differs from config.model.
+candidate_verification_fallback_models=[]
+candidate_verification_fallback_deployments=[] # Must match fallback models for Azure routes.
+candidate_verification_max_output_tokens=0 # 0 inherits config.max_output_tokens/provider-specific caps.
+candidate_verification_max_model_calls=1 # The implementation performs at most one verifier call per review.
+candidate_verification_max_candidates=3
+# Sensitive audits bypass the coordinator candidate cap but remain bounded independently.
+# Earlier glob entries win deterministic overflow selection; removed ranges win within a glob.
+candidate_verification_max_sensitive_candidates=6
+candidate_verification_max_files=6
+candidate_verification_max_lines_per_file=160
+candidate_verification_max_total_lines=600
+candidate_verification_max_context_tokens=6000
+candidate_verification_timeout_seconds=10
+# Matching changed files are always submitted as independent audit candidates.
+candidate_verification_sensitive_path_globs=[]
 require_score_review=false
 require_tests_review=true
 require_estimate_effort_to_review=true
@@ -140,9 +161,97 @@ enable_review_coverage_footer=true
 
 [review_thread_lifecycle]
 # Reserved foundation for stable GitHub review threads. The runtime does not execute
-# lifecycle plans until candidate identity (#9) and rollout evidence (#27) are complete.
+# lifecycle plans until the gated /review integration is implemented and rollout evidence (#27) is complete.
 enabled=false
 obsolete_thread_policy="keep" # "keep", "resolve", or visible "mark_fixed"; inert until gated integration.
+
+[review_depth]
+# Disabled preserves the existing standard /review path and all inherited budgets.
+enabled=false
+requested_depth="auto" # "auto", "quick", "standard", or "deep"
+version="review-router-v1"
+large_change_files=25
+large_change_lines=1000
+# Specialist outputs remain observational unless this separate guarded consumer is
+# explicitly enabled. A validated "escalate" can only raise to the configured floor.
+consume_specialist_escalation=false
+specialist_escalation_depth="deep" # "standard" or "deep"; never "quick"
+
+[review_depth.profiles.quick]
+context_tokens=8000
+max_findings=2
+max_verification_candidates=1
+model_route="weak" # provider-neutral route: inherit, regular, weak, or reasoning
+timeout_seconds=30
+max_retries=0 # retries after the first attempt
+max_output_tokens=2048
+max_published_findings=2
+publication_threshold="high"
+shadow_only=false
+
+[review_depth.profiles.standard]
+context_tokens=24000
+max_findings=3
+max_verification_candidates=3
+model_route="regular"
+timeout_seconds=120
+max_retries=1
+max_output_tokens=4096
+max_published_findings=3
+publication_threshold="medium"
+shadow_only=false
+
+[review_depth.profiles.deep]
+context_tokens=32000
+max_findings=6
+max_verification_candidates=6
+model_route="reasoning"
+timeout_seconds=240
+max_retries=2
+max_output_tokens=8192
+max_published_findings=6
+publication_threshold="low"
+shadow_only=false
+
+[[review_depth.sensitive_categories]]
+name="security"
+path_patterns=["**/security/**", "**/crypto/**", "**/secrets/**"]
+labels=["security"]
+
+[[review_depth.sensitive_categories]]
+name="authorization"
+path_patterns=["**/auth/**", "**/authorization/**", "**/permissions/**"]
+labels=["authorization"]
+
+[[review_depth.sensitive_categories]]
+name="tenant_isolation"
+path_patterns=["**/tenant/**", "**/tenancy/**"]
+labels=["tenant-isolation"]
+
+[[review_depth.sensitive_categories]]
+name="billing"
+path_patterns=["**/billing/**", "**/payments/**", "**/invoices/**"]
+labels=["billing"]
+
+[[review_depth.sensitive_categories]]
+name="migration"
+path_patterns=["**/migrations/**", "**/schema/**"]
+labels=["migration"]
+
+[[review_depth.sensitive_categories]]
+name="concurrency"
+path_patterns=["**/concurrency/**", "**/locks/**", "**/queues/**"]
+labels=["concurrency"]
+
+[[review_depth.sensitive_categories]]
+name="destructive_operation"
+path_patterns=["**/delete/**", "**/cleanup/**", "**/purge/**"]
+labels=["destructive-operation"]
+
+[[review_depth.sensitive_categories]]
+name="deployment_credentials"
+path_patterns=["**/.github/workflows/**", "**/deploy/**", "**/credentials/**"]
+labels=["deployment-credentials"]
 
 [pr_description] # /describe #
 publish_labels=false

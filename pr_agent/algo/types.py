@@ -25,3 +25,7 @@ class FilePatchInfo:
     language: Optional[str] = None
     ai_file_summary: str = None
     head_file_is_complete: bool = True
+    # Hosted-provider patches can be truncated even when their visible hunks are
+    # internally consistent.  Only providers that own an immutable, complete
+    # diff input may assert this provenance bit.
+    patch_is_complete: bool = False

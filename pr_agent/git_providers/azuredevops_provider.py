@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as _dt
 import os
 import re
+from collections.abc import Mapping
 from typing import Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
@@ -37,7 +38,9 @@ try:
     # noinspection PyUnresolvedReferences
     from azure.devops.connection import Connection
     # noinspection PyUnresolvedReferences
-    from azure.devops.released.git import (Comment, CommentThread, GitPullRequest, GitVersionDescriptor, GitClient, CommentThreadContext, CommentPosition)
+    from azure.devops.released.git import (Comment, CommentThread, GitBaseVersionDescriptor, GitPullRequest,
+                                           GitTargetVersionDescriptor, GitVersionDescriptor, GitClient,
+                                           CommentThreadContext, CommentPosition)
     from azure.devops.released.work_item_tracking import WorkItemTrackingClient
     # noinspection PyUnresolvedReferences
     from azure.identity import DefaultAzureCredential
@@ -72,23 +75,103 @@ class _AzureCommitAdapter:
         self.parents = list(getattr(raw, "parents", None) or [])
 
 
-def _get_azure_change_path(change):
+def _get_azure_change_item(change):
     try:
         item = change["item"]
     except (KeyError, TypeError):
         item = getattr(change, "item", None)
         if item is None:
             additional = getattr(change, "additional_properties", None) or {}
-            item = additional.get("item") or {}
+            item = additional.get("item")
+    return item
+
+
+def _is_azure_tree_change(change) -> bool:
+    item = _get_azure_change_item(change)
+    if isinstance(item, dict):
+        return item.get("gitObjectType", item.get("git_object_type")) == "tree"
+    return getattr(item, "git_object_type", getattr(item, "gitObjectType", None)) == "tree"
+
+
+def _get_azure_change_path(change):
+    item = _get_azure_change_item(change)
 
     if isinstance(item, dict):
-        if item.get("gitObjectType", item.get("git_object_type")) == "tree":
+        if _is_azure_tree_change(change):
             return None
         return item.get("path")
 
-    if getattr(item, "git_object_type", getattr(item, "gitObjectType", None)) == "tree":
+    if _is_azure_tree_change(change):
         return None
     return getattr(item, "path", None)
+
+
+def _get_azure_change_property(change, *names):
+    """Read a pull-request change property from dict or Azure SDK shapes."""
+
+    if isinstance(change, dict):
+        for name in names:
+            value = change.get(name)
+            if value is not None:
+                return value
+        return None
+    for name in names:
+        value = getattr(change, name, None)
+        if value is not None:
+            return value
+    additional = getattr(change, "additional_properties", None) or {}
+    for name in names:
+        value = additional.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def _azure_change_edit_type(change) -> EDIT_TYPE:
+    change_type = _get_azure_change_property(change, "changeType", "change_type")
+    normalized = str(change_type or "").casefold()
+    if "rename" in normalized:
+        return EDIT_TYPE.RENAMED
+    if normalized == "add":
+        return EDIT_TYPE.ADDED
+    if normalized == "delete":
+        return EDIT_TYPE.DELETED
+    if normalized in {"edit", "encoding", "property", "undelete"}:
+        return EDIT_TYPE.MODIFIED
+    return EDIT_TYPE.UNKNOWN
+
+
+def _azure_change_old_path(change) -> str | None:
+    return _get_azure_change_property(
+        change,
+        "originalPath",
+        "original_path",
+        "sourceServerItem",
+        "source_server_item",
+    )
+
+
+def _azure_change_for_routing(change) -> FilePatchInfo | None:
+    """Adapt one unfiltered Azure change into provider-neutral routing evidence."""
+    path = _get_azure_change_path(change)
+    if not path:
+        if _is_azure_tree_change(change):
+            return None
+        return FilePatchInfo(
+            base_file="",
+            head_file="",
+            patch="",
+            filename="",
+            edit_type=EDIT_TYPE.UNKNOWN,
+        )
+    return FilePatchInfo(
+        base_file="",
+        head_file="",
+        patch="",
+        filename=path,
+        edit_type=_azure_change_edit_type(change),
+        old_filename=_azure_change_old_path(change),
+    )
 
 
 class AzureDevopsProvider(GitProvider):
@@ -104,6 +187,9 @@ class AzureDevopsProvider(GitProvider):
         self.azure_devops_client, self.azure_devops_board_client = self._get_azure_devops_client()
         self.diff_files = None
         self._diff_path_map = None
+        self._latest_pr_iteration_changes = None
+        self._latest_pr_iteration_changes_incomplete = None
+        self._routing_incremental_files = None
         self.workspace_slug = None
         self.repo_slug = None
         self.repo = None
@@ -317,17 +403,31 @@ class AzureDevopsProvider(GitProvider):
         except Exception as e:
             get_logger().warning(f"Failed to publish labels, error: {e}")
 
+    def _read_pr_labels(self):
+        labels = self.azure_devops_client.get_pull_request_labels(
+            project=self.workspace_slug,
+            repository_id=self.repo_slug,
+            pull_request_id=self.pr_num,
+        )
+        return [label.name for label in labels]
+
     def get_pr_labels(self, update=False):
         try:
-            labels = self.azure_devops_client.get_pull_request_labels(
-                project=self.workspace_slug,
-                repository_id=self.repo_slug,
-                pull_request_id=self.pr_num,
-            )
-            return [label.name for label in labels]
+            return self._read_pr_labels()
         except Exception as e:
             get_logger().exception(f"Failed to get labels, error: {e}")
+            # Preserve the provider's historical best-effort contract for callers
+            # that do not need to distinguish failure from a confirmed empty set.
             return []
+
+    def get_pr_labels_for_routing(self, update=False):
+        try:
+            return self._read_pr_labels()
+        except Exception as e:
+            get_logger().exception(f"Failed to get labels for review routing, error: {e}")
+            # Routing must distinguish unavailable evidence from a confirmed empty
+            # set so a metadata outage cannot select the quick profile.
+            return None
 
     def is_supported(self, capability: str) -> bool:
         return True
@@ -335,6 +435,9 @@ class AzureDevopsProvider(GitProvider):
     def set_pr(self, pr_url: str):
         self.diff_files = None
         self._diff_path_map = None
+        self._latest_pr_iteration_changes = None
+        self._latest_pr_iteration_changes_incomplete = None
+        self._routing_incremental_files = None
         self._published_inline_comment_bodies = []
         self._inline_comment_store = None
         self.pr_url = pr_url
@@ -351,10 +454,14 @@ class AzureDevopsProvider(GitProvider):
             # returning the full-PR diff.
             self.diff_files = None
             self._diff_path_map = None
+            self._latest_pr_iteration_changes = None
+            self._latest_pr_iteration_changes_incomplete = None
+            self._routing_incremental_files = None
             self.unreviewed_files_map = {}
             self._get_incremental_commits()
 
     def _get_incremental_commits(self):
+        self._routing_incremental_files = ()
         if not self.pr_commits:
             raw = list(self.azure_devops_client.get_pull_request_commits(
                 project=self.workspace_slug,
@@ -379,27 +486,35 @@ class AzureDevopsProvider(GitProvider):
         if self.incremental.commits_range is None:
             return
         candidate_paths = []
-        had_errors = False
-        non_merge_seen = False
-        for commit in self.incremental.commits_range:
-            if len(commit.parents) > 1:
-                get_logger().info(f"Skipping merge commit {commit.sha}")
-                continue
-            non_merge_seen = True
-            try:
-                changes_obj = self.azure_devops_client.get_changes(
-                    project=self.workspace_slug,
-                    repository_id=self.repo_slug,
-                    commit_id=commit.commit_id,
+        routing_files = []
+        routing_file_keys = set()
+        net_changes, had_errors = self._get_incremental_net_changes()
+        net_changes, scope_incomplete = self._scope_incremental_changes_to_pr(net_changes)
+        had_errors = had_errors or scope_incomplete
+        for change in net_changes:
+            routing_file = _azure_change_for_routing(change)
+            if routing_file is not None:
+                key = (
+                    routing_file.filename,
+                    routing_file.old_filename,
+                    routing_file.edit_type,
                 )
-            except Exception as e:
-                had_errors = True
-                get_logger().warning(f"Failed to fetch changes for {commit.commit_id}: {e}")
-                continue
-            for change in (getattr(changes_obj, "changes", None) or []):
-                path = _get_azure_change_path(change)
-                if path:
-                    candidate_paths.append(path)
+                if key not in routing_file_keys:
+                    routing_file_keys.add(key)
+                    routing_files.append(routing_file)
+            path = _get_azure_change_path(change)
+            if path:
+                candidate_paths.append(path)
+
+        if had_errors:
+            routing_files.append(FilePatchInfo(
+                base_file="",
+                head_file="",
+                patch="",
+                filename="",
+                edit_type=EDIT_TYPE.UNKNOWN,
+            ))
+        self._routing_incremental_files = tuple(routing_files)
 
         if candidate_paths:
             deduped = list(dict.fromkeys(candidate_paths))
@@ -409,14 +524,128 @@ class AzureDevopsProvider(GitProvider):
                     self.unreviewed_files_map[path] = path
         elif had_errors and self.incremental.commits_range:
             get_logger().warning(
-                "Failed to fetch changes for incremental commits; falling back to full review."
+                "Failed to fetch the incremental net diff; falling back to full review."
             )
             self.incremental.is_incremental = False
-        elif self.incremental.commits_range and not non_merge_seen:
-            get_logger().info(
-                "Incremental range only contains merge commits; falling back to full review."
+
+    def _scope_incremental_changes_to_pr(self, net_changes: list) -> tuple[list, bool]:
+        """Exclude target-branch merge noise using the current PR's own inventory."""
+
+        try:
+            current_pr_changes = self._get_latest_pr_iteration_changes()
+        except Exception as error:
+            get_logger().warning(
+                "Failed to scope Azure incremental net changes to the pull request; "
+                f"preserving net evidence and marking it incomplete: {error}"
             )
-            self.incremental.is_incremental = False
+            return net_changes, True
+        if getattr(self, "_latest_pr_iteration_changes_incomplete", None) is True:
+            return net_changes, True
+
+        current_pr_paths = set()
+        for change in current_pr_changes:
+            if _is_azure_tree_change(change):
+                continue
+            path = _get_azure_change_path(change)
+            if not isinstance(path, str) or not path.strip():
+                get_logger().warning(
+                    "Azure pull-request inventory contains a non-tree change without a path; "
+                    "preserving incremental net evidence and marking it incomplete."
+                )
+                return net_changes, True
+            current_pr_paths.add(path.strip())
+            old_path = _azure_change_old_path(change)
+            if isinstance(old_path, str) and old_path.strip():
+                current_pr_paths.add(old_path.strip())
+
+        scoped_changes = []
+        scope_incomplete = False
+        for change in net_changes:
+            if _is_azure_tree_change(change):
+                continue
+            path = _get_azure_change_path(change)
+            old_path = _azure_change_old_path(change)
+            paths = {
+                candidate.strip()
+                for candidate in (path, old_path)
+                if isinstance(candidate, str) and candidate.strip()
+            }
+            if not paths:
+                # Retain malformed compare evidence so routing sees its UNKNOWN shape.
+                scoped_changes.append(change)
+                scope_incomplete = True
+            elif paths & current_pr_paths:
+                scoped_changes.append(change)
+        return scoped_changes, scope_incomplete
+
+    def _get_incremental_net_changes(self) -> tuple[list, bool]:
+        """Fetch the baseline-to-head net diff, retaining evidence before a later failure."""
+
+        base_sha = self.incremental.last_seen_commit_sha
+        target_sha = getattr(self.pr_commits[-1], "commit_id", None) if self.pr_commits else None
+        if not base_sha or not target_sha:
+            get_logger().warning(
+                "Cannot fetch Azure incremental net diff without baseline and head commits."
+            )
+            return [], True
+
+        try:
+            base_version = GitBaseVersionDescriptor(
+                base_version=base_sha,
+                base_version_type="commit",
+            )
+            target_version = GitTargetVersionDescriptor(
+                target_version=target_sha,
+                target_version_type="commit",
+            )
+        except Exception as error:
+            get_logger().warning(
+                f"Cannot construct Azure incremental net-diff versions: {error}"
+            )
+            return [], True
+        page_size = 2000
+        skip = 0
+        changes = []
+        while True:
+            page = []
+            try:
+                response = self.azure_devops_client.get_commit_diffs(
+                    project=self.workspace_slug,
+                    repository_id=self.repo_slug,
+                    diff_common_commit=False,
+                    top=page_size,
+                    skip=skip,
+                    base_version_descriptor=base_version,
+                    target_version_descriptor=target_version,
+                )
+                raw_page = _get_azure_change_property(response, "changes")
+                if raw_page is None:
+                    page = []
+                elif isinstance(raw_page, (str, bytes, Mapping)):
+                    raise TypeError("Azure net diff changes must be a sequence")
+                else:
+                    page = list(raw_page)
+                changes.extend(page)
+                all_included = _get_azure_change_property(
+                    response,
+                    "allChangesIncluded",
+                    "all_changes_included",
+                )
+                if all_included is not None and not isinstance(all_included, bool):
+                    raise TypeError("Azure net diff completeness must be a boolean")
+            except Exception as error:
+                get_logger().warning(
+                    "Failed to fetch all Azure incremental net-diff pages; preserving "
+                    f"fetched paths and marking routing evidence incomplete: {error}"
+                )
+                return changes, True
+            if all_included is True:
+                return changes, False
+            if not page:
+                return changes, True
+            if all_included is None and len(page) < page_size:
+                return changes, True
+            skip += len(page)
 
     def _get_commit_range(self):
         last_review_time = _to_naive_utc(getattr(self.previous_review, "created_at", None))
@@ -531,12 +760,190 @@ class AzureDevopsProvider(GitProvider):
                 return ""
             raise
 
+    def get_pr_head_file_content(self, file_path: str):
+        """Read candidate-verification context from the current PR head commit."""
+        head_commit = getattr(getattr(self, "pr", None), "last_merge_commit", None)
+        head_sha = getattr(head_commit, "commit_id", None)
+        if not head_sha:
+            return ""
+        try:
+            item = self.azure_devops_client.get_item(
+                repository_id=self.repo_slug,
+                path=file_path,
+                project=self.workspace_slug,
+                version_descriptor=GitVersionDescriptor(
+                    version=head_sha, version_type="commit"
+                ),
+                download=False,
+                include_content=True,
+            )
+            return item.content or ""
+        except Exception as e:
+            if get_settings().config.verbosity_level >= 2:
+                get_logger().warning(f"Failed to load PR-head file: {file_path}, error: {e}")
+            if _is_not_found_error(e):
+                return ""
+            raise
+
     def get_files(self):
         if (isinstance(getattr(self, "incremental", None), IncrementalPR)
-                and self.incremental.is_incremental
-                and self.unreviewed_files_map):
-            return list(self.unreviewed_files_map.keys())
+                and self.incremental.is_incremental):
+            if self.unreviewed_files_map:
+                return list(self.unreviewed_files_map.keys())
+            routing_files = getattr(self, "_routing_incremental_files", None)
+            if routing_files is not None and not any(
+                file.edit_type is EDIT_TYPE.UNKNOWN for file in routing_files
+            ):
+                # A complete raw inventory may contain only ignored or unsupported
+                # paths. Keep that incremental scope empty for review input rather
+                # than silently falling back to the full PR after routing has seen
+                # the unfiltered safety evidence.
+                return []
         return self._get_files_full()
+
+    def normalize_file_path_for_routing(self, path: str | None) -> str | None:
+        """Translate Azure's documented repository-root paths for routing only."""
+        if not isinstance(path, str):
+            return path
+        return path[1:] if path.startswith("/") else path
+
+    def _get_latest_pr_iteration_changes(self):
+        """Return cached unfiltered net PR changes and retain completeness state."""
+        cached = getattr(self, "_latest_pr_iteration_changes", None)
+        if cached is not None:
+            return cached
+
+        entries = []
+        incomplete = False
+        try:
+            raw_iterations = self.azure_devops_client.get_pull_request_iterations(
+                repository_id=self.repo_slug,
+                pull_request_id=self.pr_num,
+                project=self.workspace_slug,
+            )
+            if not isinstance(raw_iterations, (list, tuple)):
+                raise TypeError("Azure pull-request iterations must be a sequence")
+            iterations = list(raw_iterations)
+        except Exception as error:
+            get_logger().warning(
+                "Failed to fetch Azure pull-request iterations; marking the current "
+                f"PR inventory incomplete: {error}"
+            )
+            iterations = []
+            incomplete = True
+        if not iterations:
+            self._latest_pr_iteration_changes = ()
+            # A PR with no iteration descriptor cannot prove an authoritative empty
+            # change set. Preserve baseline-to-head evidence and fail safe.
+            self._latest_pr_iteration_changes_incomplete = True
+            return self._latest_pr_iteration_changes
+
+        iteration_id = getattr(iterations[-1], "id", None)
+        if iteration_id is None:
+            get_logger().warning(
+                "Azure pull-request iteration is missing its id; marking the current "
+                "PR inventory incomplete."
+            )
+            self._latest_pr_iteration_changes = ()
+            self._latest_pr_iteration_changes_incomplete = True
+            return self._latest_pr_iteration_changes
+
+        skip = 0
+        page_size = 2000
+        while True:
+            try:
+                changes = self.azure_devops_client.get_pull_request_iteration_changes(
+                    repository_id=self.repo_slug,
+                    pull_request_id=self.pr_num,
+                    iteration_id=iteration_id,
+                    project=self.workspace_slug,
+                    top=page_size,
+                    skip=skip,
+                    compare_to=0,
+                )
+                if isinstance(changes, Mapping):
+                    has_entries = "change_entries" in changes or "changeEntries" in changes
+                else:
+                    has_entries = hasattr(changes, "change_entries") or hasattr(changes, "changeEntries")
+                if not has_entries:
+                    raise TypeError("Azure iteration response is missing change entries")
+                raw_page = _get_azure_change_property(
+                    changes,
+                    "change_entries",
+                    "changeEntries",
+                )
+                if raw_page is None:
+                    page = []
+                elif isinstance(raw_page, (str, bytes, Mapping)):
+                    raise TypeError("Azure iteration changes must be a sequence")
+                else:
+                    page = list(raw_page)
+                entries.extend(page)
+                next_skip = _get_azure_change_property(changes, "next_skip", "nextSkip")
+            except Exception as error:
+                get_logger().warning(
+                    "Failed to fetch the complete Azure pull-request inventory; preserving "
+                    f"known paths and marking it incomplete: {error}"
+                )
+                incomplete = True
+                break
+            if not isinstance(next_skip, int) or isinstance(next_skip, bool):
+                incomplete = True
+                break
+            if next_skip == 0:
+                break
+            if next_skip <= skip:
+                incomplete = True
+                break
+            skip = next_skip
+
+        self._latest_pr_iteration_changes = tuple(entries)
+        self._latest_pr_iteration_changes_incomplete = incomplete
+        return self._latest_pr_iteration_changes
+
+    def get_files_for_routing(self):
+        """Return current, unfiltered net paths instead of per-commit history."""
+        if (isinstance(getattr(self, "incremental", None), IncrementalPR)
+                and self.incremental.is_incremental):
+            routing_files = getattr(self, "_routing_incremental_files", None)
+            if routing_files is None:
+                return [FilePatchInfo(
+                    base_file="",
+                    head_file="",
+                    patch="",
+                    filename="",
+                    edit_type=EDIT_TYPE.UNKNOWN,
+                )]
+            return list(routing_files)
+
+        files = []
+        for change in self._get_latest_pr_iteration_changes():
+            routing_file = _azure_change_for_routing(change)
+            if routing_file is not None:
+                files.append(routing_file)
+        if getattr(self, "_latest_pr_iteration_changes_incomplete", None) is True:
+            files.append(FilePatchInfo(
+                base_file="",
+                head_file="",
+                patch="",
+                filename="",
+                edit_type=EDIT_TYPE.UNKNOWN,
+            ))
+        return files
+
+    def is_incremental_scope_empty(self) -> bool | None:
+        empty = super().is_incremental_scope_empty()
+        if empty is not True:
+            return empty
+        routing_files = getattr(self, "_routing_incremental_files", None)
+        if routing_files is None or any(
+            file.edit_type is EDIT_TYPE.UNKNOWN for file in routing_files
+        ):
+            return None
+        # The reviewable map may be empty because ignore/extension filters removed
+        # every path. That is not an authoritative empty change set: the raw paths
+        # still need deterministic safety routing before the run can stop.
+        return not routing_files
 
     def _get_files_full(self):
         files = []
@@ -575,33 +982,23 @@ class AzureDevopsProvider(GitProvider):
             base_sha = self.pr.last_merge_target_commit
             head_sha = self.pr.last_merge_commit
 
-            # Get PR iterations
-            iterations = self.azure_devops_client.get_pull_request_iterations(
-                repository_id=self.repo_slug,
-                pull_request_id=self.pr_num,
-                project=self.workspace_slug
-            )
-            changes = None
-            if iterations:
-                iteration_id = iterations[-1].id  # Get the last iteration (most recent changes)
-
-                # Get changes for the iteration
-                changes = self.azure_devops_client.get_pull_request_iteration_changes(
-                    repository_id=self.repo_slug,
-                    pull_request_id=self.pr_num,
-                    iteration_id=iteration_id,
-                    project=self.workspace_slug
-                )
+            changes = self._get_latest_pr_iteration_changes()
             diff_files = []
             diffs = []
             diff_types = {}
-            if changes:
-                for change in changes.change_entries:
-                    item = change.additional_properties.get('item', {})
-                    path = item.get('path', None)
-                    if path:
-                        diffs.append(path)
-                        diff_types[path] = change.additional_properties.get('changeType', 'Unknown')
+            old_paths = {}
+            for change in changes:
+                path = _get_azure_change_path(change)
+                if path:
+                    diffs.append(path)
+                    edit_type = _azure_change_edit_type(change)
+                    # Preserve the review-diff adapter's historical fallback for an
+                    # unrecognized Azure change type. The routing inventory above
+                    # intentionally retains UNKNOWN so risk classification fails safe.
+                    diff_types[path] = (
+                        EDIT_TYPE.MODIFIED if edit_type is EDIT_TYPE.UNKNOWN else edit_type
+                    )
+                    old_paths[path] = _azure_change_old_path(change)
 
             # wrong implementation - gets all the files that were changed in any commit in the PR
             # commits = self.azure_devops_client.get_pull_request_commits(
@@ -677,13 +1074,7 @@ class AzureDevopsProvider(GitProvider):
                     # )
                     new_file_content_str = ""
 
-                edit_type = EDIT_TYPE.MODIFIED
-                if diff_types[file] == "add":
-                    edit_type = EDIT_TYPE.ADDED
-                elif diff_types[file] == "delete":
-                    edit_type = EDIT_TYPE.DELETED
-                elif "rename" in diff_types[file]: # diff_type can be `rename` | `edit, rename`
-                    edit_type = EDIT_TYPE.RENAMED
+                edit_type = diff_types[file]
 
                 if edit_type == EDIT_TYPE.ADDED or edit_type == EDIT_TYPE.RENAMED:
                     original_file_content_str = ""
@@ -745,6 +1136,7 @@ class AzureDevopsProvider(GitProvider):
                         patch=patch,
                         filename=file,
                         edit_type=edit_type,
+                        old_filename=old_paths.get(file),
                         num_plus_lines=num_plus_lines,
                         num_minus_lines=num_minus_lines,
                     )

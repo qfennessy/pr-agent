@@ -233,6 +233,33 @@ class BitbucketServerProvider(GitProvider):
         diffstat = [change["path"]['toString'] for change in changes]
         return diffstat
 
+    def get_files_for_routing(self):
+        """Return unfiltered Bitbucket Server changes with both rename paths."""
+        changes = self.bitbucket_client.get_pull_requests_changes(
+            self.workspace_slug,
+            self.repo_slug,
+            self.pr_num,
+        )
+        routing_files = []
+        for change in changes:
+            destination = (change.get('path') or {}).get('toString')
+            source = (change.get('srcPath') or {}).get('toString')
+            change_type = str(change.get('type') or '').upper()
+            status = {
+                'ADD': 'added',
+                'DELETE': 'deleted',
+                'MOVE': 'renamed',
+                'RENAME': 'renamed',
+                'MODIFY': 'modified',
+                'UPDATE': 'modified',
+            }.get(change_type, change_type.casefold())
+            routing_files.append({
+                'filename': destination or (source if status == 'deleted' else None),
+                'previous_filename': source if status == 'renamed' else None,
+                'status': status,
+            })
+        return routing_files
+
     #gets the best common ancestor: https://git-scm.com/docs/git-merge-base
     @staticmethod
     def get_best_common_ancestor(source_commits_list, destination_commits_list, guaranteed_common_ancestor) -> str:

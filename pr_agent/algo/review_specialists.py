@@ -718,6 +718,7 @@ def build_specialist_input(
     head_sha: str,
     allowed_change_labels: Sequence[str],
     snapshot: Optional[ReviewSnapshot] = None,
+    additional_deterministic_results: Sequence[Mapping[str, Any]] = (),
 ) -> SpecialistInput:
     """Build one input from provider-normalized files or an existing local snapshot."""
 
@@ -736,7 +737,10 @@ def build_specialist_input(
         input_head = snapshot.snapshot_id
         changed_paths = snapshot.changed_paths
         diff = snapshot.diff
-        deterministic_results = snapshot.deterministic_results
+        deterministic_results = (
+            *snapshot.deterministic_results,
+            *additional_deterministic_results,
+        )
         event = snapshot.event.value
         policy_version = snapshot.policy_version
         review_configuration_hash = snapshot.review_configuration_hash
@@ -753,7 +757,7 @@ def build_specialist_input(
         input_head = head_sha
         changed_paths = tuple(path for path, _ in normalized_files)
         diff = provider_diff
-        deterministic_results = ()
+        deterministic_results = tuple(additional_deterministic_results)
         event = "pull_request"
         policy_version = "specialist-shadow-v1"
         review_configuration_hash = None
