@@ -2,8 +2,8 @@ import hashlib
 
 import pytest
 
-import pr_agent.algo.candidate_verification as candidate_verification
-from pr_agent.algo.candidate_verification import apply_verification_decisions
+from pr_agent.algo.candidate_verification import (
+    _changed_anchor_identity_details, apply_verification_decisions)
 from pr_agent.algo.inline_comment_dedup import (
     body_fingerprint, body_with_finding_identity_marker,
     build_summary_fallback_marker, finding_identity_markers, has_marker,
@@ -445,9 +445,7 @@ def test_single_verified_finding_with_a_patch_repeated_anchor_shape_fails_closed
         "+return second(value)"
     )
     anchor_shape, anchor_ordinal, anchor_occurrence_count = (
-        candidate_verification._changed_anchor_identity_details(
-            patch_text, 12, 12
-        )
+        _changed_anchor_identity_details(patch_text, 12, 12)
     )
     candidate = {
         "candidate_id": "candidate-1",
