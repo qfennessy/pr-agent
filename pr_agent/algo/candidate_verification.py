@@ -420,13 +420,13 @@ def _normalized_evidence_shape(content: str) -> str:
     return "".join(shaped.split())
 
 
-def _changed_anchor_identity(
+def _changed_anchor_identity_details(
     patch: str,
     start_line: int,
     end_line: int,
     side: str = "new",
-) -> tuple[str, int]:
-    """Derive the range shape and equal-shape start ordinal in one patch traversal."""
+) -> tuple[str, int, int]:
+    """Derive a range shape, its ordinal, and its total patch occurrence count."""
     old_line = None
     new_line = None
     segment = 0
@@ -467,7 +467,7 @@ def _changed_anchor_identity(
         if start_line <= line_number <= end_line
     ]
     if not target_record_indexes:
-        return "", 0
+        return "", 0, 0
 
     def tokenized(records: list[tuple[int, int, str]]) -> list[Optional[str]]:
         tokens = []
@@ -483,10 +483,10 @@ def _changed_anchor_identity(
     target_records = [changed_records[index] for index in target_record_indexes]
     target_shapes = tokenized(target_records)
     if not any(isinstance(token, str) and token for token in target_shapes):
-        return "", 0
+        return "", 0, 0
     anchor_shape = json.dumps(target_shapes, separators=(",", ":"))
     if target_records[0][0] != start_line:
-        return anchor_shape, 0
+        return anchor_shape, 0, 0
 
     target_record_index = target_record_indexes[0]
     target_start_index = target_record_index
@@ -508,18 +508,32 @@ def _changed_anchor_identity(
             prefix[index] = matched
 
     anchor_ordinal = 0
+    anchor_occurrence_count = 0
     matched = 0
-    scan_limit = target_start_index + len(target_shapes)
-    for index, line_shape in enumerate(changed_tokens[:scan_limit]):
+    for index, line_shape in enumerate(changed_tokens):
         while matched and line_shape != target_shapes[matched]:
             matched = prefix[matched - 1]
         if line_shape == target_shapes[matched]:
             matched += 1
         if matched == len(target_shapes):
             occurrence_start = index - len(target_shapes) + 1
+            anchor_occurrence_count += 1
             if occurrence_start <= target_start_index:
                 anchor_ordinal += 1
             matched = prefix[matched - 1]
+    return anchor_shape, anchor_ordinal, anchor_occurrence_count
+
+
+def _changed_anchor_identity(
+    patch: str,
+    start_line: int,
+    end_line: int,
+    side: str = "new",
+) -> tuple[str, int]:
+    """Derive the range shape and equal-shape start ordinal in one patch traversal."""
+    anchor_shape, anchor_ordinal, _ = _changed_anchor_identity_details(
+        patch, start_line, end_line, side
+    )
     return anchor_shape, anchor_ordinal
 
 
@@ -656,7 +670,7 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
                 "sensitive_path": True,
             })
             continue
-        anchor_shape, anchor_ordinal = _changed_anchor_identity(
+        anchor_shape, anchor_ordinal, anchor_occurrence_count = _changed_anchor_identity_details(
             patch, start_line, end_line, side
         )
         candidates.append({
@@ -677,6 +691,7 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             "_changed_line_ranges": changed_line_ranges,
             "_changed_anchor_shape": anchor_shape,
             "_changed_anchor_ordinal": anchor_ordinal,
+            "_changed_anchor_occurrence_count": anchor_occurrence_count,
             "_trusted_lineage_key": _trusted_file_lineage(diff_file),
             "_trusted_side_line_count": trusted_side_line_count,
             "_display_file": (
@@ -785,12 +800,14 @@ def prepare_candidates(review_data: dict, diff_files: list, sensitive_globs: lis
             continue
         seen.add(key)
         candidate["_changed_line_ranges"] = changed_line_ranges
-        candidate["_changed_anchor_shape"], candidate["_changed_anchor_ordinal"] = (
-            _changed_anchor_identity(
-                getattr(diff_file, "patch", ""),
-                candidate["start_line"],
-                candidate["end_line"],
-            )
+        (
+            candidate["_changed_anchor_shape"],
+            candidate["_changed_anchor_ordinal"],
+            candidate["_changed_anchor_occurrence_count"],
+        ) = _changed_anchor_identity_details(
+            getattr(diff_file, "patch", ""),
+            candidate["start_line"],
+            candidate["end_line"],
         )
         candidate["_trusted_lineage_key"] = _trusted_file_lineage(diff_file)
         candidate["_trusted_side_line_count"] = trusted_side_line_count
@@ -2784,13 +2801,20 @@ def apply_verification_decisions(
             result_records.append(record)
             continue
         anchor_shape_id = _verified_anchor_shape_id(candidate)
-        if anchor_shape_id is None:
+        anchor_occurrence_count = candidate.get("_changed_anchor_occurrence_count")
+        if (
+            anchor_shape_id is None
+            or isinstance(anchor_occurrence_count, bool)
+            or not isinstance(anchor_occurrence_count, int)
+            or anchor_occurrence_count < 1
+        ):
             record["verdict"] = "rejected"
             record["reason"] = "trusted_identity_unavailable"
             result_records.append(record)
             continue
         finding["root_cause_id"], finding["trusted_stable_key"] = identity
         finding["_trusted_anchor_shape_id"] = anchor_shape_id
+        finding["_trusted_anchor_shape_occurrence_count"] = anchor_occurrence_count
         if identity in seen_identities:
             record["verdict"] = "rejected"
             record["reason"] = "trusted_identity_collision"

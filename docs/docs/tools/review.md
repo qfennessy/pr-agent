@@ -63,11 +63,12 @@ The lifecycle foundation is not connected to `/review` publication yet. Its inte
 scopes them to the current repository and pull request, and never derives a substitute identity from finding prose or
 line numbers. The root-cause contract is `verified-root-cause-v2`; verifier-supplied identity fields are ignored before
 the finding reaches this boundary. Because v2 uses occurrence ordinals to distinguish repeated normalized code shapes,
-the batch adapter consumes a non-reversible trusted shape discriminator and rejects same-anchor or equal-shape ambiguity.
-Older batches without that discriminator also fail closed when multiple findings in one file could shift identity. This
-leaves any persisted thread mapping untouched instead of swapping content when candidates reorder or one repeated shape
-is deleted. The reserved setting remains off and has no runtime effect until the publication integration is implemented
-and rollout evidence exists:
+the batch adapter consumes a non-reversible trusted shape discriminator and a patch-derived total occurrence count. It
+only accepts shapes that occur exactly once anywhere in the patch, even when the verifier retained just one of several
+equal-shape candidates, and rejects same-anchor or equal-shape ambiguity. Older batches without both trusted values fail
+closed. This leaves any persisted thread mapping untouched instead of swapping content when candidates reorder or one
+repeated shape is deleted. The reserved setting remains off and has no runtime effect until the publication integration
+is implemented and rollout evidence exists:
 
 ```toml
 [review_thread_lifecycle]

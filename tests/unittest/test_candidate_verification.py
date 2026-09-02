@@ -379,9 +379,9 @@ def test_sensitive_audit_budget_bounds_expensive_shape_work_for_generated_diffs(
     max_sensitive_candidates = 6
 
     with patch(
-        "pr_agent.algo.candidate_verification._changed_anchor_identity",
-        wraps=candidate_verification._changed_anchor_identity,
-    ) as changed_anchor_identity:
+        "pr_agent.algo.candidate_verification._changed_anchor_identity_details",
+        wraps=candidate_verification._changed_anchor_identity_details,
+    ) as changed_anchor_identity_details:
         candidates, rejected = prepare_candidates(
             _review_data(),
             [diff_file],
@@ -393,7 +393,7 @@ def test_sensitive_audit_budget_bounds_expensive_shape_work_for_generated_diffs(
     assert len(candidates) == max_sensitive_candidates
     assert rejected[-1]["total_count"] == 2_000
     assert rejected[-1]["omitted_count"] == 1_994
-    assert changed_anchor_identity.call_count == max_sensitive_candidates
+    assert changed_anchor_identity_details.call_count == max_sensitive_candidates
 
 
 def test_late_model_candidate_computes_anchor_identity_in_one_patch_pass():
@@ -418,6 +418,7 @@ def test_late_model_candidate_computes_anchor_identity_in_one_patch_pass():
     assert len(candidates) == 1
     assert rejected == []
     assert candidates[0]["_changed_anchor_ordinal"] == 5_000
+    assert candidates[0]["_changed_anchor_occurrence_count"] == 5_000
     assert patch_lines.call_count == 2
 
 

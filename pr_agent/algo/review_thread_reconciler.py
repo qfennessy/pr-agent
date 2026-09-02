@@ -144,11 +144,12 @@ def finding_identities_from_verified_findings(
 
     Issue #9's v2 hashes use order-derived ordinals for defects at one anchor
     and repeated normalized anchor shapes. Its non-reversible trusted shape
-    discriminator lets distinct shapes proceed, while ambiguous equal shapes
-    are refused so publication leaves existing mappings untouched.
+    discriminator and patch-wide occurrence count let unique shapes proceed,
+    while ambiguous equal shapes are refused so publication leaves existing
+    mappings untouched.
     """
     anchor_counts: dict[tuple[str, str, int], int] = {}
-    shape_ids_by_file_side: dict[tuple[str, str], list[Optional[str]]] = {}
+    shape_ids_by_file_side: dict[tuple[str, str], list[str]] = {}
     for finding in findings:
         if not isinstance(finding, Mapping):
             raise TypeError("verified finding must be a mapping")
@@ -167,23 +168,29 @@ def finding_identities_from_verified_findings(
         anchor = (relevant_file.strip().lstrip("/"), side, start_line)
         anchor_counts[anchor] = anchor_counts.get(anchor, 0) + 1
         shape_id = finding.get("_trusted_anchor_shape_id")
-        if shape_id is not None and (
+        if (
             not isinstance(shape_id, str)
             or not re.fullmatch(r"sha256:[a-f0-9]{64}", shape_id.strip())
         ):
             raise ValueError("verified finding trusted anchor shape id must be a sha256 identity")
+        shape_occurrence_count = finding.get("_trusted_anchor_shape_occurrence_count")
+        if (
+            isinstance(shape_occurrence_count, bool)
+            or not isinstance(shape_occurrence_count, int)
+            or shape_occurrence_count < 1
+        ):
+            raise ValueError("verified finding requires a trusted anchor shape occurrence count")
+        if shape_occurrence_count != 1:
+            raise ValueError("verified finding anchor shape is not unique in the patch")
         shape_ids_by_file_side.setdefault(anchor[:2], []).append(
-            shape_id.strip() if isinstance(shape_id, str) else None
+            shape_id.strip()
         )
     if any(count > 1 for count in anchor_counts.values()):
         raise ValueError(
             "multiple verified findings share one anchor without a trusted semantic discriminator"
         )
     for shape_ids in shape_ids_by_file_side.values():
-        if len(shape_ids) > 1 and (
-            any(shape_id is None for shape_id in shape_ids)
-            or len(set(shape_ids)) != len(shape_ids)
-        ):
+        if len(shape_ids) > 1 and len(set(shape_ids)) != len(shape_ids):
             raise ValueError(
                 "multiple verified findings have an ambiguous equal anchor shape"
             )

@@ -2,6 +2,7 @@ import hashlib
 
 import pytest
 
+import pr_agent.algo.candidate_verification as candidate_verification
 from pr_agent.algo.candidate_verification import apply_verification_decisions
 from pr_agent.algo.inline_comment_dedup import (
     body_fingerprint, body_with_finding_identity_marker,
@@ -182,6 +183,8 @@ def test_verified_finding_identity_consumes_exact_upstream_hashes_without_derivi
         "relevant_file": "src/app.py",
         "trusted_stable_key": trusted_stable_key,
         "issue_content": "Mutable wording is not identity input.",
+        "_trusted_anchor_shape_id": f"sha256:{'c' * 64}",
+        "_trusted_anchor_shape_occurrence_count": 1,
         "side": "new",
         "start_line": 12,
     }], repository="owner/repo", pull_request_number=7)[0]
@@ -199,6 +202,9 @@ def test_verified_finding_identity_consumes_exact_upstream_hashes_without_derivi
         ({"trusted_stable_key": "candidate-1"}, "trusted_stable_key"),
         ({"trusted_stable_key": None}, "trusted_stable_key"),
         ({"relevant_file": None}, "publication anchor"),
+        ({"_trusted_anchor_shape_id": None}, "trusted anchor shape id"),
+        ({"_trusted_anchor_shape_occurrence_count": None}, "occurrence count"),
+        ({"_trusted_anchor_shape_occurrence_count": True}, "occurrence count"),
     ],
 )
 def test_verified_finding_identity_fails_closed_on_untrusted_or_malformed_identity(replacement, error):
@@ -206,6 +212,8 @@ def test_verified_finding_identity_fails_closed_on_untrusted_or_malformed_identi
         "root_cause_id": f"sha256:{'a' * 64}",
         "relevant_file": "src/app.py",
         "trusted_stable_key": f"sha256:{'b' * 64}",
+        "_trusted_anchor_shape_id": f"sha256:{'c' * 64}",
+        "_trusted_anchor_shape_occurrence_count": 1,
         "side": "new",
         "start_line": 12,
     }
@@ -231,6 +239,7 @@ def test_verified_finding_identity_accepts_actual_verification_output():
         "_changed_line_ranges": [(12, 12)],
         "_changed_anchor_shape": "return <id> ( <id> )",
         "_changed_anchor_ordinal": 1,
+        "_changed_anchor_occurrence_count": 1,
         "_trusted_defect_ordinal": 1,
         "_trusted_lineage_key": "file:src/service.py",
         "_trusted_side_line_count": 20,
@@ -292,6 +301,7 @@ def test_same_anchor_v2_identity_reordering_fails_closed_without_swapping_thread
                 "_changed_line_ranges": [(12, 12)],
                 "_changed_anchor_shape": "return <id> ( <id> )",
                 "_changed_anchor_ordinal": 1,
+                "_changed_anchor_occurrence_count": 1,
                 "_trusted_defect_ordinal": ordinal,
                 "_trusted_lineage_key": "file:src/service.py",
                 "_trusted_side_line_count": 20,
@@ -358,6 +368,7 @@ def test_equal_shape_v2_occurrence_shift_after_deletion_fails_closed_before_mapp
                 "_changed_line_ranges": [(line, line)],
                 "_changed_anchor_shape": anchor_shape,
                 "_changed_anchor_ordinal": anchor_ordinal,
+                "_changed_anchor_occurrence_count": len(specs),
                 "_trusted_defect_ordinal": 1,
                 "_trusted_lineage_key": "file:src/service.py",
                 "_trusted_side_line_count": 30,
@@ -400,7 +411,7 @@ def test_equal_shape_v2_occurrence_shift_after_deletion_fails_closed_before_mapp
     assert before_by_header["first"]["root_cause_id"] == after_deletion[0]["root_cause_id"]
     assert before_by_header["second"]["root_cause_id"] != after_deletion[0]["root_cause_id"]
     assert len({finding["_trusted_anchor_shape_id"] for finding in before}) == 1
-    with pytest.raises(ValueError, match="ambiguous equal anchor shape"):
+    with pytest.raises(ValueError, match="anchor shape is not unique in the patch"):
         finding_identities_from_verified_findings(
             tuple(before), repository="owner/repo", pull_request_number=7
         )
@@ -414,6 +425,7 @@ def test_distinct_trusted_anchor_shapes_in_one_file_remain_eligible():
             "relevant_file": "src/service.py",
             "trusted_stable_key": f"sha256:{str(index + 2) * 64}",
             "_trusted_anchor_shape_id": f"sha256:{shape_id * 64}",
+            "_trusted_anchor_shape_occurrence_count": 1,
             "side": "new",
             "start_line": index * 10,
         })
@@ -423,6 +435,61 @@ def test_distinct_trusted_anchor_shapes_in_one_file_remain_eligible():
     )
 
     assert len(identities) == 2
+
+
+def test_single_verified_finding_with_a_patch_repeated_anchor_shape_fails_closed():
+    patch_text = (
+        "@@ -0,0 +10,3 @@\n"
+        "+return first(value)\n"
+        "+record(event)\n"
+        "+return second(value)"
+    )
+    anchor_shape, anchor_ordinal, anchor_occurrence_count = (
+        candidate_verification._changed_anchor_identity_details(
+            patch_text, 12, 12
+        )
+    )
+    candidate = {
+        "candidate_id": "candidate-1",
+        "relevant_file": "src/service.py",
+        "issue_header": "Incorrect fallback",
+        "issue_content": "The second return skips the required fallback.",
+        "start_line": 12,
+        "end_line": 12,
+        "side": "new",
+        "trigger": "The primary lookup returns no result.",
+        "impact": "The request returns an invalid response.",
+        "_changed_line_ranges": [(10, 12)],
+        "_changed_anchor_shape": anchor_shape,
+        "_changed_anchor_ordinal": anchor_ordinal,
+        "_changed_anchor_occurrence_count": anchor_occurrence_count,
+        "_trusted_defect_ordinal": 1,
+        "_trusted_lineage_key": "file:src/service.py",
+        "_trusted_side_line_count": 20,
+    }
+    evidence = [{
+        "candidate_id": "candidate-1",
+        "source": "changed_patch",
+        "path": "src/service.py",
+        "content": "return second(value)",
+        "start_line": 12,
+        "end_line": 12,
+        "side": "new",
+    }]
+    verification = {"verification": {"decisions": [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "evidence_paths": ["src/service.py"],
+    }]}}
+
+    findings, decisions = apply_verification_decisions([candidate], evidence, verification)
+
+    assert decisions[0]["verdict"] == "verified"
+    assert findings[0]["_trusted_anchor_shape_occurrence_count"] == 2
+    with pytest.raises(ValueError, match="anchor shape is not unique in the patch"):
+        finding_identities_from_verified_findings(
+            findings, repository="owner/repo", pull_request_number=7
+        )
 
 
 @pytest.mark.parametrize(
