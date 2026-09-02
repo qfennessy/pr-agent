@@ -583,8 +583,8 @@ class ShadowJournalWriter:
         pending: Optional[ShadowJournalRecord] = None
         while True:
             item = self._queue.get()
-            try:
-                if item is self._STOP:
+            if item is self._STOP:
+                try:
                     if pending is not None:
                         with self._submit_lock:
                             summary = ShadowJournalSessionSummary(
@@ -594,7 +594,12 @@ class ShadowJournalWriter:
                                 writer_failed=self._failed.is_set(),
                             )
                         self._append_record(replace(pending, session_summary=summary))
-                    return
+                except (OSError, EvaluationValidationError):
+                    self._failed.set()
+                finally:
+                    self._queue.task_done()
+                return
+            try:
                 if not isinstance(item, ShadowJournalRecord):
                     raise EvaluationValidationError("shadow queue contained an invalid record")
                 previous = pending

@@ -851,6 +851,32 @@ def test_shadow_journal_persists_queue_drops_in_the_session_summary(tmp_path, mo
     )
 
 
+def test_shadow_journal_final_seal_failure_stops_the_writer_and_fails_close(tmp_path, monkeypatch):
+    case = _case("case", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
+    manifest = _manifest((case,), (_arm("deterministic", EvaluationArmKind.DETERMINISTIC),))
+    entry = ShadowJournalEntry.from_run_record(
+        _record(manifest, case, "deterministic"),
+        arm=manifest.arms[0],
+        event=case.event,
+        policy_hash=manifest.policy_hash,
+        configuration_hash=manifest.configuration_hash,
+    )
+
+    def failed_append(path, payload):
+        raise OSError("simulated journal failure")
+
+    monkeypatch.setattr(
+        "pr_agent.algo.checkpoint_shadow_journal._append_private_line",
+        failed_append,
+    )
+    writer = ShadowJournalWriter(tmp_path / "failed-shadow.ndjson", enabled=True)
+    assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
+
+    writer_closed = writer.close()
+    assert writer_closed is False
+    assert writer._thread is not None and not writer._thread.is_alive()
+
+
 def test_scorer_reports_lineage_lifecycle_events_stages_cohorts_and_paired_uncertainty():
     root = _case("root", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
     child = _case("child", EvaluationCohort.HOLDOUT, ReviewEvent.WORKTREE_IDLE, 30, parent="root")
