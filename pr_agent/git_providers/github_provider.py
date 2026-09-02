@@ -70,29 +70,29 @@ from .git_provider import (
     is_own_persistent_comment_for_identities,
 )
 
-_REVIEW_THREAD_CREATE_LOCKS_GUARD = threading.Lock()
-_REVIEW_THREAD_CREATE_LOCKS = WeakValueDictionary()
-_REVIEW_THREAD_CREATE_PROCESS_LOCK_PREFIX = os.path.join(tempfile.gettempdir(), "pr-agent-review-thread-create")
+_REVIEW_THREAD_MUTATION_LOCKS_GUARD = threading.Lock()
+_REVIEW_THREAD_MUTATION_LOCKS = WeakValueDictionary()
+_REVIEW_THREAD_MUTATION_PROCESS_LOCK_PREFIX = os.path.join(tempfile.gettempdir(), "pr-agent-review-thread")
 
 
-class _ReviewThreadCreateLockError(RuntimeError):
+class _ReviewThreadMutationLockError(RuntimeError):
     pass
 
 
 @contextmanager
-def _review_thread_create_lock(repository: str, pull_request_number: int, finding_id: str):
-    """Serialize creates across threads and same-host service workers."""
+def _review_thread_mutation_lock(repository: str, pull_request_number: int, finding_id: str):
+    """Serialize same-finding mutations across threads and service workers."""
     key = f"{repository.casefold()}#{pull_request_number}:{finding_id}"
     lock_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    lock_path = f"{_REVIEW_THREAD_CREATE_PROCESS_LOCK_PREFIX}-{lock_digest}.lock"
-    with _REVIEW_THREAD_CREATE_LOCKS_GUARD:
-        lock = _REVIEW_THREAD_CREATE_LOCKS.get(key)
+    lock_path = f"{_REVIEW_THREAD_MUTATION_PROCESS_LOCK_PREFIX}-{lock_digest}.lock"
+    with _REVIEW_THREAD_MUTATION_LOCKS_GUARD:
+        lock = _REVIEW_THREAD_MUTATION_LOCKS.get(key)
         if lock is None:
             lock = threading.Lock()
-            _REVIEW_THREAD_CREATE_LOCKS[key] = lock
+            _REVIEW_THREAD_MUTATION_LOCKS[key] = lock
     with lock:
         if fcntl is None:
-            raise _ReviewThreadCreateLockError("cross-process file locking is unavailable")
+            raise _ReviewThreadMutationLockError("cross-process file locking is unavailable")
         descriptor = None
         try:
             flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -107,7 +107,7 @@ def _review_thread_create_lock(repository: str, pull_request_number: int, findin
         except (OSError, ValueError) as error:
             if descriptor is not None:
                 os.close(descriptor)
-            raise _ReviewThreadCreateLockError(f"cross-process create coordination failed: {error}") from error
+            raise _ReviewThreadMutationLockError(f"cross-process mutation coordination failed: {error}") from error
         try:
             yield
         finally:
@@ -1618,7 +1618,7 @@ class GithubProvider(GitProvider):
                 for duplicate in active:
                     if duplicate.thread_id == canonical.thread_id:
                         continue
-                    resolved = self.resolve_review_thread(
+                    resolved = self._resolve_review_thread_locked(
                         duplicate.thread_id,
                         expected_head_sha,
                         duplicate,
@@ -1696,7 +1696,7 @@ class GithubProvider(GitProvider):
             )
         finding_id = next(iter(marker_ids))
         try:
-            with _review_thread_create_lock(self.repo, self.pr_num, finding_id):
+            with _review_thread_mutation_lock(self.repo, self.pr_num, finding_id):
                 return self._create_review_thread_locked(
                     comment,
                     expected_head_sha,
@@ -1704,7 +1704,7 @@ class GithubProvider(GitProvider):
                     anchor,
                     expected_threads,
                 )
-        except _ReviewThreadCreateLockError as error:
+        except _ReviewThreadMutationLockError as error:
             return ReviewThreadActionOutcome(
                 kind=ReviewThreadActionKind.CREATE,
                 state=ReviewThreadActionState.FAILED,
@@ -1715,6 +1715,41 @@ class GithubProvider(GitProvider):
             )
 
     def update_review_thread(
+        self,
+        comment_id: int,
+        body: str,
+        expected_head_sha: str,
+        expected_thread: ReviewThreadSnapshot,
+    ) -> ReviewThreadActionOutcome:
+        if not expected_thread.finding_id:
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.UPDATE,
+                state=ReviewThreadActionState.STALE_INVENTORY,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=None,
+                comment_id=comment_id,
+                reason="planned_thread_finding_id_is_missing",
+            )
+        try:
+            with _review_thread_mutation_lock(self.repo, self.pr_num, expected_thread.finding_id):
+                return self._update_review_thread_locked(
+                    comment_id,
+                    body,
+                    expected_head_sha,
+                    expected_thread,
+                )
+        except _ReviewThreadMutationLockError as error:
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.UPDATE,
+                state=ReviewThreadActionState.FAILED,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=None,
+                comment_id=comment_id,
+                reason=f"update_coordination_failed: {error}",
+                failure_kind=ReviewThreadFailureKind.PROVIDER_FAILURE,
+            )
+
+    def _update_review_thread_locked(
         self,
         comment_id: int,
         body: str,
@@ -1752,6 +1787,39 @@ class GithubProvider(GitProvider):
             )
 
     def resolve_review_thread(
+        self,
+        thread_id: str,
+        expected_head_sha: str,
+        expected_thread: ReviewThreadSnapshot,
+    ) -> ReviewThreadActionOutcome:
+        if not expected_thread.finding_id:
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.RESOLVE,
+                state=ReviewThreadActionState.STALE_INVENTORY,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=None,
+                thread_id=thread_id,
+                reason="planned_thread_finding_id_is_missing",
+            )
+        try:
+            with _review_thread_mutation_lock(self.repo, self.pr_num, expected_thread.finding_id):
+                return self._resolve_review_thread_locked(
+                    thread_id,
+                    expected_head_sha,
+                    expected_thread,
+                )
+        except _ReviewThreadMutationLockError as error:
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.RESOLVE,
+                state=ReviewThreadActionState.FAILED,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=None,
+                thread_id=thread_id,
+                reason=f"resolve_coordination_failed: {error}",
+                failure_kind=ReviewThreadFailureKind.PROVIDER_FAILURE,
+            )
+
+    def _resolve_review_thread_locked(
         self,
         thread_id: str,
         expected_head_sha: str,

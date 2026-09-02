@@ -97,11 +97,11 @@ instead of looping. A changed or unverifiable post-mutation head stops the rest 
 inventory. Rate limits are reported separately from permission failures with available `Retry-After` or rate-limit-reset
 evidence; a rate-limited create is never blindly retried because GitHub may already have accepted it.
 
-Creates are serialized by repository, pull request, and finding identity across threads and same-host service workers,
-then re-inventory immediately before publishing. Unrelated findings retain worker concurrency. If cross-process
-coordination is unavailable or unsafe, creation fails closed. Create revalidation also requires the complete planned
-same-finding thread set to remain unchanged, including bot-resolved recurrence history. A post-create inventory selects
-the oldest identical safe Bot-owned copy and resolves only duplicate copies with no replies; disagreement or unsafe
+Create, update, and resolve mutations are serialized by repository, pull request, and finding identity across threads and
+same-host service workers. Unrelated findings retain worker concurrency. If cross-process coordination is unavailable or
+unsafe, the mutation fails closed. Create revalidation requires the complete planned same-finding thread set to remain
+unchanged, including bot-resolved recurrence history, while holding that lock through publication. A post-create inventory
+selects the oldest identical safe Bot-owned copy and resolves only duplicate copies with no replies; disagreement or unsafe
 ownership fails closed for a fresh inventory instead of deleting discussion. A bot-resolved historical thread is also
 preserved when it gains a reply or first appears after recurrence was planned.
 

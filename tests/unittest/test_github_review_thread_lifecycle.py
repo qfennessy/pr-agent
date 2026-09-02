@@ -19,7 +19,7 @@ from pr_agent.algo.review_thread_reconciler import (
     execute_review_thread_action_plan,
     plan_review_thread_actions,
 )
-from pr_agent.git_providers.github_provider import GithubProvider, _review_thread_create_lock
+from pr_agent.git_providers.github_provider import GithubProvider, _review_thread_mutation_lock
 from pr_agent.servers.utils import RateLimitExceeded
 
 
@@ -66,8 +66,8 @@ def _identity():
     )
 
 
-def _hold_review_thread_create_lock(acquired, release, finding_id=None):
-    with _review_thread_create_lock("owner/repo", 42, finding_id or _identity().finding_id):
+def _hold_review_thread_mutation_lock(acquired, release, finding_id=None):
+    with _review_thread_mutation_lock("owner/repo", 42, finding_id or _identity().finding_id):
         acquired.set()
         if not release.wait(5):
             raise RuntimeError("timed out waiting to release review-thread create lock")
@@ -675,7 +675,7 @@ def test_concurrent_create_review_thread_calls_publish_once_for_one_finding():
     assert len([call for call in requester.calls if call[0] == "rest" and call[1] == "POST"]) == 1
 
 
-def test_review_thread_create_lock_is_keyed_and_serializes_same_finding_across_processes():
+def test_review_thread_mutation_lock_is_keyed_and_serializes_same_finding_across_processes():
     if "fork" not in multiprocessing.get_all_start_methods():
         pytest.skip("cross-process file-lock regression requires fork")
     context = multiprocessing.get_context("fork")
@@ -685,10 +685,10 @@ def test_review_thread_create_lock_is_keyed_and_serializes_same_finding_across_p
     second_release = context.Event()
     unrelated_acquired = context.Event()
     unrelated_release = context.Event()
-    first = context.Process(target=_hold_review_thread_create_lock, args=(first_acquired, first_release))
-    second = context.Process(target=_hold_review_thread_create_lock, args=(second_acquired, second_release))
+    first = context.Process(target=_hold_review_thread_mutation_lock, args=(first_acquired, first_release))
+    second = context.Process(target=_hold_review_thread_mutation_lock, args=(second_acquired, second_release))
     unrelated = context.Process(
-        target=_hold_review_thread_create_lock,
+        target=_hold_review_thread_mutation_lock,
         args=(unrelated_acquired, unrelated_release, "different-finding"),
     )
     first.start()
@@ -718,6 +718,56 @@ def test_review_thread_create_lock_is_keyed_and_serializes_same_finding_across_p
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=1)
+
+
+@pytest.mark.parametrize("operation", ["update", "resolve"])
+def test_same_finding_update_and_resolve_wait_for_lifecycle_mutation_lock(operation):
+    expected_thread, inventory = _owned_thread_state()
+    if operation == "update":
+        requester = _Requester(
+            graphql=[inventory],
+            rest=[
+                {"head": {"sha": "head-1"}},
+                {"head": {"sha": "head-1"}},
+                {"id": 77, "node_id": "comment-node-77"},
+                {"head": {"sha": "head-1"}},
+            ],
+        )
+    else:
+        requester = _Requester(
+            graphql=[
+                inventory,
+                _graphql({"resolveReviewThread": {"thread": {"id": "thread-1", "isResolved": True}}}),
+            ],
+            rest=[
+                {"head": {"sha": "head-1"}},
+                {"head": {"sha": "head-1"}},
+                {"head": {"sha": "head-1"}},
+            ],
+        )
+    provider = _provider(requester)
+    started = threading.Event()
+    finished = threading.Event()
+    outcomes = []
+
+    def mutate():
+        started.set()
+        if operation == "update":
+            outcomes.append(provider.update_review_thread(77, "new body", "head-1", expected_thread))
+        else:
+            outcomes.append(provider.resolve_review_thread("thread-1", "head-1", expected_thread))
+        finished.set()
+
+    with _review_thread_mutation_lock("owner/repo", 42, expected_thread.finding_id):
+        worker = threading.Thread(target=mutate)
+        worker.start()
+        assert started.wait(1)
+        assert not finished.wait(0.1)
+        assert requester.calls == []
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert outcomes[0].state == ReviewThreadActionState.APPLIED
 
 
 def test_create_review_thread_converges_safe_concurrent_duplicates_to_oldest_thread():
