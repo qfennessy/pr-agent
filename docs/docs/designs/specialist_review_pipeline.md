@@ -1,7 +1,9 @@
 # Specialist review pipeline
 
-!!! note "Status: proposed, not implemented"
-    This page describes a design for the `qfennessy/pr-agent` fork. The configuration keys and CLI commands below are illustrative. Current PR-Agent releases do not yet provide the file-save watcher, specialist router, or quality-escalation pipeline described here.
+!!! note "Status: staged implementation"
+    This page describes the target design for the `qfennessy/pr-agent` fork. Immutable snapshots, shadow specialists,
+    deterministic review-depth routing, candidate verification, and a default-off frontier adjudication contract are
+    implemented. Activation and developer-visible output remain gated by the #27 evaluation and #10 rollout work.
 
 ## Executive decision
 

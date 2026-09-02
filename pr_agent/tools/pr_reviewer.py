@@ -29,6 +29,18 @@ from pr_agent.algo.candidate_verification import (
     safe_repo_path,
     telemetry_safe_artifact,
     validated_specialist_prioritization,
+    verified_finding_identity,
+)
+from pr_agent.algo.frontier_adjudication import (
+    FrontierAdjudicationRequest,
+    FrontierCandidate,
+    FrontierContractError,
+    FrontierSignals,
+    NormalizedSeverity,
+    build_frontier_evidence,
+    load_frontier_adjudication_config,
+    normalize_severity,
+    run_frontier_adjudication,
 )
 from pr_agent.algo.config_utils import parse_env_bool
 from pr_agent.algo.git_patch_processing import iter_git_patch_lines, split_git_file_lines
@@ -170,6 +182,7 @@ class PRReviewer:
         self.deleted_files_list = []
         self.prediction = None
         self.candidate_verification_artifact = None
+        self.frontier_adjudication_artifact = None
         self._candidate_verification_published_finding_count = None
         self.verified_review_data = None
         self.specialist_shadow_input = None
@@ -1595,6 +1608,28 @@ class PRReviewer:
                 return "duplicate_decision"
             if str(decision.get("verdict") or "").strip().lower() not in {"verified", "rejected"}:
                 return "invalid_verdict"
+            severity = decision.get("normalized_severity")
+            if severity is not None and str(severity).strip().lower() not in {"low", "medium", "high", "critical"}:
+                return "invalid_severity"
+            confidence = decision.get("confidence")
+            if confidence is not None and (
+                isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not 0 <= confidence <= 1
+            ):
+                return "invalid_confidence"
+            disputed = decision.get("disputed")
+            if disputed is not None and not isinstance(disputed, bool):
+                return "invalid_disputed_signal"
+            evidence_status = decision.get("evidence_status")
+            if evidence_status is not None and str(evidence_status).strip().lower() not in {"complete", "insufficient"}:
+                return "invalid_evidence_status"
+            unresolved_questions = decision.get("unresolved_questions")
+            if unresolved_questions is not None and (
+                not isinstance(unresolved_questions, list)
+                or any(not isinstance(question, str) or not question.strip() for question in unresolved_questions)
+            ):
+                return "invalid_unresolved_questions"
             if str(decision.get("verdict") or "").strip().lower() == "verified":
                 required_text = (
                     "issue_header", "issue_content", "trigger", "impact",
@@ -1748,6 +1783,182 @@ class PRReviewer:
             first_key="review",
             last_key="security_concerns",
         )
+
+    @staticmethod
+    def _frontier_adjudication_enabled() -> bool:
+        value = get_settings().pr_reviewer.get("enable_frontier_adjudication", False)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    @staticmethod
+    def _frontier_candidate_severity(candidate: Mapping[str, Any], decision: Mapping[str, Any]):
+        explicit = decision.get("normalized_severity") or candidate.get("normalized_severity")
+        if explicit:
+            return normalize_severity(explicit)
+        header = str(candidate.get("issue_header") or "").casefold()
+        if "critical" in header or "p0" in header:
+            return NormalizedSeverity.CRITICAL
+        if "high" in header or "p1" in header:
+            return NormalizedSeverity.HIGH
+        if "low" in header or "p3" in header:
+            return NormalizedSeverity.LOW
+        return NormalizedSeverity.MEDIUM
+
+    async def _run_frontier_adjudications(
+        self,
+        verified_findings: list[dict],
+        candidates: list[dict],
+        evidence: list[dict],
+        decisions: list[dict],
+    ) -> None:
+        """Run selected frontier calls as telemetry without changing verified findings."""
+
+        artifact = {
+            "enabled": True,
+            "status": "initializing",
+            "results": [],
+            "publication_safe": False,
+        }
+        self.frontier_adjudication_artifact = artifact
+        try:
+            config = load_frontier_adjudication_config(
+                get_settings().pr_reviewer,
+                get_settings().frontier_adjudication_prompt,
+                azure=getattr(self.ai_handler, "azure", False) is True,
+            )
+        except (FrontierContractError, TypeError, ValueError):
+            artifact.update({"status": "configuration_invalid", "failure": "invalid_configuration"})
+            return
+
+        snapshot_context = get_specialist_snapshot_context()
+        if snapshot_context is not None:
+            snapshot_id = snapshot_context.snapshot.snapshot_id
+            current_identity = snapshot_context.current_snapshot_id
+        else:
+            try:
+                snapshot_id = self.git_provider.get_pr_head_sha(refresh=False)
+            except Exception:
+                snapshot_id = None
+
+            def current_identity():
+                return self.git_provider.get_pr_head_sha(refresh=True)
+
+        if not snapshot_id:
+            artifact.update({"status": "unavailable", "failure": "stable_identity_unavailable"})
+            return
+
+        candidate_by_identity = {}
+        for candidate in candidates:
+            identity = verified_finding_identity(candidate)
+            if identity is not None:
+                candidate_by_identity[identity] = candidate
+        decision_by_candidate = {
+            item.get("candidate_id"): item
+            for item in decisions
+            if isinstance(item, dict) and item.get("candidate_id")
+        }
+        route_decision = getattr(self, "review_route_decision", None)
+        route_sensitive = bool(
+            route_decision is not None and route_decision.matched_sensitive_categories
+        )
+        risk_policy_version = (
+            route_decision.policy_version if route_decision is not None else "review-router-unavailable"
+        )
+        max_calls = config.max_calls
+        eligible_count = 0
+        call_count = 0
+        for finding in verified_findings:
+            identity = (finding.get("root_cause_id"), finding.get("trusted_stable_key"))
+            candidate = candidate_by_identity.get(identity)
+            if candidate is None:
+                artifact["results"].append({
+                    "state": "unavailable",
+                    "failure_reason": "trusted_candidate_identity_unavailable",
+                    "publication_safe": False,
+                })
+                continue
+            decision = decision_by_candidate.get(candidate.get("candidate_id"), {})
+            severity = self._frontier_candidate_severity(candidate, decision)
+            sensitive = bool(candidate.get("sensitive_path")) or route_sensitive
+            questions = tuple(decision.get("_unresolved_questions") or ())
+            signals = FrontierSignals(
+                sensitive=sensitive,
+                severe=severity in {NormalizedSeverity.HIGH, NormalizedSeverity.CRITICAL},
+                disputed=decision.get("disputed") is True,
+                insufficient_evidence=(
+                    decision.get("evidence_status") == "insufficient" or bool(questions)
+                ),
+                deterministic_forced=sensitive,
+                deterministic_severity_floor=(
+                    NormalizedSeverity.HIGH if sensitive else NormalizedSeverity.LOW
+                ),
+                reasons=("deterministic_sensitive_route",) if sensitive else (),
+                unresolved_questions=questions,
+            )
+            if not signals.requires_escalation:
+                continue
+            eligible_count += 1
+            if call_count >= max_calls:
+                artifact["results"].append({
+                    "stable_finding_id": finding.get("trusted_stable_key"),
+                    "state": "unavailable",
+                    "failure_reason": "call_budget_exhausted",
+                    "publication_safe": False,
+                })
+                continue
+            frontier_evidence = build_frontier_evidence(
+                str(candidate.get("candidate_id") or ""), evidence
+            )
+            try:
+                frontier_candidate = FrontierCandidate(
+                    stable_finding_id=str(finding.get("trusted_stable_key") or ""),
+                    root_cause_id=str(finding.get("root_cause_id") or ""),
+                    path=str(finding.get("relevant_file") or ""),
+                    side=str(finding.get("side") or "new"),
+                    start_line=int(finding.get("start_line")),
+                    end_line=int(finding.get("end_line")),
+                    title=str(finding.get("issue_header") or ""),
+                    explanation=str(finding.get("issue_content") or ""),
+                    trigger=str(finding.get("trigger") or ""),
+                    impact=str(finding.get("impact") or ""),
+                    verified_severity=severity,
+                )
+                request = FrontierAdjudicationRequest(
+                    candidate=frontier_candidate,
+                    evidence=frontier_evidence,
+                    signals=signals,
+                    snapshot_id=str(snapshot_id),
+                    configuration_hash=config.configuration_hash,
+                    prompt_hash=config.prompt_hash,
+                    policy_version=config.policy_version,
+                    risk_policy_version=risk_policy_version,
+                )
+            except (FrontierContractError, TypeError, ValueError):
+                artifact["results"].append({
+                    "stable_finding_id": finding.get("trusted_stable_key"),
+                    "state": "unavailable",
+                    "failure_reason": "adjudication_input_incomplete",
+                    "publication_safe": False,
+                })
+                continue
+            result = await run_frontier_adjudication(
+                request,
+                config,
+                self.ai_handler,
+                current_identity=current_identity,
+            )
+            call_count += 1
+            artifact["results"].append(result.to_telemetry_dict())
+        if not eligible_count:
+            artifact["status"] = "not_required"
+        elif any(
+            result.get("state") not in {"confirmed", "rejected"}
+            for result in artifact["results"]
+        ):
+            artifact["status"] = "partial"
+        else:
+            artifact["status"] = "complete"
 
     async def _run_candidate_verification(self) -> None:
         """Verify review candidates against bounded base-branch repository evidence."""
@@ -2192,6 +2403,13 @@ class PRReviewer:
                 verification_data,
                 retrieval_requests=retrieval_artifact["requests"],
             )
+            if self._frontier_adjudication_enabled():
+                await self._run_frontier_adjudications(
+                    verified_findings,
+                    candidates,
+                    prompt_evidence,
+                    decisions,
+                )
             max_findings = max(0, int(config.get("num_max_findings", 3)))
             published_findings = (
                 [] if model_candidate_coverage_incomplete

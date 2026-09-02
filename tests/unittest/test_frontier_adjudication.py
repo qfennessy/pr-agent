@@ -1,0 +1,362 @@
+import asyncio
+import json
+from decimal import Decimal
+
+import pytest
+
+from pr_agent.algo.ai_request_context import AIModelRoute
+from pr_agent.algo.frontier_adjudication import (
+    FRONTIER_INPUT_SCHEMA_VERSION,
+    FRONTIER_OUTPUT_SCHEMA_VERSION,
+    FrontierAdjudicationConfig,
+    FrontierAdjudicationRequest,
+    FrontierCandidate,
+    FrontierDecision,
+    FrontierEvidence,
+    FrontierModelIdentity,
+    FrontierSignals,
+    FrontierState,
+    NormalizedSeverity,
+    build_frontier_evidence,
+    load_frontier_adjudication_config,
+    run_frontier_adjudication,
+)
+from pr_agent.algo.run_details import get_run_details, init_run_details, record_ai_call
+
+
+SYSTEM_PROMPT = "Adjudicate {{ input_schema_version }} into {{ output_schema_version }}."
+USER_PROMPT = "Evidence: {{ adjudication_input_json }}"
+
+
+class FakeHandler:
+    def __init__(self, responses, *, account=True, telemetry_gap=None, delay=0):
+        self.responses = list(responses)
+        self.account = account
+        self.telemetry_gap = telemetry_gap
+        self.delay = delay
+        self.calls = []
+
+    async def chat_completion(self, model, system, user, temperature):
+        self.calls.append(model)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        if self.account:
+            record_ai_call(
+                usage=(
+                    None if self.telemetry_gap == "usage"
+                    else {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20}
+                ),
+                model=model,
+                cost_usd=None if self.telemetry_gap == "cost" else Decimal("0.01"),
+            )
+        return response, "stop"
+
+
+def output(decision="confirm", severity="medium", confidence=0.9, citations=None):
+    if decision != "confirm":
+        severity = None
+    return json.dumps({
+        "schema_version": FRONTIER_OUTPUT_SCHEMA_VERSION,
+        "decision": decision,
+        "normalized_severity": severity,
+        "confidence": confidence,
+        "evidence_citations": citations if citations is not None else ["evidence-1"],
+        "unresolved_questions": [],
+    })
+
+
+def config(*, enabled=True, fallback=False, stage_timeout=1, minimum_confidence=0):
+    models = ("frontier-primary", "frontier-fallback") if fallback else ("frontier-primary",)
+    deployments = (None,) * len(models)
+    identities = tuple(
+        FrontierModelIdentity(
+            model=model,
+            provider="provider-primary" if index == 0 else "provider-fallback",
+            revision="revision-primary" if index == 0 else "revision-fallback",
+        )
+        for index, model in enumerate(models)
+    )
+    return FrontierAdjudicationConfig(
+        enabled=enabled,
+        route=AIModelRoute(
+            models=models,
+            deployments=deployments,
+            timeout_seconds=0.5,
+            model_retries=1,
+            provider_retries=0,
+            max_output_tokens=256,
+        ),
+        model_identities=identities,
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt=USER_PROMPT,
+        minimum_confidence=minimum_confidence,
+        stage_timeout_seconds=stage_timeout,
+    )
+
+
+def request(stage_config, *, signals=None, snapshot_id="head-1"):
+    return FrontierAdjudicationRequest(
+        candidate=FrontierCandidate(
+            stable_finding_id="sha256:finding",
+            root_cause_id="sha256:root",
+            path="src/auth.py",
+            side="new",
+            start_line=10,
+            end_line=12,
+            title="Authorization bypass",
+            explanation="The guard can be skipped.",
+            trigger="Pass an unowned object id.",
+            impact="Another tenant's object is returned.",
+            verified_severity=NormalizedSeverity.HIGH,
+        ),
+        evidence=(FrontierEvidence(
+            evidence_id="evidence-1",
+            source="changed_patch",
+            path="src/auth.py",
+            side="new",
+            start_line=10,
+            end_line=12,
+            content="return object_by_id(value)",
+        ),),
+        signals=signals or FrontierSignals(sensitive=True),
+        snapshot_id=snapshot_id,
+        configuration_hash=stage_config.configuration_hash,
+        prompt_hash=stage_config.prompt_hash,
+        policy_version=stage_config.policy_version,
+        risk_policy_version="review-router-v1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_escalation_does_not_call_provider():
+    init_run_details()
+    stage_config = config()
+    handler = FakeHandler([output()])
+    result = await run_frontier_adjudication(
+        request(stage_config, signals=FrontierSignals()),
+        stage_config,
+        handler,
+        current_identity=lambda: "head-1",
+    )
+    assert result.state is FrontierState.NOT_REQUIRED
+    assert result.decision is FrontierDecision.UNAVAILABLE
+    assert handler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_deterministic_forced_escalation_preserves_severity_floor():
+    init_run_details()
+    stage_config = config()
+    signals = FrontierSignals(
+        deterministic_forced=True,
+        deterministic_severity_floor=NormalizedSeverity.HIGH,
+    )
+    result = await run_frontier_adjudication(
+        request(stage_config, signals=signals),
+        stage_config,
+        FakeHandler([output(severity="low")]),
+        current_identity=lambda: "head-1",
+    )
+    assert result.decision is FrontierDecision.CONFIRM
+    assert result.normalized_finding.severity is NormalizedSeverity.HIGH
+    assert result.telemetry["provider"] == "provider-primary"
+    assert result.telemetry["model_revision"] == "revision-primary"
+    assert result.telemetry["usage"]["status"] == "complete"
+    assert result.telemetry["cost"]["status"] == "complete"
+    assert get_run_details().specialist_runs == {}
+    assert "sha256:finding" in get_run_details().adjudication_runs
+
+
+@pytest.mark.asyncio
+async def test_reject_retains_source_free_lifecycle_telemetry():
+    init_run_details()
+    stage_config = config()
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([output(decision="reject")]),
+        current_identity=lambda: "head-1",
+    )
+    assert result.decision is FrontierDecision.REJECT
+    assert result.normalized_finding is None
+    assert result.to_telemetry_dict()["publication_safe"] is False
+    assert "src/auth.py" not in json.dumps(result.to_telemetry_dict())
+
+
+@pytest.mark.asyncio
+async def test_insufficient_evidence_signal_is_eligible():
+    init_run_details()
+    stage_config = config()
+    signals = FrontierSignals(insufficient_evidence=True, unresolved_questions=("Does the caller scope access?",))
+    handler = FakeHandler([output()])
+    await run_frontier_adjudication(
+        request(stage_config, signals=signals),
+        stage_config,
+        handler,
+        current_identity=lambda: "head-1",
+    )
+    assert handler.calls == ["frontier-primary"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_output_fails_unavailable():
+    init_run_details()
+    stage_config = config()
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler(["not-json"]),
+        current_identity=lambda: "head-1",
+    )
+    assert result.decision is FrontierDecision.UNAVAILABLE
+    assert result.state is FrontierState.MALFORMED_OUTPUT
+    assert result.failure_reason == "malformed_output"
+
+
+@pytest.mark.asyncio
+async def test_timeout_fails_unavailable():
+    init_run_details()
+    stage_config = config(stage_timeout=0.01)
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([output()], delay=0.05),
+        current_identity=lambda: "head-1",
+    )
+    assert result.state is FrontierState.TIMEOUT
+    assert result.failure_reason == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_fails_unavailable():
+    init_run_details()
+    stage_config = config()
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([RuntimeError("provider down")]),
+        current_identity=lambda: "head-1",
+    )
+    assert result.state is FrontierState.PROVIDER_FAILURE
+    assert result.failure_reason == "provider_failure"
+
+
+@pytest.mark.asyncio
+async def test_availability_fallback_remains_one_adjudication():
+    init_run_details()
+    stage_config = config(fallback=True)
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([RuntimeError("primary down"), output()]),
+        current_identity=lambda: "head-1",
+    )
+    assert result.decision is FrontierDecision.CONFIRM
+    assert result.telemetry["fallback_used"] is True
+    assert result.telemetry["route_attempts"] == 2
+    assert result.telemetry["model"] == "frontier-fallback"
+    assert result.telemetry["provider"] == "provider-fallback"
+
+
+@pytest.mark.asyncio
+async def test_stale_snapshot_before_call_fails_without_provider():
+    init_run_details()
+    stage_config = config()
+    handler = FakeHandler([output()])
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        handler,
+        current_identity=lambda: "head-2",
+    )
+    assert result.state is FrontierState.STALE
+    assert handler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_snapshot_that_changes_during_call_discards_confirmation():
+    init_run_details()
+    stage_config = config()
+    identities = iter(("head-1", "head-2"))
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([output()]),
+        current_identity=lambda: next(identities),
+    )
+    assert result.state is FrontierState.STALE
+    assert result.normalized_finding is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("telemetry_gap", ["usage", "cost"])
+async def test_missing_usage_or_cost_fails_unavailable(telemetry_gap):
+    init_run_details()
+    stage_config = config()
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([output()], telemetry_gap=telemetry_gap),
+        current_identity=lambda: "head-1",
+    )
+    assert result.state is FrontierState.UNAVAILABLE
+    assert result.failure_reason == "telemetry_incomplete"
+    expected_usage = "partial" if telemetry_gap == "usage" else "complete"
+    expected_cost = "unavailable" if telemetry_gap == "cost" else "complete"
+    assert result.telemetry["usage"]["status"] == expected_usage
+    assert result.telemetry["cost"]["status"] == expected_cost
+
+
+def test_loader_requires_exact_fallback_identities():
+    section = {
+        "enable_frontier_adjudication": True,
+        "frontier_adjudication_model": "frontier-primary",
+        "frontier_adjudication_provider": "provider-primary",
+        "frontier_adjudication_revision": "revision-primary",
+        "frontier_adjudication_fallback_models": ["frontier-fallback"],
+        "frontier_adjudication_fallback_providers": [],
+        "frontier_adjudication_fallback_revisions": [],
+    }
+    with pytest.raises(ValueError, match="fallback providers"):
+        load_frontier_adjudication_config(section, {
+            "system": SYSTEM_PROMPT,
+            "user": USER_PROMPT,
+            "prompt_version": "frontier-adjudication-prompt-v1",
+            "input_schema_version": FRONTIER_INPUT_SCHEMA_VERSION,
+            "schema_version": FRONTIER_OUTPUT_SCHEMA_VERSION,
+        })
+
+
+def test_candidate_verification_evidence_is_bounded_to_candidate():
+    result = build_frontier_evidence("candidate-1", [
+        {
+            "candidate_id": "candidate-1",
+            "evidence_id": "evidence-1",
+            "source": "changed_patch",
+            "path": "src/auth.py",
+            "side": "new",
+            "start_line": 10,
+            "end_line": 12,
+            "content": "return object_by_id(value)",
+        },
+        {
+            "candidate_id": "candidate-2",
+            "evidence_id": "evidence-2",
+            "source": "changed_patch",
+            "path": "src/billing.py",
+            "side": "new",
+            "start_line": 1,
+            "end_line": 1,
+            "content": "charge()",
+        },
+    ])
+    assert [item.evidence_id for item in result] == ["evidence-1"]
+    assert result[0].content_sha256.startswith("sha256:")
+
+
+def test_contract_versions_are_explicit():
+    assert FRONTIER_INPUT_SCHEMA_VERSION == "frontier-adjudication-input-v1"
+    assert FRONTIER_OUTPUT_SCHEMA_VERSION == "frontier-adjudication-output-v1"

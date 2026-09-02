@@ -499,6 +499,46 @@ tradeoff. Compare the same PR corpus with the feature off and on, and record ver
 positives, missed defects, end-to-end latency, token usage, and model cost. Re-run the benchmark whenever prompts,
 models, or budgets change.
 
+### Frontier adjudication
+
+Frontier adjudication is a separate, default-off production stage after candidate verification. It receives only an
+already verified finding with its trusted stable and root-cause identities, bounded evidence that verification already
+gathered, upward-only risk signals, and the exact snapshot/head, configuration, prompt, and policy identities. It runs
+only for a sensitive, high/critical, disputed, or explicitly insufficient case. An ordinary finding does not make a
+frontier call.
+
+```toml
+[pr_reviewer]
+enable_frontier_adjudication = false
+frontier_adjudication_model = "provider/model-revision"
+frontier_adjudication_deployment = ""
+frontier_adjudication_provider = "provider"
+frontier_adjudication_revision = "immutable-provider-revision"
+frontier_adjudication_fallback_models = []
+frontier_adjudication_fallback_deployments = []
+frontier_adjudication_fallback_providers = []
+frontier_adjudication_fallback_revisions = []
+frontier_adjudication_timeout_seconds = 120
+frontier_adjudication_model_timeout_seconds = 60
+frontier_adjudication_model_retries = 1
+frontier_adjudication_provider_retries = 0
+frontier_adjudication_max_output_tokens = 2048
+frontier_adjudication_minimum_confidence = 0.0
+frontier_adjudication_max_calls = 3
+```
+
+Every primary and fallback entry needs an exact provider and revision identity. Fallback entries only recover from
+availability failures while performing the same adjudication; they are not another review vote. The output contract is
+versioned and allows only `confirm`, `reject`, or `unavailable`. Confirmed severity cannot fall below a deterministic
+risk floor. Unknown citations, malformed output, timeout, provider failure, a changed snapshot, missing model identity,
+missing usage, or incomplete pricing turns the result into `unavailable` rather than a clean result.
+
+The stage has its own `RunDetails.adjudication_runs` accounting for model/deployment/provider/revision, route attempts,
+fallback use, configured provider retries, latency, tokens, cost, cache state, confidence, and failure state. These
+records are telemetry only: the stage does not alter `verified_review_data`, publish comments, execute repository code,
+block a save, approve a pull request, or merge. Keep the flag off until the #27 replay and rollout gates pass. Roll back
+by setting `enable_frontier_adjudication = false`; no other review behavior needs to change.
+
 ## Usage Tips
 
 ### General guidelines

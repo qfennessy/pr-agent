@@ -90,6 +90,85 @@ class SpecialistRunDetails:
 
 
 @dataclass
+class AdjudicationRunDetails:
+    """Telemetry for one frontier adjudication, isolated from specialists and publication."""
+
+    finding_id: str
+    model_used: Optional[str] = None
+    provider: Optional[str] = None
+    model_revision: Optional[str] = None
+    deployment_id: Optional[str] = None
+    fallback_used: bool = False
+    route_attempts: int = 0
+    provider_retries_configured: Optional[int] = None
+    provider_retry_attempts: Optional[int] = None
+    prompt_version: Optional[str] = None
+    input_schema_version: Optional[str] = None
+    schema_version: Optional[str] = None
+    state: Optional[str] = None
+    latency_seconds: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    num_ai_calls: int = 0
+    total_cost_usd: Decimal = field(default_factory=lambda: Decimal("0"))
+    known_cost_call_count: int = 0
+    model_costs_usd: dict[str, Decimal] = field(default_factory=dict)
+    confidence: Optional[float] = None
+    failure_reason: Optional[str] = None
+    cache_state: str = "not_requested"
+
+    @property
+    def cost_status(self) -> str:
+        if self.known_cost_call_count == 0:
+            return "unavailable"
+        if self.known_cost_call_count == self.num_ai_calls:
+            return "complete"
+        return "partial"
+
+    @property
+    def usage_status(self) -> str:
+        if self.num_ai_calls == 0:
+            return "unavailable"
+        if self.total_tokens > 0 and self.prompt_tokens > 0 and self.completion_tokens > 0:
+            return "complete"
+        return "partial"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "finding_id": self.finding_id,
+            "model": self.model_used,
+            "provider": self.provider,
+            "model_revision": self.model_revision,
+            "deployment": self.deployment_id,
+            "fallback_used": self.fallback_used,
+            "route_attempts": self.route_attempts,
+            "provider_retries_configured": self.provider_retries_configured,
+            "provider_retry_attempts": self.provider_retry_attempts,
+            "prompt_version": self.prompt_version,
+            "input_schema_version": self.input_schema_version,
+            "schema_version": self.schema_version,
+            "state": self.state,
+            "latency_seconds": self.latency_seconds,
+            "usage": {
+                "status": self.usage_status,
+                "prompt_tokens": self.prompt_tokens or None,
+                "completion_tokens": self.completion_tokens or None,
+                "total_tokens": self.total_tokens or None,
+                "ai_calls": self.num_ai_calls or None,
+            },
+            "cost": {
+                "status": self.cost_status,
+                "total_usd": str(self.total_cost_usd) if self.known_cost_call_count else None,
+                "by_model_usd": {model: str(cost) for model, cost in self.model_costs_usd.items()},
+            },
+            "confidence": self.confidence,
+            "failure_reason": self.failure_reason,
+            "cache_state": self.cache_state,
+        }
+
+
+@dataclass
 class RunDetails:
     """Counters and identifiers accumulated over a single command run.
 
@@ -131,6 +210,10 @@ class RunDetails:
     # Shadow specialists are intentionally excluded from the aggregate fields above.
     # Otherwise enabling shadow mode would change the published main-review footer.
     specialist_runs: dict[str, SpecialistRunDetails] = field(default_factory=dict)
+    # Frontier adjudication is a distinct production stage. Keeping a separate
+    # collection prevents availability fallbacks from masquerading as specialist
+    # decisions and gives every stable finding its own accounting record.
+    adjudication_runs: dict[str, AdjudicationRunDetails] = field(default_factory=dict)
     # Monotonic reference taken when the collector is installed, i.e. at the top of the
     # tool's run(). Monotonic so that wall-clock adjustments cannot yield a negative duration.
     start_time: float = field(default_factory=time.monotonic)
@@ -176,6 +259,26 @@ def _get_specialist_details(attribution: str) -> Optional[SpecialistRunDetails]:
     return details.specialist_runs.setdefault(attribution, SpecialistRunDetails(role=attribution))
 
 
+_FRONTIER_ATTRIBUTION_PREFIX = "frontier_adjudication:"
+
+
+def _frontier_finding_id(attribution: Optional[str]) -> Optional[str]:
+    if not attribution or not attribution.startswith(_FRONTIER_ATTRIBUTION_PREFIX):
+        return None
+    finding_id = attribution.removeprefix(_FRONTIER_ATTRIBUTION_PREFIX).strip()
+    return finding_id or None
+
+
+def _get_adjudication_details(attribution: Optional[str]) -> Optional[AdjudicationRunDetails]:
+    finding_id = _frontier_finding_id(attribution)
+    details = get_run_details()
+    if finding_id is None or details is None:
+        return None
+    return details.adjudication_runs.setdefault(
+        finding_id, AdjudicationRunDetails(finding_id=finding_id)
+    )
+
+
 def record_model_used(
     model: str,
     is_fallback: bool,
@@ -187,6 +290,13 @@ def record_model_used(
     if details is None:
         return
     if attribution:
+        adjudication = _get_adjudication_details(attribution)
+        if adjudication is not None:
+            adjudication.model_used = model
+            adjudication.deployment_id = deployment_id
+            if is_fallback:
+                adjudication.fallback_used = True
+            return
         specialist = _get_specialist_details(attribution)
         if specialist is not None:
             specialist.model_used = model
@@ -210,6 +320,14 @@ def record_specialist_model_attempt(
     """Preserve the last attempted specialist route even when its output is rejected."""
 
     if not attribution:
+        return
+    adjudication = _get_adjudication_details(attribution)
+    if adjudication is not None:
+        adjudication.model_used = model
+        adjudication.deployment_id = deployment_id
+        adjudication.route_attempts += 1
+        if is_fallback:
+            adjudication.fallback_used = True
         return
     specialist = _get_specialist_details(attribution)
     if specialist is None:
@@ -293,7 +411,10 @@ def record_ai_call(
         return
     request_options = get_ai_request_options()
     attribution = attribution or (request_options.attribution if request_options is not None else None)
-    target = _get_specialist_details(attribution) if attribution else details
+    if attribution:
+        target = _get_adjudication_details(attribution) or _get_specialist_details(attribution)
+    else:
+        target = details
     if target is None:
         return
     target.num_ai_calls += 1
@@ -356,3 +477,48 @@ def specialist_runs_to_dict(details: Optional[RunDetails] = None) -> dict[str, d
     if details is None:
         return {}
     return {role: run.to_dict() for role, run in sorted(details.specialist_runs.items())}
+
+
+def record_adjudication_result(
+    finding_id: str,
+    *,
+    provider: Optional[str],
+    model_revision: Optional[str],
+    provider_retries_configured: Optional[int],
+    prompt_version: str,
+    input_schema_version: str,
+    schema_version: str,
+    state: str,
+    latency_seconds: float,
+    confidence: Optional[float] = None,
+    failure_reason: Optional[str] = None,
+    cache_state: str = "not_requested",
+) -> None:
+    """Finish one frontier record without changing main-review or specialist totals."""
+
+    adjudication = _get_adjudication_details(f"{_FRONTIER_ATTRIBUTION_PREFIX}{finding_id}")
+    if adjudication is None:
+        return
+    adjudication.provider = provider
+    adjudication.model_revision = model_revision
+    adjudication.provider_retries_configured = provider_retries_configured
+    adjudication.prompt_version = prompt_version
+    adjudication.input_schema_version = input_schema_version
+    adjudication.schema_version = schema_version
+    adjudication.state = state
+    adjudication.latency_seconds = max(0.0, float(latency_seconds))
+    adjudication.confidence = confidence
+    adjudication.failure_reason = failure_reason
+    adjudication.cache_state = cache_state
+
+
+def adjudication_runs_to_dict(details: Optional[RunDetails] = None) -> dict[str, dict[str, Any]]:
+    """Serialize frontier records without model-generated repository text."""
+
+    details = details or get_run_details()
+    if details is None:
+        return {}
+    return {
+        finding_id: run.to_dict()
+        for finding_id, run in sorted(details.adjudication_runs.items())
+    }
