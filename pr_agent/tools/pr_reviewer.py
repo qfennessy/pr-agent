@@ -396,8 +396,17 @@ class PRReviewer:
                 )
             if not self.prediction:
                 return None
-            if self._candidate_verification_enabled():
+            candidate_verification_enabled = self._candidate_verification_enabled()
+            if candidate_verification_enabled:
                 await self._run_candidate_verification()
+            elif self._frontier_adjudication_enabled():
+                self.frontier_adjudication_artifact = {
+                    "enabled": True,
+                    "status": "configuration_invalid",
+                    "failure": "candidate_verification_required",
+                    "results": [],
+                    "publication_safe": False,
+                }
 
             pr_review = self._prepare_pr_review()
             await self._push_prepared_review_output(pr_review)
@@ -1947,6 +1956,7 @@ class PRReviewer:
         max_calls = config.max_calls
         eligible_count = 0
         call_count = 0
+        eligible_findings = []
         for finding in verified_findings:
             identity = (finding.get("root_cause_id"), finding.get("trusted_stable_key"))
             matching_candidates = candidates_by_identity.get(identity, [])
@@ -1968,6 +1978,23 @@ class PRReviewer:
             if not signals.requires_escalation:
                 continue
             eligible_count += 1
+            eligible_findings.append((finding, candidate, severity, signals))
+
+        deterministic_severity_rank = {
+            NormalizedSeverity.LOW: 0,
+            NormalizedSeverity.MEDIUM: 1,
+            NormalizedSeverity.HIGH: 2,
+            NormalizedSeverity.CRITICAL: 3,
+        }
+        # Verifier severity, dispute signals, and response order are not trusted budget
+        # inputs. The stable sort preserves the existing order for deterministic ties.
+        eligible_findings.sort(key=lambda item: (
+            not item[3].deterministic_forced,
+            -deterministic_severity_rank.get(
+                item[3].deterministic_severity_floor, len(deterministic_severity_rank)
+            ),
+        ))
+        for finding, candidate, severity, signals in eligible_findings:
             if call_count >= max_calls:
                 artifact["results"].append({
                     "stable_finding_id": finding.get("trusted_stable_key"),

@@ -511,6 +511,9 @@ only for a sensitive, high/critical, disputed, or explicitly insufficient case. 
 the finding's own path, so an unrelated finding in a mixed pull request does not inherit another file's risk floor or
 make a frontier call.
 
+`enable_frontier_adjudication = true` requires `enable_candidate_verification = true`. If that prerequisite is missing,
+the review records an explicit `configuration_invalid` frontier artifact and makes no frontier call.
+
 ```toml
 [pr_reviewer]
 enable_frontier_adjudication = false

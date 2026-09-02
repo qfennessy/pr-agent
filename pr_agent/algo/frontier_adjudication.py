@@ -412,6 +412,18 @@ def load_frontier_adjudication_config(
 ) -> FrontierAdjudicationConfig:
     """Build one immutable route from explicit frontier-only configuration."""
 
+    def enabled_flag(key: str) -> bool:
+        value = section.get(key, False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    enabled = enabled_flag("enable_frontier_adjudication")
+    if enabled and not enabled_flag("enable_candidate_verification"):
+        raise FrontierContractError(
+            "enabled frontier adjudication requires candidate verification to be enabled"
+        )
+
     def strings(key: str, *, required: bool = False) -> tuple[str, ...]:
         raw = section.get(key, [])
         if isinstance(raw, str):
@@ -486,11 +498,8 @@ def load_frontier_adjudication_config(
         max_output_tokens=max_output_tokens,
         collect_cost=True,
     )
-    enabled = section.get("enable_frontier_adjudication", False)
-    if isinstance(enabled, str):
-        enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
     return FrontierAdjudicationConfig(
-        enabled=bool(enabled),
+        enabled=enabled,
         route=route,
         model_identities=identities,
         system_prompt=str(prompt.get("system") or ""),

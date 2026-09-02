@@ -617,6 +617,7 @@ def test_frontier_route_rejects_duplicate_model_deployment_identity():
 def test_loader_requires_exact_fallback_identities():
     section = {
         "enable_frontier_adjudication": True,
+        "enable_candidate_verification": True,
         "frontier_adjudication_model": "frontier-primary",
         "frontier_adjudication_provider": "provider-primary",
         "frontier_adjudication_revision": "revision-primary",
@@ -632,6 +633,25 @@ def test_loader_requires_exact_fallback_identities():
             "input_schema_version": FRONTIER_INPUT_SCHEMA_VERSION,
             "schema_version": FRONTIER_OUTPUT_SCHEMA_VERSION,
         })
+
+
+@pytest.mark.parametrize(
+    "candidate_verification_config",
+    [{}, {"enable_candidate_verification": False}, {"enable_candidate_verification": "false"}],
+)
+def test_loader_requires_candidate_verification_when_frontier_is_enabled(
+    candidate_verification_config,
+):
+    section = {
+        "enable_frontier_adjudication": True,
+        **candidate_verification_config,
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="frontier adjudication requires candidate verification to be enabled",
+    ):
+        load_frontier_adjudication_config(section, {})
 
 
 def test_candidate_verification_evidence_is_bounded_to_candidate():

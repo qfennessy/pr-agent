@@ -1472,6 +1472,56 @@ async def test_disabled_routing_adds_no_provider_inventory_or_model_calls(monkey
     assert "review_route" not in structured["metadata"]
 
 
+@pytest.mark.asyncio
+async def test_frontier_without_candidate_verification_reports_invalid_configuration(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.get_files.return_value = ["src/service.py"]
+    provider.get_diff_files.return_value = [_route_file("src/service.py")]
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
+    reviewer._review_model_route = MagicMock(return_value=None)
+    reviewer._prepare_pr_review = MagicMock(return_value="review")
+    reviewer._should_publish_review_no_suggestions = MagicMock(return_value=False)
+    reviewer._clear_stale_persistent_bugs_only_review = MagicMock()
+    reviewer._run_candidate_verification = AsyncMock()
+
+    async def fake_retry(*_args, **_kwargs):
+        reviewer.prediction = VALID_PREDICTION
+
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", AsyncMock())
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.publish_output",
+        "pr_reviewer.enable_candidate_verification",
+        "pr_reviewer.enable_frontier_adjudication",
+        "data",
+    ))
+    try:
+        settings.config.publish_output = False
+        settings.pr_reviewer.enable_candidate_verification = False
+        settings.pr_reviewer.enable_frontier_adjudication = True
+        settings.data = {"artifact": ""}
+
+        await reviewer.run()
+    finally:
+        restore_settings(snapshot)
+
+    reviewer._run_candidate_verification.assert_not_awaited()
+    assert reviewer.frontier_adjudication_artifact == {
+        "enabled": True,
+        "status": "configuration_invalid",
+        "failure": "candidate_verification_required",
+        "results": [],
+        "publication_safe": False,
+    }
+
+
 @pytest.mark.parametrize("file_count", [1, 12, 13])
 def test_incremental_docs_inventory_is_snapshotted_before_patch_mutation(file_count):
     raw_files = [
@@ -1715,6 +1765,117 @@ async def test_frontier_adjudication_binds_the_accepted_sensitive_candidate_on_i
     }
     assert (finding, candidates, evidence, decisions) == originals
     assert "return user.is_admin" not in repr(reviewer.frontier_adjudication_artifact)
+
+
+@pytest.mark.asyncio
+async def test_frontier_adjudication_prioritizes_deterministic_risk_before_call_budget(
+        monkeypatch):
+    from pr_agent.algo.candidate_verification import verified_finding_identity
+
+    candidate_specs = (
+        ("ordinary-high", "src/high.py", False, "high", False),
+        ("sensitive-first", "services/auth/first.py", True, "medium", False),
+        ("sensitive-second", "services/auth/second.py", True, "low", False),
+        ("ordinary-disputed", "src/disputed.py", False, "medium", True),
+    )
+    candidates = []
+    findings = []
+    evidence = []
+    decisions = []
+    for ordinal, (candidate_id, path, sensitive, severity, disputed) in enumerate(
+            candidate_specs, start=1):
+        candidate = {
+            "candidate_id": candidate_id,
+            "candidate_type": "sensitive_path_audit" if sensitive else "model_finding",
+            "sensitive_path": sensitive,
+            "relevant_file": path,
+            "issue_header": candidate_id,
+            "issue_content": f"Explanation for {candidate_id}.",
+            "trigger": f"Trigger for {candidate_id}.",
+            "impact": f"Impact for {candidate_id}.",
+            "start_line": ordinal,
+            "end_line": ordinal,
+            "side": "new",
+            "_changed_anchor_shape": f"changed line {ordinal}",
+            "_changed_anchor_ordinal": 1,
+            "_trusted_defect_ordinal": 1,
+            "_trusted_lineage_key": f"file:{path}",
+        }
+        root_cause_id, stable_key = verified_finding_identity(candidate)
+        candidates.append(candidate)
+        findings.append({
+            "root_cause_id": root_cause_id,
+            "trusted_stable_key": stable_key,
+            "relevant_file": path,
+            "issue_header": candidate_id,
+            "issue_content": f"Explanation for {candidate_id}.",
+            "trigger": f"Trigger for {candidate_id}.",
+            "impact": f"Impact for {candidate_id}.",
+            "start_line": ordinal,
+            "end_line": ordinal,
+            "side": "new",
+        })
+        evidence.append({
+            "candidate_id": candidate_id,
+            "evidence_id": f"evidence-{candidate_id}",
+            "source": "changed_head",
+            "path": path,
+            "side": "new",
+            "start_line": ordinal,
+            "end_line": ordinal,
+            "content": f"changed line {ordinal}",
+        })
+        decisions.append({
+            "candidate_id": candidate_id,
+            "verdict": "verified",
+            "normalized_severity": severity,
+            "disputed": disputed,
+        })
+
+    config = SimpleNamespace(
+        max_calls=2,
+        configuration_hash="sha256:configuration",
+        prompt_hash="sha256:prompt",
+        policy_version="frontier-policy-v1",
+    )
+
+    def _frontier_result(request, *_args, **_kwargs):
+        result = MagicMock()
+        result.to_telemetry_dict.return_value = {
+            "stable_finding_id": request.candidate.stable_finding_id,
+            "state": "confirmed",
+            "publication_safe": False,
+        }
+        return result
+
+    run_frontier = AsyncMock(side_effect=_frontier_result)
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.load_frontier_adjudication_config",
+        lambda *args, **kwargs: config,
+    )
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.get_specialist_snapshot_context",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.run_frontier_adjudication",
+        run_frontier,
+    )
+    reviewer = _make_reviewer()
+    reviewer.ai_handler = SimpleNamespace(azure=False)
+    reviewer.review_route_decision = None
+    reviewer.git_provider.get_pr_head_sha.return_value = "head-sha"
+
+    await reviewer._run_frontier_adjudications(findings, candidates, evidence, decisions)
+
+    assert [
+        call.args[0].candidate.title for call in run_frontier.await_args_list
+    ] == ["sensitive-first", "sensitive-second"]
+    assert [
+        result.get("failure_reason")
+        for result in reviewer.frontier_adjudication_artifact["results"]
+    ] == [None, None, "call_budget_exhausted", "call_budget_exhausted"]
+    assert reviewer.frontier_adjudication_artifact["status"] == "partial"
 
 
 @pytest.mark.asyncio
