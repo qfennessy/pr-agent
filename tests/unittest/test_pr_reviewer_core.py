@@ -1507,6 +1507,9 @@ def test_verified_candidate_response_requires_normalized_severity():
         "trigger": "The request enters the changed branch.",
         "impact": "The request fails.",
         "evidence_paths": ["src/service.py"],
+        "disputed": False,
+        "evidence_status": "complete",
+        "unresolved_questions": [],
     }
 
     assert PRReviewer._verification_response_contract_error(
@@ -1518,6 +1521,38 @@ def test_verified_candidate_response_requires_normalized_severity():
         candidates,
         {"verification": {"decisions": [decision]}},
     ) is None
+
+
+@pytest.mark.parametrize(("field", "expected_error"), (
+    ("disputed", "invalid_disputed_signal"),
+    ("evidence_status", "invalid_evidence_status"),
+    ("unresolved_questions", "invalid_unresolved_questions"),
+))
+def test_verified_candidate_response_requires_frontier_routing_signals(
+        field, expected_error):
+    candidates = [{"candidate_id": "candidate-1"}]
+    decision = {
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "normalized_severity": "medium",
+        "disputed": False,
+        "evidence_status": "complete",
+        "unresolved_questions": [],
+        "relevant_file": "src/service.py",
+        "start_line": 10,
+        "end_line": 10,
+        "issue_header": "Possible bug",
+        "issue_content": "The changed branch can fail.",
+        "trigger": "The request enters the changed branch.",
+        "impact": "The request fails.",
+        "evidence_paths": ["src/service.py"],
+    }
+    decision.pop(field)
+
+    assert PRReviewer._verification_response_contract_error(
+        candidates,
+        {"verification": {"decisions": [decision]}},
+    ) == expected_error
 
 
 def test_incremental_sensitive_path_still_forces_deep_after_patch_mutation():

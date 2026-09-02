@@ -5920,6 +5920,8 @@ async def test_verified_sensitive_finding_cannot_escape_an_all_invalid_model_can
         "      issue_header: Sensitive regression\n"
         "      issue_content: The changed policy permits unauthorized access.\n"
         "      normalized_severity: high\n"
+        "      disputed: false\n      evidence_status: complete\n"
+        "      unresolved_questions: []\n"
         "      trigger: A request reaches the changed policy.\n"
         "      impact: Unauthorized access is allowed.\n"
         "      evidence_paths: [auth/policy.py]\n",
@@ -5993,6 +5995,8 @@ async def test_model_candidate_budget_has_exact_fail_closed_boundary(
                 "      issue_header: Verified bug\n"
                 "      issue_content: The changed code has a verified defect.\n"
                 "      normalized_severity: high\n"
+                "      disputed: false\n      evidence_status: complete\n"
+                "      unresolved_questions: []\n"
                 "      trigger: The changed branch executes.\n"
                 "      impact: The request fails.\n"
                 "      evidence_paths: [src/service.py]"
@@ -6156,7 +6160,10 @@ async def test_verification_failure_suppresses_false_clean_publication(
             "  decisions:\n"
             "    - candidate_id: candidate-1\n"
             "      verdict: verified\n"
-            "      normalized_severity: high",
+            "      normalized_severity: high\n"
+            "      disputed: false\n"
+            "      evidence_status: complete\n"
+            "      unresolved_questions: []",
             None,
         ))
     elif failure_mode == "wrong_verified_types":
@@ -6171,6 +6178,9 @@ async def test_verification_failure_suppresses_false_clean_publication(
             "      issue_header: Bug\n"
             "      issue_content: Incorrect behavior.\n"
             "      normalized_severity: high\n"
+            "      disputed: false\n"
+            "      evidence_status: complete\n"
+            "      unresolved_questions: []\n"
             "      trigger: Concrete trigger.\n"
             "      impact: Concrete impact.\n"
             "      evidence_paths: src/service.py",
@@ -6663,6 +6673,8 @@ async def test_orchestration_retains_deleted_candidate_patch_when_global_diff_is
         "      issue_header: Sensitive regression\n"
         "      issue_content: The deleted guard permits unauthorized access.\n"
         "      normalized_severity: high\n"
+        "      disputed: false\n      evidence_status: complete\n"
+        "      unresolved_questions: []\n"
         "      trigger: A request reaches the policy without the deleted guard.\n"
         "      impact: Unauthorized access is allowed.\n"
         "      evidence_paths: [auth/policy.py]\n",
@@ -6711,6 +6723,8 @@ async def test_orchestration_applies_global_finding_limit_after_verification():
         "      relevant_file: src/service.py\n      start_line: 12\n      end_line: 12\n"
         "      issue_header: First bug\n      issue_content: First verified defect.\n"
         "      normalized_severity: high\n"
+        "      disputed: false\n      evidence_status: complete\n"
+        "      unresolved_questions: []\n"
         "      trigger: The first changed branch runs.\n"
         "      impact: The first request fails.\n"
         "      evidence_paths: [src/service.py]\n"
@@ -6718,6 +6732,8 @@ async def test_orchestration_applies_global_finding_limit_after_verification():
         "      relevant_file: src/service.py\n      start_line: 13\n      end_line: 13\n"
         "      issue_header: Second bug\n      issue_content: Second verified defect.\n"
         "      normalized_severity: high\n"
+        "      disputed: false\n      evidence_status: complete\n"
+        "      unresolved_questions: []\n"
         "      trigger: The second changed branch runs.\n"
         "      impact: The second request fails.\n"
         "      evidence_paths: [src/service.py]\n",

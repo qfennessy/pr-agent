@@ -1624,15 +1624,27 @@ class PRReviewer:
             ):
                 return "invalid_confidence"
             disputed = decision.get("disputed")
-            if disputed is not None and not isinstance(disputed, bool):
+            if (
+                verdict == "verified" and not isinstance(disputed, bool)
+            ) or (disputed is not None and not isinstance(disputed, bool)):
                 return "invalid_disputed_signal"
             evidence_status = decision.get("evidence_status")
-            if evidence_status is not None and str(evidence_status).strip().lower() not in {"complete", "insufficient"}:
+            if (
+                verdict == "verified"
+                and str(evidence_status or "").strip().lower()
+                not in {"complete", "insufficient"}
+            ) or (
+                evidence_status is not None
+                and str(evidence_status).strip().lower()
+                not in {"complete", "insufficient"}
+            ):
                 return "invalid_evidence_status"
             unresolved_questions = decision.get("unresolved_questions")
-            if unresolved_questions is not None and (
+            if (verdict == "verified" and not isinstance(unresolved_questions, list)) or (
+                unresolved_questions is not None and (
                 not isinstance(unresolved_questions, list)
                 or any(not isinstance(question, str) or not question.strip() for question in unresolved_questions)
+                )
             ):
                 return "invalid_unresolved_questions"
             if verdict == "verified":

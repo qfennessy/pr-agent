@@ -702,6 +702,7 @@ def _telemetry_complete(telemetry: Mapping[str, Any]) -> bool:
         if isinstance(provider_retries, Mapping)
         else None
     )
+    successful_ai_calls = usage.get("ai_calls") if isinstance(usage, Mapping) else None
     provider_retry_telemetry_complete = bool(
         isinstance(provider_retries, Mapping)
         and provider_retries.get("status") == "complete"
@@ -713,9 +714,15 @@ def _telemetry_complete(telemetry: Mapping[str, Any]) -> bool:
         and isinstance(provider_retry_attempts, int)
         and not isinstance(provider_retry_attempts, bool)
         and isinstance(model_attempts, int)
-        and provider_attempts == model_attempts
-        and provider_retry_attempts == 0
+        and provider_attempts >= model_attempts
+        and provider_retry_attempts == provider_attempts - model_attempts
         and provider_retries.get("unavailable_reason") is None
+    )
+    attempt_accounting_complete = bool(
+        isinstance(successful_ai_calls, int)
+        and not isinstance(successful_ai_calls, bool)
+        and isinstance(provider_attempts, int)
+        and successful_ai_calls == provider_attempts
     )
     return bool(
         telemetry.get("model")
@@ -724,6 +731,7 @@ def _telemetry_complete(telemetry: Mapping[str, Any]) -> bool:
         and route_attempts_complete
         and model_retry_telemetry_complete
         and provider_retry_telemetry_complete
+        and attempt_accounting_complete
         and isinstance(usage, Mapping)
         and usage.get("status") == "complete"
         and isinstance(cost, Mapping)
@@ -762,6 +770,12 @@ async def run_frontier_adjudication(
         return _unavailable(request, FrontierState.UNAVAILABLE, "policy_identity_mismatch")
     if await _refresh_identity(current_identity) != request.snapshot_id:
         return _unavailable(request, FrontierState.STALE, "stale_snapshot")
+    if getattr(ai_handler, "supports_frontier_adjudication_telemetry", False) is not True:
+        return _unavailable(
+            request,
+            FrontierState.UNAVAILABLE,
+            "handler_telemetry_unsupported",
+        )
 
     finding_id = request.candidate.stable_finding_id
     attribution = f"frontier_adjudication:{finding_id}"

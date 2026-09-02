@@ -483,8 +483,9 @@ overflow priority, and removed ranges are selected before added ranges within th
 text is passed to the verifier as untrusted data. Structured review publishers receive a
 `candidate_verification` artifact containing candidate and decision counts, the verifier model and call count, retrieval
 statuses, budget usage, latency, and concise rejection or failure reasons.
-Every verified decision must include a normalized `low`, `medium`, `high`, or `critical` severity; a missing or invalid
-severity fails the verifier response closed instead of falling back to wording in the first-pass finding title.
+Every verified decision must include a normalized `low`, `medium`, `high`, or `critical` severity plus explicit
+`disputed`, `evidence_status`, and `unresolved_questions` fields. Missing or invalid routing fields fail the verifier
+response closed instead of becoming a false non-escalation or falling back to wording in the first-pass finding title.
 
 Verifier model/deployment pairs use an immutable request-local route. Azure deployments must be explicit when the verifier
 or any fallback differs from the primary reviewer model; missing or mismatched routes fail closed. Prompt clipping reserves
@@ -546,9 +547,12 @@ model-handler attempt across those routes, including each route's first attempt,
 usable adjudication result; missing or inconsistent counts fail closed as incomplete telemetry. Provider-client retry
 attempts are not observable, so an enabled frontier route currently requires
 `frontier_adjudication_provider_retries = 0`. With SDK retries disabled, `retries.provider.attempts` is counted at the
-provider-call boundary, must match the observable model-attempt count, and `retry_attempts` is therefore zero. A
+provider-call boundary and `retry_attempts` counts observed provider re-invocations beyond model attempts. Handlers
+that cannot provide complete identity, usage, cost, and retry telemetry are rejected before any frontier call. A
 positive provider retry budget is rejected before a paid call rather than inventing a zero or understating retries;
-the unavailable ledger form uses `unavailable_reason = provider_internal_attempts_not_exposed`. Frontier requests
+the unavailable ledger form uses `unavailable_reason = provider_internal_attempts_not_exposed`. Any observed attempt
+without complete usage and price accounting makes the adjudication unavailable, including a fallback after an
+unmetered failed provider call. Frontier requests
 collect their attributed cost independently of the global `output_run_cost` display setting. The source-free
 aggregate is exported as `frontier_adjudication` and its per-finding ledger as `adjudication_runs` in structured review
 data for replay and rollout consumers. These records are telemetry only: the stage does not alter

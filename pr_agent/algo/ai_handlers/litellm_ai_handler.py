@@ -216,6 +216,8 @@ class LiteLLMAIHandler(BaseAiHandler):
     and provides a method for performing chat completions using the OpenAI ChatCompletion API.
     """
 
+    supports_frontier_adjudication_telemetry = True
+
     def __init__(self):
         """
         Initializes the OpenAI API key and other settings from a configuration file.

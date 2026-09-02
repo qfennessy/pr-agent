@@ -34,6 +34,8 @@ USER_PROMPT = "Evidence: {{ adjudication_input_json }}"
 
 
 class FakeHandler:
+    supports_frontier_adjudication_telemetry = True
+
     def __init__(
         self,
         responses,
@@ -44,6 +46,8 @@ class FakeHandler:
         provider_override=None,
         revision_override=None,
         model_attempts_per_call=1,
+        provider_attempts_per_call=None,
+        account_failed_attempts=False,
         delay=0,
     ):
         self.responses = list(responses)
@@ -53,6 +57,8 @@ class FakeHandler:
         self.provider_override = provider_override
         self.revision_override = revision_override
         self.model_attempts_per_call = model_attempts_per_call
+        self.provider_attempts_per_call = provider_attempts_per_call
+        self.account_failed_attempts = account_failed_attempts
         self.delay = delay
         self.calls = []
 
@@ -60,12 +66,17 @@ class FakeHandler:
         self.calls.append(model)
         for _ in range(max(0, self.model_attempts_per_call - 1)):
             record_model_request_attempt()
-        for _ in range(self.model_attempts_per_call):
+        provider_attempts = (
+            self.model_attempts_per_call
+            if self.provider_attempts_per_call is None
+            else self.provider_attempts_per_call
+        )
+        for _ in range(provider_attempts):
             record_provider_request_attempt()
         if self.delay:
             await asyncio.sleep(self.delay)
         response = self.responses.pop(0)
-        if isinstance(response, Exception):
+        if isinstance(response, Exception) and not self.account_failed_attempts:
             raise response
         if self.account:
             record_ai_call(
@@ -84,6 +95,8 @@ class FakeHandler:
                     or ("revision-fallback" if model == "frontier-fallback" else "revision-primary")
                 ),
             )
+        if isinstance(response, Exception):
+            raise response
         if self.telemetry_gap == "model_attempts":
             get_run_details().adjudication_runs["sha256:finding"].model_attempts = None
         if self.telemetry_gap == "provider_attempts":
@@ -189,6 +202,26 @@ async def test_no_escalation_does_not_call_provider():
     )
     assert result.state is FrontierState.NOT_REQUIRED
     assert result.decision is FrontierDecision.UNAVAILABLE
+    assert handler.calls == []
+
+
+@pytest.mark.asyncio
+async def test_unsupported_handler_fails_before_provider_call():
+    init_run_details()
+    stage_config = config()
+    handler = FakeHandler([output()])
+    handler.supports_frontier_adjudication_telemetry = False
+
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        handler,
+        current_identity=lambda: "head-1",
+    )
+
+    assert result.decision is FrontierDecision.UNAVAILABLE
+    assert result.state is FrontierState.UNAVAILABLE
+    assert result.failure_reason == "handler_telemetry_unsupported"
     assert handler.calls == []
 
 
@@ -305,7 +338,7 @@ async def test_provider_failure_fails_unavailable():
 
 
 @pytest.mark.asyncio
-async def test_availability_fallback_remains_one_adjudication():
+async def test_availability_fallback_remains_distinct_and_fails_closed_without_attempt_accounting():
     init_run_details()
     stage_config = config(fallback=True)
     result = await run_frontier_adjudication(
@@ -314,7 +347,8 @@ async def test_availability_fallback_remains_one_adjudication():
         FakeHandler([RuntimeError("primary down"), output()]),
         current_identity=lambda: "head-1",
     )
-    assert result.decision is FrontierDecision.CONFIRM
+    assert result.decision is FrontierDecision.UNAVAILABLE
+    assert result.failure_reason == "telemetry_incomplete"
     assert result.telemetry["fallback_used"] is True
     assert result.telemetry["route_attempts"] == 2
     assert result.telemetry["retries"]["model"] == {
@@ -345,7 +379,8 @@ async def test_model_retry_attempts_are_distinct_from_route_attempts():
         current_identity=lambda: "head-1",
     )
 
-    assert result.decision is FrontierDecision.CONFIRM
+    assert result.decision is FrontierDecision.UNAVAILABLE
+    assert result.failure_reason == "telemetry_incomplete"
     assert result.telemetry["route_attempts"] == 1
     assert result.telemetry["retries"]["model"] == {
         "status": "complete",
@@ -353,6 +388,29 @@ async def test_model_retry_attempts_are_distinct_from_route_attempts():
         "attempts": 2,
         "retry_attempts": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_observed_provider_reinvocation_is_counted_and_fails_closed_when_unmetered():
+    init_run_details()
+    stage_config = config()
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([output()], provider_attempts_per_call=2),
+        current_identity=lambda: "head-1",
+    )
+
+    assert result.decision is FrontierDecision.UNAVAILABLE
+    assert result.failure_reason == "telemetry_incomplete"
+    assert result.telemetry["retries"]["provider"] == {
+        "status": "complete",
+        "configured_retries_per_model_attempt": 0,
+        "attempts": 2,
+        "retry_attempts": 1,
+        "unavailable_reason": None,
+    }
+    assert result.telemetry["usage"]["ai_calls"] == 1
 
 
 @pytest.mark.asyncio
@@ -429,6 +487,7 @@ async def test_distinct_routes_may_share_pinned_completion_identity():
             [RuntimeError("primary down"), output()],
             provider_override=shared_provider,
             revision_override=shared_revision,
+            account_failed_attempts=True,
         ),
         current_identity=lambda: "head-1",
     )
@@ -438,6 +497,8 @@ async def test_distinct_routes_may_share_pinned_completion_identity():
     assert result.telemetry["deployment"] == "deployment-fallback"
     assert result.telemetry["provider"] == shared_provider
     assert result.telemetry["model_revision"] == shared_revision
+    assert result.telemetry["usage"]["ai_calls"] == 2
+    assert result.telemetry["cost"]["total_usd"] == "0.02"
 
 
 @pytest.mark.asyncio

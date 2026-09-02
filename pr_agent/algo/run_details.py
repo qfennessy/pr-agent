@@ -113,6 +113,7 @@ class AdjudicationRunDetails:
     completion_tokens: int = 0
     total_tokens: int = 0
     num_ai_calls: int = 0
+    known_usage_call_count: int = 0
     total_cost_usd: Decimal = field(default_factory=lambda: Decimal("0"))
     known_cost_call_count: int = 0
     model_costs_usd: dict[str, Decimal] = field(default_factory=dict)
@@ -132,7 +133,7 @@ class AdjudicationRunDetails:
     def usage_status(self) -> str:
         if self.num_ai_calls == 0:
             return "unavailable"
-        if self.total_tokens > 0 and self.prompt_tokens > 0 and self.completion_tokens > 0:
+        if self.known_usage_call_count == self.num_ai_calls:
             return "complete"
         return "partial"
 
@@ -152,10 +153,10 @@ class AdjudicationRunDetails:
             self.provider_retries_configured != 0
             or self.provider_attempts is None
             or self.model_attempts is None
-            or self.provider_attempts != self.model_attempts
+            or self.provider_attempts < self.model_attempts
         ):
             return None
-        return 0
+        return self.provider_attempts - self.model_attempts
 
     @property
     def provider_attempts_unavailable_reason(self) -> Optional[str]:
@@ -467,6 +468,15 @@ def _add_token_usage(details, usage) -> None:
     details.total_tokens += total_tokens
 
 
+def _has_complete_token_usage(usage) -> bool:
+    prompt_tokens = _read_token_field(usage, "prompt_tokens")
+    completion_tokens = _read_token_field(usage, "completion_tokens")
+    total_tokens = _read_token_field(usage, "total_tokens") or (
+        prompt_tokens + completion_tokens
+    )
+    return prompt_tokens > 0 and completion_tokens > 0 and total_tokens > 0
+
+
 def add_token_usage(usage) -> None:
     """Accumulate token counts from a litellm usage object or dict."""
     details = get_run_details()
@@ -520,6 +530,8 @@ def record_ai_call(
     target.num_ai_calls += 1
     if usage is not None:
         _add_token_usage(target, usage)
+        if isinstance(target, AdjudicationRunDetails) and _has_complete_token_usage(usage):
+            target.known_usage_call_count += 1
     cost = _as_decimal_cost(cost_usd)
     if cost is not None:
         target.total_cost_usd += cost
