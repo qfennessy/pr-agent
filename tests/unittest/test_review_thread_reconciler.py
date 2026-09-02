@@ -1003,6 +1003,21 @@ def test_executor_enforces_create_before_resolve_and_emits_deduplicated_fallback
     )
     assert repeated.summary_fallbacks == ()
 
+    future_body = build_summary_fallback_marker(identity.finding_id, marker_version="v2")
+    future_version = execute_review_thread_action_plan(
+        plan,
+        _MutationProvider([failed]),
+        existing_summary_bodies=(future_body,),
+    )
+    assert len(future_version.summary_fallbacks) == 1
+
+    mixed_versions = execute_review_thread_action_plan(
+        plan,
+        _MutationProvider([failed]),
+        existing_summary_bodies=(f"{existing_body}\n{future_body}",),
+    )
+    assert len(mixed_versions.summary_fallbacks) == 1
+
 
 def test_post_create_head_change_blocks_cleanup_and_requires_fresh_inventory():
     identity = _identity()

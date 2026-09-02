@@ -45,6 +45,7 @@ FINDING_IDENTITY_MARKER_VERSION = "v1"
 SUMMARY_FALLBACK_MARKER_RE = re.compile(
     r"<!-- pr-agent-thread-fallback:(v[1-9][0-9]*) id=(sha256:[a-f0-9]{64}) -->"
 )
+SUMMARY_FALLBACK_MARKER_VERSION = "v1"
 _MARKER_RES = (BODY_MARKER_RE, CODE_MARKER_RE, KEY_ISSUE_LOCATION_MARKER_RE)
 
 _LEAD_RE = re.compile(r"^\*\*Suggestion:\*\*\s*", re.IGNORECASE)
@@ -104,7 +105,10 @@ def summary_fallback_markers(body: str) -> tuple[tuple[str, str], ...]:
     return tuple((match.group(1), match.group(2)) for match in SUMMARY_FALLBACK_MARKER_RE.finditer(body or ""))
 
 
-def build_summary_fallback_marker(finding_id: str, marker_version: str = "v1") -> str:
+def build_summary_fallback_marker(
+    finding_id: str,
+    marker_version: str = SUMMARY_FALLBACK_MARKER_VERSION,
+) -> str:
     if not re.fullmatch(r"v[1-9][0-9]*", marker_version):
         raise ValueError("marker_version must look like v1")
     if not re.fullmatch(r"sha256:[a-f0-9]{64}", finding_id or ""):

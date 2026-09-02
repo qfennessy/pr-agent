@@ -15,7 +15,8 @@ from enum import Enum
 from typing import Any, Mapping, Optional, Protocol, Sequence
 
 from pr_agent.algo.inline_comment_dedup import (
-    body_with_finding_identity_marker, build_summary_fallback_marker,
+    SUMMARY_FALLBACK_MARKER_VERSION, body_with_finding_identity_marker,
+    build_summary_fallback_marker,
     strip_inline_comment_markers, summary_fallback_markers)
 
 REVIEW_THREAD_LIFECYCLE_SCHEMA_VERSION = "review-thread-lifecycle-v1"
@@ -550,7 +551,12 @@ def deduplicate_summary_fallbacks(
     existing_summary_bodies: tuple[str, ...] = (),
 ) -> tuple[SummaryFallbackEntry, ...]:
     """Return one not-yet-published fallback entry per logical finding."""
-    seen = {finding_id for body in existing_summary_bodies for _, finding_id in summary_fallback_markers(body)}
+    seen = set()
+    for body in existing_summary_bodies:
+        markers = summary_fallback_markers(body)
+        if any(version != SUMMARY_FALLBACK_MARKER_VERSION for version, _ in markers):
+            continue
+        seen.update(finding_id for _, finding_id in markers)
     pending = []
     for entry in entries:
         if entry.finding_id in seen:
