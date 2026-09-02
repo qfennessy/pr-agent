@@ -1483,6 +1483,8 @@ async def test_frontier_without_candidate_verification_reports_invalid_configura
     reviewer.review_profile = "full"
     reviewer.vars = {}
     reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
+    reviewer._prepare_review_route = MagicMock()
+    reviewer._review_shadow_only = True
     reviewer._review_model_route = MagicMock(return_value=None)
     reviewer._prepare_pr_review = MagicMock(return_value="review")
     reviewer._should_publish_review_no_suggestions = MagicMock(return_value=False)
@@ -1505,9 +1507,10 @@ async def test_frontier_without_candidate_verification_reports_invalid_configura
         settings.config.publish_output = False
         settings.pr_reviewer.enable_candidate_verification = False
         settings.pr_reviewer.enable_frontier_adjudication = True
-        settings.data = {"artifact": ""}
+        settings.data = {"artifact": "STALE REVIEW"}
 
         await reviewer.run()
+        artifact = settings.data["artifact"]
     finally:
         restore_settings(snapshot)
 
@@ -1515,6 +1518,7 @@ async def test_frontier_without_candidate_verification_reports_invalid_configura
     retry.assert_not_awaited()
     extract_tickets.assert_not_awaited()
     reviewer._prepare_pr_review.assert_not_called()
+    assert artifact == ""
     assert reviewer.frontier_adjudication_artifact == {
         "enabled": True,
         "status": "configuration_invalid",
@@ -1540,6 +1544,8 @@ async def test_invalid_frontier_identity_configuration_fails_before_every_model_
     reviewer.vars = {}
     reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
     reviewer.ai_handler = SimpleNamespace(azure=False, chat_completion=AsyncMock())
+    reviewer._prepare_review_route = MagicMock()
+    reviewer._review_shadow_only = True
     retry = AsyncMock()
     extract_tickets = AsyncMock()
     specialists = AsyncMock()
@@ -1554,6 +1560,7 @@ async def test_invalid_frontier_identity_configuration_fails_before_every_model_
     settings = get_settings()
     keys = (
         "config.publish_output",
+        "data",
         "pr_reviewer.enable_candidate_verification",
         "pr_reviewer.enable_frontier_adjudication",
         "pr_reviewer.frontier_adjudication_model",
@@ -1568,6 +1575,7 @@ async def test_invalid_frontier_identity_configuration_fails_before_every_model_
     snapshot = snapshot_settings(keys)
     try:
         settings.config.publish_output = False
+        settings.data = {"artifact": "STALE REVIEW"}
         settings.pr_reviewer.enable_candidate_verification = True
         settings.pr_reviewer.enable_frontier_adjudication = True
         settings.pr_reviewer.frontier_adjudication_model = "frontier-primary"
@@ -1580,6 +1588,7 @@ async def test_invalid_frontier_identity_configuration_fails_before_every_model_
         settings.pr_reviewer.frontier_adjudication_fallback_revisions = []
 
         await reviewer.run()
+        artifact = settings.data["artifact"]
     finally:
         restore_settings(snapshot)
 
@@ -1589,6 +1598,7 @@ async def test_invalid_frontier_identity_configuration_fails_before_every_model_
     verifier.assert_not_awaited()
     frontier.assert_not_awaited()
     reviewer.ai_handler.chat_completion.assert_not_awaited()
+    assert artifact == ""
     assert reviewer.frontier_adjudication_artifact == {
         "enabled": True,
         "status": "configuration_invalid",
@@ -1608,6 +1618,7 @@ async def test_frontier_adjudication_reuses_preflight_config_after_first_pass(mo
         prompt_hash="sha256:prompt",
         policy_version="frontier-policy-v1",
     )
+
     def load_frontier_config(*_args, **_kwargs):
         events.append("preflight")
         return config
