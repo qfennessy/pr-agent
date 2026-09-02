@@ -781,6 +781,79 @@ def test_loader_rejects_non_finite_frontier_timeouts(
 
 
 @pytest.mark.parametrize(
+    ("setting", "boolean_value"),
+    [
+        ("frontier_adjudication_timeout_seconds", True),
+        ("frontier_adjudication_timeout_seconds", False),
+        ("frontier_adjudication_model_timeout_seconds", True),
+        ("frontier_adjudication_model_timeout_seconds", False),
+        ("frontier_adjudication_minimum_confidence", True),
+        ("frontier_adjudication_minimum_confidence", False),
+    ],
+)
+def test_loader_rejects_boolean_frontier_number_settings(setting, boolean_value):
+    section = {
+        "enable_frontier_adjudication": True,
+        "enable_candidate_verification": True,
+        "frontier_adjudication_model": "frontier-primary",
+        "frontier_adjudication_provider": "provider-primary",
+        "frontier_adjudication_revision": "revision-primary",
+        setting: boolean_value,
+    }
+
+    with pytest.raises(ValueError, match=rf"{setting} must be a non-boolean number"):
+        load_frontier_adjudication_config(section, {})
+
+
+def test_loader_accepts_numeric_string_frontier_number_settings():
+    section = {
+        "enable_frontier_adjudication": True,
+        "enable_candidate_verification": True,
+        "frontier_adjudication_model": "frontier-primary",
+        "frontier_adjudication_provider": "provider-primary",
+        "frontier_adjudication_revision": "revision-primary",
+        "frontier_adjudication_timeout_seconds": "90.5",
+        "frontier_adjudication_model_timeout_seconds": "30",
+        "frontier_adjudication_minimum_confidence": "0.75",
+    }
+    prompt = {
+        "system": SYSTEM_PROMPT,
+        "user": USER_PROMPT,
+        "prompt_version": "frontier-adjudication-prompt-v1",
+        "input_schema_version": FRONTIER_INPUT_SCHEMA_VERSION,
+        "schema_version": FRONTIER_OUTPUT_SCHEMA_VERSION,
+    }
+
+    loaded = load_frontier_adjudication_config(section, prompt)
+
+    assert loaded.stage_timeout_seconds == 90.5
+    assert loaded.route.timeout_seconds == 30.0
+    assert loaded.minimum_confidence == 0.75
+
+
+@pytest.mark.parametrize("minimum_confidence", ["inf", "nan"])
+def test_loader_rejects_non_finite_minimum_confidence(minimum_confidence):
+    section = {
+        "enable_frontier_adjudication": True,
+        "enable_candidate_verification": True,
+        "frontier_adjudication_model": "frontier-primary",
+        "frontier_adjudication_provider": "provider-primary",
+        "frontier_adjudication_revision": "revision-primary",
+        "frontier_adjudication_minimum_confidence": minimum_confidence,
+    }
+    prompt = {
+        "system": SYSTEM_PROMPT,
+        "user": USER_PROMPT,
+        "prompt_version": "frontier-adjudication-prompt-v1",
+        "input_schema_version": FRONTIER_INPUT_SCHEMA_VERSION,
+        "schema_version": FRONTIER_OUTPUT_SCHEMA_VERSION,
+    }
+
+    with pytest.raises(ValueError, match="minimum confidence must be between 0 and 1"):
+        load_frontier_adjudication_config(section, prompt)
+
+
+@pytest.mark.parametrize(
     ("setting", "invalid_value"),
     [
         ("frontier_adjudication_model_retries", True),

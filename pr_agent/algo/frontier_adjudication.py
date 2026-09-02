@@ -309,7 +309,7 @@ class FrontierAdjudicationConfig:
         for index, identity in enumerate(self.model_identities):
             if identity.model != self.route.models[index] or identity.deployment != self.route.deployments[index]:
                 raise FrontierContractError("frontier model identity does not match its route entry")
-        if not 0 <= self.minimum_confidence <= 1:
+        if isinstance(self.minimum_confidence, bool) or not 0 <= self.minimum_confidence <= 1:
             raise FrontierContractError("frontier minimum confidence must be between 0 and 1")
         if (
             not isinstance(self.stage_timeout_seconds, (int, float))
@@ -503,6 +503,17 @@ def load_frontier_adjudication_config(
                 ) from exc
         raise FrontierContractError(f"{key} must be a non-boolean integer")
 
+    def number(key: str, default: float) -> float:
+        raw = section.get(key, default)
+        if isinstance(raw, bool):
+            raise FrontierContractError(f"{key} must be a non-boolean number")
+        try:
+            return float(raw)
+        except (TypeError, ValueError) as exc:
+            raise FrontierContractError(
+                f"{key} must be a non-boolean number"
+            ) from exc
+
     primary_model = strings("frontier_adjudication_model", required=True)
     if len(primary_model) != 1:
         raise FrontierContractError("frontier_adjudication_model requires one model")
@@ -530,12 +541,9 @@ def load_frontier_adjudication_config(
             strict=True,
         )
     )
-    try:
-        model_timeout = float(section.get("frontier_adjudication_model_timeout_seconds", 60))
-        stage_timeout = float(section.get("frontier_adjudication_timeout_seconds", 120))
-        minimum_confidence = float(section.get("frontier_adjudication_minimum_confidence", 0.0))
-    except (TypeError, ValueError) as exc:
-        raise FrontierContractError("frontier numeric configuration is invalid") from exc
+    model_timeout = number("frontier_adjudication_model_timeout_seconds", 60)
+    stage_timeout = number("frontier_adjudication_timeout_seconds", 120)
+    minimum_confidence = number("frontier_adjudication_minimum_confidence", 0.0)
     model_retries = integer("frontier_adjudication_model_retries", 1)
     provider_retries = integer("frontier_adjudication_provider_retries", 0)
     max_output_tokens = integer("frontier_adjudication_max_output_tokens", 2048)
