@@ -41,6 +41,7 @@ KEY_ISSUE_LOCATION_MARKER_RE = re.compile(r"<!-- pr-agent-key-issue-location: ([
 FINDING_IDENTITY_MARKER_RE = re.compile(
     r"<!-- pr-agent-finding:(v[1-9][0-9]*) id=(sha256:[a-f0-9]{64}) -->"
 )
+FINDING_IDENTITY_MARKER_VERSION = "v1"
 SUMMARY_FALLBACK_MARKER_RE = re.compile(
     r"<!-- pr-agent-thread-fallback:(v[1-9][0-9]*) id=(sha256:[a-f0-9]{64}) -->"
 )
@@ -81,7 +82,10 @@ def finding_identity_markers(body: str) -> tuple[tuple[str, str], ...]:
     return tuple((match.group(1), match.group(2)) for match in FINDING_IDENTITY_MARKER_RE.finditer(body or ""))
 
 
-def build_finding_identity_marker(finding_id: str, marker_version: str = "v1") -> str:
+def build_finding_identity_marker(
+    finding_id: str,
+    marker_version: str = FINDING_IDENTITY_MARKER_VERSION,
+) -> str:
     """Build a versioned stable-finding marker.
 
     Marker versions are independent from the reconciler's full schema version,

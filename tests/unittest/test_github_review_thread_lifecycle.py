@@ -167,6 +167,17 @@ def test_inventory_parses_identity_ownership_anchor_and_reviewed_head():
     assert snapshot.reviewed_head_sha == "head-1"
 
 
+def test_inventory_leaves_future_identity_marker_versions_unowned():
+    identity = _identity()
+    body = body_with_finding_identity_marker("future finding", identity.finding_id, marker_version="v2")
+    requester = _Requester(graphql=[_inventory_page([_thread("thread-1", [_comment(body)])])])
+
+    snapshot = _provider(requester).get_review_thread_snapshots()[0]
+
+    assert snapshot.finding_id is None
+    assert snapshot.bot_owned is False
+
+
 def test_inventory_paginates_threads_and_comments():
     identity = _identity()
     body = body_with_finding_identity_marker("finding", identity.finding_id)

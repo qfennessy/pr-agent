@@ -20,7 +20,8 @@ from ..algo.file_filter import filter_ignored
 from ..algo.git_patch_processing import (extract_hunk_headers,
                                          iter_git_patch_lines,
                                          strip_git_line_ending)
-from ..algo.inline_comment_dedup import (body_fingerprint, body_with_markers,
+from ..algo.inline_comment_dedup import (FINDING_IDENTITY_MARKER_VERSION,
+                                         body_fingerprint, body_with_markers,
                                          code_fingerprint,
                                          finding_identity_markers,
                                          get_inline_comment_store, has_marker,
@@ -1113,7 +1114,11 @@ class GithubProvider(GitProvider):
 
             root = comments[0] if comments else None
             marker_values = finding_identity_markers(root.body if root else "")
-            marker_ids = {finding_id for _, finding_id in marker_values}
+            marker_ids = {
+                finding_id
+                for marker_version, finding_id in marker_values
+                if marker_version == FINDING_IDENTITY_MARKER_VERSION
+            }
             finding_id = next(iter(marker_ids)) if len(marker_ids) == 1 else None
             root_actor = {
                 "id": root.author_id if root else None,
