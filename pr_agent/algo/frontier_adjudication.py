@@ -465,7 +465,9 @@ def load_frontier_adjudication_config(
         if isinstance(raw, str):
             values = (raw.strip(),) if raw.strip() else ()
         elif isinstance(raw, (list, tuple)):
-            values = tuple(str(item).strip() for item in raw)
+            if any(not isinstance(item, str) for item in raw):
+                raise FrontierContractError(f"{key} must be a string list")
+            values = tuple(item.strip() for item in raw)
         else:
             raise FrontierContractError(f"{key} must be a string list")
         if any(not item for item in values) or (required and not values):
@@ -477,7 +479,9 @@ def load_frontier_adjudication_config(
         if isinstance(raw, str):
             values = (raw.strip() or None,) if raw.strip() else ()
         elif isinstance(raw, (list, tuple)):
-            values = tuple(str(item).strip() or None for item in raw)
+            if any(not isinstance(item, str) for item in raw):
+                raise FrontierContractError(f"{key} must be a string list")
+            values = tuple(item.strip() or None for item in raw)
         else:
             raise FrontierContractError(f"{key} must be a string list")
         if not values:

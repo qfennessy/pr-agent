@@ -1020,6 +1020,39 @@ def test_loader_requires_exact_fallback_identities():
 
 
 @pytest.mark.parametrize(
+    "setting",
+    [
+        "frontier_adjudication_model",
+        "frontier_adjudication_provider",
+        "frontier_adjudication_revision",
+        "frontier_adjudication_deployment",
+        "frontier_adjudication_fallback_models",
+        "frontier_adjudication_fallback_providers",
+        "frontier_adjudication_fallback_revisions",
+        "frontier_adjudication_fallback_deployments",
+    ],
+)
+@pytest.mark.parametrize("invalid_value", [[True], [7]])
+def test_loader_rejects_non_string_route_identity_list_entries(setting, invalid_value):
+    section = {
+        "enable_frontier_adjudication": True,
+        "enable_candidate_verification": True,
+        "frontier_adjudication_model": ["frontier-primary"],
+        "frontier_adjudication_provider": ["provider-primary"],
+        "frontier_adjudication_revision": ["revision-primary"],
+        "frontier_adjudication_deployment": ["deployment-primary"],
+        "frontier_adjudication_fallback_models": ["frontier-fallback"],
+        "frontier_adjudication_fallback_providers": ["provider-fallback"],
+        "frontier_adjudication_fallback_revisions": ["revision-fallback"],
+        "frontier_adjudication_fallback_deployments": ["deployment-fallback"],
+        setting: invalid_value,
+    }
+
+    with pytest.raises(ValueError, match=rf"{setting} must be a string list"):
+        load_frontier_adjudication_config(section, {})
+
+
+@pytest.mark.parametrize(
     ("timeout_key", "timeout_value", "timeout_name"),
     [
         ("frontier_adjudication_timeout_seconds", "inf", "stage"),
