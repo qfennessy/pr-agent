@@ -563,6 +563,78 @@ async def test_async_identity_refresh_remains_supported():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failed_refresh", [1, 2])
+@pytest.mark.parametrize(
+    ("failure_value", "expected_state", "expected_reason"),
+    [
+        (None, FrontierState.UNAVAILABLE, "identity_refresh_unavailable"),
+        (
+            RuntimeError("provider unavailable"),
+            FrontierState.UNAVAILABLE,
+            "identity_refresh_failed",
+        ),
+    ],
+)
+async def test_identity_refresh_availability_is_distinct_from_stale_snapshot(
+    failed_refresh,
+    failure_value,
+    expected_state,
+    expected_reason,
+):
+    init_run_details()
+    stage_config = config()
+    handler = FakeHandler([output()])
+    refresh_count = 0
+
+    def current_identity():
+        nonlocal refresh_count
+        refresh_count += 1
+        if refresh_count == failed_refresh:
+            if isinstance(failure_value, Exception):
+                raise failure_value
+            return failure_value
+        return "head-1"
+
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        handler,
+        current_identity=current_identity,
+    )
+
+    assert result.state is expected_state
+    assert result.failure_reason == expected_reason
+    assert result.telemetry["state"] == expected_state.value
+    assert result.telemetry["failure_reason"] == expected_reason
+    assert handler.calls == ([] if failed_refresh == 1 else ["frontier-primary"])
+
+
+@pytest.mark.asyncio
+async def test_success_latency_includes_final_identity_refresh():
+    init_run_details()
+    stage_config = config(stage_timeout=0.5)
+    refresh_count = 0
+
+    def delayed_final_identity_refresh():
+        nonlocal refresh_count
+        refresh_count += 1
+        if refresh_count == 2:
+            time.sleep(0.03)
+        return "head-1"
+
+    result = await run_frontier_adjudication(
+        request(stage_config),
+        stage_config,
+        FakeHandler([output()]),
+        current_identity=delayed_final_identity_refresh,
+    )
+
+    assert result.state is FrontierState.CONFIRMED
+    assert refresh_count == 2
+    assert result.telemetry["latency_seconds"] >= 0.02
+
+
+@pytest.mark.asyncio
 async def test_provider_failure_fails_unavailable():
     init_run_details()
     stage_config = config()

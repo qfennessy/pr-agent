@@ -612,6 +612,10 @@ def _hash_json(value: Any) -> str:
     return f"sha256:{digest}"
 
 
+class _FrontierIdentityRefreshError(RuntimeError):
+    """The identity callback failed independently of the stage deadline."""
+
+
 async def _refresh_identity(current_identity: Callable[[], Any]) -> Optional[str]:
     try:
         if inspect.iscoroutinefunction(current_identity):
@@ -621,8 +625,8 @@ async def _refresh_identity(current_identity: Callable[[], Any]) -> Optional[str
         if inspect.isawaitable(value):
             value = await value
         return str(value) if value else None
-    except Exception:
-        return None
+    except Exception as exc:
+        raise _FrontierIdentityRefreshError from exc
 
 
 async def _refresh_identity_before(
@@ -865,6 +869,25 @@ async def run_frontier_adjudication(
             current_identity,
             deadline_monotonic,
         )
+    except _FrontierIdentityRefreshError:
+        record_adjudication_result(
+            finding_id,
+            provider=None,
+            model_revision=None,
+            model_attempts_configured=config.route.model_retries,
+            provider_retries_configured=config.route.provider_retries,
+            prompt_version=config.prompt_version,
+            input_schema_version=config.input_schema_version,
+            schema_version=config.output_schema_version,
+            state=FrontierState.UNAVAILABLE.value,
+            latency_seconds=time.monotonic() - started_at,
+            failure_reason="identity_refresh_failed",
+        )
+        return _unavailable(
+            request,
+            FrontierState.UNAVAILABLE,
+            "identity_refresh_failed",
+        )
     except asyncio.TimeoutError:
         record_adjudication_result(
             finding_id,
@@ -880,7 +903,35 @@ async def run_frontier_adjudication(
             failure_reason="timeout",
         )
         return _unavailable(request, FrontierState.TIMEOUT, "timeout")
+    if current_snapshot_id is None:
+        record_adjudication_result(
+            finding_id,
+            provider=None,
+            model_revision=None,
+            model_attempts_configured=config.route.model_retries,
+            provider_retries_configured=config.route.provider_retries,
+            prompt_version=config.prompt_version,
+            input_schema_version=config.input_schema_version,
+            schema_version=config.output_schema_version,
+            state=FrontierState.UNAVAILABLE.value,
+            latency_seconds=time.monotonic() - started_at,
+            failure_reason="identity_refresh_unavailable",
+        )
+        return _unavailable(request, FrontierState.UNAVAILABLE, "identity_refresh_unavailable")
     if current_snapshot_id != request.snapshot_id:
+        record_adjudication_result(
+            finding_id,
+            provider=None,
+            model_revision=None,
+            model_attempts_configured=config.route.model_retries,
+            provider_retries_configured=config.route.provider_retries,
+            prompt_version=config.prompt_version,
+            input_schema_version=config.input_schema_version,
+            schema_version=config.output_schema_version,
+            state=FrontierState.STALE.value,
+            latency_seconds=time.monotonic() - started_at,
+            failure_reason="stale_snapshot",
+        )
         return _unavailable(request, FrontierState.STALE, "stale_snapshot")
     if getattr(ai_handler, "supports_frontier_adjudication_telemetry", False) is not True:
         return _unavailable(
@@ -936,7 +987,6 @@ async def run_frontier_adjudication(
         }[parsed["decision"]]
         failure_reason = parsed["failure_reason"]
 
-    elapsed = time.monotonic() - started_at
     details = get_run_details()
     existing = details.adjudication_runs.get(finding_id) if details is not None else None
     configured_identity = _model_identity(
@@ -946,20 +996,6 @@ async def run_frontier_adjudication(
     )
     actual_provider = existing.provider if existing is not None else None
     actual_revision = existing.model_revision if existing is not None else None
-    record_adjudication_result(
-        finding_id,
-        provider=actual_provider,
-        model_revision=actual_revision,
-        model_attempts_configured=config.route.model_retries,
-        provider_retries_configured=config.route.provider_retries,
-        prompt_version=config.prompt_version,
-        input_schema_version=config.input_schema_version,
-        schema_version=config.output_schema_version,
-        state=state.value,
-        latency_seconds=elapsed,
-        confidence=parsed["confidence"] if parsed is not None else None,
-        failure_reason=failure_reason,
-    )
     try:
         current_snapshot_id = await _refresh_identity_before(
             current_identity,
@@ -980,6 +1016,40 @@ async def run_frontier_adjudication(
             failure_reason="timeout",
         )
         return _unavailable(request, FrontierState.TIMEOUT, "timeout")
+    except _FrontierIdentityRefreshError:
+        record_adjudication_result(
+            finding_id,
+            provider=actual_provider,
+            model_revision=actual_revision,
+            model_attempts_configured=config.route.model_retries,
+            provider_retries_configured=config.route.provider_retries,
+            prompt_version=config.prompt_version,
+            input_schema_version=config.input_schema_version,
+            schema_version=config.output_schema_version,
+            state=FrontierState.UNAVAILABLE.value,
+            latency_seconds=time.monotonic() - started_at,
+            failure_reason="identity_refresh_failed",
+        )
+        return _unavailable(
+            request,
+            FrontierState.UNAVAILABLE,
+            "identity_refresh_failed",
+        )
+    if current_snapshot_id is None:
+        record_adjudication_result(
+            finding_id,
+            provider=actual_provider,
+            model_revision=actual_revision,
+            model_attempts_configured=config.route.model_retries,
+            provider_retries_configured=config.route.provider_retries,
+            prompt_version=config.prompt_version,
+            input_schema_version=config.input_schema_version,
+            schema_version=config.output_schema_version,
+            state=FrontierState.UNAVAILABLE.value,
+            latency_seconds=time.monotonic() - started_at,
+            failure_reason="identity_refresh_unavailable",
+        )
+        return _unavailable(request, FrontierState.UNAVAILABLE, "identity_refresh_unavailable")
     if current_snapshot_id != request.snapshot_id:
         record_adjudication_result(
             finding_id,
@@ -995,6 +1065,21 @@ async def run_frontier_adjudication(
             failure_reason="stale_snapshot",
         )
         return _unavailable(request, FrontierState.STALE, "stale_snapshot")
+    elapsed = time.monotonic() - started_at
+    record_adjudication_result(
+        finding_id,
+        provider=actual_provider,
+        model_revision=actual_revision,
+        model_attempts_configured=config.route.model_retries,
+        provider_retries_configured=config.route.provider_retries,
+        prompt_version=config.prompt_version,
+        input_schema_version=config.input_schema_version,
+        schema_version=config.output_schema_version,
+        state=state.value,
+        latency_seconds=elapsed,
+        confidence=parsed["confidence"] if parsed is not None else None,
+        failure_reason=failure_reason,
+    )
     if parsed is None:
         return _unavailable(request, state, failure_reason or "unavailable")
 
