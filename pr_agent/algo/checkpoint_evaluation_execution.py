@@ -42,10 +42,16 @@ class OutputCapability(str, Enum):
     PR_PUBLICATION = "pr_publication"
 
 
-_OUTPUT_GATE_BY_CAPABILITY = {
-    OutputCapability.OPT_IN_PAIR_REVIEW: "opt-in-pair-review",
-    OutputCapability.DEFAULT_PAIR_REVIEW: "default-pair-review",
-    OutputCapability.PR_PUBLICATION: "pr-publication",
+_OUTPUT_GATES_BY_CAPABILITY = {
+    OutputCapability.OPT_IN_PAIR_REVIEW: (
+        "offline-replay", "live-shadow", "opt-in-pair-review",
+    ),
+    OutputCapability.DEFAULT_PAIR_REVIEW: (
+        "offline-replay", "live-shadow", "opt-in-pair-review", "default-pair-review",
+    ),
+    OutputCapability.PR_PUBLICATION: (
+        "offline-replay", "live-shadow", "opt-in-pair-review", "default-pair-review", "pr-publication",
+    ),
 }
 _MUTABLE_MODEL_REVISIONS = {"default", "latest", "main", "stable"}
 
@@ -71,32 +77,43 @@ def evaluate_output_permission(
     *,
     arm_id: str,
     scorecard_id: str,
-    required_gate_spec_hash: str,
+    required_gate_spec_hashes: Mapping[str, str],
 ) -> OutputPermissionDecision:
-    """Require one exact passed gate; missing or stale evidence never enables output."""
-    if not isinstance(required_gate_spec_hash, str) or not required_gate_spec_hash.startswith("sha256:"):
-        raise EvaluationValidationError("required_gate_spec_hash must be an approved sha256 identity")
-    required_gate = _OUTPUT_GATE_BY_CAPABILITY[capability]
-    matching = [
-        decision for decision in decisions
-        if decision.gate_name == required_gate
-        and decision.arm_id == arm_id
-        and decision.scorecard_id == scorecard_id
-        and decision.gate_spec_hash == required_gate_spec_hash
-    ]
-    if not matching:
-        status = GateStatus.NOT_EVALUABLE
-        reason = "the exact current scorecard has no matching rollout decision"
-    elif len(matching) > 1:
-        status = GateStatus.NOT_EVALUABLE
-        reason = "multiple conflicting rollout decisions match the current scorecard"
-    else:
-        status = matching[0].status
-        reason = (
-            "the exact rollout gate passed"
-            if status is GateStatus.PASSED
-            else f"the exact rollout gate is {status.value}"
+    """Require the exact passed prerequisite chain; stale evidence never enables output."""
+    required_gates = _OUTPUT_GATES_BY_CAPABILITY[capability]
+    if (
+        not isinstance(required_gate_spec_hashes, Mapping)
+        or set(required_gate_spec_hashes) != set(required_gates)
+        or any(
+            not isinstance(value, str) or not value.startswith("sha256:")
+            for value in required_gate_spec_hashes.values()
         )
+    ):
+        raise EvaluationValidationError(
+            "required_gate_spec_hashes must pin every approved prerequisite gate"
+        )
+    status = GateStatus.PASSED
+    reason = "the exact rollout gate and every prerequisite passed"
+    for required_gate in required_gates:
+        matching = [
+            decision for decision in decisions
+            if decision.gate_name == required_gate
+            and decision.arm_id == arm_id
+            and decision.scorecard_id == scorecard_id
+            and decision.gate_spec_hash == required_gate_spec_hashes[required_gate]
+        ]
+        if not matching:
+            status = GateStatus.NOT_EVALUABLE
+            reason = f"the exact current scorecard has no matching {required_gate} decision"
+            break
+        if len(matching) > 1:
+            status = GateStatus.NOT_EVALUABLE
+            reason = f"multiple conflicting {required_gate} decisions match the current scorecard"
+            break
+        if matching[0].status is not GateStatus.PASSED:
+            status = matching[0].status
+            reason = f"the exact {required_gate} gate is {status.value}"
+            break
     return OutputPermissionDecision(
         capability=capability,
         arm_id=arm_id,
@@ -108,11 +125,11 @@ def evaluate_output_permission(
 
 @dataclass(frozen=True)
 class PaidPlanItemBudget:
-    """Maximum paid attempts and reserved cost for one immutable case/arm pair."""
+    """Maximum paid attempts and hard per-call cost for one immutable case/arm pair."""
 
     case_id: str
     arm_id: str
-    projected_cost_per_attempt_usd: float
+    hard_cost_cap_per_attempt_usd: float
     max_attempts: int
 
     def __post_init__(self) -> None:
@@ -120,12 +137,12 @@ class PaidPlanItemBudget:
             if not isinstance(value, str) or not value.strip():
                 raise EvaluationValidationError(f"paid budget {name} must be non-empty")
         if (
-            not isinstance(self.projected_cost_per_attempt_usd, (int, float))
-            or isinstance(self.projected_cost_per_attempt_usd, bool)
-            or not math.isfinite(self.projected_cost_per_attempt_usd)
-            or self.projected_cost_per_attempt_usd <= 0
+            not isinstance(self.hard_cost_cap_per_attempt_usd, (int, float))
+            or isinstance(self.hard_cost_cap_per_attempt_usd, bool)
+            or not math.isfinite(self.hard_cost_cap_per_attempt_usd)
+            or self.hard_cost_cap_per_attempt_usd <= 0
         ):
-            raise EvaluationValidationError("paid budget projected cost must be finite and positive")
+            raise EvaluationValidationError("paid budget hard cost cap must be finite and positive")
         if (
             not isinstance(self.max_attempts, int)
             or isinstance(self.max_attempts, bool)
@@ -137,19 +154,19 @@ class PaidPlanItemBudget:
         return {
             "case_id": self.case_id,
             "arm_id": self.arm_id,
-            "projected_cost_per_attempt_usd": self.projected_cost_per_attempt_usd,
+            "hard_cost_cap_per_attempt_usd": self.hard_cost_cap_per_attempt_usd,
             "max_attempts": self.max_attempts,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "PaidPlanItemBudget":
-        allowed = {"case_id", "arm_id", "projected_cost_per_attempt_usd", "max_attempts"}
+        allowed = {"case_id", "arm_id", "hard_cost_cap_per_attempt_usd", "max_attempts"}
         if not isinstance(value, Mapping) or set(value) - allowed:
             raise EvaluationValidationError("paid plan-item budget contains unknown fields")
         return cls(
             case_id=value["case_id"],
             arm_id=value["arm_id"],
-            projected_cost_per_attempt_usd=value["projected_cost_per_attempt_usd"],
+            hard_cost_cap_per_attempt_usd=value["hard_cost_cap_per_attempt_usd"],
             max_attempts=value["max_attempts"],
         )
 
@@ -286,11 +303,11 @@ def evaluate_paid_execution(
     budget_pairs = {(budget.case_id, budget.arm_id) for budget in request.plan_item_budgets}
     if budget_pairs != paid_pairs:
         reasons.append("paid budgets must match every model-backed plan item exactly")
-    projected_cost = sum(
-        budget.projected_cost_per_attempt_usd * budget.max_attempts
+    reserved_cost = sum(
+        budget.hard_cost_cap_per_attempt_usd * budget.max_attempts
         for budget in request.plan_item_budgets
     )
-    if projected_cost > request.cost_cap_usd:
+    if reserved_cost > request.cost_cap_usd:
         reasons.append("reserved paid plan-item cost exceeds the explicit cap")
 
     for arm in sorted((item for item in manifest.arms if item.enabled), key=lambda item: item.arm_id):

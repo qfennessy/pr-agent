@@ -129,7 +129,7 @@ runner. It returns `denied` unless all of these facts are true at the same time:
 
 - evaluation and paid execution were explicitly enabled;
 - publication is still disabled;
-- every model-backed case/arm pair has a positive projected per-attempt cost and a bounded
+- every model-backed case/arm pair has a positive hard per-attempt cost cap and a bounded
   maximum attempt count whose full reservation fits a positive cap for this exact manifest;
 - every enabled model arm pins a model revision; and
 - the process has a credential for every named provider.
@@ -138,8 +138,10 @@ The request records only credential presence booleans. It never serializes an en
 variable name, token, key, credential value, or provider request identifier. The request is
 immutably bound beside the manifest. Before every adapter call, the runner reloads retained
 attempts, requires complete cost telemetry, and checks cumulative spend plus all remaining
-reserved attempts against the cap. A final failed attempt is terminalized at its immutable
-limit, so restarting cannot create unbounded retries. The default cost cap is zero and
+reserved attempts against the cap. Every model-backed binding must also declare hard-cap
+support and receives the immutable per-attempt cap in its adapter context; a binding that
+cannot enforce that cap before provider calls is unavailable. A final failed attempt is
+terminalized at its immutable limit, so restarting cannot create unbounded retries. The default cost cap is zero and
 therefore cannot authorize spending. A caller must invoke
 `PaidExecutionDecision.require_authorized()` immediately before entering production
 orchestration; planning alone is not authorization.
@@ -310,7 +312,8 @@ the report. Keep the report JSON publishable and keep the manifest, source-beari
 truth ledger, raw attempt files, and shadow journals in their existing private stores.
 
 `evaluate_output_permission()` separately binds opt-in advice, default advice, or PR
-publication to one exact passed gate, arm, and scorecard id. Missing decisions, stale
+publication to its exact passed gate plus every preceding offline-replay and rollout gate
+for the same arm and scorecard id. Missing decisions, stale
 scorecards, duplicate decisions, failed gates, and `not_evaluable` gates deny output.
 Gate rules may target a cohort explicitly with names such as
 `cohort.temporal.verified_recall`, so a healthy aggregate cannot hide a temporal regression.

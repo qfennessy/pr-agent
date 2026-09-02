@@ -250,7 +250,7 @@ def test_small_paired_sample_uses_student_t_instead_of_the_normal_approximation(
 
 
 @pytest.mark.parametrize(
-    ("enabled", "allow_paid", "publish", "projected_cost", "credentials"),
+    ("enabled", "allow_paid", "publish", "hard_cost_cap", "credentials"),
     [
         (False, True, False, 1.0, True),
         (True, False, False, 1.0, True),
@@ -260,14 +260,14 @@ def test_small_paired_sample_uses_student_t_instead_of_the_normal_approximation(
     ],
 )
 def test_paid_execution_fails_closed_for_each_missing_proof(
-    enabled, allow_paid, publish, projected_cost, credentials
+    enabled, allow_paid, publish, hard_cost_cap, credentials
 ):
     case = _case("case", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
     manifest = _manifest((case,), (_arm("small", EvaluationArmKind.GENERAL_REVIEW),))
     request = PaidExecutionRequest(
         manifest_id=manifest.manifest_id,
         cost_cap_usd=2.0,
-        plan_item_budgets=(PaidPlanItemBudget(case.case_id, "small", projected_cost, 1),),
+        plan_item_budgets=(PaidPlanItemBudget(case.case_id, "small", hard_cost_cap, 1),),
         credential_present_by_provider={"provider-v1": credentials},
     )
     assert evaluate_paid_execution(
@@ -279,10 +279,10 @@ def test_paid_execution_fails_closed_for_each_missing_proof(
     ).status is PaidExecutionStatus.DENIED
 
 
-@pytest.mark.parametrize("projected_cost", [0.0, -1.0, float("inf")])
-def test_paid_execution_request_rejects_invalid_plan_item_cost(projected_cost):
-    with pytest.raises(EvaluationValidationError, match="projected cost"):
-        PaidPlanItemBudget("case", "small", projected_cost, 1)
+@pytest.mark.parametrize("hard_cost_cap", [0.0, -1.0, float("inf")])
+def test_paid_execution_request_rejects_invalid_plan_item_cost(hard_cost_cap):
+    with pytest.raises(EvaluationValidationError, match="hard cost cap"):
+        PaidPlanItemBudget("case", "small", hard_cost_cap, 1)
 
 
 def test_frozen_production_fallback_identity_is_authorized_retained_and_scored(tmp_path):
@@ -920,38 +920,72 @@ def test_scorer_reports_lineage_lifecycle_events_stages_cohorts_and_paired_uncer
         "structured_output_rate": 4,
         "tokens": 4,
     }
-    publication_gate = evaluate_rollout_gate(
-        "pr-publication",
-        scorecard,
-        "deterministic",
-        (GateRule("verified_precision", GateComparator.AT_LEAST, 0.9),),
+    prerequisite_gates = tuple(
+        evaluate_rollout_gate(
+            gate_name,
+            scorecard,
+            "deterministic",
+            (GateRule("verified_precision", GateComparator.AT_LEAST, 0.9),),
+        )
+        for gate_name in (
+            "offline-replay",
+            "live-shadow",
+            "opt-in-pair-review",
+            "default-pair-review",
+            "pr-publication",
+        )
     )
+    required_gate_spec_hashes = {
+        decision.gate_name: decision.gate_spec_hash for decision in prerequisite_gates
+    }
     permission = evaluate_output_permission(
         OutputCapability.PR_PUBLICATION,
-        (publication_gate,),
+        prerequisite_gates,
         arm_id="deterministic",
         scorecard_id=scorecard.scorecard_id,
-        required_gate_spec_hash=publication_gate.gate_spec_hash,
+        required_gate_spec_hashes=required_gate_spec_hashes,
     )
     permission.require_permitted()
     stale_permission = evaluate_output_permission(
         OutputCapability.PR_PUBLICATION,
-        (publication_gate,),
+        prerequisite_gates,
         arm_id="deterministic",
         scorecard_id=_hash("stale-scorecard"),
-        required_gate_spec_hash=publication_gate.gate_spec_hash,
+        required_gate_spec_hashes=required_gate_spec_hashes,
     )
     with pytest.raises(EvaluationValidationError, match="not permitted"):
         stale_permission.require_permitted()
     weak_policy_permission = evaluate_output_permission(
         OutputCapability.PR_PUBLICATION,
-        (publication_gate,),
+        prerequisite_gates,
         arm_id="deterministic",
         scorecard_id=scorecard.scorecard_id,
-        required_gate_spec_hash=_hash("approved-stronger-policy"),
+        required_gate_spec_hashes={
+            **required_gate_spec_hashes,
+            "pr-publication": _hash("approved-stronger-policy"),
+        },
     )
     with pytest.raises(EvaluationValidationError, match="not permitted"):
         weak_policy_permission.require_permitted()
+
+    failed_offline_gate = evaluate_rollout_gate(
+        "offline-replay",
+        scorecard,
+        "deterministic",
+        (GateRule("verified_precision", GateComparator.AT_LEAST, 1.1),),
+    )
+    blocked_by_prerequisite = evaluate_output_permission(
+        OutputCapability.PR_PUBLICATION,
+        (failed_offline_gate, *prerequisite_gates[1:]),
+        arm_id="deterministic",
+        scorecard_id=scorecard.scorecard_id,
+        required_gate_spec_hashes={
+            **required_gate_spec_hashes,
+            "offline-replay": failed_offline_gate.gate_spec_hash,
+        },
+    )
+    with pytest.raises(EvaluationValidationError, match="not permitted"):
+        blocked_by_prerequisite.require_permitted()
 
     paired_gate = evaluate_rollout_gate(
         "pr-publication",

@@ -218,6 +218,7 @@ def _bindings(manifest: EvaluationManifest, adapter_factory=None) -> list[Produc
                 ),
                 adapter=adapter,
                 available=True,
+                enforces_hard_cost_cap=arm.kind is not EvaluationArmKind.DETERMINISTIC,
             )
         )
     return bindings
@@ -312,6 +313,8 @@ async def test_every_arm_receives_the_same_loaded_snapshot_object(tmp_path):
     assert all(item[0] is received[0][0] for item in received)
     assert received[0][0] is not snapshot
     assert all(context.publish_output is False for _, context in received)
+    assert received[0][1].hard_cost_cap_usd is None
+    assert all(context.hard_cost_cap_usd == 0.02 for _, context in received[1:])
     assert all(record.terminal for record in store.load_records(manifest))
 
 
@@ -754,6 +757,19 @@ def test_preflight_requires_all_five_kinds_and_the_exact_paid_decision(tmp_path)
         ).preflight()
     assert store.calls == []
 
+    bindings = _bindings(manifest)
+    general_index = next(
+        index for index, binding in enumerate(bindings)
+        if binding.kind is EvaluationArmKind.GENERAL_REVIEW
+    )
+    bindings[general_index] = replace(
+        bindings[general_index],
+        enforces_hard_cost_cap=False,
+    )
+    with pytest.raises(ProductionDependencyUnavailable, match="hard per-call cost cap"):
+        _runner(manifest, path, bindings, store, request, _decision).preflight()
+    assert store.calls == []
+
 
 @pytest.mark.asyncio
 async def test_result_with_wrong_snapshot_or_selected_model_is_rejected(tmp_path):
@@ -948,7 +964,7 @@ async def test_paid_capacity_rechecks_actual_cumulative_spend_before_each_model_
         return adapter
 
     store = EvaluationArtifactStore(tmp_path / "cumulative-cap")
-    with pytest.raises(EvaluationValidationError, match="cumulative spend plus remaining projected work"):
+    with pytest.raises(EvaluationValidationError, match="cumulative spend plus remaining hard-capped work"):
         await _runner(manifest, path, _bindings(manifest, factory), store, request, decision).run()
 
     assert calls == [EvaluationArmKind.DETERMINISTIC, EvaluationArmKind.FULL_CASCADE]

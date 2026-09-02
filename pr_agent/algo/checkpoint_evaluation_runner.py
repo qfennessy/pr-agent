@@ -70,11 +70,19 @@ class ProductionArmContext:
     configuration_hash: str
     prompt_hash: str
     model_visible_metadata: Mapping[str, object]
+    hard_cost_cap_usd: Optional[float] = None
     publish_output: bool = False
 
     def __post_init__(self) -> None:
         if self.publish_output:
             raise EvaluationValidationError("checkpoint production bindings cannot publish output")
+        if self.hard_cost_cap_usd is not None and (
+            not isinstance(self.hard_cost_cap_usd, (int, float))
+            or isinstance(self.hard_cost_cap_usd, bool)
+            or not math.isfinite(self.hard_cost_cap_usd)
+            or self.hard_cost_cap_usd <= 0
+        ):
+            raise EvaluationValidationError("production adapter hard cost cap must be finite and positive")
         object.__setattr__(
             self,
             "model_visible_metadata",
@@ -188,6 +196,7 @@ class ProductionArmBinding:
     telemetry_shape: ModelTelemetryShape
     adapter: Optional[ProductionArmAdapter]
     available: bool
+    enforces_hard_cost_cap: bool = False
     unavailable_reason: Optional[str] = None
     publish_output: bool = False
 
@@ -205,7 +214,11 @@ class ProductionArmBinding:
             raise EvaluationValidationError("production binding stage_plan must contain unique stages")
         if not isinstance(self.telemetry_shape, ModelTelemetryShape):
             raise EvaluationValidationError("production binding telemetry_shape is invalid")
-        if not isinstance(self.available, bool) or not isinstance(self.publish_output, bool):
+        if (
+            not isinstance(self.available, bool)
+            or not isinstance(self.enforces_hard_cost_cap, bool)
+            or not isinstance(self.publish_output, bool)
+        ):
             raise EvaluationValidationError("production binding flags must be booleans")
         if self.available:
             if self.adapter is None:
@@ -299,16 +312,6 @@ class ProductionEvaluationRunner:
             arm = arms_by_id[item.arm_id]
             binding = bindings_by_arm_id[item.arm_id]
             snapshot = preflight.snapshots_by_case_id[item.case_id]
-            context = ProductionArmContext(
-                manifest_id=self.manifest.manifest_id,
-                case_id=case.case_id,
-                arm_id=arm.arm_id,
-                event=case.event.value,
-                snapshot_artifact_hash=case.snapshot_artifact_hash,
-                configuration_hash=arm.configuration_hash,
-                prompt_hash=arm.prompt_hash,
-                model_visible_metadata=case.model_visible_metadata,
-            )
             adapter = binding.adapter
             if adapter is None:  # guarded by preflight; keep the paid boundary explicit
                 raise ProductionDependencyUnavailable(f"{binding.kind.value} production adapter is unavailable")
@@ -322,6 +325,21 @@ class ProductionEvaluationRunner:
             )
             if arm.kind is not EvaluationArmKind.DETERMINISTIC and paid_budget is None:
                 raise EvaluationValidationError(f"pair {case.case_id}/{arm.arm_id} has no immutable paid budget")
+            context = ProductionArmContext(
+                manifest_id=self.manifest.manifest_id,
+                case_id=case.case_id,
+                arm_id=arm.arm_id,
+                event=case.event.value,
+                snapshot_artifact_hash=case.snapshot_artifact_hash,
+                configuration_hash=arm.configuration_hash,
+                prompt_hash=arm.prompt_hash,
+                model_visible_metadata=case.model_visible_metadata,
+                hard_cost_cap_usd=(
+                    paid_budget.hard_cost_cap_per_attempt_usd
+                    if paid_budget is not None
+                    else None
+                ),
+            )
             max_attempts = paid_budget.max_attempts if paid_budget is not None else None
             if max_attempts is not None and resume_item.next_attempt > max_attempts:
                 raise EvaluationValidationError(
@@ -401,6 +419,8 @@ def _validate_bindings(
             raise EvaluationValidationError(f"{kind.value} binding stage plan does not match its arm")
         if binding.publish_output:
             raise EvaluationValidationError(f"{kind.value} binding can publish output")
+        if kind is not EvaluationArmKind.DETERMINISTIC and not binding.enforces_hard_cost_cap:
+            unavailable.append(f"{kind.value}: adapter cannot enforce a hard per-call cost cap")
         expected_shape = {
             EvaluationArmKind.DETERMINISTIC: ModelTelemetryShape.NONE,
             EvaluationArmKind.GENERAL_REVIEW: ModelTelemetryShape.SINGLE_SELECTED,
@@ -476,18 +496,18 @@ def _require_remaining_paid_capacity(
         (budget.case_id, budget.arm_id): budget
         for budget in request.plan_item_budgets
     }
-    remaining_projected_cost = sum(
-        budget.projected_cost_per_attempt_usd
+    remaining_reserved_cost = sum(
+        budget.hard_cost_cap_per_attempt_usd
         * (budget.max_attempts - attempts_by_pair.get(pair, 0))
         for pair, budget in budget_by_pair.items()
         if pair not in terminal_pairs
     )
-    if remaining_projected_cost <= 0:
+    if remaining_reserved_cost <= 0:
         raise EvaluationValidationError("paid replay has no bounded model attempts remaining")
-    worst_case_total = cumulative_cost + remaining_projected_cost
+    worst_case_total = cumulative_cost + remaining_reserved_cost
     if worst_case_total > request.cost_cap_usd + 1e-12:
         raise EvaluationValidationError(
-            "retained cumulative spend plus remaining projected work exceeds the explicit cost cap"
+            "retained cumulative spend plus remaining hard-capped work exceeds the explicit cost cap"
         )
 
 
