@@ -1032,8 +1032,13 @@ def test_loader_requires_exact_fallback_identities():
         "frontier_adjudication_fallback_deployments",
     ],
 )
-@pytest.mark.parametrize("invalid_value", [[True], [7]])
-def test_loader_rejects_non_string_route_identity_list_entries(setting, invalid_value):
+@pytest.mark.parametrize("invalid_value", [[True], [7]], ids=["boolean", "number"])
+@pytest.mark.asyncio
+async def test_loader_rejects_non_string_route_identity_entries_before_model_call(
+    setting,
+    invalid_value,
+):
+    handler = FakeHandler([output()])
     section = {
         "enable_frontier_adjudication": True,
         "enable_candidate_verification": True,
@@ -1047,9 +1052,58 @@ def test_loader_rejects_non_string_route_identity_list_entries(setting, invalid_
         "frontier_adjudication_fallback_deployments": ["deployment-fallback"],
         setting: invalid_value,
     }
+    prompt = {
+        "system": SYSTEM_PROMPT,
+        "user": USER_PROMPT,
+        "prompt_version": "frontier-adjudication-prompt-v1",
+        "input_schema_version": FRONTIER_INPUT_SCHEMA_VERSION,
+        "schema_version": FRONTIER_OUTPUT_SCHEMA_VERSION,
+    }
 
     with pytest.raises(ValueError, match=rf"{setting} must be a string list"):
-        load_frontier_adjudication_config(section, {})
+        stage_config = load_frontier_adjudication_config(section, prompt)
+        await run_frontier_adjudication(
+            request(stage_config),
+            stage_config,
+            handler,
+            current_identity=lambda: "head-1",
+        )
+    assert handler.calls == []
+
+
+def test_loader_retains_valid_string_array_route_identities():
+    section = {
+        "enable_frontier_adjudication": True,
+        "enable_candidate_verification": True,
+        "frontier_adjudication_model": [" frontier-primary "],
+        "frontier_adjudication_provider": [" provider-primary "],
+        "frontier_adjudication_revision": [" revision-primary "],
+        "frontier_adjudication_deployment": [" deployment-primary "],
+        "frontier_adjudication_fallback_models": [" frontier-fallback "],
+        "frontier_adjudication_fallback_providers": [" provider-fallback "],
+        "frontier_adjudication_fallback_revisions": [" revision-fallback "],
+        "frontier_adjudication_fallback_deployments": [" deployment-fallback "],
+    }
+    prompt = {
+        "system": SYSTEM_PROMPT,
+        "user": USER_PROMPT,
+        "prompt_version": "frontier-adjudication-prompt-v1",
+        "input_schema_version": FRONTIER_INPUT_SCHEMA_VERSION,
+        "schema_version": FRONTIER_OUTPUT_SCHEMA_VERSION,
+    }
+
+    loaded = load_frontier_adjudication_config(section, prompt)
+
+    assert loaded.route.models == ("frontier-primary", "frontier-fallback")
+    assert loaded.route.deployments == ("deployment-primary", "deployment-fallback")
+    assert [identity.provider for identity in loaded.model_identities] == [
+        "provider-primary",
+        "provider-fallback",
+    ]
+    assert [identity.revision for identity in loaded.model_identities] == [
+        "revision-primary",
+        "revision-fallback",
+    ]
 
 
 @pytest.mark.parametrize(
