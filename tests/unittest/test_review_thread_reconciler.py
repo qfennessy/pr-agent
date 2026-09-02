@@ -134,8 +134,8 @@ class _MutationProvider:
             current_head_sha="head-1",
         )
 
-    def create_review_thread(self, comment, expected_head_sha):
-        self.calls.append(("create", comment, expected_head_sha))
+    def create_review_thread(self, comment, expected_head_sha, expected_threads=()):
+        self.calls.append(("create", comment, expected_head_sha, expected_threads))
         return self._outcome(ReviewThreadActionKind.CREATE)
 
     def update_review_thread(self, comment_id, body, expected_head_sha, expected_thread):
@@ -755,6 +755,7 @@ def test_two_outdated_safe_copies_create_once_then_resolve_both_dependencies():
         ReviewThreadActionKind.RESOLVE,
         ReviewThreadActionKind.RESOLVE,
     ]
+    assert plan.actions[0].expected_threads == old_threads
     assert {action.thread_id for action in plan.actions[1:]} == {"thread-old-1", "thread-old-2"}
     assert all(action.depends_on_action_id == plan.actions[0].action_id for action in plan.actions[1:])
 
@@ -899,6 +900,7 @@ def test_authoritative_bot_resolved_reply_free_history_can_recur_without_fixed_m
 
     assert [action.kind for action in plan.actions] == [ReviewThreadActionKind.CREATE]
     assert plan.actions[0].reason == "finding_reintroduced_after_bot_resolution"
+    assert plan.actions[0].expected_threads == (resolved,)
 
 
 def test_bot_resolved_history_with_human_reply_does_not_recur():

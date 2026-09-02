@@ -66,8 +66,8 @@ def _identity():
     )
 
 
-def _hold_review_thread_create_lock(acquired, release):
-    with _review_thread_create_lock("owner/repo", 42, _identity().finding_id):
+def _hold_review_thread_create_lock(acquired, release, finding_id=None):
+    with _review_thread_create_lock("owner/repo", 42, finding_id or _identity().finding_id):
         acquired.set()
         if not release.wait(5):
             raise RuntimeError("timed out waiting to release review-thread create lock")
@@ -192,12 +192,18 @@ def _owned_thread_state(body=None, *, replies=(), resolved=False, viewer_can_res
         comments=comments,
         subject_type="LINE",
         viewer_can_resolve=viewer_can_resolve,
+        resolved_by_viewer_bot=resolved,
     )
     raw_thread = _thread(
         "thread-1",
         raw_comments,
         resolved=resolved,
         viewer_can_resolve=viewer_can_resolve,
+        resolved_by=(
+            {"id": "BOT-1", "login": "pr-agent[bot]", "__typename": "Bot"}
+            if resolved
+            else None
+        ),
     )
     return snapshot, _inventory_page([raw_thread])
 
@@ -582,6 +588,58 @@ def test_create_preserves_bot_resolved_same_finding_thread_that_gained_a_human_r
     assert not any(call[0] == "rest" and call[1] == "POST" for call in requester.calls)
 
 
+def test_create_aborts_when_same_finding_was_bot_resolved_after_planning():
+    comment = _create_comment()
+    resolved_thread = _thread(
+        "thread-1",
+        [_comment(comment["body"], database_id=77)],
+        resolved=True,
+        resolved_by={"id": "BOT-1", "login": "pr-agent[bot]", "__typename": "Bot"},
+    )
+    requester = _Requester(
+        graphql=[_inventory_page([resolved_thread])],
+        rest=[{"head": {"sha": "head-1"}}],
+    )
+
+    outcome = _provider(requester).create_review_thread(comment, "head-1", ())
+
+    assert outcome.state == ReviewThreadActionState.STALE_INVENTORY
+    assert outcome.reason == "finding_thread_appeared_since_planning"
+    assert outcome.mutation_attempted is False
+    assert not any(call[0] == "rest" and call[1] == "POST" for call in requester.calls)
+
+
+def test_create_allows_unchanged_planned_bot_resolved_recurrence_history():
+    comment = _create_comment()
+    expected_thread, resolved_inventory = _owned_thread_state(body=comment["body"], resolved=True)
+    resolved_thread = _thread(
+        "thread-1",
+        [_comment(comment["body"], database_id=77)],
+        resolved=True,
+        resolved_by={"id": "BOT-1", "login": "pr-agent[bot]", "__typename": "Bot"},
+    )
+    created_thread = _thread(
+        "thread-2",
+        [_comment(comment["body"], node_id="comment-2", database_id=78)],
+    )
+    requester = _Requester(
+        graphql=[resolved_inventory, _inventory_page([resolved_thread, created_thread])],
+        rest=[
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+            {"id": 78, "node_id": "comment-2"},
+            {"head": {"sha": "head-1"}},
+        ],
+    )
+
+    outcome = _provider(requester).create_review_thread(comment, "head-1", (expected_thread,))
+
+    assert outcome.state == ReviewThreadActionState.APPLIED
+    assert outcome.thread_id == "thread-2"
+    assert outcome.comment_id == 78
+    assert len([call for call in requester.calls if call[0] == "rest" and call[1] == "POST"]) == 1
+
+
 def test_concurrent_create_review_thread_calls_publish_once_for_one_finding():
     comment = _create_comment()
     _, created_inventory = _owned_thread_state(body=comment["body"])
@@ -617,7 +675,7 @@ def test_concurrent_create_review_thread_calls_publish_once_for_one_finding():
     assert len([call for call in requester.calls if call[0] == "rest" and call[1] == "POST"]) == 1
 
 
-def test_review_thread_create_lock_serializes_same_finding_across_processes():
+def test_review_thread_create_lock_is_keyed_and_serializes_same_finding_across_processes():
     if "fork" not in multiprocessing.get_all_start_methods():
         pytest.skip("cross-process file-lock regression requires fork")
     context = multiprocessing.get_context("fork")
@@ -625,24 +683,36 @@ def test_review_thread_create_lock_serializes_same_finding_across_processes():
     first_release = context.Event()
     second_acquired = context.Event()
     second_release = context.Event()
+    unrelated_acquired = context.Event()
+    unrelated_release = context.Event()
     first = context.Process(target=_hold_review_thread_create_lock, args=(first_acquired, first_release))
     second = context.Process(target=_hold_review_thread_create_lock, args=(second_acquired, second_release))
+    unrelated = context.Process(
+        target=_hold_review_thread_create_lock,
+        args=(unrelated_acquired, unrelated_release, "different-finding"),
+    )
     first.start()
     try:
         assert first_acquired.wait(2)
         second.start()
         assert not second_acquired.wait(0.2)
+        unrelated.start()
+        assert unrelated_acquired.wait(2)
+        unrelated_release.set()
         first_release.set()
         assert second_acquired.wait(2)
         second_release.set()
         first.join(timeout=2)
         second.join(timeout=2)
+        unrelated.join(timeout=2)
         assert first.exitcode == 0
         assert second.exitcode == 0
+        assert unrelated.exitcode == 0
     finally:
         first_release.set()
         second_release.set()
-        for process in (first, second):
+        unrelated_release.set()
+        for process in (first, second, unrelated):
             if process.pid is not None:
                 process.join(timeout=1)
             if process.is_alive():

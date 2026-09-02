@@ -366,6 +366,7 @@ class ReviewThreadAction:
     body: Optional[str] = None
     depends_on_action_id: Optional[str] = None
     expected_thread: Optional[ReviewThreadSnapshot] = None
+    expected_threads: tuple[ReviewThreadSnapshot, ...] = ()
     schema_version: str = REVIEW_THREAD_LIFECYCLE_SCHEMA_VERSION
 
 
@@ -531,7 +532,12 @@ class ReviewThreadReconciliationOutcome:
 class ReviewThreadMutationProvider(Protocol):
     """Provider surface required by the disabled lifecycle executor."""
 
-    def create_review_thread(self, comment: dict, expected_head_sha: str) -> ReviewThreadActionOutcome:
+    def create_review_thread(
+        self,
+        comment: dict,
+        expected_head_sha: str,
+        expected_threads: tuple[ReviewThreadSnapshot, ...] = (),
+    ) -> ReviewThreadActionOutcome:
         raise NotImplementedError
 
     def update_review_thread(
@@ -658,6 +664,7 @@ def plan_review_thread_actions(
                 "new_finding",
                 anchor=desired.anchor,
                 body=desired.marked_body,
+                expected_threads=(),
             )
             continue
         active_matches = [thread for thread in matches if not thread.is_resolved]
@@ -679,6 +686,7 @@ def plan_review_thread_actions(
                     reason,
                     anchor=desired.anchor,
                     body=desired.marked_body,
+                    expected_threads=tuple(matches),
                 )
             else:
                 add(
@@ -797,6 +805,7 @@ def plan_review_thread_actions(
             move_reason,
             anchor=desired.anchor,
             body=desired.marked_body,
+            expected_threads=tuple(matches),
         )
         for previous in active_matches:
             root = previous.root_comment
@@ -950,7 +959,9 @@ def execute_review_thread_action_plan(
             add_fallback(action, SummaryFallbackReason.INVALID_INLINE_LOCATION)
         elif action.kind == ReviewThreadActionKind.CREATE and action.anchor and action.body:
             outcome = provider.create_review_thread(
-                action.anchor.to_github_comment(action.body), action.expected_head_sha
+                action.anchor.to_github_comment(action.body),
+                action.expected_head_sha,
+                action.expected_threads,
             )
         elif (
             action.kind == ReviewThreadActionKind.UPDATE

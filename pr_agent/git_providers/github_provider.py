@@ -72,7 +72,7 @@ from .git_provider import (
 
 _REVIEW_THREAD_CREATE_LOCKS_GUARD = threading.Lock()
 _REVIEW_THREAD_CREATE_LOCKS = WeakValueDictionary()
-_REVIEW_THREAD_CREATE_PROCESS_LOCK = os.path.join(tempfile.gettempdir(), "pr-agent-review-thread-create.lock")
+_REVIEW_THREAD_CREATE_PROCESS_LOCK_PREFIX = os.path.join(tempfile.gettempdir(), "pr-agent-review-thread-create")
 
 
 class _ReviewThreadCreateLockError(RuntimeError):
@@ -83,6 +83,8 @@ class _ReviewThreadCreateLockError(RuntimeError):
 def _review_thread_create_lock(repository: str, pull_request_number: int, finding_id: str):
     """Serialize creates across threads and same-host service workers."""
     key = f"{repository.casefold()}#{pull_request_number}:{finding_id}"
+    lock_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    lock_path = f"{_REVIEW_THREAD_CREATE_PROCESS_LOCK_PREFIX}-{lock_digest}.lock"
     with _REVIEW_THREAD_CREATE_LOCKS_GUARD:
         lock = _REVIEW_THREAD_CREATE_LOCKS.get(key)
         if lock is None:
@@ -94,7 +96,7 @@ def _review_thread_create_lock(repository: str, pull_request_number: int, findin
         descriptor = None
         try:
             flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(_REVIEW_THREAD_CREATE_PROCESS_LOCK, flags, 0o600)
+            descriptor = os.open(lock_path, flags, 0o600)
             lock_stat = os.fstat(descriptor)
             if not stat.S_ISREG(lock_stat.st_mode):
                 raise OSError("create coordination path is not a regular file")
@@ -1450,6 +1452,7 @@ class GithubProvider(GitProvider):
         expected_head_sha: str,
         finding_id: str,
         anchor: ReviewThreadAnchor,
+        expected_threads: tuple[ReviewThreadSnapshot, ...],
     ) -> ReviewThreadActionOutcome:
         current_head_sha, blocked = self._check_review_thread_head(
             ReviewThreadActionKind.CREATE, expected_head_sha
@@ -1471,6 +1474,31 @@ class GithubProvider(GitProvider):
                 reason=f"create_inventory_failed: {e}",
                 **_review_thread_failure_details(e),
             )
+        expected_by_id = {thread.thread_id: thread for thread in expected_threads}
+        current_by_id = {thread.thread_id: thread for thread in same_finding}
+        if (
+            len(expected_by_id) != len(expected_threads)
+            or len(current_by_id) != len(same_finding)
+            or any(thread.finding_id != finding_id for thread in expected_threads)
+        ):
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.CREATE,
+                state=ReviewThreadActionState.STALE_INVENTORY,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                reason="create_inventory_identity_set_is_invalid",
+            )
+        if any(
+            current_by_id.get(thread_id) != expected_thread
+            for thread_id, expected_thread in expected_by_id.items()
+        ):
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.CREATE,
+                state=ReviewThreadActionState.STALE_INVENTORY,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=current_head_sha,
+                reason="finding_thread_changed_since_planning",
+            )
         if any(
             thread.is_resolved
             and (
@@ -1487,14 +1515,18 @@ class GithubProvider(GitProvider):
                 current_head_sha=current_head_sha,
                 reason="finding_thread_authoritatively_resolved_since_planning",
             )
-        existing = [thread for thread in same_finding if not thread.is_resolved]
-        if existing:
-            root = existing[0].root_comment if len(existing) == 1 else None
+        unexpected = [
+            thread for thread in same_finding
+            if thread.thread_id not in expected_by_id
+        ]
+        if unexpected:
+            root = unexpected[0].root_comment if len(unexpected) == 1 else None
             if (
-                len(existing) == 1
-                and existing[0].anchor == anchor
-                and existing[0].bot_owned
-                and not existing[0].has_replies
+                len(unexpected) == 1
+                and not unexpected[0].is_resolved
+                and unexpected[0].anchor == anchor
+                and unexpected[0].bot_owned
+                and not unexpected[0].has_replies
                 and root
                 and root.body == comment.get("body")
             ):
@@ -1503,7 +1535,7 @@ class GithubProvider(GitProvider):
                     state=ReviewThreadActionState.ALREADY_APPLIED,
                     expected_head_sha=expected_head_sha,
                     current_head_sha=current_head_sha,
-                    thread_id=existing[0].thread_id,
+                    thread_id=unexpected[0].thread_id,
                     comment_id=root.database_id,
                     comment_node_id=root.node_id,
                     reason="finding_thread_already_created",
@@ -1630,7 +1662,12 @@ class GithubProvider(GitProvider):
                 **failure_details,
             )
 
-    def create_review_thread(self, comment: dict, expected_head_sha: str) -> ReviewThreadActionOutcome:
+    def create_review_thread(
+        self,
+        comment: dict,
+        expected_head_sha: str,
+        expected_threads: tuple[ReviewThreadSnapshot, ...] = (),
+    ) -> ReviewThreadActionOutcome:
         marker_values = finding_identity_markers(comment.get("body") if isinstance(comment, dict) else "")
         marker_ids = {
             finding_id
@@ -1660,7 +1697,13 @@ class GithubProvider(GitProvider):
         finding_id = next(iter(marker_ids))
         try:
             with _review_thread_create_lock(self.repo, self.pr_num, finding_id):
-                return self._create_review_thread_locked(comment, expected_head_sha, finding_id, anchor)
+                return self._create_review_thread_locked(
+                    comment,
+                    expected_head_sha,
+                    finding_id,
+                    anchor,
+                    expected_threads,
+                )
         except _ReviewThreadCreateLockError as error:
             return ReviewThreadActionOutcome(
                 kind=ReviewThreadActionKind.CREATE,
