@@ -28,8 +28,8 @@ from pr_agent.algo.checkpoint_evaluation_execution import (
     EvaluationArtifactStore, PaidExecutionRequest, PaidPlanItemBudget)
 from pr_agent.algo.checkpoint_evaluation_scoring import (ScoreMetric,
                                                          score_matched_arms)
-from pr_agent.algo.checkpoint_shadow_journal import (DeveloperTimeBasis,
-                                                     ShadowJournalEntry)
+from pr_agent.algo.checkpoint_shadow_journal import (
+    DeveloperTimeBasis, ShadowJournalEntry, ShadowJournalSessionSummary)
 from pr_agent.algo.review_snapshot import ReviewEvent
 
 DEFAULT_PAIR_REVIEW_GATE = report_module.DEFAULT_PAIR_REVIEW_GATE
@@ -53,7 +53,7 @@ _PINNED_TEST_COCOS_ACCEPTANCE_ID = (
     "sha256:d934504cb16b48f81b661fae4962c07fe26d63adef67668e100845a99b2b2459"
 )
 _PINNED_TEST_SHADOW_ACCEPTANCE_ID = (
-    "sha256:bb46374fc32b07fb647f61091eec34394dd549042bfecca3ea456a6ca5ebbc8a"
+    "sha256:509975310b252bc83d165ca343c7374888377e3a527ef913cf8daa1cd8822cc8"
 )
 _PINNED_TEST_SETTLED_ACCEPTANCE_ID = (
     "sha256:fccce140bdb6b685f43e30b49bc38be04101bb6b09b91375c0a8a5312ce8693b"
@@ -344,6 +344,16 @@ def _shadow_records(
             ),
             entry=entry,
             developer_elapsed_seconds=None if index == 0 else 60,
+            session_summary=(
+                ShadowJournalSessionSummary(
+                    submitted_entry_count=2,
+                    queued_entry_count=2,
+                    dropped_entry_count=0,
+                    writer_failed=False,
+                )
+                if index == 1
+                else None
+            ),
         )
 
     return (
@@ -1049,6 +1059,48 @@ def test_partial_journal_measurements_are_recomputed_and_cannot_pass(tmp_path, m
     assert cost is not None
     assert cost.status is MeasurementStatus.PARTIAL
     assert cost.value == pytest.approx(0.06)
+
+
+def test_dropped_shadow_entries_make_inventory_latency_and_cost_incomplete(tmp_path, monkeypatch):
+    manifest = _manifest()
+    records = _shadow_records(manifest)
+    incomplete_records = (
+        records[0],
+        replace(
+            records[1],
+            session_summary=ShadowJournalSessionSummary(
+                submitted_entry_count=3,
+                queued_entry_count=2,
+                dropped_entry_count=1,
+                writer_failed=False,
+            ),
+        ),
+    )
+    acceptance_id = build_shadow_pilot_acceptance(
+        incomplete_records,
+        manifest=manifest,
+        target_arm_id="cascade",
+    ).acceptance_id
+    report = _report(
+        tmp_path,
+        _complete_evidence(),
+        _budgets(),
+        pin_shadow_acceptance=True,
+        monkeypatch=monkeypatch,
+        shadow_records=incomplete_records,
+        pinned_shadow_acceptance_id=acceptance_id,
+    )
+    live_shadow = next(
+        decision for decision in report.gate_decisions if decision.gate_name == LIVE_SHADOW_GATE
+    )
+    results = {result.rule.metric: result.observed for result in live_shadow.rule_results}
+
+    assert live_shadow.status is GateStatus.NOT_EVALUABLE
+    assert report.shadow_binding is not None
+    assert report.shadow_binding.inventory_complete is False
+    assert results["evidence.raw_shadow_inventory_complete"].status is MeasurementStatus.PARTIAL
+    assert results["evidence.shadow_latency_p95_seconds"].status is MeasurementStatus.PARTIAL
+    assert results["evidence.shadow_cost_per_developer_hour_usd"].status is MeasurementStatus.PARTIAL
 
 
 def test_single_journal_record_has_no_duration_and_is_not_evaluable(tmp_path, monkeypatch):

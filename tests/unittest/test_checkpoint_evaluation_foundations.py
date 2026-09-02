@@ -42,10 +42,9 @@ from pr_agent.algo.checkpoint_evaluation_scoring import (GateComparator,
                                                          _paired_interval,
                                                          evaluate_rollout_gate,
                                                          score_matched_arms)
-from pr_agent.algo.checkpoint_shadow_journal import (ShadowJournalEntry,
-                                                     ShadowJournalWriter,
-                                                     ShadowSubmitStatus,
-                                                     load_shadow_journal)
+from pr_agent.algo.checkpoint_shadow_journal import (
+    ShadowJournalEntry, ShadowJournalSessionSummary, ShadowJournalWriter,
+    ShadowSubmitStatus, _append_private_line, load_shadow_journal)
 from pr_agent.algo.review_snapshot import (ReviewEvent, ReviewResultState,
                                            ReviewSnapshotResult)
 from pr_agent.algo.run_details import RunDetails
@@ -491,6 +490,12 @@ def test_shadow_journal_is_opt_in_source_free_and_non_blocking(tmp_path):
     assert parsed[0].sequence == 1
     assert parsed[0].developer_elapsed_seconds is None
     assert parsed[0].entry == entry
+    assert parsed[0].session_summary == ShadowJournalSessionSummary(
+        submitted_entry_count=1,
+        queued_entry_count=1,
+        dropped_entry_count=0,
+        writer_failed=False,
+    )
 
     failed_record = _record(
         manifest,
@@ -787,6 +792,8 @@ def test_shadow_journal_close_retries_when_the_bounded_queue_was_full(tmp_path, 
     )
     writer = ShadowJournalWriter(tmp_path / "shadow.ndjson", enabled=True, max_queue_entries=1)
     assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
+    writer._queue.join()
+    assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
     assert worker_started.wait(1)
     assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
     writer_closed = writer.close(timeout_seconds=0.01)
@@ -797,6 +804,51 @@ def test_shadow_journal_close_retries_when_the_bounded_queue_was_full(tmp_path, 
     writer_closed = writer.close(timeout_seconds=1)
     assert writer_closed is True
     assert writer._thread is not None and not writer._thread.is_alive()
+
+
+def test_shadow_journal_persists_queue_drops_in_the_session_summary(tmp_path, monkeypatch):
+    case = _case("case", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
+    manifest = _manifest((case,), (_arm("deterministic", EvaluationArmKind.DETERMINISTIC),))
+    entry = ShadowJournalEntry.from_run_record(
+        _record(manifest, case, "deterministic"),
+        arm=manifest.arms[0],
+        event=case.event,
+        policy_hash=manifest.policy_hash,
+        configuration_hash=manifest.configuration_hash,
+    )
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    def blocked_first_append(path, payload):
+        if not worker_started.is_set():
+            worker_started.set()
+            assert release_worker.wait(2)
+        _append_private_line(path, payload)
+
+    monkeypatch.setattr(
+        "pr_agent.algo.checkpoint_shadow_journal._append_private_line",
+        blocked_first_append,
+    )
+    path = tmp_path / "dropped-shadow.ndjson"
+    writer = ShadowJournalWriter(path, enabled=True, max_queue_entries=1)
+    assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
+    writer._queue.join()
+    assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
+    assert worker_started.wait(1)
+    assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
+    assert writer.submit(entry) is ShadowSubmitStatus.DROPPED
+    release_worker.set()
+
+    writer_closed = writer.close()
+    assert writer_closed is False
+    records = load_shadow_journal(path)
+    assert len(records) == 3
+    assert records[-1].session_summary == ShadowJournalSessionSummary(
+        submitted_entry_count=4,
+        queued_entry_count=3,
+        dropped_entry_count=1,
+        writer_failed=False,
+    )
 
 
 def test_scorer_reports_lineage_lifecycle_events_stages_cohorts_and_paired_uncertainty():
@@ -1304,6 +1356,18 @@ def test_cocos_adapter_reads_external_locked_corpus_without_copying(tmp_path, ca
     assert inventory.checkpoint_controls_status == "complete"
     assert inventory.checkpoint_controls_hash is not None
     assert str(corpus) not in json.dumps(inventory.to_dict())
+
+    for duplicate_field in ("snapshot_artifact_hash", "adjudication_hash"):
+        duplicate_controls = json.loads(json.dumps(checkpoint_payload))
+        duplicate_controls["entries"][1][duplicate_field] = duplicate_controls["entries"][0][duplicate_field]
+        _write_json(checkpoint_controls, duplicate_controls)
+        with pytest.raises(EvaluationValidationError, match=f"{duplicate_field} values must be unique"):
+            validate_cocos_story_corpus(
+                corpus,
+                lock,
+                checkpoint_controls_path=checkpoint_controls,
+            )
+    _write_json(checkpoint_controls, checkpoint_payload)
 
     real_control_parent = tmp_path / "real-control-parent"
     real_control_parent.mkdir()

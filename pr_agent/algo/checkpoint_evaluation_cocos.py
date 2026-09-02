@@ -327,6 +327,8 @@ def _validate_checkpoint_controls(path: Optional[str | Path]) -> tuple[Optional[
         raise EvaluationValidationError("checkpoint controls must contain 15 to 20 independently adjudicated cases")
     ids: set[str] = set()
     snapshot_ids: set[str] = set()
+    snapshot_artifact_hashes: set[str] = set()
+    adjudication_hashes: set[str] = set()
     scenarios: set[str] = set()
     parents: dict[str, Optional[str]] = {}
     for entry in entries:
@@ -358,6 +360,10 @@ def _validate_checkpoint_controls(path: Optional[str | Path]) -> tuple[Optional[
             value = entry.get(field_name)
             if not isinstance(value, str) or not _SHA256.fullmatch(value):
                 raise EvaluationValidationError(f"checkpoint control {field_name} must be a sha256 identity")
+            identities = snapshot_artifact_hashes if field_name == "snapshot_artifact_hash" else adjudication_hashes
+            if value in identities:
+                raise EvaluationValidationError(f"checkpoint control {field_name} values must be unique")
+            identities.add(value)
         if entry.get("is_clean") is not True:
             raise EvaluationValidationError("checkpoint controls must be independently adjudicated as clean")
         withdrawn = entry.get("expected_withdrawn_fingerprints", [])

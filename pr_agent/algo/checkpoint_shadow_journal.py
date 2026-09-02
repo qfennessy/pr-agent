@@ -10,7 +10,7 @@ import re
 import stat
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -32,7 +32,7 @@ from pr_agent.algo.review_snapshot import ReviewEvent
 _REASON_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REVIEW_DEPTHS = {"quick", "standard", "deep"}
-SHADOW_JOURNAL_RECORD_SCHEMA_VERSION = "checkpoint-shadow-journal-record-v1"
+SHADOW_JOURNAL_RECORD_SCHEMA_VERSION = "checkpoint-shadow-journal-record-v2"
 
 
 def _reject_unknown_fields(name: str, value: Mapping[str, Any], allowed: set[str]) -> None:
@@ -298,6 +298,51 @@ class DeveloperTimeBasis(str, Enum):
 
 
 @dataclass(frozen=True)
+class ShadowJournalSessionSummary:
+    """Writer-owned completeness evidence attached to the last retained event in a session."""
+
+    submitted_entry_count: int
+    queued_entry_count: int
+    dropped_entry_count: int
+    writer_failed: bool
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("submitted_entry_count", self.submitted_entry_count),
+            ("queued_entry_count", self.queued_entry_count),
+            ("dropped_entry_count", self.dropped_entry_count),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise EvaluationValidationError(f"shadow journal {name} must be a non-negative integer")
+        if self.queued_entry_count < 1:
+            raise EvaluationValidationError("shadow journal session summary requires a retained entry")
+        if self.submitted_entry_count != self.queued_entry_count + self.dropped_entry_count:
+            raise EvaluationValidationError("shadow journal session counts do not reconcile")
+        if not isinstance(self.writer_failed, bool):
+            raise EvaluationValidationError("shadow journal writer_failed must be a boolean")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "submitted_entry_count": self.submitted_entry_count,
+            "queued_entry_count": self.queued_entry_count,
+            "dropped_entry_count": self.dropped_entry_count,
+            "writer_failed": self.writer_failed,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ShadowJournalSessionSummary":
+        _reject_unknown_fields("shadow journal session summary", value, {
+            "submitted_entry_count", "queued_entry_count", "dropped_entry_count", "writer_failed",
+        })
+        return cls(
+            submitted_entry_count=value["submitted_entry_count"],
+            queued_entry_count=value["queued_entry_count"],
+            dropped_entry_count=value["dropped_entry_count"],
+            writer_failed=value["writer_failed"],
+        )
+
+
+@dataclass(frozen=True)
 class ShadowJournalRecord:
     """Writer-stamped immutable envelope around one source-free entry."""
 
@@ -306,6 +351,7 @@ class ShadowJournalRecord:
     developer_time_basis: DeveloperTimeBasis
     developer_elapsed_seconds: Optional[float]
     entry: ShadowJournalEntry
+    session_summary: Optional[ShadowJournalSessionSummary] = None
     schema_version: str = SHADOW_JOURNAL_RECORD_SCHEMA_VERSION
     record_id: str = field(init=False)
 
@@ -335,6 +381,11 @@ class ShadowJournalRecord:
             raise EvaluationValidationError("writer-monotonic records require developer elapsed time")
         if not isinstance(self.entry, ShadowJournalEntry):
             raise EvaluationValidationError("shadow journal record requires a validated entry")
+        if self.session_summary is not None and not isinstance(
+            self.session_summary,
+            ShadowJournalSessionSummary,
+        ):
+            raise EvaluationValidationError("shadow journal session_summary is invalid")
         object.__setattr__(self, "record_id", content_hash(self._identity_payload()))
 
     def _identity_payload(self) -> dict[str, Any]:
@@ -345,6 +396,7 @@ class ShadowJournalRecord:
             "developer_time_basis": self.developer_time_basis.value,
             "developer_elapsed_seconds": self.developer_elapsed_seconds,
             "entry": self.entry.to_dict(),
+            "session_summary": self.session_summary.to_dict() if self.session_summary is not None else None,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -354,7 +406,7 @@ class ShadowJournalRecord:
     def from_dict(cls, value: Mapping[str, Any]) -> "ShadowJournalRecord":
         _reject_unknown_fields("shadow journal record", value, {
             "schema_version", "sequence", "ingested_at_utc", "developer_time_basis",
-            "developer_elapsed_seconds", "entry", "record_id",
+            "developer_elapsed_seconds", "entry", "session_summary", "record_id",
         })
         record = cls(
             sequence=value["sequence"],
@@ -362,11 +414,39 @@ class ShadowJournalRecord:
             developer_time_basis=DeveloperTimeBasis(value["developer_time_basis"]),
             developer_elapsed_seconds=value.get("developer_elapsed_seconds"),
             entry=ShadowJournalEntry.from_dict(value["entry"]),
+            session_summary=(
+                ShadowJournalSessionSummary.from_dict(value["session_summary"])
+                if value.get("session_summary") is not None
+                else None
+            ),
             schema_version=value["schema_version"],
         )
         if value.get("record_id") != record.record_id:
             raise EvaluationValidationError("shadow journal record identity does not match its content")
         return record
+
+
+def shadow_journal_inventory_complete(records: tuple[ShadowJournalRecord, ...]) -> bool:
+    """Validate writer-session boundaries and report whether every submission was retained."""
+    session_entry_count = 0
+    inventory_complete = bool(records)
+    for record in records:
+        if record.developer_time_basis is DeveloperTimeBasis.WRITER_START:
+            if session_entry_count:
+                inventory_complete = False
+            session_entry_count = 1
+        else:
+            if session_entry_count == 0:
+                raise EvaluationValidationError("shadow writer-monotonic record has no writer-start record")
+            session_entry_count += 1
+        if record.session_summary is None:
+            continue
+        if record.session_summary.queued_entry_count != session_entry_count:
+            raise EvaluationValidationError("shadow journal session summary does not match retained entries")
+        if record.session_summary.dropped_entry_count or record.session_summary.writer_failed:
+            inventory_complete = False
+        session_entry_count = 0
+    return inventory_complete and session_entry_count == 0
 
 
 def _append_private_line(path: Path, payload: bytes) -> None:
@@ -430,6 +510,7 @@ def load_shadow_journal(path: str | Path) -> tuple[ShadowJournalRecord, ...]:
         raise EvaluationValidationError("shadow journal ingestion time cannot move backwards")
     if len({record.record_id for record in records}) != len(records):
         raise EvaluationValidationError("shadow journal records must be unique")
+    shadow_journal_inventory_complete(tuple(records))
     return tuple(records)
 
 
@@ -455,6 +536,9 @@ class ShadowJournalWriter:
         existing = load_shadow_journal(self.path) if self.enabled else ()
         self._next_sequence = len(existing) + 1
         self._last_submitted_monotonic: Optional[float] = None
+        self._submitted_entry_count = 0
+        self._queued_entry_count = 0
+        self._dropped_entry_count = 0
         if self.enabled:
             self._thread = threading.Thread(target=self._drain, name="pr-agent-shadow-journal", daemon=True)
             self._thread.start()
@@ -466,9 +550,11 @@ class ShadowJournalWriter:
             return ShadowSubmitStatus.DISABLED
         if self._closed.is_set():
             return ShadowSubmitStatus.CLOSED
-        if self._failed.is_set():
-            return ShadowSubmitStatus.DROPPED
         with self._submit_lock:
+            self._submitted_entry_count += 1
+            if self._failed.is_set():
+                self._dropped_entry_count += 1
+                return ShadowSubmitStatus.DROPPED
             submitted_monotonic = time.monotonic()
             if self._last_submitted_monotonic is None:
                 basis = DeveloperTimeBasis.WRITER_START
@@ -486,34 +572,52 @@ class ShadowJournalWriter:
             try:
                 self._queue.put_nowait(record)
             except queue.Full:
+                self._dropped_entry_count += 1
                 return ShadowSubmitStatus.DROPPED
             self._next_sequence += 1
+            self._queued_entry_count += 1
             self._last_submitted_monotonic = submitted_monotonic
         return ShadowSubmitStatus.QUEUED
 
     def _drain(self) -> None:
+        pending: Optional[ShadowJournalRecord] = None
         while True:
             item = self._queue.get()
             try:
                 if item is self._STOP:
+                    if pending is not None:
+                        with self._submit_lock:
+                            summary = ShadowJournalSessionSummary(
+                                submitted_entry_count=self._submitted_entry_count,
+                                queued_entry_count=self._queued_entry_count,
+                                dropped_entry_count=self._dropped_entry_count,
+                                writer_failed=self._failed.is_set(),
+                            )
+                        self._append_record(replace(pending, session_summary=summary))
                     return
                 if not isinstance(item, ShadowJournalRecord):
                     raise EvaluationValidationError("shadow queue contained an invalid record")
-                payload = (
-                    json.dumps(
-                        item.to_dict(),
-                        allow_nan=False,
-                        ensure_ascii=True,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    + "\n"
-                ).encode("utf-8")
-                _append_private_line(self.path, payload)
+                previous = pending
+                pending = item
+                if previous is not None:
+                    self._append_record(previous)
             except (OSError, EvaluationValidationError):
                 self._failed.set()
             finally:
                 self._queue.task_done()
+
+    def _append_record(self, record: ShadowJournalRecord) -> None:
+        payload = (
+            json.dumps(
+                record.to_dict(),
+                allow_nan=False,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        _append_private_line(self.path, payload)
 
     def close(self, timeout_seconds: float = 5.0) -> bool:
         """Flush only during explicit shutdown; ``submit`` remains non-blocking."""
@@ -523,7 +627,7 @@ class ShadowJournalWriter:
         assert self._thread is not None
         with self._close_lock:
             if not self._thread.is_alive():
-                return not self._failed.is_set()
+                return not self._failed.is_set() and self._dropped_entry_count == 0
             if not self._stop_enqueued.is_set():
                 try:
                     self._queue.put(self._STOP, timeout=timeout_seconds)
@@ -531,4 +635,8 @@ class ShadowJournalWriter:
                     return False
                 self._stop_enqueued.set()
             self._thread.join(timeout_seconds)
-            return not self._thread.is_alive() and not self._failed.is_set()
+            return (
+                not self._thread.is_alive()
+                and not self._failed.is_set()
+                and self._dropped_entry_count == 0
+            )

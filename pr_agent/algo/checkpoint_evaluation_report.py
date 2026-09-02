@@ -38,9 +38,9 @@ from pr_agent.algo.checkpoint_evaluation_scoring import (GateComparator,
                                                          ScoreMetric,
                                                          evaluate_rollout_gate,
                                                          score_matched_arms)
-from pr_agent.algo.checkpoint_shadow_journal import (DeveloperTimeBasis,
-                                                     ShadowJournalRecord,
-                                                     load_shadow_journal)
+from pr_agent.algo.checkpoint_shadow_journal import (
+    DeveloperTimeBasis, ShadowJournalRecord, load_shadow_journal,
+    shadow_journal_inventory_complete)
 from pr_agent.algo.review_snapshot import ReviewEvent
 
 PILOT_REPORT_SCHEMA_VERSION = "checkpoint-evaluation-pilot-report-v1"
@@ -586,6 +586,7 @@ def build_shadow_pilot_acceptance(
     records = tuple(records)
     if not records or any(not isinstance(record, ShadowJournalRecord) for record in records):
         raise EvaluationValidationError("shadow pilot acceptance requires journal records")
+    shadow_journal_inventory_complete(records)
     observed_at_utc = tuple(record.ingested_at_utc for record in records)
     if any(
         later < earlier
@@ -674,6 +675,7 @@ class ShadowPilotBinding:
     file_save_count: int
     worktree_count: int
     developer_elapsed_seconds: Optional[float]
+    inventory_complete: bool
     latency_p95_seconds: ScoreMetric
     cost_per_developer_hour_usd: ScoreMetric
 
@@ -711,11 +713,18 @@ class ShadowPilotBinding:
             "shadow pilot developer_elapsed_seconds",
             self.developer_elapsed_seconds,
         )
+        if not isinstance(self.inventory_complete, bool):
+            raise EvaluationValidationError("shadow pilot inventory_complete must be a boolean")
         if not isinstance(self.latency_p95_seconds, ScoreMetric) or not isinstance(
             self.cost_per_developer_hour_usd,
             ScoreMetric,
         ):
             raise EvaluationValidationError("shadow pilot metrics must use ScoreMetric")
+        if not self.inventory_complete and any(
+            metric.status is MeasurementStatus.COMPLETE
+            for metric in (self.latency_p95_seconds, self.cost_per_developer_hour_usd)
+        ):
+            raise EvaluationValidationError("incomplete shadow inventory cannot claim complete metrics")
 
     def elapsed_days(self) -> ScoreMetric:
         if self.event_count < 2:
@@ -723,7 +732,11 @@ class ShadowPilotBinding:
         elapsed = (self.ended_at_utc - self.started_at_utc).total_seconds() / 86400.0
         if elapsed <= 0:
             return _unavailable_metric()
-        return ScoreMetric(MeasurementStatus.COMPLETE, elapsed, self.event_count)
+        return ScoreMetric(
+            MeasurementStatus.COMPLETE if self.inventory_complete else MeasurementStatus.PARTIAL,
+            elapsed,
+            self.event_count,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -736,6 +749,7 @@ class ShadowPilotBinding:
             "file_save_count": self.file_save_count,
             "worktree_count": self.worktree_count,
             "developer_elapsed_seconds": self.developer_elapsed_seconds,
+            "inventory_complete": self.inventory_complete,
             "latency_p95_seconds": self.latency_p95_seconds.to_dict(),
             "cost_per_developer_hour_usd": self.cost_per_developer_hour_usd.to_dict(),
         }
@@ -749,6 +763,8 @@ def _p95(values: Sequence[float]) -> float:
 def _journal_metric(
     records: Sequence[ShadowJournalRecord],
     attribute: str,
+    *,
+    inventory_complete: bool,
 ) -> ScoreMetric:
     measurements = tuple(getattr(record.entry, attribute) for record in records)
     known = tuple(
@@ -760,7 +776,7 @@ def _journal_metric(
         return _unavailable_metric()
     status = (
         MeasurementStatus.COMPLETE
-        if len(known) == len(measurements)
+        if inventory_complete and len(known) == len(measurements)
         else MeasurementStatus.PARTIAL
     )
     return ScoreMetric(status, _p95(known), len(known))
@@ -768,6 +784,8 @@ def _journal_metric(
 
 def _journal_cost_per_developer_hour(
     records: Sequence[ShadowJournalRecord],
+    *,
+    inventory_complete: bool,
 ) -> ScoreMetric:
     interval_records = tuple(
         record
@@ -791,7 +809,11 @@ def _journal_cost_per_developer_hour(
     total_cost = sum(float(record.entry.cost_usd.value) for record in known_costs)
     status = (
         MeasurementStatus.COMPLETE
-        if len(known_costs) == len(records) and len(known_intervals) == len(interval_records)
+        if (
+            inventory_complete
+            and len(known_costs) == len(records)
+            and len(known_intervals) == len(interval_records)
+        )
         else MeasurementStatus.PARTIAL
     )
     return ScoreMetric(status, total_cost / (denominator_seconds / 3600.0), len(known_costs))
@@ -824,6 +846,7 @@ def _build_shadow_pilot_binding(
         for record in records
         if record.developer_time_basis is DeveloperTimeBasis.WRITER_MONOTONIC
     )
+    inventory_complete = shadow_journal_inventory_complete(records)
     return ShadowPilotBinding(
         acceptance_id=acceptance.acceptance_id,
         journal_hash=acceptance.journal_hash,
@@ -838,8 +861,16 @@ def _build_shadow_pilot_binding(
             if developer_seconds and all(value is not None for value in developer_seconds)
             else None
         ),
-        latency_p95_seconds=_journal_metric(records, "latency_seconds"),
-        cost_per_developer_hour_usd=_journal_cost_per_developer_hour(records),
+        inventory_complete=inventory_complete,
+        latency_p95_seconds=_journal_metric(
+            records,
+            "latency_seconds",
+            inventory_complete=inventory_complete,
+        ),
+        cost_per_developer_hour_usd=_journal_cost_per_developer_hour(
+            records,
+            inventory_complete=inventory_complete,
+        ),
     )
 
 
@@ -1460,8 +1491,14 @@ def _external_metrics(
         "evidence.shadow_worktree_count": _count_metric(
             shadow_binding.worktree_count if shadow_binding is not None else None
         ),
-        "evidence.raw_shadow_inventory_complete": _presence_metric(
-            True if shadow_binding is not None else None
+        "evidence.raw_shadow_inventory_complete": (
+            _presence_metric(True)
+            if shadow_binding is not None and shadow_binding.inventory_complete
+            else (
+                ScoreMetric(MeasurementStatus.PARTIAL, 0.0, shadow_binding.event_count)
+                if shadow_binding is not None
+                else _unavailable_metric()
+            )
         ),
         "evidence.shadow_latency_budget_accepted": _presence_metric(
             True if budgets.shadow_latency_p95_seconds is not None else None

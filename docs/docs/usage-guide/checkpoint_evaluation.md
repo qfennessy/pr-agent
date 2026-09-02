@@ -177,6 +177,10 @@ Each accepted entry is wrapped by the writer with a contiguous sequence, UTC ing
 and writer-owned monotonic developer-time basis. Reports derive duration and cost-hour evidence
 only from parsed, identity-checked journal records; caller-supplied timestamps or elapsed-time
 wrappers cannot satisfy a gate.
+At explicit shutdown, the writer seals the last retained record in each session with immutable
+submitted, queued, and dropped counts plus writer-failure status. A missing seal, any dropped
+submission, or any writer failure makes the raw inventory unavailable and keeps retained latency
+and cost samples partial, so a biased subset cannot satisfy the live-shadow gate.
 
 The schema allowlists snapshot and lineage hashes, event and configuration versions,
 selected depth and machine reason codes, model/provider identities, hashed finding
@@ -279,7 +283,8 @@ schema, corpus, assignment, cohort count, or holdout hash is invalid input. Eigh
 Live shadow evidence follows the same two-step boundary. `ShadowJournalRecord` binds one actual
 `ShadowJournalEntry` content id to the writer-stamped ingestion time in UTC, contiguous sequence,
 and writer-owned monotonic developer-time
-denominator. `build_shadow_pilot_acceptance()` verifies the journal entries use the exact manifest
+denominator. The last record in each writer session also binds the writer-owned submission,
+retention, drop, and failure summary. `build_shadow_pilot_acceptance()` verifies the journal entries use the exact manifest
 policy, configuration, target arm, aggregate model identity, required stage plan, primary/fallback
 route, deployment identity, prompt/configuration/schema versions, cost model identities, and journal
 schema. It also rejects negative aggregate or stage latency, token, cost, or developer-time
@@ -292,6 +297,8 @@ substituted, duplicated, or reordered journal records fail validation. Duration 
 the first and last UTC ingestion records, p95 latency from every entry's recorded latency, event counts
 from the recorded event enum, and cost per developer-hour from recorded costs and accepted developer
 elapsed denominators. Missing, partial, or unpriced entries remain partial or unavailable. The report
+also refuses to call the raw inventory complete, or the retained latency and cost samples complete,
+when a writer session lacks its final seal or reports any drop or write failure. The report
 contains only the accepted journal and record hashes, UTC span, derived counts, and derived metrics;
 it does not expose journal model/provider identities or entry payloads.
 
