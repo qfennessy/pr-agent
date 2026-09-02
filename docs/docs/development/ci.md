@@ -112,8 +112,9 @@ contain unreviewed upstream workflow code.
 
 `upstream-provenance.yml` uses `pull_request_target` with read-only contents permission so GitHub loads the workflow
 from the protected base branch. It checks out the event's exact base SHA, fetches the PR head as a Git object without
-checking it out, and runs only `scripts/verify_upstream_provenance.py` from that protected base. It never executes a
-script, action, hook, or configuration from the PR candidate.
+checking it out, and runs only the thin `scripts/verify_upstream_provenance.py` entrypoint from that protected base.
+That entrypoint delegates to the packaged `pr_agent.upstream_provenance` module from the same base checkout. It never
+executes a script, action, hook, or configuration from the PR candidate.
 
 The verifier binds the branch suffix, title, and exactly one PR-body pin to the immutable upstream SHA; verifies the
 pin is on upstream `main`; and requires exactly one declared fork baseline that remains an ancestor of the PR base.

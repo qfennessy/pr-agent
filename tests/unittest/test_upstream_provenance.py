@@ -6,9 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from scripts.verify_upstream_provenance import ProvenanceError, PullRequestMetadata, verify_upstream_provenance
+from pr_agent.upstream_provenance import ProvenanceError, PullRequestMetadata, verify_upstream_provenance
 
 EXPECTED_REPOSITORY = "qfennessy/pr-agent"
+
+
+def _read_source_contract(path: str) -> str:
+    source = Path(path)
+    if not source.exists():
+        pytest.skip("source-only workflow contract is not copied into the Docker test target")
+    return source.read_text()
 
 
 def _git(repository: Path, *args: str) -> str:
@@ -203,16 +210,26 @@ def test_rejects_metadata_mismatches(
 
 
 def test_workflow_runs_only_the_protected_base_verifier() -> None:
-    workflow = Path(".github/workflows/upstream-provenance.yml").read_text()
+    workflow = _read_source_contract(".github/workflows/upstream-provenance.yml")
+    wrapper = _read_source_contract("scripts/verify_upstream_provenance.py")
     assert "pull_request_target:" in workflow
     assert "permissions:\n  contents: read" in workflow
     assert "ref: ${{ github.event.pull_request.base.sha }}" in workflow
     assert "python scripts/verify_upstream_provenance.py" in workflow
     assert "persist-credentials: false" in workflow
+    assert wrapper == (
+        "#!/usr/bin/env python3\n"
+        '"""Run the packaged upstream-provenance verifier from a protected base checkout."""\n'
+        "\n"
+        "from pr_agent.upstream_provenance import main\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    raise SystemExit(main())\n"
+    )
 
 
 def test_importer_conflict_recipe_creates_and_safely_retires_a_worktree() -> None:
-    workflow = Path(".github/workflows/upstream-sync.yml").read_text()
+    workflow = _read_source_contract(".github/workflows/upstream-sync.yml")
     assert 'WORKTREE_PATH=/absolute/path/you/choose/pr-agent-upstream-${SHORT}' in workflow
     assert 'git worktree add --detach \\"\\$WORKTREE_PATH\\" \\"$BASELINE\\"' in workflow
     assert "GitHub shows the PR merged" in workflow
@@ -226,7 +243,7 @@ def test_importer_conflict_recipe_creates_and_safely_retires_a_worktree() -> Non
 
 
 def test_importer_conflict_recipe_leases_the_exact_current_remote_head() -> None:
-    workflow = Path(".github/workflows/upstream-sync.yml").read_text()
+    workflow = _read_source_contract(".github/workflows/upstream-sync.yml")
     assert 'EXPECTED_REMOTE_HEAD=$(git ls-remote --exit-code origin "refs/heads/%s" | cut -f1)' in workflow
     assert "--force-with-lease=refs/heads/%s:$EXPECTED_REMOTE_HEAD" in workflow
     assert "--force-with-lease=refs/heads/$BRANCH:$SHA" not in workflow
