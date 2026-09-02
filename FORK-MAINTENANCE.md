@@ -26,20 +26,33 @@ identifies the upstream pin, not the integration commit.
 
 ### Resolving an upstream conflict
 
-Use a dedicated worktree. Start from the exact `Fork integration baseline`
-listed in the PR body, merge the exact `Pinned upstream sync` commit, resolve
-the conflicts, and create one merge commit. Do not add preparation or cleanup
-commits to the sync branch: the resulting candidate must have exactly two
-parents, the fork baseline and the upstream pin (either parent order is valid).
+From a trusted fork checkout, choose a new, unique absolute path and create a
+detached worktree at the exact `Fork integration baseline` listed in the PR
+body (`git worktree add --detach <new-path> <baseline>`). Enter that worktree,
+merge the exact `Pinned upstream sync` commit, resolve the conflicts, and
+create one merge commit. Do not run the recipe in the main checkout and do not
+add preparation or cleanup commits to the sync branch: the resulting candidate
+must have exactly two parents, the fork baseline and the upstream pin (either
+parent order is valid).
 
 The generated PR body provides copyable commands with an exact
-`--force-with-lease` expectation for replacing the raw pin. Existing raw-pin
-PRs, including PR #35, can use the same protocol: add exactly one canonical
-`Fork integration baseline` line to the body, create the two-parent merge on
-that baseline, and replace the PR head. If `main` advances and the candidate
-then conflicts, rebuild the candidate directly on the new baseline and update
-that body line; do not merge `main` into the existing candidate because that
-would add an unverified commit layer.
+`--force-with-lease` expectation for replacing the raw pin. The recipe reads
+the branch's exact current remote head immediately before pushing and uses that
+SHA as the lease. This matters on later rebuilds: after the raw pin has already
+been replaced, the expected remote head is the current integration candidate,
+not the original upstream SHA.
+
+Existing raw-pin PRs, including PR #35, can use the same protocol: add exactly
+one canonical `Fork integration baseline` line to the body, create the
+two-parent merge on that baseline, and replace the PR head. If `main` advances
+and the candidate then conflicts, rebuild the candidate directly on the new
+baseline and update that body line; do not merge `main` into the existing
+candidate because that would add an unverified commit layer. Retire the
+resolution worktree only after GitHub confirms the PR merged and its status is
+clean. The generated cleanup recipe checks the PR state with `gh`, fails on an
+unmerged PR or dirty worktree, and runs `git worktree remove <path>` from the
+trusted checkout without `--force`. If Git refuses, preserve the worktree and
+investigate.
 
 ### Automation credential
 

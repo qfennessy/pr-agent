@@ -209,3 +209,24 @@ def test_workflow_runs_only_the_protected_base_verifier() -> None:
     assert "ref: ${{ github.event.pull_request.base.sha }}" in workflow
     assert "python scripts/verify_upstream_provenance.py" in workflow
     assert "persist-credentials: false" in workflow
+
+
+def test_importer_conflict_recipe_creates_and_safely_retires_a_worktree() -> None:
+    workflow = Path(".github/workflows/upstream-sync.yml").read_text()
+    assert 'WORKTREE_PATH=/absolute/path/you/choose/pr-agent-upstream-${SHORT}' in workflow
+    assert 'git worktree add --detach \\"\\$WORKTREE_PATH\\" \\"$BASELINE\\"' in workflow
+    assert "GitHub shows the PR merged" in workflow
+    assert 'git -C \\"\\$WORKTREE_PATH\\" status --short' in workflow
+    assert "set -euo pipefail" in workflow
+    assert "TRUSTED_CHECKOUT=/absolute/path/to/your/trusted/pr-agent-checkout" in workflow
+    assert 'gh pr view \\"$BRANCH\\" --json state --jq .state' in workflow
+    assert 'test -z "$(git -C "$WORKTREE_PATH" status --short)"' in workflow
+    assert 'git worktree remove "$WORKTREE_PATH"' in workflow
+    assert "git worktree remove --force" not in workflow
+
+
+def test_importer_conflict_recipe_leases_the_exact_current_remote_head() -> None:
+    workflow = Path(".github/workflows/upstream-sync.yml").read_text()
+    assert 'EXPECTED_REMOTE_HEAD=$(git ls-remote --exit-code origin "refs/heads/%s" | cut -f1)' in workflow
+    assert "--force-with-lease=refs/heads/%s:$EXPECTED_REMOTE_HEAD" in workflow
+    assert "--force-with-lease=refs/heads/$BRANCH:$SHA" not in workflow
