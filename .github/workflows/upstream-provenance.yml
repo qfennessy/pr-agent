@@ -72,7 +72,7 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           set -euo pipefail
-          python scripts/verify_upstream_provenance.py \
+          python -m pr_agent.upstream_provenance \
             --repository . \
             --head-ref "$HEAD_REF" \
             --head-repo "$HEAD_REPO" \

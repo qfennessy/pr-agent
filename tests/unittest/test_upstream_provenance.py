@@ -211,21 +211,11 @@ def test_rejects_metadata_mismatches(
 
 def test_workflow_runs_only_the_protected_base_verifier() -> None:
     workflow = _read_source_contract(".github/workflows/upstream-provenance.yml")
-    wrapper = _read_source_contract("scripts/verify_upstream_provenance.py")
     assert "pull_request_target:" in workflow
     assert "permissions:\n  contents: read" in workflow
     assert "ref: ${{ github.event.pull_request.base.sha }}" in workflow
-    assert "python scripts/verify_upstream_provenance.py" in workflow
+    assert "python -m pr_agent.upstream_provenance" in workflow
     assert "persist-credentials: false" in workflow
-    assert wrapper == (
-        "#!/usr/bin/env python3\n"
-        '"""Run the packaged upstream-provenance verifier from a protected base checkout."""\n'
-        "\n"
-        "from pr_agent.upstream_provenance import main\n"
-        "\n"
-        'if __name__ == "__main__":\n'
-        "    raise SystemExit(main())\n"
-    )
 
 
 def test_importer_conflict_recipe_creates_and_safely_retires_a_worktree() -> None:
