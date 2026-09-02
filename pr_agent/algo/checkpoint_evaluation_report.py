@@ -761,24 +761,32 @@ def _journal_metric(
 def _journal_cost_per_developer_hour(
     records: Sequence[ShadowJournalRecord],
 ) -> ScoreMetric:
-    eligible = tuple(
+    interval_records = tuple(
         record
         for record in records
         if record.developer_time_basis is DeveloperTimeBasis.WRITER_MONOTONIC
     )
-    known = tuple(
+    known_intervals = tuple(
         record
-        for record in eligible
+        for record in interval_records
+        if record.developer_elapsed_seconds is not None
+    )
+    known_costs = tuple(
+        record
+        for record in records
         if record.entry.cost_usd.status is MeasurementStatus.COMPLETE
         and record.entry.cost_usd.value is not None
-        and record.developer_elapsed_seconds is not None
     )
-    denominator_seconds = sum(record.developer_elapsed_seconds or 0.0 for record in known)
-    if not known or denominator_seconds <= 0:
+    denominator_seconds = sum(record.developer_elapsed_seconds or 0.0 for record in known_intervals)
+    if not known_costs or denominator_seconds <= 0:
         return _unavailable_metric()
-    total_cost = sum(float(record.entry.cost_usd.value) for record in known)
-    status = MeasurementStatus.COMPLETE if len(known) == len(eligible) else MeasurementStatus.PARTIAL
-    return ScoreMetric(status, total_cost / (denominator_seconds / 3600.0), len(known))
+    total_cost = sum(float(record.entry.cost_usd.value) for record in known_costs)
+    status = (
+        MeasurementStatus.COMPLETE
+        if len(known_costs) == len(records) and len(known_intervals) == len(interval_records)
+        else MeasurementStatus.PARTIAL
+    )
+    return ScoreMetric(status, total_cost / (denominator_seconds / 3600.0), len(known_costs))
 
 
 def _build_shadow_pilot_binding(

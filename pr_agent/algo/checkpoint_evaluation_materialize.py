@@ -821,6 +821,10 @@ def materialize_checkpoint_controls(
                 raise EvaluationValidationError(
                     f"checkpoint {entry.case_id} ReviewSnapshot is not bound to its declared parent"
                 )
+        elif snapshot.parent_snapshot_id is not None:
+            raise EvaluationValidationError(
+                f"checkpoint {entry.case_id} ReviewSnapshot root cannot name a parent"
+            )
         payload = review_snapshot_canonical_bytes(snapshot)
         artifact_hash = _sha256_bytes(payload)
         if snapshot.snapshot_id in snapshot_ids or snapshot.snapshot_id in all_identity_hashes:

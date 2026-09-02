@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import stat
+from dataclasses import replace
 
 import pytest
 
@@ -286,6 +287,14 @@ def test_snapshot_validation_rejects_coverage_mismatch_duplicates_and_bad_lineag
         parent_snapshot_id="sha256:" + "0" * 64,
     )
     with pytest.raises(EvaluationValidationError, match="not bound to its declared parent"):
+        _materialize(tmp_path, spec, snapshots)
+
+    spec, snapshots = _fixture()
+    snapshots["checkpoint-0"] = replace(
+        snapshots["checkpoint-0"],
+        parent_snapshot_id=_hash("undeclared-parent"),
+    )
+    with pytest.raises(EvaluationValidationError, match="root cannot name a parent"):
         _materialize(tmp_path, spec, snapshots)
 
 

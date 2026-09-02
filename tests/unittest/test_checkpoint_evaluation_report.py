@@ -556,7 +556,8 @@ def test_genuine_pinned_canonical_assignments_journal_and_settled_candidates_pas
     assert report.shadow_binding is not None
     assert report.shadow_binding.elapsed_days().value == 8
     assert report.shadow_binding.latency_p95_seconds.value == 0.6
-    assert report.shadow_binding.cost_per_developer_hour_usd.value == pytest.approx(0.06)
+    assert report.shadow_binding.cost_per_developer_hour_usd.status is MeasurementStatus.COMPLETE
+    assert report.shadow_binding.cost_per_developer_hour_usd.value == pytest.approx(0.12)
     assert report.settled_candidate_binding is not None
     assert report.settled_candidate_binding.settled_count == 100
     assert report.settled_candidate_binding.actionable_count == 95
@@ -1033,7 +1034,8 @@ def test_partial_journal_measurements_are_recomputed_and_cannot_pass(tmp_path, m
 
     assert live_shadow.status is GateStatus.NOT_EVALUABLE
     assert cost is not None
-    assert cost.status is MeasurementStatus.UNAVAILABLE
+    assert cost.status is MeasurementStatus.PARTIAL
+    assert cost.value == pytest.approx(0.06)
 
 
 def test_single_journal_record_has_no_duration_and_is_not_evaluable(tmp_path, monkeypatch):
