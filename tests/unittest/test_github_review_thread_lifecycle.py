@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import threading
 from types import SimpleNamespace
 
@@ -18,7 +19,7 @@ from pr_agent.algo.review_thread_reconciler import (
     execute_review_thread_action_plan,
     plan_review_thread_actions,
 )
-from pr_agent.git_providers.github_provider import GithubProvider
+from pr_agent.git_providers.github_provider import GithubProvider, _review_thread_create_lock
 from pr_agent.servers.utils import RateLimitExceeded
 
 
@@ -63,6 +64,13 @@ def _identity():
         "run",
         root_cause_id_schema=VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
     )
+
+
+def _hold_review_thread_create_lock(acquired, release):
+    with _review_thread_create_lock("owner/repo", 42, _identity().finding_id):
+        acquired.set()
+        if not release.wait(5):
+            raise RuntimeError("timed out waiting to release review-thread create lock")
 
 
 def _create_comment(body="finding"):
@@ -550,6 +558,30 @@ def test_create_preserves_same_finding_thread_resolved_by_human_or_unknown_actor
     assert not any(call[0] == "rest" and call[1] == "POST" for call in requester.calls)
 
 
+def test_create_preserves_bot_resolved_same_finding_thread_that_gained_a_human_reply():
+    comment = _create_comment()
+    resolved_thread = _thread(
+        "thread-1",
+        [
+            _comment(comment["body"], database_id=77),
+            _comment("human reply", node_id="reply-1", database_id=78, author="human"),
+        ],
+        resolved=True,
+        resolved_by={"id": "BOT-1", "login": "pr-agent[bot]", "__typename": "Bot"},
+    )
+    requester = _Requester(
+        graphql=[_inventory_page([resolved_thread])],
+        rest=[{"head": {"sha": "head-1"}}],
+    )
+
+    outcome = _provider(requester).create_review_thread(comment, "head-1")
+
+    assert outcome.state == ReviewThreadActionState.STALE_INVENTORY
+    assert outcome.reason == "finding_thread_authoritatively_resolved_since_planning"
+    assert outcome.mutation_attempted is False
+    assert not any(call[0] == "rest" and call[1] == "POST" for call in requester.calls)
+
+
 def test_concurrent_create_review_thread_calls_publish_once_for_one_finding():
     comment = _create_comment()
     _, created_inventory = _owned_thread_state(body=comment["body"])
@@ -583,6 +615,39 @@ def test_concurrent_create_review_thread_calls_publish_once_for_one_finding():
         ReviewThreadActionState.ALREADY_APPLIED,
     }
     assert len([call for call in requester.calls if call[0] == "rest" and call[1] == "POST"]) == 1
+
+
+def test_review_thread_create_lock_serializes_same_finding_across_processes():
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("cross-process file-lock regression requires fork")
+    context = multiprocessing.get_context("fork")
+    first_acquired = context.Event()
+    first_release = context.Event()
+    second_acquired = context.Event()
+    second_release = context.Event()
+    first = context.Process(target=_hold_review_thread_create_lock, args=(first_acquired, first_release))
+    second = context.Process(target=_hold_review_thread_create_lock, args=(second_acquired, second_release))
+    first.start()
+    try:
+        assert first_acquired.wait(2)
+        second.start()
+        assert not second_acquired.wait(0.2)
+        first_release.set()
+        assert second_acquired.wait(2)
+        second_release.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+        assert first.exitcode == 0
+        assert second.exitcode == 0
+    finally:
+        first_release.set()
+        second_release.set()
+        for process in (first, second):
+            if process.pid is not None:
+                process.join(timeout=1)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
 
 
 def test_create_review_thread_converges_safe_concurrent_duplicates_to_oldest_thread():

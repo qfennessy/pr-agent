@@ -5,13 +5,21 @@ import itertools
 import json
 import os
 import re
+import stat
+import tempfile
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 from weakref import WeakValueDictionary
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the GitHub service runs on Unix.
+    fcntl = None
 
 from github import AppAuthentication, Auth, Github, GithubException
 from github.Issue import Issue
@@ -64,17 +72,47 @@ from .git_provider import (
 
 _REVIEW_THREAD_CREATE_LOCKS_GUARD = threading.Lock()
 _REVIEW_THREAD_CREATE_LOCKS = WeakValueDictionary()
+_REVIEW_THREAD_CREATE_PROCESS_LOCK = os.path.join(tempfile.gettempdir(), "pr-agent-review-thread-create.lock")
 
 
+class _ReviewThreadCreateLockError(RuntimeError):
+    pass
+
+
+@contextmanager
 def _review_thread_create_lock(repository: str, pull_request_number: int, finding_id: str):
-    """Serialize same-process creates without retaining unbounded per-finding locks."""
+    """Serialize creates across threads and same-host service workers."""
     key = f"{repository.casefold()}#{pull_request_number}:{finding_id}"
     with _REVIEW_THREAD_CREATE_LOCKS_GUARD:
         lock = _REVIEW_THREAD_CREATE_LOCKS.get(key)
         if lock is None:
             lock = threading.Lock()
             _REVIEW_THREAD_CREATE_LOCKS[key] = lock
-        return lock
+    with lock:
+        if fcntl is None:
+            raise _ReviewThreadCreateLockError("cross-process file locking is unavailable")
+        descriptor = None
+        try:
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(_REVIEW_THREAD_CREATE_PROCESS_LOCK, flags, 0o600)
+            lock_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(lock_stat.st_mode):
+                raise OSError("create coordination path is not a regular file")
+            if hasattr(os, "geteuid") and lock_stat.st_uid != os.geteuid():
+                raise OSError("create coordination file has an unexpected owner")
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except (OSError, ValueError) as error:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise _ReviewThreadCreateLockError(f"cross-process create coordination failed: {error}") from error
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def _next_page_url(headers: dict) -> str:
@@ -1434,7 +1472,12 @@ class GithubProvider(GitProvider):
                 **_review_thread_failure_details(e),
             )
         if any(
-            thread.is_resolved and not thread.resolved_by_viewer_bot
+            thread.is_resolved
+            and (
+                not thread.bot_owned
+                or thread.has_replies
+                or not thread.resolved_by_viewer_bot
+            )
             for thread in same_finding
         ):
             return ReviewThreadActionOutcome(
@@ -1615,8 +1658,18 @@ class GithubProvider(GitProvider):
                 failure_kind=ReviewThreadFailureKind.PROVIDER_FAILURE,
             )
         finding_id = next(iter(marker_ids))
-        with _review_thread_create_lock(self.repo, self.pr_num, finding_id):
-            return self._create_review_thread_locked(comment, expected_head_sha, finding_id, anchor)
+        try:
+            with _review_thread_create_lock(self.repo, self.pr_num, finding_id):
+                return self._create_review_thread_locked(comment, expected_head_sha, finding_id, anchor)
+        except _ReviewThreadCreateLockError as error:
+            return ReviewThreadActionOutcome(
+                kind=ReviewThreadActionKind.CREATE,
+                state=ReviewThreadActionState.FAILED,
+                expected_head_sha=expected_head_sha,
+                current_head_sha=None,
+                reason=f"create_coordination_failed: {error}",
+                failure_kind=ReviewThreadFailureKind.PROVIDER_FAILURE,
+            )
 
     def update_review_thread(
         self,
