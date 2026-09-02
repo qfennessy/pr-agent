@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from math import isfinite
+from numbers import Integral
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
@@ -487,6 +488,21 @@ def load_frontier_adjudication_config(
             raise FrontierContractError("every Azure frontier model requires a deployment")
         return values
 
+    def integer(key: str, default: int) -> int:
+        raw = section.get(key, default)
+        if isinstance(raw, bool):
+            raise FrontierContractError(f"{key} must be a non-boolean integer")
+        if isinstance(raw, Integral):
+            return int(raw)
+        if isinstance(raw, str):
+            try:
+                return int(raw.strip(), 10)
+            except ValueError as exc:
+                raise FrontierContractError(
+                    f"{key} must be a non-boolean integer"
+                ) from exc
+        raise FrontierContractError(f"{key} must be a non-boolean integer")
+
     primary_model = strings("frontier_adjudication_model", required=True)
     if len(primary_model) != 1:
         raise FrontierContractError("frontier_adjudication_model requires one model")
@@ -517,13 +533,13 @@ def load_frontier_adjudication_config(
     try:
         model_timeout = float(section.get("frontier_adjudication_model_timeout_seconds", 60))
         stage_timeout = float(section.get("frontier_adjudication_timeout_seconds", 120))
-        model_retries = int(section.get("frontier_adjudication_model_retries", 1))
-        provider_retries = int(section.get("frontier_adjudication_provider_retries", 0))
-        max_output_tokens = int(section.get("frontier_adjudication_max_output_tokens", 2048))
         minimum_confidence = float(section.get("frontier_adjudication_minimum_confidence", 0.0))
-        max_calls = int(section.get("frontier_adjudication_max_calls", 3))
     except (TypeError, ValueError) as exc:
         raise FrontierContractError("frontier numeric configuration is invalid") from exc
+    model_retries = integer("frontier_adjudication_model_retries", 1)
+    provider_retries = integer("frontier_adjudication_provider_retries", 0)
+    max_output_tokens = integer("frontier_adjudication_max_output_tokens", 2048)
+    max_calls = integer("frontier_adjudication_max_calls", 3)
     route = AIModelRoute(
         models=models,
         deployments=route_deployments,

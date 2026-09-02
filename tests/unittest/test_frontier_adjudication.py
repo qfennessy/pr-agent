@@ -781,6 +781,61 @@ def test_loader_rejects_non_finite_frontier_timeouts(
 
 
 @pytest.mark.parametrize(
+    ("setting", "invalid_value"),
+    [
+        ("frontier_adjudication_model_retries", True),
+        ("frontier_adjudication_model_retries", 1.5),
+        ("frontier_adjudication_provider_retries", False),
+        ("frontier_adjudication_provider_retries", 0.5),
+        ("frontier_adjudication_max_output_tokens", True),
+        ("frontier_adjudication_max_output_tokens", 1.5),
+        ("frontier_adjudication_max_calls", False),
+        ("frontier_adjudication_max_calls", 1.5),
+    ],
+)
+def test_loader_rejects_non_integral_frontier_settings(setting, invalid_value):
+    section = {
+        "enable_frontier_adjudication": True,
+        "enable_candidate_verification": True,
+        "frontier_adjudication_model": "frontier-primary",
+        "frontier_adjudication_provider": "provider-primary",
+        "frontier_adjudication_revision": "revision-primary",
+        setting: invalid_value,
+    }
+
+    with pytest.raises(ValueError, match=rf"{setting} must be a non-boolean integer"):
+        load_frontier_adjudication_config(section, {})
+
+
+def test_loader_accepts_integral_string_frontier_settings():
+    section = {
+        "enable_frontier_adjudication": True,
+        "enable_candidate_verification": True,
+        "frontier_adjudication_model": "frontier-primary",
+        "frontier_adjudication_provider": "provider-primary",
+        "frontier_adjudication_revision": "revision-primary",
+        "frontier_adjudication_model_retries": "2",
+        "frontier_adjudication_provider_retries": "0",
+        "frontier_adjudication_max_output_tokens": "512",
+        "frontier_adjudication_max_calls": "2",
+    }
+    prompt = {
+        "system": SYSTEM_PROMPT,
+        "user": USER_PROMPT,
+        "prompt_version": "frontier-adjudication-prompt-v1",
+        "input_schema_version": FRONTIER_INPUT_SCHEMA_VERSION,
+        "schema_version": FRONTIER_OUTPUT_SCHEMA_VERSION,
+    }
+
+    loaded = load_frontier_adjudication_config(section, prompt)
+
+    assert loaded.route.model_retries == 2
+    assert loaded.route.provider_retries == 0
+    assert loaded.route.max_output_tokens == 512
+    assert loaded.max_calls == 2
+
+
+@pytest.mark.parametrize(
     "candidate_verification_config",
     [{}, {"enable_candidate_verification": False}, {"enable_candidate_verification": "false"}],
 )
