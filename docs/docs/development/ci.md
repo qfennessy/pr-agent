@@ -22,7 +22,7 @@ no-op jobs or update the ruleset so documentation-only PRs do not wait forever f
 | `pre-commit` | Manual dispatch | Runs the hooks in `.pre-commit-config.yaml` | Read-only checkout |
 | `PR-Agent` | A non-draft pull request is opened, reopened, or marked ready | Runs describe, review, and improve through the fork's own action | Model and Pinecone secrets; PR and issue write access |
 | `Upstream provenance` | Pull request activity targeting `main` | On `sync/upstream-*` branches, verifies that the branch, title, body, head SHA, and upstream ancestry agree | Read-only checkout; network read from upstream |
-| `Upstream sync PR` | Mondays at 12:17 UTC, or manual dispatch | Pins upstream `main`, creates a local sync branch, and opens a review PR | Repository-only deploy key for branch pushes; pull-request write access |
+| `Upstream sync PR` | Mondays at 12:17 UTC, or manual dispatch | Pins upstream `main`, creates a local sync branch, and opens a review PR | `main`-restricted environment containing a repository-only deploy key; pull-request write access |
 | `Publish` | Published GitHub release, or manual dispatch | Publishes PyPI distributions and a multi-platform Docker image matrix, records provenance, and finalizes repository release state | Release environment and publishing secrets |
 
 ## Pull-request validation
@@ -95,10 +95,12 @@ sync/upstream-YYYYMMDD-<8-character-sha>
 ```
 
 The generated PR names high-scrutiny paths such as workflows, dependencies, prompts, secret handling, and Docker
-files. The workflow uses the private write-enabled deploy key in the `UPSTREAM_SYNC_DEPLOY_KEY` Actions repository
-secret for Git operations. The key is attached only to `qfennessy/pr-agent`; the built-in `GITHUB_TOKEN` remains
-limited to pull-request API calls. GitHub's built-in token cannot push upstream commits that modify
-`.github/workflows/**`, so the job fails immediately when the deploy-key secret is missing instead of falling back.
+files. The workflow uses the protected `upstream-sync` Actions environment, which permits only `main`. Its
+`UPSTREAM_SYNC_DEPLOY_KEY` secret contains a private write-enabled deploy key attached only to
+`qfennessy/pr-agent`; the built-in `GITHUB_TOKEN` remains limited to pull-request API calls. GitHub's built-in token
+cannot push upstream commits that modify `.github/workflows/**`, so the job fails immediately when the deploy-key
+secret is missing instead of falling back. Never permit `sync/upstream-*` branches to use this environment: they
+contain unreviewed upstream workflow code.
 
 `upstream-provenance.yml` checks the sync PR's fixed head SHA and metadata. Because it runs on `pull_request`,
 GitHub executes the workflow from the PR merge ref rather than guaranteeing the protected base-branch definition.

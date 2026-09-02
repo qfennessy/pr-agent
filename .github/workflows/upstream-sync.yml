@@ -23,6 +23,7 @@ jobs:
     # Guard: never run if this file ever lands upstream or in another fork.
     if: github.repository == 'qfennessy/pr-agent'
     runs-on: ubuntu-latest
+    environment: upstream-sync
     steps:
       - name: Require importer deploy key
         env:
