@@ -1832,6 +1832,16 @@ class PRReviewer:
                 1 for rejection in candidate_rejections
                 if not rejection.get("sensitive_path")
             )
+            model_candidate_validation_rejection_count = sum(
+                1 for rejection in candidate_rejections
+                if (
+                    not rejection.get("sensitive_path")
+                    and rejection.get("reason") != "duplicate_candidate"
+                )
+            )
+            model_candidate_validation_incomplete = bool(
+                model_candidate_validation_rejection_count
+            )
             model_candidate_budget_exhausted = any(
                 rejection.get("reason") == "candidate_budget_exhausted"
                 for rejection in candidate_rejections
@@ -1841,6 +1851,7 @@ class PRReviewer:
                 proposed_candidate_count
                 and (
                     not accepted_model_candidate_count
+                    or model_candidate_validation_incomplete
                     or model_candidate_budget_exhausted
                 )
             )
