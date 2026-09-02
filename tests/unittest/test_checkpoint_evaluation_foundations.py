@@ -32,8 +32,8 @@ from pr_agent.algo.checkpoint_evaluation_cocos import (
     validate_cocos_story_corpus)
 from pr_agent.algo.checkpoint_evaluation_execution import (
     EvaluationArtifactStore, OutputCapability, PaidExecutionRequest,
-    PaidPlanItemBudget,
-    PaidExecutionStatus, evaluate_output_permission, evaluate_paid_execution)
+    PaidExecutionStatus, PaidPlanItemBudget, evaluate_output_permission,
+    evaluate_paid_execution)
 from pr_agent.algo.checkpoint_evaluation_scoring import (GateComparator,
                                                          GateRule,
                                                          GateRuleResult,

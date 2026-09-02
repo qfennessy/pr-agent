@@ -24,8 +24,8 @@ from pr_agent.algo.checkpoint_evaluation import (CheckpointCase,
                                                  ObservedFinding,
                                                  TruthArtifact, content_hash)
 from pr_agent.algo.checkpoint_evaluation_cocos import CocosCorpusInventory
-from pr_agent.algo.checkpoint_evaluation_execution import \
-    EvaluationArtifactStore, PaidExecutionRequest, PaidPlanItemBudget
+from pr_agent.algo.checkpoint_evaluation_execution import (
+    EvaluationArtifactStore, PaidExecutionRequest, PaidPlanItemBudget)
 from pr_agent.algo.checkpoint_evaluation_scoring import (ScoreMetric,
                                                          score_matched_arms)
 from pr_agent.algo.checkpoint_shadow_journal import (DeveloperTimeBasis,
