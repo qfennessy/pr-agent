@@ -169,6 +169,12 @@ enable_intro_text=true
 enable_help_text=false # Determines whether to include help text in the PR review. Enabled by default.
 enable_review_coverage_footer=true
 
+[review_thread_lifecycle]
+# Reserved foundation for stable GitHub review threads. The runtime does not execute
+# lifecycle plans until the gated /review integration is implemented and rollout evidence (#27) is complete.
+enabled=false
+obsolete_thread_policy="keep" # "keep", "resolve", or visible "mark_fixed"; inert until gated integration.
+
 [review_depth]
 # Disabled preserves the existing standard /review path and all inherited budgets.
 enabled=false
