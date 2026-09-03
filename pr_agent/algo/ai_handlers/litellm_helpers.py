@@ -4,7 +4,6 @@ import json
 import sys
 
 import litellm
-import openai
 
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
@@ -60,6 +59,14 @@ def _stream_usage(chunk):
     return None
 
 
+class _IncompleteStreamingResponseError(RuntimeError):
+    """Carry a completed but unusable stream response into retry accounting."""
+
+    def __init__(self, message, completed_response):
+        super().__init__(message)
+        self.completed_response = completed_response
+
+
 async def _handle_streaming_response(response, model=None):
     """
     Handle streaming response from acompletion and collect the full response.
@@ -73,12 +80,22 @@ async def _handle_streaming_response(response, model=None):
     full_response = ""
     finish_reason = None
     finalized_usage = None
+    completion_model = None
+    completion_provider = None
 
     try:
         async for chunk in response:
             usage = _stream_usage(chunk)
             if usage is not None:
                 finalized_usage = usage
+            chunk_model = _response_field(chunk, "model")
+            if chunk_model:
+                completion_model = str(chunk_model).strip() or None
+            hidden_params = _response_field(chunk, "_hidden_params")
+            if isinstance(hidden_params, dict):
+                provider = hidden_params.get("custom_llm_provider") or hidden_params.get("provider")
+                if provider:
+                    completion_provider = str(provider).strip().casefold() or None
             if chunk.choices and len(chunk.choices) > 0:
                 choice = chunk.choices[0]
                 delta = choice.delta
@@ -91,20 +108,37 @@ async def _handle_streaming_response(response, model=None):
         get_logger().error(f"Error handling streaming response: {e}")
         raise
 
+    completed_response = MockResponse(
+        full_response,
+        finish_reason,
+        finalized_usage,
+        model=completion_model,
+        provider=completion_provider,
+    )
     if not full_response and finish_reason is None:
         get_logger().warning("Streaming response resulted in empty content with no finish reason")
-        raise openai.APIError("Empty streaming response received without proper completion")
+        raise _IncompleteStreamingResponseError(
+            "Empty streaming response received without proper completion",
+            completed_response,
+        )
     elif not full_response and finish_reason:
-        get_logger().debug(f"Streaming response resulted in empty content but completed with finish_reason: {finish_reason}")
-        raise openai.APIError(f"Streaming response completed with finish_reason '{finish_reason}' but no content received")
-    return full_response, finish_reason, MockResponse(full_response, finish_reason, finalized_usage, model)
+        get_logger().debug(
+            f"Streaming response resulted in empty content but completed with finish_reason: {finish_reason}"
+        )
+        raise _IncompleteStreamingResponseError(
+            f"Streaming response completed with finish_reason '{finish_reason}' but no content received",
+            completed_response,
+        )
+    return full_response, finish_reason, completed_response
 
 
 class MockResponse:
     """Represent a completed streaming response while retaining LiteLLM's finalized usage object."""
 
-    def __init__(self, resp, finish_reason, usage=None, model=None):
+    def __init__(self, resp, finish_reason, usage=None, model=None, provider=None):
         self.usage = usage
+        self.model = model
+        self._hidden_params = {"custom_llm_provider": provider} if provider else {}
         self._data = {
             "choices": [
                 {

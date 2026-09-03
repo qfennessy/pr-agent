@@ -12,6 +12,7 @@ import sys
 import textwrap
 import time
 import traceback
+from collections.abc import Hashable
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
@@ -1037,7 +1038,79 @@ def sanitize_yaml_control_chars(text: str, log: bool = True) -> str:
     return sanitized
 
 
-def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", last_key="") -> dict:
+class DuplicateYamlKeyError(ValueError):
+    """Raised when strict AI-response parsing encounters an ambiguous mapping."""
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """SafeLoader variant that rejects duplicate mapping keys."""
+
+
+def _construct_unique_yaml_mapping(loader, node, deep=False):
+    loader.flatten_mapping(node)
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if not isinstance(key, Hashable):
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found unhashable key",
+                key_node.start_mark,
+            )
+        if key in mapping:
+            raise DuplicateYamlKeyError(f"duplicate YAML key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_yaml_mapping,
+)
+
+
+def _safe_load_yaml(response_text: str, *, reject_duplicate_keys: bool):
+    if reject_duplicate_keys:
+        return yaml.load(response_text, Loader=_UniqueKeySafeLoader)
+    return yaml.safe_load(response_text)
+
+
+def _find_yaml_key_start(response_text: str, first_key: str) -> int:
+    index_start = response_text.find(f"\n{first_key}:")
+    if index_start == -1:
+        index_start = response_text.find(f"{first_key}:")
+    return index_start
+
+
+def _extract_yaml_document(response_text: str, index_start: int, first_key: str) -> str:
+    """Extract one root-keyed YAML document without truncating internal blank lines."""
+    response_tail = response_text[index_start:].strip()
+    response_lines = response_tail.splitlines()
+    if not response_lines:
+        return ""
+
+    root_indent = len(response_lines[0]) - len(response_lines[0].lstrip())
+    index_end = len(response_lines)
+    for index, line in enumerate(response_lines[1:], start=1):
+        stripped_line = line.strip()
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+        line_indent = len(line) - len(line.lstrip())
+        if line_indent <= root_indent and not stripped_line.startswith(f"{first_key}:"):
+            index_end = index
+            break
+    return "\n".join(response_lines[:index_end]).strip()
+
+
+def load_yaml(
+    response_text: str,
+    keys_fix_yaml: List[str] = [],
+    first_key="",
+    last_key="",
+    *,
+    reject_duplicate_keys: bool = False,
+) -> dict:
     response_text_original = copy.deepcopy(response_text)
     response_text = response_text.strip('\n')
     # strip the fence label only when it is a complete info string, so a key such as
@@ -1048,6 +1121,11 @@ def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", l
     response_text = unfenced.rstrip().removesuffix('```')
     response_text = sanitize_yaml_control_chars(response_text)
     response_text_original_sanitized = sanitize_yaml_control_chars(response_text_original, log=False)
+    if reject_duplicate_keys and first_key and last_key:
+        index_start = _find_yaml_key_start(response_text, first_key)
+        if index_start != -1:
+            response_text = _extract_yaml_document(response_text, index_start, first_key)
+            response_text_original_sanitized = response_text
     try:
         # yaml.safe_load('') / yaml.safe_load(' ') returns None without raising, so a response that was
         # non-empty before preprocessing/sanitization but is blank afterwards (e.g. it consisted entirely of
@@ -1056,11 +1134,14 @@ def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", l
         # through the same exception handling as a normal parse failure instead.
         if response_text_original.strip() and not response_text.strip():
             raise ValueError("Preprocessing/sanitization removed all content from a non-empty AI prediction")
-        data = yaml.safe_load(response_text)
+        data = _safe_load_yaml(response_text, reject_duplicate_keys=reject_duplicate_keys)
+    except DuplicateYamlKeyError:
+        raise
     except Exception as e:
         get_logger().warning(f"Initial failure to parse AI prediction: {e}")
         data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key,
-                            response_text_original=response_text_original_sanitized)
+                            response_text_original=response_text_original_sanitized,
+                            reject_duplicate_keys=reject_duplicate_keys)
         if not data:
             get_logger().error("Failed to parse AI prediction after fallbacks",
                                artifact={'response_text': response_text})
@@ -1077,7 +1158,9 @@ def try_fix_yaml(response_text: str,
                  keys_fix_yaml: List[str] = [],
                  first_key="",
                  last_key="",
-                 response_text_original="") -> dict:
+                 response_text_original="",
+                 *,
+                 reject_duplicate_keys: bool = False) -> dict:
     response_text_lines = response_text.split('\n')
 
     keys_yaml = ['relevant line:', 'suggestion content:', 'relevant file:', 'existing code:',
@@ -1092,10 +1175,15 @@ def try_fix_yaml(response_text: str,
                 response_text_lines_copy[i] = response_text_lines_copy[i].replace(f'{key}',
                                                                                   f'{key} |\n        ')
     try:
-        data = yaml.safe_load('\n'.join(response_text_lines_copy))
+        data = _safe_load_yaml(
+            '\n'.join(response_text_lines_copy),
+            reject_duplicate_keys=reject_duplicate_keys,
+        )
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after adding |-\n")
             return data
+    except DuplicateYamlKeyError:
+        raise
     except:
         pass
 
@@ -1103,10 +1191,12 @@ def try_fix_yaml(response_text: str,
     response_text_copy = copy.deepcopy(response_text)
     response_text_copy = response_text_copy.replace('|\n', '|2\n')
     try:
-        data = yaml.safe_load(response_text_copy)
+        data = _safe_load_yaml(response_text_copy, reject_duplicate_keys=reject_duplicate_keys)
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after replacing | with |2")
             return data
+    except DuplicateYamlKeyError:
+        raise
     except:
         pass
     # try to add spaces to lines that are not indented properly, and contain '}'.
@@ -1117,10 +1207,15 @@ def try_fix_yaml(response_text: str,
         if initial_space == 2 and '|2' not in response_text_lines_copy[i] and '}' in response_text_lines_copy[i]:
             response_text_lines_copy[i] = '    ' + response_text_lines_copy[i].lstrip()
     try:
-        data = yaml.safe_load('\n'.join(response_text_lines_copy))
+        data = _safe_load_yaml(
+            '\n'.join(response_text_lines_copy),
+            reject_duplicate_keys=reject_duplicate_keys,
+        )
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after replacing | with |2 and adding spaces")
             return data
+    except DuplicateYamlKeyError:
+        raise
     except:
         pass
 
@@ -1133,10 +1228,12 @@ def try_fix_yaml(response_text: str,
         # group(1) is the snippet body, without the ``` fences or the optional yaml/yml language identifier
         snippet_text = snippet.group(1)
         try:
-            data = yaml.safe_load(snippet_text)
+            data = _safe_load_yaml(snippet_text, reject_duplicate_keys=reject_duplicate_keys)
             if data is not None:
                 get_logger().info("Successfully parsed AI prediction after extracting yaml snippet")
                 return data
+        except DuplicateYamlKeyError:
+            raise
         except Exception as e:
             get_logger().debug(f"Failed to parse AI prediction after extracting yaml snippet: {e}")
 
@@ -1144,10 +1241,12 @@ def try_fix_yaml(response_text: str,
     # third fallback - try to remove leading and trailing curly brackets
     response_text_copy = response_text.strip().rstrip().removeprefix('{').removesuffix('}').rstrip(':\n')
     try:
-        data = yaml.safe_load(response_text_copy)
+        data = _safe_load_yaml(response_text_copy, reject_duplicate_keys=reject_duplicate_keys)
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after removing curly brackets")
             return data
+    except DuplicateYamlKeyError:
+        raise
     except:
         pass
 
@@ -1156,14 +1255,15 @@ def try_fix_yaml(response_text: str,
     # note that 'last_key' can be in practice a key that is not the last key in the yaml snippet.
     # it just needs to be some inner key, so we can look for newlines after it
     if first_key and last_key:
-        index_start = response_text.find(f"\n{first_key}:")
-        if index_start == -1:
-            index_start = response_text.find(f"{first_key}:")
+        index_start = _find_yaml_key_start(response_text, first_key)
         index_last_code = response_text.rfind(f"{last_key}:")
-        index_end = response_text.find("\n\n", index_last_code) # look for newlines after last_key
-        if index_end == -1:
-            index_end = len(response_text)
-        response_text_copy = response_text[index_start:index_end].strip()
+        if reject_duplicate_keys:
+            response_text_copy = _extract_yaml_document(response_text, index_start, first_key)
+        else:
+            index_end = response_text.find("\n\n", index_last_code)  # look for newlines after last_key
+            if index_end == -1:
+                index_end = len(response_text)
+            response_text_copy = response_text[index_start:index_end].strip()
         for fence in ("\n```yaml", "\n```yml"):
             if response_text_copy[-len(fence):].lower() == fence:
                 response_text_copy = response_text_copy[: -len(fence)]
@@ -1171,10 +1271,12 @@ def try_fix_yaml(response_text: str,
         response_text_copy = response_text_copy.strip("`").strip()
         if response_text_copy:
             try:
-                data = yaml.safe_load(response_text_copy)
+                data = _safe_load_yaml(response_text_copy, reject_duplicate_keys=reject_duplicate_keys)
                 if data is not None:
                     get_logger().info("Successfully parsed AI prediction after extracting yaml snippet")
                     return data
+            except DuplicateYamlKeyError:
+                raise
             except:
                 pass
 
@@ -1184,10 +1286,15 @@ def try_fix_yaml(response_text: str,
         if response_text_lines_copy[i].startswith('+'):
             response_text_lines_copy[i] = ' ' + response_text_lines_copy[i][1:]
     try:
-        data = yaml.safe_load('\n'.join(response_text_lines_copy))
+        data = _safe_load_yaml(
+            '\n'.join(response_text_lines_copy),
+            reject_duplicate_keys=reject_duplicate_keys,
+        )
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after removing leading '+'")
             return data
+    except DuplicateYamlKeyError:
+        raise
     except:
         pass
 
@@ -1222,10 +1329,15 @@ def try_fix_yaml(response_text: str,
             modified = True
     if modified:
         try:
-            data = yaml.safe_load('\n'.join(response_text_lines_copy))
+            data = _safe_load_yaml(
+                '\n'.join(response_text_lines_copy),
+                reject_duplicate_keys=reject_duplicate_keys,
+            )
             if data is not None:
                 get_logger().info("Successfully parsed AI prediction after normalizing diff removal markers")
                 return data
+        except DuplicateYamlKeyError:
+            raise
         except Exception:
             pass
 
@@ -1235,10 +1347,12 @@ def try_fix_yaml(response_text: str,
         response_text_copy = copy.deepcopy(response_text)
         response_text_copy = response_text_copy.replace('\t', '    ')
         try:
-            data = yaml.safe_load(response_text_copy)
+            data = _safe_load_yaml(response_text_copy, reject_duplicate_keys=reject_duplicate_keys)
             if data is not None:
                 get_logger().info("Successfully parsed AI prediction after replacing tabs with spaces")
                 return data
+        except DuplicateYamlKeyError:
+            raise
         except:
             pass
 
@@ -1259,10 +1373,12 @@ def try_fix_yaml(response_text: str,
     response_text_copy = '\n'.join(response_text_copy_lines)
     response_text_copy = response_text_copy.replace(' |\n', ' |2\n')
     try:
-        data = yaml.safe_load(response_text_copy)
+        data = _safe_load_yaml(response_text_copy, reject_duplicate_keys=reject_duplicate_keys)
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after adding indent for sections of code blocks")
             return data
+    except DuplicateYamlKeyError:
+        raise
     except:
         pass
 
@@ -1270,10 +1386,12 @@ def try_fix_yaml(response_text: str,
     response_text_copy = copy.deepcopy(response_text)
     response_text_copy = response_text_copy.lstrip('|\n')
     try:
-        data = yaml.safe_load(response_text_copy)
+        data = _safe_load_yaml(response_text_copy, reject_duplicate_keys=reject_duplicate_keys)
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after removing pipe chars")
             return data
+    except DuplicateYamlKeyError:
+        raise
     except:
         pass
 
@@ -1281,10 +1399,15 @@ def try_fix_yaml(response_text: str,
     encodings_to_try = ['latin-1', 'utf-16']
     for encoding in encodings_to_try:
         try:
-            data = yaml.safe_load(response_text.encode(encoding).decode("utf-8"))
+            data = _safe_load_yaml(
+                response_text.encode(encoding).decode("utf-8"),
+                reject_duplicate_keys=reject_duplicate_keys,
+            )
             if data:
                 get_logger().info(f"Successfully parsed AI prediction after decoding with {encoding} encoding")
                 return data
+        except DuplicateYamlKeyError:
+            raise
         except:
             pass
 

@@ -20,7 +20,6 @@ from pr_agent.log import get_logger
 
 OPENAI_RETRIES = 5
 
-
 class LangChainOpenAIHandler(BaseAiHandler):
     def __init__(self):
         if not _LANGCHAIN_INSTALLED:

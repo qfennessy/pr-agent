@@ -225,7 +225,12 @@ def telemetry_safe_artifact(artifact: dict) -> dict:
             if not isinstance(item, dict):
                 continue
             decision = {
-                key: item[key] for key in ("candidate_id", "verdict", "evidence_paths") if key in item
+                key: item[key]
+                for key in (
+                    "candidate_id", "verdict", "evidence_paths", "normalized_severity",
+                    "confidence", "disputed", "evidence_status",
+                )
+                if key in item
             }
             if "reason" in item:
                 reason = str(item.get("reason") or "")
@@ -2616,7 +2621,7 @@ def prompt_evidence_coverage(
     }
 
 
-def _verified_finding_identity(candidate: dict) -> Optional[tuple[str, str]]:
+def verified_finding_identity(candidate: dict) -> Optional[tuple[str, str]]:
     """Derive identities internally from a verified assertion and its cited proof.
 
     The verifier cannot supply either identifier. The stable key ignores paths,
@@ -2713,6 +2718,23 @@ def apply_verification_decisions(
         candidate = candidates_by_id.get(candidate_id)
         verdict = str(decision.get("verdict") or "").strip().lower()
         record = {"candidate_id": candidate_id, "verdict": verdict or "invalid"}
+        normalized_severity = str(decision.get("normalized_severity") or "").strip().lower()
+        if normalized_severity in {"low", "medium", "high", "critical"}:
+            record["normalized_severity"] = normalized_severity
+        confidence = decision.get("confidence")
+        if isinstance(confidence, (int, float)) and not isinstance(confidence, bool) and 0 <= confidence <= 1:
+            record["confidence"] = float(confidence)
+        if isinstance(decision.get("disputed"), bool):
+            record["disputed"] = decision["disputed"]
+        evidence_status = str(decision.get("evidence_status") or "").strip().lower()
+        if evidence_status in {"complete", "insufficient"}:
+            record["evidence_status"] = evidence_status
+        unresolved_questions = decision.get("unresolved_questions")
+        if isinstance(unresolved_questions, list):
+            record["_unresolved_questions"] = tuple(
+                question.strip() for question in unresolved_questions
+                if isinstance(question, str) and question.strip()
+            )
         if candidate is None:
             record["reason"] = "unknown_candidate"
             result_records.append(record)
@@ -2795,7 +2817,7 @@ def apply_verification_decisions(
             "impact": impact,
             "verification_evidence": normalized_citations,
         }
-        identity = _verified_finding_identity(candidate)
+        identity = verified_finding_identity(candidate)
         if identity is None:
             record["verdict"] = "rejected"
             record["reason"] = "trusted_identity_unavailable"

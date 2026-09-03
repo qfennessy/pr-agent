@@ -16,6 +16,12 @@ verification:
     - candidate_id: string
       verdict: verified | rejected
       reason: concise string
+      normalized_severity: low | medium | high | critical
+      confidence: number from 0 through 1
+      disputed: boolean
+      evidence_status: complete | insufficient
+      unresolved_questions:
+        - concise question that supplied evidence could not settle
       relevant_file: repository/relative/path
       start_line: integer
       end_line: integer

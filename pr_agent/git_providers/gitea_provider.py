@@ -700,6 +700,22 @@ class GiteaProvider(GitProvider):
 
         return self.pr.head.ref if self.pr.head.ref else ""
 
+    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
+        """Return the cached PR head SHA, optionally refreshing it from Gitea."""
+        if refresh:
+            pr = self.repo_api.get_pull_request(
+                owner=self.owner,
+                repo=self.repo,
+                pr_number=self.pr_number
+            )
+            head = getattr(pr, "head", None)
+            sha = getattr(head, "sha", None)
+        else:
+            sha = self.sha
+
+        normalized_sha = sha.strip() if isinstance(sha, str) else ""
+        return normalized_sha or None
+
     def get_pr_description_full(self) -> str:
         """Get full PR description with metadata"""
         if not self.pr:

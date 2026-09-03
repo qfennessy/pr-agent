@@ -137,6 +137,24 @@ candidate_verification_max_context_tokens=6000
 candidate_verification_timeout_seconds=10
 # Matching changed files are always submitted as independent audit candidates.
 candidate_verification_sensitive_path_globs=[]
+# Frontier adjudication consumes only stable, evidence-backed verification output.
+# Keep disabled until #27's replay and rollout gates pass; no call is made while disabled.
+enable_frontier_adjudication=false
+frontier_adjudication_model="" # Required and separate from the verifier model when enabled.
+frontier_adjudication_deployment=""
+frontier_adjudication_provider="" # Exact provider identity recorded in stage telemetry.
+frontier_adjudication_revision="" # Immutable provider model revision recorded in stage telemetry.
+frontier_adjudication_fallback_models=[] # Availability recovery only, never another adjudication.
+frontier_adjudication_fallback_deployments=[]
+frontier_adjudication_fallback_providers=[]
+frontier_adjudication_fallback_revisions=[]
+frontier_adjudication_timeout_seconds=120
+frontier_adjudication_model_timeout_seconds=60
+frontier_adjudication_model_retries=1
+frontier_adjudication_provider_retries=0
+frontier_adjudication_max_output_tokens=2048
+frontier_adjudication_minimum_confidence=0.0
+frontier_adjudication_max_calls=3
 require_score_review=false
 require_tests_review=true
 require_estimate_effort_to_review=true

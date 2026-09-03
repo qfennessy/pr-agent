@@ -1520,6 +1520,21 @@ class AzureDevopsProvider(GitProvider):
         source_branch = pr_info.source_ref_name.split("/")[-1]
         return source_branch
 
+    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
+        if refresh:
+            pull_request = self.azure_devops_client.get_pull_request_by_id(
+                pull_request_id=self.pr_num,
+                project=self.workspace_slug,
+            )
+        else:
+            pull_request = getattr(self, "pr", None)
+        source_commit = getattr(pull_request, "last_merge_source_commit", None)
+        head_sha = getattr(source_commit, "commit_id", None)
+        if not isinstance(head_sha, str):
+            return None
+        head_sha = head_sha.strip()
+        return head_sha or None
+
     def get_user_id(self):
         return 0
 

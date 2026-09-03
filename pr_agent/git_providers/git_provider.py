@@ -828,7 +828,11 @@ class GitProvider(ABC):
         return ""
 
     def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
-        """Return a stable current head identity when the provider supports it."""
+        """Return a stable current head identity when the provider supports it.
+
+        A refreshed lookup must not replace cached PR or diff state: callers use
+        it to compare the live head with the immutable snapshot being reviewed.
+        """
 
         return None
 

@@ -371,6 +371,70 @@ class TestGiteaProvider:
         assert content == ""
         provider.repo_api.get_file_content.assert_not_called()
 
+    def test_get_pr_head_sha_returns_cached_sha_without_api_call(self):
+        provider = GiteaProvider.__new__(GiteaProvider)
+        provider.sha = " cached-head-sha "
+        provider.repo_api = MagicMock()
+
+        assert provider.get_pr_head_sha() == "cached-head-sha"
+        assert provider.sha == " cached-head-sha "
+        provider.repo_api.get_pull_request.assert_not_called()
+
+    @pytest.mark.parametrize("sha", [None, "", "   ", 123])
+    def test_get_pr_head_sha_returns_none_for_invalid_cached_sha(self, sha):
+        provider = GiteaProvider.__new__(GiteaProvider)
+        provider.sha = sha
+        provider.repo_api = MagicMock()
+
+        assert provider.get_pr_head_sha() is None
+        assert provider.sha is sha
+        provider.repo_api.get_pull_request.assert_not_called()
+
+    def test_get_pr_head_sha_refreshes_head_without_replacing_cached_state(self):
+        provider = GiteaProvider.__new__(GiteaProvider)
+        provider.owner = "owner"
+        provider.repo = "repo"
+        provider.pr_number = 123
+        provider.sha = "old-head-sha"
+        cached_pr = MagicMock(head=MagicMock(sha="old-head-sha"))
+        provider.pr = cached_pr
+        provider.repo_api = MagicMock()
+        refreshed_pr = MagicMock(head=MagicMock(sha=" new-head-sha "))
+        provider.repo_api.get_pull_request.return_value = refreshed_pr
+
+        assert provider.get_pr_head_sha(refresh=True) == "new-head-sha"
+        assert provider.pr is cached_pr
+        assert provider.sha == "old-head-sha"
+        provider.repo_api.get_pull_request.assert_called_once_with(
+            owner="owner",
+            repo="repo",
+            pr_number=123
+        )
+
+    @pytest.mark.parametrize(
+        "head",
+        [
+            None,
+            MagicMock(sha="", ref="feature-branch"),
+            MagicMock(sha="   ", ref="feature-branch"),
+            MagicMock(sha=123, ref="feature-branch"),
+        ],
+    )
+    def test_get_pr_head_sha_returns_none_when_refreshed_head_sha_is_missing(self, head):
+        provider = GiteaProvider.__new__(GiteaProvider)
+        provider.owner = "owner"
+        provider.repo = "repo"
+        provider.pr_number = 123
+        provider.sha = "old-head-sha"
+        cached_pr = MagicMock(head=MagicMock(sha="old-head-sha"))
+        provider.pr = cached_pr
+        provider.repo_api = MagicMock()
+        provider.repo_api.get_pull_request.return_value = MagicMock(head=head)
+
+        assert provider.get_pr_head_sha(refresh=True) is None
+        assert provider.pr is cached_pr
+        assert provider.sha == "old-head-sha"
+
 
 class TestGiteaProviderPRCommits:
     """Regression tests for #2206: the provider must resolve ``last_commit`` from the

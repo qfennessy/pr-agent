@@ -527,6 +527,8 @@ async def retry_with_fallback_models(
             attribution=model_route.attribution,
             deployment_id=deployment_id,
             is_fallback=i > 0,
+            model_attempts_configured=model_route.model_retries,
+            provider_retries_configured=model_route.provider_retries,
         )
         try:
             get_logger().debug(

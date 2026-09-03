@@ -12,7 +12,6 @@ from pr_agent.log import get_logger
 
 OPENAI_RETRIES = 5
 
-
 class OpenAIHandler(BaseAiHandler):
     def __init__(self):
         # Initialize OpenAIHandler specific attributes here

@@ -637,6 +637,15 @@ class BitbucketProvider(GitProvider):
     def get_pr_branch(self):
         return self.pr.source_branch
 
+    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
+        pr = self._get_pr() if refresh else self.pr
+        source = (getattr(pr, "data", None) or {}).get("source") or {}
+        commit = source.get("commit") or {}
+        head_sha = commit.get("hash")
+        if not isinstance(head_sha, str) or not head_sha.strip():
+            return None
+        return head_sha.strip()
+
     # This function attempts to get the default branch of the repository. As a fallback, uses the PR destination branch.
     # Note: Must be running from a PR context.
     def get_repo_default_branch(self):

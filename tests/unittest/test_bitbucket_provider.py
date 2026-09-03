@@ -20,6 +20,43 @@ class TestBitbucketProvider:
         assert repo_slug == "MY_TEST_REPO"
         assert pr_number == 321
 
+    def test_get_pr_head_sha_uses_cached_source_commit(self):
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.pr = MagicMock(data={
+            "source": {
+                "branch": {"name": "feature"},
+                "commit": {"hash": "cached-head-sha"},
+            },
+        })
+        provider._get_pr = MagicMock()
+
+        assert provider.get_pr_head_sha() == "cached-head-sha"
+        provider._get_pr.assert_not_called()
+
+    def test_get_pr_head_sha_refreshes_source_commit_without_replacing_cached_pr(self):
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        original_pr = MagicMock(data={"source": {"commit": {"hash": "old-head-sha"}}})
+        provider.pr = original_pr
+        refreshed_pr = MagicMock(data={"source": {"commit": {"hash": "new-head-sha"}}})
+        provider._get_pr = MagicMock(return_value=refreshed_pr)
+
+        assert provider.get_pr_head_sha(refresh=True) == "new-head-sha"
+        assert provider.pr is original_pr
+        provider._get_pr.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "source",
+        [None, {}, {"branch": {"name": "feature"}}, {"commit": {}}, {"commit": {"hash": "   "}}],
+    )
+    def test_get_pr_head_sha_returns_none_when_source_commit_is_missing(self, source):
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.pr = MagicMock(data={
+            "source": source,
+            "source_branch": "feature",
+        })
+
+        assert provider.get_pr_head_sha() is None
+
     def test_get_repo_file_content_reads_from_target_branch(self):
         # Repo-context files must be read from the PR destination (target) branch,
         # matching the other providers.
@@ -306,6 +343,39 @@ class TestBitbucketServerProvider:
         assert workspace_slug == "AAA"
         assert repo_slug == "my-repo"
         assert pr_number == 1
+
+    def test_get_pr_head_sha_uses_cached_source_commit(self):
+        provider = BitbucketServerProvider.__new__(BitbucketServerProvider)
+        provider.pr = MagicMock(fromRef={
+            "displayId": "refs/heads/feature",
+            "latestCommit": "cached-head-sha",
+        })
+        provider._get_pr = MagicMock()
+
+        assert provider.get_pr_head_sha() == "cached-head-sha"
+        provider._get_pr.assert_not_called()
+
+    def test_get_pr_head_sha_refreshes_source_commit_without_replacing_cached_pr(self):
+        provider = BitbucketServerProvider.__new__(BitbucketServerProvider)
+        original_pr = MagicMock(fromRef={"latestCommit": "old-head-sha"})
+        provider.pr = original_pr
+        refreshed_pr = MagicMock(fromRef={"latestCommit": "new-head-sha"})
+        provider._get_pr = MagicMock(return_value=refreshed_pr)
+
+        assert provider.get_pr_head_sha(refresh=True) == "new-head-sha"
+        assert provider.pr is original_pr
+        provider._get_pr.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "from_ref",
+        [None, {}, {"displayId": "refs/heads/feature"}, {"latestCommit": "   "}],
+    )
+    def test_get_pr_head_sha_returns_none_when_source_commit_is_missing(self, from_ref):
+        provider = BitbucketServerProvider.__new__(BitbucketServerProvider)
+        provider.pr = MagicMock(fromRef=from_ref)
+        provider.pr.source_branch = "feature"
+
+        assert provider.get_pr_head_sha() is None
 
     def test_parse_pr_url_with_users(self):
         url = "https://bitbucket.company-server.url/users/username/repos/my-repo/pull-requests/1"

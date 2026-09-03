@@ -97,6 +97,53 @@ class TestAzureDevopsProviderRepoContext:
         assert provider.get_pr_head_file_content("src/helper.py") == ""
         provider.azure_devops_client.get_item.assert_not_called()
 
+    def test_get_pr_head_sha_uses_cached_source_commit(self):
+        provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+        provider.pr = SimpleNamespace(
+            last_merge_source_commit=SimpleNamespace(commit_id="cached-head-sha")
+        )
+        provider.azure_devops_client = MagicMock()
+
+        assert provider.get_pr_head_sha() == "cached-head-sha"
+        provider.azure_devops_client.get_pull_request_by_id.assert_not_called()
+
+    def test_get_pr_head_sha_refreshes_changed_source_commit(self):
+        provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+        provider.workspace_slug = "my-project"
+        provider.pr_num = 1
+        cached_pr = SimpleNamespace(
+            last_merge_source_commit=SimpleNamespace(commit_id="old-head-sha")
+        )
+        provider.pr = cached_pr
+        refreshed_pr = SimpleNamespace(
+            last_merge_source_commit=SimpleNamespace(commit_id="new-head-sha")
+        )
+        provider.azure_devops_client = MagicMock()
+        provider.azure_devops_client.get_pull_request_by_id.return_value = refreshed_pr
+
+        assert provider.get_pr_head_sha(refresh=True) == "new-head-sha"
+        assert provider.pr is cached_pr
+        provider.azure_devops_client.get_pull_request_by_id.assert_called_once_with(
+            pull_request_id=1,
+            project="my-project",
+        )
+
+    @pytest.mark.parametrize("commit_id", [None, "", "   ", 123])
+    def test_get_pr_head_sha_fails_closed_without_a_string_source_commit(self, commit_id):
+        provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+        provider.pr = SimpleNamespace(
+            last_merge_source_commit=SimpleNamespace(commit_id=commit_id)
+        )
+
+        assert provider.get_pr_head_sha() is None
+
+    @pytest.mark.parametrize("pull_request", [None, SimpleNamespace()])
+    def test_get_pr_head_sha_fails_closed_without_source_commit(self, pull_request):
+        provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+        provider.pr = pull_request
+
+        assert provider.get_pr_head_sha() is None
+
 
 class TestAzureDevopsProviderFiles:
     @pytest.fixture(autouse=True)

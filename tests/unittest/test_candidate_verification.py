@@ -519,13 +519,13 @@ def test_anchor_shape_preserves_line_partitions_to_avoid_root_identity_collision
     two_line_shape, two_line_ordinal = candidate_verification._changed_anchor_identity(
         patch_text, 2, 3
     )
-    one_line_identity = candidate_verification._verified_finding_identity({
+    one_line_identity = candidate_verification.verified_finding_identity({
         "_changed_anchor_shape": one_line_shape,
         "_changed_anchor_ordinal": one_line_ordinal,
         "_trusted_defect_ordinal": 1,
         "_trusted_lineage_key": "file:src/service.py",
     })
-    two_line_identity = candidate_verification._verified_finding_identity({
+    two_line_identity = candidate_verification.verified_finding_identity({
         "_changed_anchor_shape": two_line_shape,
         "_changed_anchor_ordinal": two_line_ordinal,
         "_trusted_defect_ordinal": 1,
@@ -1649,7 +1649,7 @@ def test_same_anchor_defect_identity_multiset_is_stable_when_candidates_reorder(
         )
         assert rejected == []
         return {
-            candidate_verification._verified_finding_identity(candidate)
+            candidate_verification.verified_finding_identity(candidate)
             for candidate in candidates
         }
 
@@ -5919,6 +5919,9 @@ async def test_verified_sensitive_finding_cannot_escape_an_all_invalid_model_can
         "      start_line: 12\n      end_line: 12\n"
         "      issue_header: Sensitive regression\n"
         "      issue_content: The changed policy permits unauthorized access.\n"
+        "      normalized_severity: high\n"
+        "      disputed: false\n      evidence_status: complete\n"
+        "      unresolved_questions: []\n"
         "      trigger: A request reaches the changed policy.\n"
         "      impact: Unauthorized access is allowed.\n"
         "      evidence_paths: [auth/policy.py]\n",
@@ -5991,6 +5994,9 @@ async def test_model_candidate_budget_has_exact_fail_closed_boundary(
                 f"      end_line: {line}\n"
                 "      issue_header: Verified bug\n"
                 "      issue_content: The changed code has a verified defect.\n"
+                "      normalized_severity: high\n"
+                "      disputed: false\n      evidence_status: complete\n"
+                "      unresolved_questions: []\n"
                 "      trigger: The changed branch executes.\n"
                 "      impact: The request fails.\n"
                 "      evidence_paths: [src/service.py]"
@@ -6153,7 +6159,11 @@ async def test_verification_failure_suppresses_false_clean_publication(
             "verification:\n"
             "  decisions:\n"
             "    - candidate_id: candidate-1\n"
-            "      verdict: verified",
+            "      verdict: verified\n"
+            "      normalized_severity: high\n"
+            "      disputed: false\n"
+            "      evidence_status: complete\n"
+            "      unresolved_questions: []",
             None,
         ))
     elif failure_mode == "wrong_verified_types":
@@ -6167,6 +6177,10 @@ async def test_verification_failure_suppresses_false_clean_publication(
             "      end_line: 12\n"
             "      issue_header: Bug\n"
             "      issue_content: Incorrect behavior.\n"
+            "      normalized_severity: high\n"
+            "      disputed: false\n"
+            "      evidence_status: complete\n"
+            "      unresolved_questions: []\n"
             "      trigger: Concrete trigger.\n"
             "      impact: Concrete impact.\n"
             "      evidence_paths: src/service.py",
@@ -6201,6 +6215,69 @@ async def test_verification_failure_suppresses_false_clean_publication(
     assert structured["candidate_verification"]["status"] == expected_status
     assert structured["candidate_verification"]["publication_safe"] is False
     assert "unchecked lookup result" not in json.dumps(structured)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "duplicate_routing_field",
+    [
+        "      normalized_severity: high\n      normalized_severity: medium\n"
+        + "      disputed: false\n",
+        "      normalized_severity: medium\n      disputed: true\n"
+        + "      disputed: false\n",
+    ],
+    ids=["normalized-severity", "disputed"],
+)
+async def test_frontier_rejects_duplicate_verifier_routing_keys(
+    duplicate_routing_field,
+):
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._run_frontier_adjudications = AsyncMock()
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        "verification:\n"
+        "  decisions:\n"
+        "    - candidate_id: candidate-1\n"
+        "      verdict: verified\n"
+        "      relevant_file: src/service.py\n"
+        "      start_line: 12\n"
+        "      end_line: 12\n"
+        "      issue_header: Verified bug\n"
+        "      issue_content: The changed code has a verified defect.\n"
+        f"{duplicate_routing_field}"
+        "      evidence_status: complete\n"
+        "      unresolved_questions: []\n"
+        "      trigger: The changed branch executes.\n"
+        "      impact: The request fails.\n"
+        "      evidence_paths: [src/service.py]",
+        None,
+    ))
+    settings = _verification_settings()
+    settings.pr_reviewer["enable_frontier_adjudication"] = True
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "verifier_response_invalid"
+    assert artifact["failure"] == "duplicate_mapping_key"
+    assert artifact["publication_safe"] is False
+    assert artifact["verified_count"] == 0
+    assert reviewer.verified_review_data["review"]["key_issues_to_review"] == []
+    reviewer._run_frontier_adjudications.assert_not_awaited()
+    assert reviewer.frontier_adjudication_artifact == {
+        "enabled": True,
+        "status": "unavailable",
+        "failure": "candidate_verification_verifier_response_invalid",
+        "results": [],
+        "publication_safe": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -6658,6 +6735,9 @@ async def test_orchestration_retains_deleted_candidate_patch_when_global_diff_is
         "      start_line: 10\n      end_line: 10\n"
         "      issue_header: Sensitive regression\n"
         "      issue_content: The deleted guard permits unauthorized access.\n"
+        "      normalized_severity: high\n"
+        "      disputed: false\n      evidence_status: complete\n"
+        "      unresolved_questions: []\n"
         "      trigger: A request reaches the policy without the deleted guard.\n"
         "      impact: Unauthorized access is allowed.\n"
         "      evidence_paths: [auth/policy.py]\n",
@@ -6705,12 +6785,18 @@ async def test_orchestration_applies_global_finding_limit_after_verification():
         "    - candidate_id: candidate-1\n      verdict: verified\n"
         "      relevant_file: src/service.py\n      start_line: 12\n      end_line: 12\n"
         "      issue_header: First bug\n      issue_content: First verified defect.\n"
+        "      normalized_severity: high\n"
+        "      disputed: false\n      evidence_status: complete\n"
+        "      unresolved_questions: []\n"
         "      trigger: The first changed branch runs.\n"
         "      impact: The first request fails.\n"
         "      evidence_paths: [src/service.py]\n"
         "    - candidate_id: candidate-2\n      verdict: verified\n"
         "      relevant_file: src/service.py\n      start_line: 13\n      end_line: 13\n"
         "      issue_header: Second bug\n      issue_content: Second verified defect.\n"
+        "      normalized_severity: high\n"
+        "      disputed: false\n      evidence_status: complete\n"
+        "      unresolved_questions: []\n"
         "      trigger: The second changed branch runs.\n"
         "      impact: The second request fails.\n"
         "      evidence_paths: [src/service.py]\n",
