@@ -1,6 +1,7 @@
 import asyncio
 import builtins
 import json
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -166,6 +167,8 @@ async def test_parent_uses_current_interpreter_without_a_shell(monkeypatch):
     encoded_outcome = review_subprocess._encode_worker_outcome(_completed_outcome(snapshot))
     process = _FakeProcess(encoded_outcome)
     spawn = AsyncMock(return_value=process)
+    monkeypatch.setenv("PYTHONPATH", "/attacker-controlled-checkout")
+    monkeypatch.setenv("PYTHONHOME", "/attacker-controlled-runtime")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
 
     outcome = await review_subprocess.run_checkpoint_review_subprocess(
@@ -174,17 +177,56 @@ async def test_parent_uses_current_interpreter_without_a_shell(monkeypatch):
     )
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
-    spawn.assert_awaited_once_with(
+    spawn.assert_awaited_once()
+    args = spawn.await_args.args
+    kwargs = spawn.await_args.kwargs
+    assert args == (
         sys.executable,
-        "-m",
-        "pr_agent.algo.checkpoint_review_subprocess",
+        "-I",
+        "-c",
+        review_subprocess._WORKER_BOOTSTRAP,
+        review_subprocess._TRUSTED_PACKAGE_ROOT,
         "--worker",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
     )
+    assert kwargs["stdin"] is asyncio.subprocess.PIPE
+    assert kwargs["stdout"] is asyncio.subprocess.PIPE
+    assert kwargs["stderr"] is subprocess.DEVNULL
+    assert kwargs["cwd"] == review_subprocess._TRUSTED_PACKAGE_ROOT
+    assert "PYTHONPATH" not in kwargs["env"]
+    assert "PYTHONHOME" not in kwargs["env"]
     assert process.stdin.closed is True
     assert json.loads(process.stdin.written)["allow_model_execution"] is True
+
+
+def test_isolated_worker_bootstrap_ignores_untrusted_import_paths(tmp_path):
+    attacker_package = tmp_path / "pr_agent"
+    attacker_package.mkdir()
+    (attacker_package / "__init__.py").write_text(
+        'raise RuntimeError("loaded attacker-controlled package")\n',
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(tmp_path)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            review_subprocess._WORKER_BOOTSTRAP,
+            review_subprocess._TRUSTED_PACKAGE_ROOT,
+            "--worker",
+        ],
+        input=_request_bytes(_snapshot(), allow_model_execution=False),
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        check=True,
+    )
+
+    outcome = json.loads(completed.stdout)
+    assert outcome["state"] == review_subprocess.CheckpointReviewSubprocessState.REFUSED.value
+    assert outcome["failure_reason_code"] == "model_execution_not_authorized"
 
 
 @pytest.mark.asyncio

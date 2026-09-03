@@ -16,6 +16,7 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Mapping, Optional
 
@@ -33,6 +34,20 @@ MAX_REVIEW_SUBPROCESS_TIMEOUT_SECONDS = 900.0
 MAX_REVIEW_SUBPROCESS_REQUEST_BYTES = 10_250_000
 MAX_REVIEW_SUBPROCESS_OUTPUT_BYTES = 2_000_000
 _CALLBACK_DRAIN_TIMEOUT_SECONDS = 5.0
+_TRUSTED_PACKAGE_ROOT = str(Path(__file__).resolve().parents[2])
+_WORKER_BOOTSTRAP = (
+    "import runpy,sys;"
+    "sys.path.insert(0,sys.argv.pop(1));"
+    "runpy.run_module('pr_agent.algo.checkpoint_review_subprocess',run_name='__main__')"
+)
+_PYTHON_IMPORT_ENVIRONMENT_KEYS = frozenset({
+    "PYTHONHOME",
+    "PYTHONINSPECT",
+    "PYTHONPATH",
+    "PYTHONSAFEPATH",
+    "PYTHONSTARTUP",
+    "PYTHONUSERBASE",
+})
 _FAILURE_REASON_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SNAPSHOT_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ANSWER_ONLY_KEYS = frozenset({
@@ -693,14 +708,23 @@ async def run_checkpoint_review_subprocess(
             snapshot_id=snapshot.snapshot_id,
         )
     try:
+        worker_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in _PYTHON_IMPORT_ENVIRONMENT_KEYS
+        }
         process = await asyncio.create_subprocess_exec(
             sys.executable,
-            "-m",
-            "pr_agent.algo.checkpoint_review_subprocess",
+            "-I",
+            "-c",
+            _WORKER_BOOTSTRAP,
+            _TRUSTED_PACKAGE_ROOT,
             "--worker",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            cwd=_TRUSTED_PACKAGE_ROOT,
+            env=worker_environment,
         )
     except (OSError, subprocess.SubprocessError):
         return _failure_outcome(
