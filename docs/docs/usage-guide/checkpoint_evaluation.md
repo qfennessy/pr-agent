@@ -94,9 +94,10 @@ run-detail printing before importing the reviewer. It also passes only the stand
 credential and a minimal process environment; proxy, endpoint, Dynaconf, and other provider
 controls are not inherited. The bundle can be sent through the bounded local worker pipe, but it is
 not yet attached to the snapshot artifact path and is not part of a source-free manifest, journal,
-or pilot report. Existing provider-neutral local-pair snapshots retain their legacy hash path when
-no bundle is supplied; that compatibility path is not an immutable production replay and cannot
-make the production binding available.
+or pilot report. Existing provider-neutral local-pair snapshots retain their legacy hash for local
+workflows, but this production replay seam rejects them unless the exact immutable bundle is also
+supplied. That bundle still cannot make the production binding available until its source-bearing
+snapshot persistence path is implemented.
 
 Production bindings declare their telemetry shape. The deterministic arm must be model-free,
 the general-review arm must name one selected pinned model, and specialist, verified-specialist,

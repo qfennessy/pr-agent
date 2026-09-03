@@ -206,6 +206,30 @@ def test_bundle_normalizes_supported_dynaconf_string_values():
     assert normalized.settings["openrouter.provider_order"] == ("first", "second")
 
 
+@pytest.mark.parametrize(
+    "path",
+    (
+        "config.model_reasoning",
+        "config.model_weak",
+        "openai.deployment_id",
+        "openai.deployment_id_reasoning",
+        "openai.deployment_id_weak",
+    ),
+)
+def test_bundle_accepts_null_for_optional_route_identifier(path):
+    bundle = materialize_review_configuration("", {})
+    settings = dict(bundle.settings)
+    settings[path] = None
+
+    normalized = replace(
+        bundle,
+        settings=settings,
+        missing_settings=tuple(item for item in bundle.missing_settings if item != path),
+    )
+
+    assert normalized.settings[path] is None
+
+
 def test_replay_pins_captured_values_and_restores_ambient_settings():
     protected = snapshot_settings(("config.model", "config.reasoning_effort"))
     settings = get_settings()

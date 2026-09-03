@@ -21,8 +21,6 @@ from pr_agent.algo.review_snapshot import ReviewEvent, ReviewSnapshot
 from pr_agent.algo.review_specialists import get_specialist_snapshot_context
 from pr_agent.algo.skills_loader import get_skills_context
 
-_USE_DEFAULT_CONFIGURATION = object()
-
 
 def _configuration(*, skills_context=None, repo_context_files=None, repo_context_max_lines=None):
     return materialize_review_configuration(
@@ -57,15 +55,15 @@ def _snapshot(*, review_configuration=None) -> ReviewSnapshot:
 def _request_bytes(
     snapshot: ReviewSnapshot,
     *,
-    review_configuration=_USE_DEFAULT_CONFIGURATION,
+    review_configuration=None,
     allow_model_execution: bool = True,
 ) -> bytes:
-    configuration = _configuration() if review_configuration is _USE_DEFAULT_CONFIGURATION else review_configuration
+    configuration = review_configuration or _configuration()
     return json.dumps({
         "schema_version": review_subprocess.CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION,
         "allow_model_execution": allow_model_execution,
         "snapshot": snapshot.to_dict(),
-        "review_configuration": None if configuration is None else configuration.to_dict(),
+        "review_configuration": configuration.to_dict(),
     }).encode("utf-8")
 
 
@@ -234,25 +232,25 @@ async def test_parent_uses_current_interpreter_without_a_shell(monkeypatch):
     assert process.stdin.closed is True
     request = json.loads(process.stdin.written)
     assert request["allow_model_execution"] is True
-    assert request["review_configuration"] is None
+    assert request["review_configuration"]["configuration_hash"] == snapshot.review_configuration_hash
 
 
 @pytest.mark.asyncio
-async def test_parent_preserves_legacy_cli_snapshot_hash_without_inventing_a_bundle(monkeypatch):
+async def test_parent_rejects_legacy_cli_snapshot_without_an_immutable_bundle(monkeypatch):
     snapshot = replace(
         _snapshot(),
         review_configuration_hash=snapshot_review_configuration_hash(get_skills_context(), {}),
     )
-    process = _FakeProcess(review_subprocess._encode_worker_outcome(_completed_outcome(snapshot)))
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    spawn = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
 
     outcome = await review_subprocess.run_checkpoint_review_subprocess(
         snapshot,
         allow_model_execution=True,
     )
 
-    assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
-    assert json.loads(process.stdin.written)["review_configuration"] is None
+    assert outcome.failure_reason_code == "review_configuration_mismatch"
+    spawn.assert_not_awaited()
 
 
 def test_worker_environment_prefers_effective_settings_credential(monkeypatch):
@@ -501,20 +499,6 @@ async def test_worker_executes_valid_request_and_binds_snapshot():
     executor.assert_awaited_once()
     assert executor.await_args.args[0].snapshot_id == snapshot.snapshot_id
     assert executor.await_args.args[1].configuration_hash == configuration.configuration_hash
-
-
-@pytest.mark.asyncio
-async def test_worker_accepts_legacy_cli_snapshot_without_a_bundle():
-    snapshot = replace(
-        _snapshot(),
-        review_configuration_hash=snapshot_review_configuration_hash(get_skills_context(), {}),
-        changed_paths=(),
-        diff="",
-    )
-
-    outcome = await review_subprocess._execute_review(snapshot, None)
-
-    assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
 
 
 @pytest.mark.asyncio

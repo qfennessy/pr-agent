@@ -210,7 +210,7 @@ class CheckpointReviewSubprocessOutcome:
 @dataclass(frozen=True)
 class _CheckpointReviewSubprocessRequest:
     snapshot: ReviewSnapshot
-    review_configuration: Optional["ReviewConfigurationBundle"]
+    review_configuration: "ReviewConfigurationBundle"
     allow_model_execution: bool
     schema_version: str = CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION
 
@@ -221,9 +221,7 @@ class _CheckpointReviewSubprocessRequest:
             raise TypeError("checkpoint review subprocess request requires a ReviewSnapshot")
         from pr_agent.algo.review_configuration import ReviewConfigurationBundle
 
-        if self.review_configuration is not None and not isinstance(
-            self.review_configuration, ReviewConfigurationBundle
-        ):
+        if not isinstance(self.review_configuration, ReviewConfigurationBundle):
             raise TypeError("checkpoint review subprocess request requires a ReviewConfigurationBundle")
         if not isinstance(self.allow_model_execution, bool):
             raise TypeError("allow_model_execution must be a boolean")
@@ -233,9 +231,7 @@ class _CheckpointReviewSubprocessRequest:
             "schema_version": self.schema_version,
             "allow_model_execution": self.allow_model_execution,
             "snapshot": self.snapshot.to_dict(),
-            "review_configuration": (
-                None if self.review_configuration is None else self.review_configuration.to_dict()
-            ),
+            "review_configuration": self.review_configuration.to_dict(),
         }
 
 
@@ -407,16 +403,9 @@ def _request_from_dict(payload: Mapping[str, Any]) -> _CheckpointReviewSubproces
         raise ValueError("invalid_model_execution_permission")
     from pr_agent.algo.review_configuration import ReviewConfigurationBundle
 
-    serialized_configuration = payload.get("review_configuration")
-    review_configuration = (
-        None
-        if serialized_configuration is None
-        else ReviewConfigurationBundle.from_dict(serialized_configuration)
-    )
-
     return _CheckpointReviewSubprocessRequest(
         snapshot=_snapshot_from_dict(payload.get("snapshot")),
-        review_configuration=review_configuration,
+        review_configuration=ReviewConfigurationBundle.from_dict(payload.get("review_configuration")),
         allow_model_execution=payload["allow_model_execution"],
         schema_version=payload["schema_version"],
     )
@@ -534,16 +523,6 @@ def _current_review_configuration() -> "ReviewConfigurationBundle":
     return materialize_review_configuration(repo_context_files={})
 
 
-def _current_legacy_review_configuration() -> tuple[str, str]:
-    """Render the provider-neutral identity used by existing local snapshots."""
-
-    from pr_agent.algo.review_configuration import snapshot_review_configuration_hash
-    from pr_agent.algo.skills_loader import get_skills_context
-
-    skills_context = get_skills_context()
-    return snapshot_review_configuration_hash(skills_context, repo_context_files={}), skills_context
-
-
 def _worker_environment() -> dict[str, str]:
     """Pass only process plumbing and the supported provider credential."""
 
@@ -562,7 +541,7 @@ def _worker_environment() -> dict[str, str]:
 
 async def _execute_review(
     snapshot: ReviewSnapshot,
-    review_configuration: Optional["ReviewConfigurationBundle"],
+    review_configuration: "ReviewConfigurationBundle",
 ) -> CheckpointReviewSubprocessOutcome:
     """Import and run production review code only after request validation."""
 
@@ -576,33 +555,15 @@ async def _execute_review(
             "review_configuration_unverified",
             snapshot_id=snapshot.snapshot_id,
         )
-    if review_configuration is None:
-        try:
-            actual_configuration_hash, skills_context = _current_legacy_review_configuration()
-        except Exception:
-            return _failure_outcome(
-                CheckpointReviewSubprocessState.FAILED,
-                "review_configuration_unverified",
-                snapshot_id=snapshot.snapshot_id,
-            )
-        prompt_date = ""
-        repo_context_files: Mapping[str, str] = {}
-        repo_context_max_lines = None
-    else:
-        try:
-            review_configuration.require_compatible_runtime()
-        except Exception:
-            return _failure_outcome(
-                CheckpointReviewSubprocessState.FAILED,
-                "review_configuration_unverified",
-                snapshot_id=snapshot.snapshot_id,
-            )
-        actual_configuration_hash = review_configuration.configuration_hash
-        skills_context = review_configuration.skills_context
-        prompt_date = review_configuration.prompt_date
-        repo_context_files = review_configuration.repo_context_files
-        repo_context_max_lines = review_configuration.repo_context_max_lines
-    if not hmac.compare_digest(actual_configuration_hash, expected_configuration_hash):
+    try:
+        review_configuration.require_compatible_runtime()
+    except Exception:
+        return _failure_outcome(
+            CheckpointReviewSubprocessState.FAILED,
+            "review_configuration_unverified",
+            snapshot_id=snapshot.snapshot_id,
+        )
+    if not hmac.compare_digest(review_configuration.configuration_hash, expected_configuration_hash):
         return _failure_outcome(
             CheckpointReviewSubprocessState.FAILED,
             "review_configuration_mismatch",
@@ -615,8 +576,6 @@ async def _execute_review(
             review={"review": {"key_issues_to_review": []}},
             latency_seconds=0.0,
         )
-
-    from contextlib import nullcontext
 
     from pr_agent.algo.review_configuration import replay_review_configuration
     from pr_agent.algo.review_execution_context import isolate_review_execution, pin_review_prompt_date
@@ -631,11 +590,9 @@ async def _execute_review(
             try:
                 settings.unset(section, force=True)
             except KeyError:
+                # A missing provider section is already credential-free.
                 pass
-        configuration_context = (
-            nullcontext() if review_configuration is None else replay_review_configuration(review_configuration)
-        )
-        with configuration_context:
+        with replay_review_configuration(review_configuration):
             settings.set("config.git_provider", "plain-diff")
             settings.set("config.cli_mode", False)
             settings.set("config.use_repo_settings_file", False)
@@ -662,10 +619,9 @@ async def _execute_review(
             settings.set("plain_diff.json_output_path", None)
             settings.set("plain_diff.suppress_stdout", True)
             settings.set("plain_diff.disable_working_tree_enrichment", True)
-            settings.set("plain_diff.repo_context_files", dict(repo_context_files))
-            settings.set("config.repo_context_files", list(repo_context_files))
-            if repo_context_max_lines is not None:
-                settings.set("config.repo_context_max_lines", repo_context_max_lines)
+            settings.set("plain_diff.repo_context_files", dict(review_configuration.repo_context_files))
+            settings.set("config.repo_context_files", list(review_configuration.repo_context_files))
+            settings.set("config.repo_context_max_lines", review_configuration.repo_context_max_lines)
             settings.set("related_tickets", [])
             existing_instructions = str(settings.get("pr_reviewer.extra_instructions", "") or "")
             settings.set(
@@ -678,8 +634,8 @@ async def _execute_review(
 
             with (
                 isolate_review_execution(),
-                pin_review_prompt_date(prompt_date),
-                pin_skills_context(skills_context),
+                pin_review_prompt_date(review_configuration.prompt_date),
+                pin_skills_context(review_configuration.skills_context),
                 use_specialist_snapshot_context(snapshot, lambda: snapshot.snapshot_id),
             ):
                 reviewer = PRReviewer("checkpoint-review-subprocess")
@@ -705,7 +661,7 @@ async def _handle_worker_request(
     raw: bytes,
     *,
     executor: Callable[
-        [ReviewSnapshot, Optional["ReviewConfigurationBundle"]], Awaitable[CheckpointReviewSubprocessOutcome]
+        [ReviewSnapshot, "ReviewConfigurationBundle"], Awaitable[CheckpointReviewSubprocessOutcome]
     ] = _execute_review,
 ) -> CheckpointReviewSubprocessOutcome:
     """Validate a worker request completely before entering the execution seam."""
@@ -820,9 +776,11 @@ async def run_checkpoint_review_subprocess(
     )
 
     try:
-        if review_configuration is not None and not isinstance(review_configuration, ReviewConfigurationBundle):
+        if review_configuration is None:
+            review_configuration = _current_review_configuration()
+        if not isinstance(review_configuration, ReviewConfigurationBundle):
             raise TypeError("review_configuration must be a ReviewConfigurationBundle")
-        if review_configuration is not None and not hmac.compare_digest(
+        if not hmac.compare_digest(
             review_configuration.configuration_hash, snapshot.review_configuration_hash or ""
         ):
             return _failure_outcome(
@@ -834,13 +792,9 @@ async def run_checkpoint_review_subprocess(
             review_snapshot_canonical_bytes(snapshot),
             "snapshot",
         )
-        canonical_review_configuration = (
-            None
-            if review_configuration is None
-            else _decode_json_object(
-                review_configuration_canonical_bytes(review_configuration),
-                "review_configuration",
-            )
+        canonical_review_configuration = _decode_json_object(
+            review_configuration_canonical_bytes(review_configuration),
+            "review_configuration",
         )
     except (TypeError, ValueError, RecursionError):
         return _failure_outcome(

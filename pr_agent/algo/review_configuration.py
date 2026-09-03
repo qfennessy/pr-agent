@@ -56,6 +56,13 @@ _STRING_SETTINGS = frozenset({
     "pr_reviewer.review_profile",
     "config.response_language",
 })
+_NULLABLE_STRING_SETTINGS = frozenset({
+    "config.model_reasoning",
+    "config.model_weak",
+    "openai.deployment_id",
+    "openai.deployment_id_reasoning",
+    "openai.deployment_id_weak",
+})
 _BOOLEAN_SETTINGS = frozenset({
     "config.allow_dynamic_context",
     "config.custom_reasoning_model",
@@ -314,11 +321,13 @@ def _validate_setting(path: str, value: Any) -> Any:
         try:
             value = int(value.strip())
         except ValueError:
+            # Preserve invalid text so strict type validation below rejects it.
             pass
     elif path in _NUMBER_SETTINGS and isinstance(value, str):
         try:
             value = float(value.strip())
         except ValueError:
+            # Preserve invalid text so strict type validation below rejects it.
             pass
     elif path in _STRING_LIST_SETTINGS and isinstance(value, str):
         value = [item.strip() for item in value.split(",") if item.strip()]
@@ -331,7 +340,7 @@ def _validate_setting(path: str, value: Any) -> Any:
         value = decoded if isinstance(decoded, list) else [item.strip() for item in value.split(",") if item.strip()]
     value = _validate_json(value, path)
     if path in _STRING_SETTINGS:
-        if not isinstance(value, str):
+        if not isinstance(value, str) and not (path in _NULLABLE_STRING_SETTINGS and value is None):
             raise ValueError(f"{path} must be a string")
     elif path in _BOOLEAN_SETTINGS:
         if not isinstance(value, bool):
@@ -435,6 +444,7 @@ def _unset_setting(settings: Any, path: str) -> None:
         try:
             unset(path, force=True)
         except KeyError:
+            # A missing setting already has the required replay state.
             pass
         return
     section_name, leaf_name = path.split(".", 1)
