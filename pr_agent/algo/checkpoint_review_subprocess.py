@@ -603,6 +603,7 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
         try:
             process.kill()
         except ProcessLookupError:
+            # The worker exited after the timeout; the wait below still reaps it.
             pass
         await process.wait()
 
