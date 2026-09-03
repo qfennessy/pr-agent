@@ -1,6 +1,7 @@
 import json
 import multiprocessing
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -1014,6 +1015,56 @@ def test_mark_fixed_revalidates_again_before_resolve_and_preserves_new_human_rep
         ReviewThreadActionState.STALE_INVENTORY,
     ]
     assert len([call for call in requester.calls if "resolveReviewThread" in str(call[3])]) == 0
+
+
+def test_mark_fixed_second_copy_accepts_github_post_resolution_capabilities():
+    first, _ = _owned_thread_state()
+    second_root = replace(
+        first.root_comment,
+        node_id="comment-2",
+        database_id=78,
+        url="https://github.test/comment-2",
+    )
+    second = replace(first, thread_id="thread-2", comments=(second_root,))
+    plan = plan_review_thread_actions(
+        (),
+        (first, second),
+        "head-1",
+        obsolete_policy="mark_fixed",
+        authoritative_absence=True,
+    )
+    second_update = plan.actions[2]
+    resolved_first = _thread(
+        "thread-1",
+        [_comment(plan.actions[0].body, database_id=77)],
+        resolved=True,
+        viewer_can_resolve=False,
+        resolved_by={"id": "BOT-1", "login": "pr-agent[bot]", "__typename": "Bot"},
+    )
+    active_second = _thread(
+        "thread-2",
+        [_comment(second_root.body, node_id="comment-2", database_id=78)],
+    )
+    requester = _Requester(
+        graphql=[_inventory_page([resolved_first, active_second])],
+        rest=[
+            {"head": {"sha": "head-1"}},
+            {"head": {"sha": "head-1"}},
+            {"id": 78, "node_id": "comment-2"},
+            {"head": {"sha": "head-1"}},
+        ],
+    )
+
+    outcome = _provider(requester).update_review_thread(
+        78,
+        second_update.body,
+        "head-1",
+        second_update.expected_thread,
+        second_update.expected_threads,
+    )
+
+    assert outcome.state == ReviewThreadActionState.APPLIED
+    assert any(call[0] == "rest" and call[1] == "PATCH" for call in requester.calls)
 
 
 @pytest.mark.parametrize("operation", ["create", "update", "resolve"])

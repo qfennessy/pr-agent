@@ -1045,6 +1045,7 @@ def test_mark_fixed_projects_prior_copy_mutations_into_later_update_inventory():
     assert plan.actions[2].depends_on_action_id == plan.actions[1].action_id
     projected_by_id = {thread.thread_id: thread for thread in plan.actions[2].expected_threads}
     assert projected_by_id["thread-1"].is_resolved is True
+    assert projected_by_id["thread-1"].viewer_can_resolve is False
     assert projected_by_id["thread-1"].resolved_by_viewer_bot is True
     assert FIXED_THREAD_NOTICE in projected_by_id["thread-1"].root_comment.body
     assert projected_by_id["thread-2"] == second

@@ -614,6 +614,7 @@ def _thread_after_viewer_resolution(thread: ReviewThreadSnapshot) -> ReviewThrea
     return replace(
         thread,
         is_resolved=True,
+        viewer_can_resolve=False,
         resolved_by_viewer_bot=True,
         resolved_by_other_actor=False,
     )
