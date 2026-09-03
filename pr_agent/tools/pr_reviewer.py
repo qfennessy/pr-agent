@@ -60,7 +60,7 @@ from pr_agent.algo.pr_processing import (
     retry_with_fallback_models,
 )
 from pr_agent.algo.repo_context import build_repo_context
-from pr_agent.algo.review_execution_context import isolate_review_execution, review_execution_is_isolated
+from pr_agent.algo.review_execution_context import review_execution_is_isolated
 from pr_agent.algo.review_router import (
     ChangedFile,
     ChangeKind,
@@ -212,6 +212,7 @@ class PRReviewer:
         self._review_shadow_only = False
         self._force_no_publish = False
         self._structured_review_result = None
+        self._structured_execution_used = False
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
             self.git_provider.get_pr_description(split_changes_walkthrough=True))
@@ -537,8 +538,14 @@ class PRReviewer:
                 except Exception as e:
                     get_logger().exception(f"Failed to publish review failure result, error: {e}")
 
-    async def run_structured_no_publish(self) -> StructuredReviewExecution:
-        """Run production review orchestration while forcing review output sinks closed."""
+    async def _run_structured_no_publish_once(self) -> StructuredReviewExecution:
+        """Run one already-isolated reviewer while forcing review output sinks closed."""
+
+        if not review_execution_is_isolated():
+            raise RuntimeError("structured review execution requires an outer isolation boundary")
+        if getattr(self, "_structured_execution_used", False):
+            raise RuntimeError("structured review execution requires a fresh reviewer instance")
+        self._structured_execution_used = True
 
         previous_force_no_publish = getattr(self, "_force_no_publish", False)
         related_tickets = copy.deepcopy(self.vars.get("related_tickets"))
@@ -547,7 +554,7 @@ class PRReviewer:
         self._structured_review_result = None
         try:
             self.vars["related_tickets"] = []
-            with isolate_review_execution(), isolate_run_details():
+            with isolate_run_details():
                 await self.run()
                 run_details = copy.deepcopy(get_run_details())
                 if run_details is not None:

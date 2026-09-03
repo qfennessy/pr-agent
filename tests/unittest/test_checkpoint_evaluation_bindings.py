@@ -113,12 +113,17 @@ def test_production_binding_inventory_is_exact_and_fail_closed():
         item for item in inventory.bindings if item.kind is EvaluationArmKind.FULL_CASCADE
     )
     assert set(full_cascade.blocker_codes) == {
+        "no_publish_review_facade_unavailable",
         "finding_fingerprint_contract_unavailable",
         "verified_candidate_source_contract_unavailable",
         "frontier_stage_telemetry_contract_unavailable",
         "frontier_decision_semantics_unavailable",
         "hard_cost_cap_enforcement_unavailable",
     }
+    general_review = next(
+        item for item in inventory.bindings if item.kind is EvaluationArmKind.GENERAL_REVIEW
+    )
+    assert "no_publish_review_facade_unavailable" in general_review.blocker_codes
 
 
 def test_production_bindings_preserve_frozen_manifest_contracts():

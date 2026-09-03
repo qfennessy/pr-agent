@@ -6605,10 +6605,11 @@ async def test_structured_no_publish_run_returns_isolated_review_without_output_
         settings.pr_reviewer.persistent_comment = True
         settings.data = {"artifact": "unchanged"}
         with (
+            isolate_review_execution(),
             patch("pr_agent.tools.pr_reviewer.github_action_output") as action_output,
             patch("pr_agent.tools.pr_reviewer.push_outputs") as push,
         ):
-            result = await reviewer.run_structured_no_publish()
+            result = await reviewer._run_structured_no_publish_once()
         assert settings.data == {"artifact": "unchanged"}
     finally:
         restore_settings(settings_snapshot)
@@ -6650,11 +6651,38 @@ async def test_structured_no_publish_run_restores_force_gate_after_error():
     reviewer._structured_review_result = {"review": {"score": "stale"}}
     reviewer.run = AsyncMock(side_effect=RuntimeError("failed"))
 
-    with pytest.raises(RuntimeError, match="failed"):
-        await reviewer.run_structured_no_publish()
+    with isolate_review_execution(), pytest.raises(RuntimeError, match="failed"):
+        await reviewer._run_structured_no_publish_once()
 
     assert reviewer._force_no_publish is False
     assert reviewer._structured_review_result is None
+
+
+@pytest.mark.asyncio
+async def test_structured_no_publish_run_requires_outer_isolation():
+    reviewer = _make_prediction_reviewer()
+    reviewer.vars = {}
+    reviewer.run = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="outer isolation boundary"):
+        await reviewer._run_structured_no_publish_once()
+
+    reviewer.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_structured_no_publish_run_rejects_reused_reviewer_after_failure():
+    reviewer = _make_prediction_reviewer()
+    reviewer.vars = {}
+    reviewer.run = AsyncMock(side_effect=RuntimeError("first attempt failed"))
+
+    with isolate_review_execution(), pytest.raises(RuntimeError, match="first attempt failed"):
+        await reviewer._run_structured_no_publish_once()
+
+    with isolate_review_execution(), pytest.raises(RuntimeError, match="fresh reviewer instance"):
+        await reviewer._run_structured_no_publish_once()
+
+    reviewer.run.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -6708,7 +6736,8 @@ async def test_structured_no_publish_run_isolates_telemetry_and_shared_request_s
             new_callable=AsyncMock,
             return_value=[{"ticket_id": "isolated-ticket"}],
         ) as extract_tickets:
-            result = await reviewer.run_structured_no_publish()
+            with isolate_review_execution():
+                result = await reviewer._run_structured_no_publish_once()
 
         assert get_run_details() is prior_details
         assert settings.config.last_used_model == "outer-model"
@@ -6756,7 +6785,8 @@ async def test_structured_no_publish_run_suppresses_all_models_failed_ci_summary
         settings.set("openai.fallback_deployments", [])
         settings.pr_reviewer.require_ticket_analysis_review = False
 
-        result = await reviewer.run_structured_no_publish()
+        with isolate_review_execution():
+            result = await reviewer._run_structured_no_publish_once()
     finally:
         restore_settings(settings_snapshot)
 
