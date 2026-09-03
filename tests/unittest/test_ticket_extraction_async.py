@@ -314,6 +314,16 @@ class TestGithubExplicitReferenceParsing:
             "https://github.com/org/repo/issues/5/", "org/repo"
         ) == ["https://github.com/org/repo/issues/5"]
 
+    @pytest.mark.parametrize(
+        ("url", "base_url"),
+        [
+            ("https://api.github.com/repos/org/repo/issues/6", "https://github.com"),
+            ("https://github.enterprise.local/api/v3/repos/acme/repo/issues/7", "https://github.enterprise.local"),
+        ],
+    )
+    def test_github_api_issue_urls_are_supported(self, url, base_url):
+        assert extract_ticket_links_from_pr_description(url, "org/repo", base_url) == [url]
+
     def test_extra_path_segments_in_issue_url_are_rejected_without_losing_valid_ticket(self):
         description = "Fixes #2 and see https://github.com/org/repo/wiki/issues/7"
         assert extract_ticket_links_from_pr_description(description, "org/repo") == [

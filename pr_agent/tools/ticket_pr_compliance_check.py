@@ -361,13 +361,24 @@ def _parse_github_issue_reference_url(ticket_url):
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
 
-    path_parts = parsed.path.split("/")
+    path = parsed.path
+    is_github_api_path = path.startswith("/api/v3/")
+    if is_github_api_path:
+        path = path[len("/api/v3"):]
+
+    path_parts = path.split("/")
     if path_parts and path_parts[-1] == "":
         path_parts.pop()
-    if len(path_parts) != 5 or path_parts[0] != "" or path_parts[3] != "issues":
+    is_api_url = parsed.hostname == "api.github.com" or is_github_api_path
+    if not is_api_url and len(path_parts) == 5 and path_parts[0] == "" and path_parts[3] == "issues":
+        owner, repo, issue_number = path_parts[1], path_parts[2], path_parts[4]
+    elif is_api_url and len(path_parts) == 6:
+        if path_parts[0] != "" or path_parts[1] != "repos" or path_parts[4] != "issues":
+            return None
+        owner, repo, issue_number = path_parts[2], path_parts[3], path_parts[5]
+    else:
         return None
 
-    owner, repo, issue_number = path_parts[1], path_parts[2], path_parts[4]
     if not issue_number.isdigit():
         return None
     if not GITHUB_OWNER_PATTERN.fullmatch(owner) or "--" in owner:
