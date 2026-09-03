@@ -955,7 +955,8 @@ def test_shadow_journal_reopen_persists_unsealed_boundary_before_first_acknowled
     path = tmp_path / "reopened-shadow.ndjson"
     first_writer = ShadowJournalWriter(path, enabled=True)
     assert first_writer.submit(entry) is ShadowSubmitStatus.QUEUED
-    assert first_writer.close() is True
+    first_writer_closed = first_writer.close()
+    assert first_writer_closed is True
     sealed_records = load_shadow_journal(path)
 
     reopened_writer = ShadowJournalWriter(path, enabled=True)
@@ -972,7 +973,8 @@ def test_shadow_journal_reopen_persists_unsealed_boundary_before_first_acknowled
         failed_append,
     )
     assert reopened_writer.submit(entry) is ShadowSubmitStatus.QUEUED
-    assert reopened_writer.close() is False
+    reopened_writer_closed = reopened_writer.close()
+    assert reopened_writer_closed is False
     with pytest.raises(EvaluationValidationError, match="unsealed writer session"):
         load_shadow_journal(path)
 
