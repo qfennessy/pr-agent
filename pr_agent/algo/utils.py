@@ -1076,6 +1076,13 @@ def _safe_load_yaml(response_text: str, *, reject_duplicate_keys: bool):
     return yaml.safe_load(response_text)
 
 
+def _find_yaml_key_start(response_text: str, first_key: str) -> int:
+    index_start = response_text.find(f"\n{first_key}:")
+    if index_start == -1:
+        index_start = response_text.find(f"{first_key}:")
+    return index_start
+
+
 def _extract_yaml_document(response_text: str, index_start: int, first_key: str) -> str:
     """Extract one root-keyed YAML document without truncating internal blank lines."""
     response_tail = response_text[index_start:].strip()
@@ -1114,6 +1121,11 @@ def load_yaml(
     response_text = unfenced.rstrip().removesuffix('```')
     response_text = sanitize_yaml_control_chars(response_text)
     response_text_original_sanitized = sanitize_yaml_control_chars(response_text_original, log=False)
+    if reject_duplicate_keys and first_key and last_key:
+        index_start = _find_yaml_key_start(response_text, first_key)
+        if index_start != -1:
+            response_text = _extract_yaml_document(response_text, index_start, first_key)
+            response_text_original_sanitized = response_text
     try:
         # yaml.safe_load('') / yaml.safe_load(' ') returns None without raising, so a response that was
         # non-empty before preprocessing/sanitization but is blank afterwards (e.g. it consisted entirely of
@@ -1243,9 +1255,7 @@ def try_fix_yaml(response_text: str,
     # note that 'last_key' can be in practice a key that is not the last key in the yaml snippet.
     # it just needs to be some inner key, so we can look for newlines after it
     if first_key and last_key:
-        index_start = response_text.find(f"\n{first_key}:")
-        if index_start == -1:
-            index_start = response_text.find(f"{first_key}:")
+        index_start = _find_yaml_key_start(response_text, first_key)
         index_last_code = response_text.rfind(f"{last_key}:")
         if reject_duplicate_keys:
             response_text_copy = _extract_yaml_document(response_text, index_start, first_key)

@@ -122,6 +122,7 @@ PR Feedback:
         [
             "Here is the requested verifier response:\n{yaml}\nReview complete.",
             "Here is the requested verifier response:\n```yaml\n{yaml}\n```\nReview complete.",
+            "note: first preface\nnote: second preface\n{yaml}\nReview complete.",
         ],
     )
     def test_strict_duplicate_rejection_scans_past_internal_blank_lines(self, response_template):
@@ -160,6 +161,7 @@ PR Feedback:
         [
             "Here is the requested verifier response:\n{yaml}\nReview complete.",
             "Here is the requested verifier response:\n```yaml\n{yaml}\n```\nReview complete.",
+            "note: first preface\nnote: second preface\n{yaml}\nReview complete.",
         ],
     )
     def test_strict_repair_preserves_internal_blank_lines_and_excludes_trailing_prose(self, response_template):
