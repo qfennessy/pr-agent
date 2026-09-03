@@ -215,12 +215,15 @@ class PRReviewer:
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
             self.git_provider.get_pr_description(split_changes_walkthrough=True))
-        if (self.pr_description_files and get_settings().get("config.is_auto_command", False) and
-                get_settings().get("config.enable_ai_metadata", False)):
+        self._enable_ai_metadata = bool(
+            self.pr_description_files
+            and get_settings().get("config.is_auto_command", False)
+            and get_settings().get("config.enable_ai_metadata", False)
+        )
+        if self._enable_ai_metadata:
             add_ai_metadata_to_diff_files(self.git_provider, self.pr_description_files)
             get_logger().debug("AI metadata added to the this command")
         else:
-            get_settings().set("config.enable_ai_metadata", False)
             get_logger().debug("AI metadata is disabled for this command")
 
         bugs_only = self.review_profile == "bugs_only"
@@ -285,7 +288,7 @@ class PRReviewer:
             "commit_messages_str": self.git_provider.get_commit_messages(),
             "custom_labels": "",
             "enable_custom_labels": not bugs_only and get_settings().config.enable_custom_labels,
-            "is_ai_metadata":  get_settings().get("config.enable_ai_metadata", False),
+            "is_ai_metadata": self._enable_ai_metadata,
             "related_tickets": [] if bugs_only else get_settings().get('related_tickets', []),
             'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False),
             "date": datetime.datetime.now().strftime('%Y-%m-%d'),

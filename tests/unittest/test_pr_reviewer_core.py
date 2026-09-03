@@ -7613,6 +7613,35 @@ def test_init_maps_user_question_and_answer_to_correct_prompt_vars(monkeypatch):
     assert reviewer.vars["answer_str"] == "/answer Because it fixes production."
 
 
+def test_init_keeps_ai_metadata_configuration_request_local(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.get_languages.return_value = {}
+    provider.get_files.return_value = []
+    provider.get_pr_description.return_value = ("desc", [])
+    monkeypatch.setattr(pr_reviewer_module, "get_git_provider_with_context", lambda pr_url: provider)
+    monkeypatch.setattr(pr_reviewer_module, "get_main_pr_language", lambda languages, files: "Python")
+    monkeypatch.setattr(pr_reviewer_module, "TokenHandler", MagicMock())
+    settings_snapshot = snapshot_settings([
+        "config.enable_ai_metadata",
+        "config.is_auto_command",
+    ])
+    try:
+        get_settings().set("config.enable_ai_metadata", True)
+        get_settings().set("config.is_auto_command", True)
+
+        reviewer = PRReviewer(
+            "https://example/pr/1",
+            ai_handler=lambda: SimpleNamespace(main_pr_language=None),
+        )
+
+        assert get_settings().get("config.enable_ai_metadata") is True
+        assert reviewer.vars["is_ai_metadata"] is False
+    finally:
+        restore_settings(settings_snapshot)
+
+
 @pytest.mark.parametrize(("configured", "expected"), [("true", True), ("false", False)])
 def test_init_normalizes_optional_review_flag_strings(monkeypatch, configured, expected):
     from pr_agent.tools import pr_reviewer as pr_reviewer_module
