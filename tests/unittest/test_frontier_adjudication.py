@@ -120,6 +120,24 @@ def output(decision="confirm", severity="medium", confidence=0.9, citations=None
     })
 
 
+@pytest.mark.parametrize(
+    "prompt",
+    [True, 7, "not-a-table", ["not", "a", "table"]],
+    ids=["boolean", "number", "string", "list"],
+)
+def test_loader_rejects_non_mapping_prompt_section(prompt):
+    section = {
+        "enable_frontier_adjudication": True,
+        "enable_candidate_verification": True,
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="frontier adjudication prompt must be a mapping",
+    ):
+        load_frontier_adjudication_config(section, prompt)
+
+
 def config(
     *,
     enabled=True,

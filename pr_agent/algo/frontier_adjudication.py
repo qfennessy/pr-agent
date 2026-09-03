@@ -454,6 +454,9 @@ def load_frontier_adjudication_config(
 ) -> FrontierAdjudicationConfig:
     """Build one immutable route from explicit frontier-only configuration."""
 
+    if not isinstance(prompt, Mapping):
+        raise FrontierContractError("frontier adjudication prompt must be a mapping")
+
     def enabled_flag(key: str) -> bool:
         value = section.get(key, False)
         if isinstance(value, str):

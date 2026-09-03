@@ -1776,6 +1776,36 @@ async def test_invalid_frontier_identity_configuration_fails_before_every_model_
     }
 
 
+def test_non_mapping_frontier_prompt_reports_source_free_invalid_configuration():
+    reviewer = _make_prediction_reviewer()
+    reviewer.ai_handler = SimpleNamespace(azure=False)
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "frontier_adjudication_prompt",
+        "pr_reviewer.enable_candidate_verification",
+        "pr_reviewer.enable_frontier_adjudication",
+    ))
+    try:
+        settings.set("frontier_adjudication_prompt", "not-a-table")
+        settings.pr_reviewer.enable_candidate_verification = True
+        settings.pr_reviewer.enable_frontier_adjudication = True
+
+        prepared = reviewer._prepare_frontier_adjudication_config()
+    finally:
+        restore_settings(snapshot)
+
+    assert prepared is False
+    assert reviewer._frontier_adjudication_config is None
+    assert reviewer.frontier_adjudication_artifact == {
+        "enabled": True,
+        "status": "configuration_invalid",
+        "failure": "invalid_configuration",
+        "results": [],
+        "publication_safe": False,
+    }
+
+
 @pytest.mark.asyncio
 async def test_invalid_frontier_preflight_publishes_one_source_free_failure_artifact(
     monkeypatch,
