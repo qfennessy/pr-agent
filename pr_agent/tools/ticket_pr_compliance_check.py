@@ -35,11 +35,8 @@ MARKDOWN_FENCED_CODE_CLOSER_PATTERN = re.compile(
     r"^[ \t]*(?P<marker>`+|~+)[ \t]*(?:\n|$)",
     re.MULTILINE,
 )
-MARKDOWN_INLINE_CODE_PATTERN = re.compile(
-    r"(?<!`)(?P<delimiter>`+)"
-    r"(?:(?!\n)(?!(?P=delimiter))[\s\S])*?"
-    r"(?P=delimiter)(?!`)",
-)
+# Inline code is masked with a deterministic run scanner below. A backreference
+# regex can backtrack excessively on long, untrusted delimiter runs.
 # Option A: issue number at start of branch or after /, followed by - or end (e.g. feature/1-test-issue, 123-fix)
 BRANCH_ISSUE_PATTERN = re.compile(r"(?:^|/)(\d{1,6})(?=-|$)")
 
@@ -266,6 +263,66 @@ def extract_gitlab_ticket_references(pr_description, repo_path, gitlab_url):
     return references[:MAX_GITLAB_TICKETS]
 
 
+def _mask_markdown_range(masked_text, text, start, end):
+    for index in range(start, end):
+        if text[index] != "\n":
+            masked_text[index] = " "
+
+
+def _mask_markdown_inline_code(text):
+    """Mask matched backtick spans with a linear, delimiter-aware scan."""
+
+    masked_text = list(text)
+    line_start = 0
+    while line_start < len(text):
+        line_end = text.find("\n", line_start)
+        if line_end == -1:
+            line_end = len(text)
+
+        runs = []
+        index = line_start
+        while index < line_end:
+            if text[index] != "`":
+                index += 1
+                continue
+            run_end = index + 1
+            while run_end < line_end and text[run_end] == "`":
+                run_end += 1
+            runs.append((index, run_end, run_end - index))
+            index = run_end
+
+        next_same_run = [None] * len(runs)
+        last_run_by_length = {}
+        for index in range(len(runs) - 1, -1, -1):
+            delimiter_length = runs[index][2]
+            next_same_run[index] = last_run_by_length.get(delimiter_length)
+            last_run_by_length[delimiter_length] = index
+
+        cursor = line_start
+        run_index = 0
+        while run_index < len(runs):
+            opener_start, opener_end, _ = runs[run_index]
+            if opener_start < cursor:
+                run_index += 1
+                continue
+
+            closer_index = next_same_run[run_index]
+            if closer_index is None:
+                cursor = opener_end
+                run_index += 1
+                continue
+
+            _mask_markdown_range(masked_text, text, opener_start, runs[closer_index][1])
+            cursor = runs[closer_index][1]
+            run_index = closer_index + 1
+
+        if line_end == len(text):
+            break
+        line_start = line_end + 1
+
+    return "".join(masked_text)
+
+
 def _mask_markdown_code(text):
     """Replace Markdown code with spaces while retaining source offsets."""
 
@@ -285,18 +342,13 @@ def _mask_markdown_code(text):
                 break
 
         end = closer.end() if closer is not None else len(text)
-        for index in range(opener.start(), end):
-            if text[index] != "\n":
-                masked_text[index] = " "
+        _mask_markdown_range(masked_text, text, opener.start(), end)
 
         cursor = end
         if closer is None:
             break
 
-    def _mask(match):
-        return "".join("\n" if character == "\n" else " " for character in match.group(0))
-
-    return MARKDOWN_INLINE_CODE_PATTERN.sub(_mask, "".join(masked_text))
+    return _mask_markdown_inline_code("".join(masked_text))
 
 
 def _parse_github_issue_reference_url(ticket_url):

@@ -355,6 +355,18 @@ https://github.com/org/repo/issues/10
             "https://github.com/org/repo/issues/2"
         ]
 
+    def test_inline_code_masks_longer_inner_backtick_runs(self):
+        description = "`References #8 `` remains code` and Fixes #2"
+        assert extract_ticket_links_from_pr_description(description, "org/repo") == [
+            "https://github.com/org/repo/issues/2"
+        ]
+
+    def test_unclosed_long_inline_delimiter_does_not_hide_later_reference(self):
+        description = "prefix " + "`" * 3000 + " and Fixes #2"
+        assert extract_ticket_links_from_pr_description(description, "org/repo") == [
+            "https://github.com/org/repo/issues/2"
+        ]
+
     @pytest.mark.parametrize(("opener", "closer"), [("```", "````"), ("~~~", "~~~~")])
     def test_fenced_code_accepts_a_longer_matching_closer(self, opener, closer):
         description = f"{opener}markdown\nFixes #8\n{closer}\nFixes #2"
