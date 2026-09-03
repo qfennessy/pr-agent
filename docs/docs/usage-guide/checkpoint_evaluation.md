@@ -421,8 +421,15 @@ structured review payload and request-local run telemetry, with elapsed time fro
 while forcing provider publication, GitHub Action output, external output sinks, and process-local
 rendered artifacts off. It requires an outer isolation boundary and a fresh reviewer instance.
 
-This is not yet the production evaluation adapter. Provider and model-handler constructors still
-touch process-wide settings, callbacks, credentials, and environment variables. A future adapter
-must isolate reviewer construction and execution in a dedicated subprocess (or first remove those
-process-global writes). Therefore `no_publish_review_facade_unavailable` remains fail-closed for
-the general-review and full-cascade arms.
+`checkpoint_review_subprocess` wraps construction and execution in a dedicated child process.
+Its versioned pipe protocol is disabled unless model execution is explicitly allowed, validates
+the complete request before importing model handlers, disables working-tree enrichment and every
+output sink, and returns only structured review data plus bounded run telemetry. Process-wide
+settings, callbacks, credentials, and environment mutations die with the child process.
+
+This is still not a runnable production evaluation arm. General-review findings do not yet expose
+the normalized fingerprint/severity contract required by `ProductionArmResult`, effective review
+configuration does not yet have an immutable child-process replay contract, and paid calls do not
+yet have an enforceable pre-call dollar cap. The worker refuses execution when it cannot reproduce
+the snapshot's source-free configuration hash. Those blockers remain fail-closed for general review
+and the full cascade.
