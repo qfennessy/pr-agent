@@ -23,6 +23,7 @@ from pr_agent.algo.review_snapshot import (
     CoverageIssue,
     ReviewEvent,
     ReviewSnapshot,
+    snapshot_review_instructions,
 )
 
 CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION = "checkpoint-review-subprocess-v1"
@@ -471,6 +472,11 @@ async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubproces
     settings.set("plain_diff.disable_working_tree_enrichment", True)
     settings.set("plain_diff.repo_context_files", {})
     settings.set("related_tickets", [])
+    existing_instructions = str(settings.get("pr_reviewer.extra_instructions", "") or "")
+    settings.set(
+        "pr_reviewer.extra_instructions",
+        snapshot_review_instructions(snapshot, existing_instructions),
+    )
 
     started = time.monotonic()
     with open(os.devnull, "w", encoding="utf-8") as sink, redirect_stdout(sink):
@@ -554,12 +560,19 @@ async def _exchange_with_worker(
     wait_closed = getattr(process.stdin, "wait_closed", None)
     if wait_closed is not None:
         await wait_closed()
-    output = await process.stdout.read(max_output_bytes + 1)
-    if len(output) > max_output_bytes:
-        await _stop_process(process)
-        return b"", True
+    chunks: list[bytes] = []
+    output_size = 0
+    while True:
+        chunk = await process.stdout.read(min(65_536, max_output_bytes + 1 - output_size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        output_size += len(chunk)
+        if output_size > max_output_bytes:
+            await _stop_process(process)
+            return b"", True
     await process.wait()
-    return output, False
+    return b"".join(chunks), False
 
 
 async def run_checkpoint_review_subprocess(
