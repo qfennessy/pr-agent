@@ -120,6 +120,10 @@ def test_production_binding_inventory_is_exact_and_fail_closed():
         "frontier_decision_semantics_unavailable",
         "hard_cost_cap_enforcement_unavailable",
     }
+    general_review = next(
+        item for item in inventory.bindings if item.kind is EvaluationArmKind.GENERAL_REVIEW
+    )
+    assert "no_publish_review_facade_unavailable" in general_review.blocker_codes
 
 
 def test_production_bindings_preserve_frozen_manifest_contracts():

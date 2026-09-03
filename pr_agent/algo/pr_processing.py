@@ -16,6 +16,7 @@ from pr_agent.algo.git_patch_processing import (
     handle_patch_deletions,
 )
 from pr_agent.algo.language_handler import sort_files_by_main_languages
+from pr_agent.algo.review_execution_context import review_execution_is_isolated
 from pr_agent.algo.run_details import record_model_used, record_specialist_model_attempt
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.types import EDIT_TYPE
@@ -140,7 +141,8 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
     if pr_languages:
         try:
             get_logger().info(f"PR main language: {pr_languages[0]['language']}")
-        except Exception as e:
+        except Exception:
+            # Language detection is best-effort and must not block diff generation.
             pass
 
     # generate a standard diff string, with patch extension
@@ -286,7 +288,8 @@ def get_pr_diff_multiple_patchs(git_provider: GitProvider, token_handler: TokenH
     if pr_languages:
         try:
             get_logger().info(f"PR main language: {pr_languages[0]['language']}")
-        except Exception as e:
+        except Exception:
+            # Language detection is best-effort and must not block diff generation.
             pass
 
     patches_compressed_list, total_tokens_list, deleted_files_list, remaining_files_list, file_dict, files_in_patches_list = \
@@ -511,7 +514,7 @@ async def retry_with_fallback_models(
     rewrite ``openai.deployment_id`` in shared Dynaconf state.
     """
 
-    request_local_route = model_route is not None
+    request_local_route = model_route is not None or review_execution_is_isolated()
     if model_route is None:
         all_models = tuple(_get_all_models(model_type))
         all_deployments = tuple(_get_all_deployments(list(all_models)))
@@ -574,7 +577,7 @@ async def retry_with_fallback_models(
             # Keep both attribution surfaces in sync: run details power the optional
             # telemetry footer, while persistent multi-review comments display the model
             # that actually answered when a fallback succeeds.
-            if model_route.attribution is None:
+            if model_route.attribution is None and not review_execution_is_isolated():
                 get_settings().set("config.last_used_model", model)
             record_model_used(
                 model,
@@ -616,6 +619,8 @@ def _publish_model_failure_summary(attempts: List[dict], last_error: str) -> Non
     Example:
         >>> _publish_model_failure_summary([{"attempt": "1/2", "model": "openai/x"}], "timeout")
     """
+    if review_execution_is_isolated():
+        return
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path or not attempts:
         return

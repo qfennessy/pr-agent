@@ -17,6 +17,7 @@ from pr_agent.algo.frontier_adjudication import (
 )
 from pr_agent.algo.inline_comment_dedup import body_with_markers, get_inline_comment_store, key_issue_fingerprint
 from pr_agent.algo.pr_processing import PRDiffCoverage, retry_with_fallback_models
+from pr_agent.algo.review_execution_context import isolate_review_execution
 from pr_agent.algo.review_router import (
     ChangedFile,
     ChangeKind,
@@ -403,6 +404,40 @@ async def test_routed_prediction_applies_context_budget_and_model_specific_token
         return_deleted_files=True,
         max_context_tokens=8_000,
         max_output_tokens=2_048,
+    )
+
+
+@pytest.mark.asyncio
+async def test_isolated_prediction_rebuilds_token_accounting_for_current_ticket_context():
+    provider = MagicMock()
+    provider.pr = MagicMock()
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.vars = {"related_tickets": [{"ticket_id": "fresh-ticket"}]}
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
+    isolated_token_handler = MagicMock()
+
+    with (
+        isolate_review_execution(),
+        patch("pr_agent.tools.pr_reviewer.TokenHandler", return_value=isolated_token_handler) as token_handler,
+        patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value="diff") as get_pr_diff,
+    ):
+        await reviewer._prepare_prediction("review-model")
+
+    token_handler.assert_called_once_with(
+        provider.pr,
+        reviewer.vars,
+        get_settings().pr_review_prompt.system,
+        get_settings().pr_review_prompt.user,
+        model="review-model",
+    )
+    get_pr_diff.assert_called_once_with(
+        provider,
+        isolated_token_handler,
+        "review-model",
+        add_line_numbers_to_hunks=True,
+        disable_extra_lines=False,
+        return_remaining_files=True,
+        return_deleted_files=True,
     )
 
 
@@ -6521,6 +6556,276 @@ review:
 
 
 @pytest.mark.asyncio
+async def test_structured_no_publish_run_returns_isolated_review_without_output_mutations(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["app.py"]
+    git_provider.is_supported.return_value = True
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    structured_review = {
+        "review": {
+            "score": "85",
+            "key_issues_to_review": [{"issue_header": "captured finding"}],
+        }
+    }
+    reviewer.verified_review_data = structured_review
+    reviewer.set_review_labels = MagicMock()
+
+    def prepare_route():
+        # Production routing may explicitly select a publishing route. The forced
+        # no-publish boundary must remain authoritative after that decision.
+        reviewer._review_shadow_only = False
+
+    reviewer._prepare_review_route = MagicMock(side_effect=prepare_route)
+
+    async def fake_retry(prepare_fn, model_type=None, model_route=None):
+        reviewer.prediction = VALID_PREDICTION
+
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", AsyncMock())
+    monkeypatch.setattr(pr_reviewer_module, "convert_to_markdown_v2", lambda *_args, **_kwargs: "review")
+
+    settings = get_settings()
+    settings_snapshot = snapshot_settings((
+        "config.publish_output",
+        "config.is_auto_command",
+        "data",
+        "pr_reviewer.enable_candidate_verification",
+        "pr_reviewer.inline_key_issues",
+        "pr_reviewer.persistent_comment",
+    ))
+    try:
+        settings.config.publish_output = True
+        settings.config.is_auto_command = False
+        settings.pr_reviewer.enable_candidate_verification = False
+        settings.pr_reviewer.inline_key_issues = True
+        settings.pr_reviewer.persistent_comment = True
+        settings.data = {"artifact": "unchanged"}
+        with (
+            isolate_review_execution(),
+            patch("pr_agent.tools.pr_reviewer.github_action_output") as action_output,
+            patch("pr_agent.tools.pr_reviewer.push_outputs") as push,
+        ):
+            result = await reviewer._run_structured_no_publish_once()
+        assert settings.data == {"artifact": "unchanged"}
+    finally:
+        restore_settings(settings_snapshot)
+
+    assert result.review["review"]["key_issues_to_review"] == [{"issue_header": "captured finding"}]
+    assert result.review["metadata"]["review_profile"] == "full"
+    assert result.run_details.review_profile == "full"
+    assert reviewer._force_no_publish is False
+    assert reviewer._structured_review_result is None
+    assert reviewer._prepare_review_route.call_count == 1
+    action_output.assert_not_called()
+    push.assert_not_called()
+    reviewer.set_review_labels.assert_not_called()
+    for method_name in (
+        "publish_structured_review",
+        "publish_comment",
+        "publish_persistent_comment",
+        "publish_code_suggestions",
+        "publish_labels",
+        "clear_persistent_review",
+        "remove_comment",
+    ):
+        getattr(git_provider, method_name).assert_not_called()
+
+    structured_review["review"]["key_issues_to_review"].clear()
+    assert result.review["review"]["key_issues_to_review"] == [{"issue_header": "captured finding"}]
+    assert result.run_details.finish_time is not None
+    assert result.run_details.duration_seconds == max(
+        0.0,
+        result.run_details.finish_time - result.run_details.start_time,
+    )
+
+
+@pytest.mark.asyncio
+async def test_structured_no_publish_run_restores_force_gate_after_error():
+    reviewer = _make_prediction_reviewer()
+    reviewer.vars = {}
+    reviewer._force_no_publish = False
+    reviewer._structured_review_result = {"review": {"score": "stale"}}
+    reviewer.run = AsyncMock(side_effect=RuntimeError("failed"))
+
+    with isolate_review_execution(), pytest.raises(RuntimeError, match="failed"):
+        await reviewer._run_structured_no_publish_once()
+
+    assert reviewer._force_no_publish is False
+    assert reviewer._structured_review_result is None
+
+
+@pytest.mark.asyncio
+async def test_structured_no_publish_run_requires_outer_isolation():
+    reviewer = _make_prediction_reviewer()
+    reviewer.vars = {}
+    reviewer.run = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="outer isolation boundary"):
+        await reviewer._run_structured_no_publish_once()
+
+    reviewer.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_structured_no_publish_run_rejects_reused_reviewer_after_failure():
+    reviewer = _make_prediction_reviewer()
+    reviewer.vars = {}
+    reviewer.run = AsyncMock(side_effect=RuntimeError("first attempt failed"))
+
+    with isolate_review_execution(), pytest.raises(RuntimeError, match="first attempt failed"):
+        await reviewer._run_structured_no_publish_once()
+
+    with isolate_review_execution(), pytest.raises(RuntimeError, match="fresh reviewer instance"):
+        await reviewer._run_structured_no_publish_once()
+
+    reviewer.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_structured_no_publish_run_rejects_reviewer_after_ordinary_run_started():
+    reviewer = _make_prediction_reviewer()
+    reviewer.vars = {}
+    reviewer.git_provider.get_files.return_value = []
+    reviewer._prepare_route_after_empty_review_inventory = MagicMock()
+    reviewer._local_artifact_mutations_allowed = MagicMock(return_value=False)
+
+    await reviewer.run()
+
+    with isolate_review_execution(), pytest.raises(RuntimeError, match="fresh reviewer instance"):
+        await reviewer._run_structured_no_publish_once()
+
+    reviewer.git_provider.get_files.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_structured_no_publish_run_isolates_telemetry_and_shared_request_state(monkeypatch):
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["app.py"]
+    git_provider.is_supported.return_value = False
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {"related_tickets": [{"ticket_id": "constructor"}]}
+    reviewer._prepare_review_route = MagicMock()
+    reviewer._review_model_route = MagicMock(return_value=None)
+
+    async def prepare_prediction(model):
+        assert get_settings().get("openai.deployment_id") == "outer-deployment"
+        reviewer.prediction = VALID_PREDICTION
+
+    def prepare_review():
+        reviewer._publish_structured_review_data({"review": {"key_issues_to_review": []}})
+        return "review"
+
+    reviewer._prepare_prediction = prepare_prediction
+    reviewer._prepare_pr_review = prepare_review
+
+    prior_details = init_run_details()
+    prior_details.model_used = "outer-model"
+    settings = get_settings()
+    settings_snapshot = snapshot_settings((
+        "config.model",
+        "config.fallback_models",
+        "config.last_used_model",
+        "config.publish_output",
+        "data",
+        "openai.deployment_id",
+        "openai.fallback_deployments",
+        "pr_reviewer.require_ticket_analysis_review",
+        "related_tickets",
+    ))
+    try:
+        settings.config.model = "review-model"
+        settings.config.fallback_models = []
+        settings.config.last_used_model = "outer-model"
+        settings.config.publish_output = False
+        settings.set("openai.deployment_id", "outer-deployment")
+        settings.set("openai.fallback_deployments", [])
+        settings.pr_reviewer.require_ticket_analysis_review = True
+        settings.set("related_tickets", [{"ticket_id": "outer-ticket"}])
+        settings.data = {"artifact": "outer-artifact"}
+        with patch(
+            "pr_agent.tools.ticket_pr_compliance_check.extract_tickets",
+            new_callable=AsyncMock,
+            return_value=[{"ticket_id": "isolated-ticket"}],
+        ) as extract_tickets:
+            with isolate_review_execution():
+                result = await reviewer._run_structured_no_publish_once()
+
+        assert get_run_details() is prior_details
+        assert settings.config.last_used_model == "outer-model"
+        assert settings.get("related_tickets") == [{"ticket_id": "outer-ticket"}]
+        assert settings.data == {"artifact": "outer-artifact"}
+        assert reviewer.vars["related_tickets"] == [{"ticket_id": "constructor"}]
+    finally:
+        restore_settings(settings_snapshot)
+
+    extract_tickets.assert_awaited_once_with(git_provider)
+    assert result.review["review"]["key_issues_to_review"] == []
+    assert result.run_details is not prior_details
+    assert result.run_details.model_used == "review-model"
+
+
+@pytest.mark.asyncio
+async def test_structured_no_publish_run_suppresses_all_models_failed_ci_summary(tmp_path, monkeypatch):
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["app.py"]
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._prepare_review_route = MagicMock()
+    reviewer._review_model_route = MagicMock(return_value=None)
+    reviewer._prepare_prediction = AsyncMock(side_effect=TimeoutError("provider unavailable"))
+    summary_path = tmp_path / "step-summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
+
+    settings = get_settings()
+    settings_snapshot = snapshot_settings((
+        "config.model",
+        "config.fallback_models",
+        "config.propagate_tool_errors",
+        "config.publish_output",
+        "openai.deployment_id",
+        "openai.fallback_deployments",
+        "pr_reviewer.require_ticket_analysis_review",
+    ))
+    try:
+        settings.config.model = "review-model"
+        settings.config.fallback_models = ["fallback-model"]
+        settings.config.propagate_tool_errors = False
+        settings.config.publish_output = True
+        settings.set("openai.deployment_id", None)
+        settings.set("openai.fallback_deployments", [])
+        settings.pr_reviewer.require_ticket_analysis_review = False
+
+        with isolate_review_execution():
+            result = await reviewer._run_structured_no_publish_once()
+    finally:
+        restore_settings(settings_snapshot)
+
+    assert result.review is None
+    assert result.run_details.model_used is None
+    assert reviewer._prepare_prediction.await_count == 2
+    assert not summary_path.exists()
+    git_provider.publish_comment.assert_not_called()
+
+
+def test_structured_publisher_fast_path_still_skips_enrichment_when_unsupported():
+    class CannotCopy:
+        def __deepcopy__(self, memo):
+            raise AssertionError("ordinary unsupported providers must not enrich structured output")
+
+    git_provider = MagicMock()
+    git_provider.publish_structured_review = None
+    reviewer = _make_prediction_reviewer(git_provider)
+
+    reviewer._publish_structured_review_data({"review": CannotCopy()})
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("result", ["unavailable", "failed"])
 async def test_shadow_only_unavailable_or_failed_result_clears_stale_artifact_without_mutations(
         monkeypatch, result):
@@ -7352,6 +7657,35 @@ def test_init_maps_user_question_and_answer_to_correct_prompt_vars(monkeypatch):
 
     assert reviewer.vars["question_str"] == "Questions to better understand the PR:\n- Why?"
     assert reviewer.vars["answer_str"] == "/answer Because it fixes production."
+
+
+def test_init_keeps_ai_metadata_configuration_request_local(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.get_languages.return_value = {}
+    provider.get_files.return_value = []
+    provider.get_pr_description.return_value = ("desc", [])
+    monkeypatch.setattr(pr_reviewer_module, "get_git_provider_with_context", lambda pr_url: provider)
+    monkeypatch.setattr(pr_reviewer_module, "get_main_pr_language", lambda languages, files: "Python")
+    monkeypatch.setattr(pr_reviewer_module, "TokenHandler", MagicMock())
+    settings_snapshot = snapshot_settings([
+        "config.enable_ai_metadata",
+        "config.is_auto_command",
+    ])
+    try:
+        get_settings().set("config.enable_ai_metadata", True)
+        get_settings().set("config.is_auto_command", True)
+
+        reviewer = PRReviewer(
+            "https://example/pr/1",
+            ai_handler=lambda: SimpleNamespace(main_pr_language=None),
+        )
+
+        assert get_settings().get("config.enable_ai_metadata") is True
+        assert reviewer.vars["is_ai_metadata"] is False
+    finally:
+        restore_settings(settings_snapshot)
 
 
 @pytest.mark.parametrize(("configured", "expected"), [("true", True), ("false", False)])

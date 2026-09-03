@@ -20,6 +20,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from pr_agent.algo.review_execution_context import isolate_review_execution
 from pr_agent.algo.utils import (
     convert_to_markdown_v2,
     emphasize_header,
@@ -403,6 +404,20 @@ class TestTicketMarkdownLogic:
             "config.extra_statistics.compliance_level"
         )
         assert compliance_level == "PR Code Verified"
+
+    def test_isolated_ticket_rendering_does_not_mutate_extra_statistics(self):
+        get_settings().set("config.extra_statistics", {"compliance_level": "outer"})
+
+        with isolate_review_execution():
+            out = ticket_markdown_logic(
+                "🎫",
+                "",
+                [self._ticket(fully_compliant_requirements="- ok\n")],
+                True,
+            )
+
+        assert "Ticket compliance analysis ✅" in out
+        assert get_settings().get("config.extra_statistics.compliance_level") == "outer"
 
     def test_ticket_with_no_requirements_renders_header_only(self):
         # Tickets with no classified requirements are skipped in the

@@ -8,11 +8,12 @@ stay isolated between concurrent requests.
 """
 
 import time
+from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any, Mapping, Optional
+from typing import Any, Iterator, Mapping, Optional
 
 from pr_agent.algo.ai_request_context import get_ai_request_options
 
@@ -264,10 +265,18 @@ class RunDetails:
     # Monotonic reference taken when the collector is installed, i.e. at the top of the
     # tool's run(). Monotonic so that wall-clock adjustments cannot yield a negative duration.
     start_time: float = field(default_factory=time.monotonic)
+    finish_time: Optional[float] = field(default=None, repr=False, compare=False)
 
     @property
     def duration_seconds(self) -> float:
-        return max(0.0, time.monotonic() - self.start_time)
+        end_time = self.finish_time if self.finish_time is not None else time.monotonic()
+        return max(0.0, end_time - self.start_time)
+
+    def freeze_duration(self) -> None:
+        """Stop elapsed-time accounting at the current monotonic timestamp."""
+
+        if self.finish_time is None:
+            self.finish_time = time.monotonic()
 
     @property
     def has_token_usage(self) -> bool:
@@ -297,6 +306,17 @@ def init_run_details() -> RunDetails:
 def get_run_details() -> Optional[RunDetails]:
     """Return the collector for the current run, or None if not initialized."""
     return _run_details.get()
+
+
+@contextmanager
+def isolate_run_details() -> Iterator[None]:
+    """Install an empty request-local telemetry slot and restore the caller's slot."""
+
+    token = _run_details.set(None)
+    try:
+        yield
+    finally:
+        _run_details.reset(token)
 
 
 def _get_specialist_details(attribution: str) -> Optional[SpecialistRunDetails]:

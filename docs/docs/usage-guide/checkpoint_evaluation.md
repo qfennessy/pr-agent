@@ -414,3 +414,15 @@ checkpoint controls and serialized snapshots; run the
 frozen paid replay within an authorized cap; collect at least one week of opt-in live shadow
 telemetry; publish the pilot inventory, scorecard, budgets, and gate decisions; and prove
 that the cascade beats the incumbent before enabling local advice or GitHub publication.
+
+Production review orchestration now has an internal, single-use
+`PRReviewer._run_structured_no_publish_once()` execution primitive. It returns the same enriched
+structured review payload and request-local run telemetry, with elapsed time frozen at completion,
+while forcing provider publication, GitHub Action output, external output sinks, and process-local
+rendered artifacts off. It requires an outer isolation boundary and a fresh reviewer instance.
+
+This is not yet the production evaluation adapter. Provider and model-handler constructors still
+touch process-wide settings, callbacks, credentials, and environment variables. A future adapter
+must isolate reviewer construction and execution in a dedicated subprocess (or first remove those
+process-global writes). Therefore `no_publish_review_facade_unavailable` remains fail-closed for
+the general-review and full-cascade arms.
