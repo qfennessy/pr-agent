@@ -211,6 +211,7 @@ def test_bundle_normalizes_supported_dynaconf_string_values():
     (
         "config.model_reasoning",
         "config.model_weak",
+        "openai.api_base",
         "openai.deployment_id",
         "openai.deployment_id_reasoning",
         "openai.deployment_id_weak",

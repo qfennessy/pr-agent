@@ -59,6 +59,7 @@ _STRING_SETTINGS = frozenset({
 _NULLABLE_STRING_SETTINGS = frozenset({
     "config.model_reasoning",
     "config.model_weak",
+    "openai.api_base",
     "openai.deployment_id",
     "openai.deployment_id_reasoning",
     "openai.deployment_id_weak",
