@@ -453,12 +453,17 @@ def _failure_outcome(
     )
 
 
-def _current_review_configuration_hash() -> str:
-    """Recompute the source-free effective configuration identity in the worker."""
+def _current_review_configuration() -> tuple[str, str]:
+    """Render and identify the source-free effective configuration once."""
 
     from pr_agent.algo.review_configuration import snapshot_review_configuration_hash
+    from pr_agent.algo.skills_loader import get_skills_context
 
-    return snapshot_review_configuration_hash(repo_context_files={})
+    skills_context = get_skills_context()
+    return (
+        snapshot_review_configuration_hash(skills_context, repo_context_files={}),
+        skills_context,
+    )
 
 
 async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubprocessOutcome:
@@ -475,7 +480,7 @@ async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubproces
             snapshot_id=snapshot.snapshot_id,
         )
     try:
-        actual_configuration_hash = _current_review_configuration_hash()
+        actual_configuration_hash, skills_context = _current_review_configuration()
     except Exception:
         return _failure_outcome(
             CheckpointReviewSubprocessState.FAILED,
@@ -488,9 +493,18 @@ async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubproces
             "review_configuration_mismatch",
             snapshot_id=snapshot.snapshot_id,
         )
+    if not snapshot.diff.strip():
+        return CheckpointReviewSubprocessOutcome(
+            state=CheckpointReviewSubprocessState.COMPLETED,
+            snapshot_id=snapshot.snapshot_id,
+            review={"review": {"key_issues_to_review": []}},
+            latency_seconds=0.0,
+        )
 
     from pr_agent.algo.ai_handlers.litellm_helpers import drain_litellm_callbacks
     from pr_agent.algo.review_execution_context import isolate_review_execution
+    from pr_agent.algo.review_specialists import use_specialist_snapshot_context
+    from pr_agent.algo.skills_loader import pin_skills_context
     from pr_agent.config_loader import get_settings
     from pr_agent.tools.pr_reviewer import PRReviewer
 
@@ -515,7 +529,11 @@ async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubproces
 
     started = time.monotonic()
     with open(os.devnull, "w", encoding="utf-8") as sink, redirect_stdout(sink):
-        with isolate_review_execution():
+        with (
+            isolate_review_execution(),
+            pin_skills_context(skills_context),
+            use_specialist_snapshot_context(snapshot, lambda: snapshot.snapshot_id),
+        ):
             reviewer = PRReviewer("checkpoint-review-subprocess")
             # PlainDiffGitProvider enables its normal stdout publication setting
             # during construction. Re-close it inside this isolated worker.

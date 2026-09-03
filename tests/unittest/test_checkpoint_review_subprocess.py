@@ -13,6 +13,8 @@ import pytest
 from pr_agent.algo import checkpoint_review_subprocess as review_subprocess
 from pr_agent.algo.review_execution_context import review_execution_is_isolated
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewSnapshot
+from pr_agent.algo.review_specialists import get_specialist_snapshot_context
+from pr_agent.algo.skills_loader import get_skills_context
 
 
 def _snapshot() -> ReviewSnapshot:
@@ -358,8 +360,8 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
     drain = AsyncMock()
     monkeypatch.setattr(
         review_subprocess,
-        "_current_review_configuration_hash",
-        lambda: snapshot.review_configuration_hash,
+        "_current_review_configuration",
+        lambda: (snapshot.review_configuration_hash, "pinned skill content"),
     )
 
     class FakeSettings:
@@ -377,6 +379,11 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
             assert configured["plain_diff.output_path"] is None
             assert configured["plain_diff.json_output_path"] is None
             assert configured["config.propagate_tool_errors"] is True
+            assert get_skills_context() == "pinned skill content"
+            specialist_context = get_specialist_snapshot_context()
+            assert specialist_context is not None
+            assert specialist_context.snapshot is snapshot
+            assert specialist_context.current_snapshot_id() == snapshot.snapshot_id
 
         async def _run_structured_no_publish_once(self):
             assert review_execution_is_isolated() is True
@@ -423,8 +430,8 @@ async def test_execution_passes_snapshot_intent_and_deterministic_evidence_to_re
     configured = {"pr_reviewer.extra_instructions": "persistent rule"}
     monkeypatch.setattr(
         review_subprocess,
-        "_current_review_configuration_hash",
-        lambda: snapshot.review_configuration_hash,
+        "_current_review_configuration",
+        lambda: (snapshot.review_configuration_hash, ""),
     )
 
     class FakeSettings:
@@ -470,8 +477,8 @@ async def test_execution_refuses_mismatched_review_configuration(monkeypatch):
     snapshot = replace(_snapshot(), review_configuration_hash="sha256:" + "a" * 64)
     monkeypatch.setattr(
         review_subprocess,
-        "_current_review_configuration_hash",
-        lambda: "sha256:" + "b" * 64,
+        "_current_review_configuration",
+        lambda: ("sha256:" + "b" * 64, ""),
     )
 
     outcome = await review_subprocess._execute_review(snapshot)
@@ -490,6 +497,34 @@ def test_configuration_hash_does_not_import_cli_logging(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", reject_cli_import)
 
-    configuration_hash = review_subprocess._current_review_configuration_hash()
+    configuration_hash, _skills_context = review_subprocess._current_review_configuration()
 
     assert review_subprocess._SNAPSHOT_ID_PATTERN.fullmatch(configuration_hash)
+
+
+@pytest.mark.asyncio
+async def test_empty_snapshot_completes_without_constructing_reviewer(monkeypatch):
+    snapshot = replace(
+        _snapshot(),
+        changed_paths=(),
+        diff="",
+        review_configuration_hash="sha256:" + "b" * 64,
+    )
+    monkeypatch.setattr(
+        review_subprocess,
+        "_current_review_configuration",
+        lambda: (snapshot.review_configuration_hash, ""),
+    )
+
+    class UnexpectedReviewer:
+        def __init__(self, _pr_url):
+            raise AssertionError("empty snapshots must not construct a reviewer")
+
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.PRReviewer", UnexpectedReviewer)
+
+    outcome = await review_subprocess._execute_review(snapshot)
+
+    assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
+    assert outcome.review == {"review": {"key_issues_to_review": []}}
+    assert outcome.run_details is None
+    assert outcome.latency_seconds == 0.0
