@@ -6218,6 +6218,69 @@ async def test_verification_failure_suppresses_false_clean_publication(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "duplicate_routing_field",
+    [
+        "      normalized_severity: high\n      normalized_severity: medium\n"
+        "      disputed: false\n",
+        "      normalized_severity: medium\n      disputed: true\n"
+        "      disputed: false\n",
+    ],
+    ids=["normalized-severity", "disputed"],
+)
+async def test_frontier_rejects_duplicate_verifier_routing_keys(
+    duplicate_routing_field,
+):
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._run_frontier_adjudications = AsyncMock()
+    reviewer.ai_handler.chat_completion = AsyncMock(return_value=(
+        "verification:\n"
+        "  decisions:\n"
+        "    - candidate_id: candidate-1\n"
+        "      verdict: verified\n"
+        "      relevant_file: src/service.py\n"
+        "      start_line: 12\n"
+        "      end_line: 12\n"
+        "      issue_header: Verified bug\n"
+        "      issue_content: The changed code has a verified defect.\n"
+        f"{duplicate_routing_field}"
+        "      evidence_status: complete\n"
+        "      unresolved_questions: []\n"
+        "      trigger: The changed branch executes.\n"
+        "      impact: The request fails.\n"
+        "      evidence_paths: [src/service.py]",
+        None,
+    ))
+    settings = _verification_settings()
+    settings.pr_reviewer["enable_frontier_adjudication"] = True
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "verifier_response_invalid"
+    assert artifact["failure"] == "duplicate_mapping_key"
+    assert artifact["publication_safe"] is False
+    assert artifact["verified_count"] == 0
+    assert reviewer.verified_review_data["review"]["key_issues_to_review"] == []
+    reviewer._run_frontier_adjudications.assert_not_awaited()
+    assert reviewer.frontier_adjudication_artifact == {
+        "enabled": True,
+        "status": "unavailable",
+        "failure": "candidate_verification_verifier_response_invalid",
+        "results": [],
+        "publication_safe": False,
+    }
+
+
+@pytest.mark.asyncio
 async def test_explicit_rejection_for_every_candidate_is_a_valid_clean_verification():
     provider = MagicMock()
     provider.supports_repo_file_fetching.return_value = True

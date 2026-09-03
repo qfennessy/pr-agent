@@ -96,6 +96,7 @@ from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.token_handler import TokenEncoder, TokenHandler
 from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.algo.utils import (
+    DuplicateYamlKeyError,
     ModelType,
     PRReviewHeader,
     PRReviewIdentity,
@@ -2177,8 +2178,9 @@ class PRReviewer:
         """Verify review candidates against bounded base-branch repository evidence."""
         config = get_settings().pr_reviewer
         consume_specialist_prioritization = self._candidate_specialist_prioritization_enabled()
+        frontier_enabled = self._frontier_adjudication_enabled()
         frontier_dependency_artifact = None
-        if self._frontier_adjudication_enabled():
+        if frontier_enabled:
             frontier_dependency_artifact = self._frontier_verification_dependency_artifact()
         self.frontier_adjudication_artifact = frontier_dependency_artifact
         artifact = {
@@ -2590,13 +2592,22 @@ class PRReviewer:
                 call_verifier,
                 model_route=verifier_route,
             )
-            verification_data = load_yaml(
-                prediction.strip(),
-                keys_fix_yaml=["verification:", "decisions:", "candidate_id:", "relevant_file:",
-                               "start_line:", "end_line:", "evidence_paths:"],
-                first_key="verification",
-                last_key="decisions",
-            )
+            try:
+                verification_data = load_yaml(
+                    prediction.strip(),
+                    keys_fix_yaml=["verification:", "decisions:", "candidate_id:", "relevant_file:",
+                                   "start_line:", "end_line:", "evidence_paths:"],
+                    first_key="verification",
+                    last_key="decisions",
+                    reject_duplicate_keys=frontier_enabled,
+                )
+            except DuplicateYamlKeyError:
+                artifact.update({
+                    "status": "verifier_response_invalid",
+                    "failure": "duplicate_mapping_key",
+                    "verified_count": 0,
+                })
+                return
             response_error = self._verification_response_contract_error(
                 candidates, verification_data
             )
@@ -2620,7 +2631,7 @@ class PRReviewer:
                 verification_data,
                 retrieval_requests=retrieval_artifact["requests"],
             )
-            if self._frontier_adjudication_enabled():
+            if frontier_enabled:
                 await self._run_frontier_adjudications(
                     verified_findings,
                     candidates,

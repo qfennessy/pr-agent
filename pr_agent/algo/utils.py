@@ -12,6 +12,7 @@ import sys
 import textwrap
 import time
 import traceback
+from collections.abc import Hashable
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
@@ -1037,7 +1038,46 @@ def sanitize_yaml_control_chars(text: str, log: bool = True) -> str:
     return sanitized
 
 
-def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", last_key="") -> dict:
+class DuplicateYamlKeyError(ValueError):
+    """Raised when strict AI-response parsing encounters an ambiguous mapping."""
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """SafeLoader variant that rejects duplicate mapping keys."""
+
+
+def _construct_unique_yaml_mapping(loader, node, deep=False):
+    loader.flatten_mapping(node)
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if not isinstance(key, Hashable):
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found unhashable key",
+                key_node.start_mark,
+            )
+        if key in mapping:
+            raise DuplicateYamlKeyError(f"duplicate YAML key: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_yaml_mapping,
+)
+
+
+def load_yaml(
+    response_text: str,
+    keys_fix_yaml: List[str] = [],
+    first_key="",
+    last_key="",
+    *,
+    reject_duplicate_keys: bool = False,
+) -> dict:
     response_text_original = copy.deepcopy(response_text)
     response_text = response_text.strip('\n')
     # strip the fence label only when it is a complete info string, so a key such as
@@ -1056,7 +1096,13 @@ def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", l
         # through the same exception handling as a normal parse failure instead.
         if response_text_original.strip() and not response_text.strip():
             raise ValueError("Preprocessing/sanitization removed all content from a non-empty AI prediction")
-        data = yaml.safe_load(response_text)
+        data = (
+            yaml.load(response_text, Loader=_UniqueKeySafeLoader)
+            if reject_duplicate_keys
+            else yaml.safe_load(response_text)
+        )
+    except DuplicateYamlKeyError:
+        raise
     except Exception as e:
         get_logger().warning(f"Initial failure to parse AI prediction: {e}")
         data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key,
