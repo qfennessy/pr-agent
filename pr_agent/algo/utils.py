@@ -34,6 +34,7 @@ from pr_agent.algo.git_patch_processing import (
     split_git_file_lines,
     strip_git_line_ending,
 )
+from pr_agent.algo.review_execution_context import review_execution_is_isolated
 from pr_agent.algo.run_details import get_run_details
 from pr_agent.algo.token_handler import TokenEncoder
 from pr_agent.algo.types import FilePatchInfo
@@ -708,7 +709,8 @@ def ticket_markdown_logic(emoji, markdown_text, value, gfm_supported) -> str:
                 compliance_emoji = '✅'
 
             # Set extra statistics outside the ticket loop
-            get_settings().set('config.extra_statistics', {'compliance_level': compliance_level})
+            if not review_execution_is_isolated():
+                get_settings().set('config.extra_statistics', {'compliance_level': compliance_level})
 
         # editing table row for ticket compliance analysis
         if gfm_supported:
