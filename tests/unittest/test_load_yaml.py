@@ -117,9 +117,15 @@ PR Feedback:
         with pytest.raises(DuplicateYamlKeyError):
             load_yaml(response, reject_duplicate_keys=True)
 
-    def test_strict_duplicate_rejection_scans_past_internal_blank_lines(self):
-        response = (
-            "Here is the requested verifier response:\n"
+    @pytest.mark.parametrize(
+        "response_template",
+        [
+            "Here is the requested verifier response:\n{yaml}\nReview complete.",
+            "Here is the requested verifier response:\n```yaml\n{yaml}\n```\nReview complete.",
+        ],
+    )
+    def test_strict_duplicate_rejection_scans_past_internal_blank_lines(self, response_template):
+        verifier_yaml = (
             "verification:\n"
             "  decisions:\n"
             "    - candidate_id: candidate-1\n"
@@ -139,6 +145,7 @@ PR Feedback:
             "\n"
             "      disputed: false\n"
         )
+        response = response_template.format(yaml=verifier_yaml)
 
         with pytest.raises(DuplicateYamlKeyError):
             load_yaml(
@@ -147,6 +154,46 @@ PR Feedback:
                 last_key="decisions",
                 reject_duplicate_keys=True,
             )
+
+    @pytest.mark.parametrize(
+        "response_template",
+        [
+            "Here is the requested verifier response:\n{yaml}\nReview complete.",
+            "Here is the requested verifier response:\n```yaml\n{yaml}\n```\nReview complete.",
+        ],
+    )
+    def test_strict_repair_preserves_internal_blank_lines_and_excludes_trailing_prose(self, response_template):
+        verifier_yaml = (
+            "verification:\n"
+            "  decisions:\n"
+            "    - candidate_id: candidate-1\n"
+            "      verdict: verified\n"
+            "      relevant_file: src/service.py\n"
+            "      start_line: 12\n"
+            "      end_line: 12\n"
+            "      issue_header: Verified bug\n"
+            "      issue_content: The changed code has a verified defect.\n"
+            "      normalized_severity: high\n"
+            "\n"
+            "      disputed: true\n"
+            "      evidence_status: complete\n"
+            "      unresolved_questions: []\n"
+            "      trigger: The changed branch executes.\n"
+            "      impact: The request fails.\n"
+            "      evidence_paths: [src/service.py]\n"
+        )
+        response = response_template.format(yaml=verifier_yaml)
+
+        parsed = load_yaml(
+            response,
+            first_key="verification",
+            last_key="decisions",
+            reject_duplicate_keys=True,
+        )
+
+        assert set(parsed) == {"verification"}
+        assert parsed["verification"]["decisions"][0]["candidate_id"] == "candidate-1"
+        assert parsed["verification"]["decisions"][0]["disputed"] is True
 
     # Tests that a fenced block whose info string is separated by a space
     # (CommonMark allows whitespace after the opening fence) parses the same

@@ -1076,6 +1076,26 @@ def _safe_load_yaml(response_text: str, *, reject_duplicate_keys: bool):
     return yaml.safe_load(response_text)
 
 
+def _extract_yaml_document(response_text: str, index_start: int, first_key: str) -> str:
+    """Extract one root-keyed YAML document without truncating internal blank lines."""
+    response_tail = response_text[index_start:].strip()
+    response_lines = response_tail.splitlines()
+    if not response_lines:
+        return ""
+
+    root_indent = len(response_lines[0]) - len(response_lines[0].lstrip())
+    index_end = len(response_lines)
+    for index, line in enumerate(response_lines[1:], start=1):
+        stripped_line = line.strip()
+        if not stripped_line or stripped_line.startswith("#"):
+            continue
+        line_indent = len(line) - len(line.lstrip())
+        if line_indent <= root_indent and not stripped_line.startswith(f"{first_key}:"):
+            index_end = index
+            break
+    return "\n".join(response_lines[:index_end]).strip()
+
+
 def load_yaml(
     response_text: str,
     keys_fix_yaml: List[str] = [],
@@ -1227,14 +1247,13 @@ def try_fix_yaml(response_text: str,
         if index_start == -1:
             index_start = response_text.find(f"{first_key}:")
         index_last_code = response_text.rfind(f"{last_key}:")
-        index_end = (
-            len(response_text)
-            if reject_duplicate_keys
-            else response_text.find("\n\n", index_last_code)
-        )  # look for newlines after last_key
-        if index_end == -1:
-            index_end = len(response_text)
-        response_text_copy = response_text[index_start:index_end].strip()
+        if reject_duplicate_keys:
+            response_text_copy = _extract_yaml_document(response_text, index_start, first_key)
+        else:
+            index_end = response_text.find("\n\n", index_last_code)  # look for newlines after last_key
+            if index_end == -1:
+                index_end = len(response_text)
+            response_text_copy = response_text[index_start:index_end].strip()
         for fence in ("\n```yaml", "\n```yml"):
             if response_text_copy[-len(fence):].lower() == fence:
                 response_text_copy = response_text_copy[: -len(fence)]
