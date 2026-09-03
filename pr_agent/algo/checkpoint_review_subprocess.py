@@ -456,9 +456,9 @@ def _failure_outcome(
 def _current_review_configuration_hash() -> str:
     """Recompute the source-free effective configuration identity in the worker."""
 
-    from pr_agent.cli import _snapshot_review_configuration_hash
+    from pr_agent.algo.review_configuration import snapshot_review_configuration_hash
 
-    return _snapshot_review_configuration_hash(repo_context_files={})
+    return snapshot_review_configuration_hash(repo_context_files={})
 
 
 async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubprocessOutcome:

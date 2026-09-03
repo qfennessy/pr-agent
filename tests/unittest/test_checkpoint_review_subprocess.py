@@ -1,4 +1,5 @@
 import asyncio
+import builtins
 import json
 import subprocess
 import sys
@@ -477,3 +478,18 @@ async def test_execution_refuses_mismatched_review_configuration(monkeypatch):
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.FAILED
     assert outcome.failure_reason_code == "review_configuration_mismatch"
+
+
+def test_configuration_hash_does_not_import_cli_logging(monkeypatch):
+    real_import = builtins.__import__
+
+    def reject_cli_import(name, *args, **kwargs):
+        if name == "pr_agent.cli":
+            raise AssertionError("worker configuration hashing must not import the CLI")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_cli_import)
+
+    configuration_hash = review_subprocess._current_review_configuration_hash()
+
+    assert review_subprocess._SNAPSHOT_ID_PATTERN.fullmatch(configuration_hash)
