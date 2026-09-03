@@ -58,6 +58,16 @@ def test_init_replaces_previous_instance():
     assert second.fallback_used is False
 
 
+def test_freeze_duration_stops_elapsed_time(monkeypatch):
+    timestamps = iter((12.5, 99.0))
+    monkeypatch.setattr("pr_agent.algo.run_details.time.monotonic", lambda: next(timestamps))
+    details = RunDetails(start_time=10.0)
+
+    details.freeze_duration()
+
+    assert details.duration_seconds == 2.5
+
+
 def test_record_model_used_tracks_model_and_fallback_flag():
     init_run_details()
 

@@ -60,7 +60,7 @@ from pr_agent.algo.pr_processing import (
     retry_with_fallback_models,
 )
 from pr_agent.algo.repo_context import build_repo_context
-from pr_agent.algo.review_execution_context import isolate_review_execution
+from pr_agent.algo.review_execution_context import isolate_review_execution, review_execution_is_isolated
 from pr_agent.algo.review_router import (
     ChangedFile,
     ChangeKind,
@@ -546,9 +546,12 @@ class PRReviewer:
             self.vars["related_tickets"] = []
             with isolate_review_execution(), isolate_run_details():
                 await self.run()
+                run_details = copy.deepcopy(get_run_details())
+                if run_details is not None:
+                    run_details.freeze_duration()
                 return StructuredReviewExecution(
                     review=copy.deepcopy(self._structured_review_result),
-                    run_details=copy.deepcopy(get_run_details()),
+                    run_details=run_details,
                 )
         finally:
             self._force_no_publish = previous_force_no_publish
@@ -1313,10 +1316,10 @@ class PRReviewer:
 
     async def _prepare_prediction(self, model: str) -> None:
         decision = getattr(self, "review_route_decision", None)
-        if decision is not None and decision.routing_enabled:
+        if (decision is not None and decision.routing_enabled) or review_execution_is_isolated():
             # Model-specific tokenization matters when the selected profile uses a
-            # weak or reasoning route, and the rebuilt prompt includes its finding
-            # and publication budgets.
+            # weak or reasoning route. Isolated reviews also rebuild after ticket
+            # extraction so diff pruning accounts for the prompt that will be sent.
             self.token_handler = TokenHandler(
                 self.git_provider.pr,
                 self.vars,

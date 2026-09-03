@@ -265,10 +265,18 @@ class RunDetails:
     # Monotonic reference taken when the collector is installed, i.e. at the top of the
     # tool's run(). Monotonic so that wall-clock adjustments cannot yield a negative duration.
     start_time: float = field(default_factory=time.monotonic)
+    finish_time: Optional[float] = field(default=None, repr=False, compare=False)
 
     @property
     def duration_seconds(self) -> float:
-        return max(0.0, time.monotonic() - self.start_time)
+        end_time = self.finish_time if self.finish_time is not None else time.monotonic()
+        return max(0.0, end_time - self.start_time)
+
+    def freeze_duration(self) -> None:
+        """Stop elapsed-time accounting at the current monotonic timestamp."""
+
+        if self.finish_time is None:
+            self.finish_time = time.monotonic()
 
     @property
     def has_token_usage(self) -> bool:

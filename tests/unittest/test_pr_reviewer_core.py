@@ -17,6 +17,7 @@ from pr_agent.algo.frontier_adjudication import (
 )
 from pr_agent.algo.inline_comment_dedup import body_with_markers, get_inline_comment_store, key_issue_fingerprint
 from pr_agent.algo.pr_processing import PRDiffCoverage, retry_with_fallback_models
+from pr_agent.algo.review_execution_context import isolate_review_execution
 from pr_agent.algo.review_router import (
     ChangedFile,
     ChangeKind,
@@ -403,6 +404,40 @@ async def test_routed_prediction_applies_context_budget_and_model_specific_token
         return_deleted_files=True,
         max_context_tokens=8_000,
         max_output_tokens=2_048,
+    )
+
+
+@pytest.mark.asyncio
+async def test_isolated_prediction_rebuilds_token_accounting_for_current_ticket_context():
+    provider = MagicMock()
+    provider.pr = MagicMock()
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.vars = {"related_tickets": [{"ticket_id": "fresh-ticket"}]}
+    reviewer._get_prediction = AsyncMock(return_value=VALID_PREDICTION)
+    isolated_token_handler = MagicMock()
+
+    with (
+        isolate_review_execution(),
+        patch("pr_agent.tools.pr_reviewer.TokenHandler", return_value=isolated_token_handler) as token_handler,
+        patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value="diff") as get_pr_diff,
+    ):
+        await reviewer._prepare_prediction("review-model")
+
+    token_handler.assert_called_once_with(
+        provider.pr,
+        reviewer.vars,
+        get_settings().pr_review_prompt.system,
+        get_settings().pr_review_prompt.user,
+        model="review-model",
+    )
+    get_pr_diff.assert_called_once_with(
+        provider,
+        isolated_token_handler,
+        "review-model",
+        add_line_numbers_to_hunks=True,
+        disable_extra_lines=False,
+        return_remaining_files=True,
+        return_deleted_files=True,
     )
 
 
@@ -6600,6 +6635,11 @@ async def test_structured_no_publish_run_returns_isolated_review_without_output_
 
     structured_review["review"]["key_issues_to_review"].clear()
     assert result.review["review"]["key_issues_to_review"] == [{"issue_header": "captured finding"}]
+    assert result.run_details.finish_time is not None
+    assert result.run_details.duration_seconds == max(
+        0.0,
+        result.run_details.finish_time - result.run_details.start_time,
+    )
 
 
 @pytest.mark.asyncio
