@@ -18,9 +18,17 @@ shadow_journal_path = ""
 shadow_journal_max_queue_entries = 256
 ```
 
-Issue #27 must still integrate the production orchestration, specialist, router, and verifier delivered
-by issues #26, #12, #11, and #9. A frozen target-repository replay and one week of live shadow
-evidence are also required before any rollout gate can grant permission.
+The credential-free plan reports a separate, versioned `production_binding_inventory`
+beside the frozen plan. Its own schema hash and content-derived inventory ID bind the readiness
+claims to the immutable manifest. Every entry remains unavailable until all its named source-free
+blocker contracts are implemented. An unavailable arm has no adapter, cannot claim hard-cost-cap
+enforcement, and stops production preflight before the artifact store or any model client is touched.
+
+Issue #27 must still complete the finding contracts, no-publish review facade, hard cost-cap
+enforcement, candidate-source contract, and frontier stage telemetry needed to integrate the
+production orchestration delivered by issues #26, #12, #11, #9, and #33. A frozen target-repository
+replay and one week of live shadow evidence are also required before any rollout gate can grant
+permission.
 
 ## Artifact boundary
 
@@ -120,7 +128,9 @@ Both modes are local-only. Their machine-readable output states `network_calls: 
 `model_calls: 0`. The plan includes the same `snapshot_id` for every enabled arm paired
 with a checkpoint, freezes its serialized-artifact hash and every arm's prompt,
 configuration, provider, model, revision, and source-free per-stage contract, and never
-includes truth.
+includes truth. The separately versioned readiness inventory reports each arm's current
+production-binding availability and bounded blocker codes without importing a model handler
+or probing credentials.
 
 ## Paid execution is fail closed
 
@@ -398,8 +408,9 @@ set all four behavior switches to false, clear the untracked journal/artifact pa
 continue using the incumbent reviewer. Historical evidence stays immutable. Rollback never
 changes a `failed` or `not_evaluable` gate to `passed`.
 
-Still required to complete issue #27: merge and bind the production arms from #26, #12,
-#11, and #9; create the independent checkpoint controls and serialized snapshots; run the
+Still required to complete issue #27: resolve the blocker contracts reported by
+`production_binding_inventory` and make each production arm available; create the independent
+checkpoint controls and serialized snapshots; run the
 frozen paid replay within an authorized cap; collect at least one week of opt-in live shadow
 telemetry; publish the pilot inventory, scorecard, budgets, and gate decisions; and prove
 that the cascade beats the incumbent before enabling local advice or GitHub publication.

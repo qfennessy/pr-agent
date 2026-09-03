@@ -13,6 +13,7 @@ from pr_agent.algo.checkpoint_evaluation import (
     TruthArtifact,
     build_evaluation_plan,
 )
+from pr_agent.algo.checkpoint_evaluation_bindings import production_binding_inventory
 from pr_agent.algo.checkpoint_evaluation_cocos import CocosCorpusLock, validate_cocos_story_corpus
 
 _MAX_EVALUATION_ARTIFACT_BYTES = 10_000_000
@@ -138,6 +139,7 @@ def run_evaluation_plan(inargs: Optional[Sequence[str]] = None) -> dict[str, Any
         }
     else:
         payload = build_evaluation_plan(manifest).to_dict()
+    payload["production_binding_inventory"] = production_binding_inventory(manifest).to_dict()
     if truth is not None:
         payload["truth_validation"] = {
             "status": "valid",
