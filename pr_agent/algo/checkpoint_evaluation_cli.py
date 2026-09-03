@@ -7,12 +7,13 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-from pr_agent.algo.checkpoint_evaluation import (EvaluationManifest,
-                                                 EvaluationValidationError,
-                                                 TruthArtifact,
-                                                 build_evaluation_plan)
-from pr_agent.algo.checkpoint_evaluation_cocos import (
-    CocosCorpusLock, validate_cocos_story_corpus)
+from pr_agent.algo.checkpoint_evaluation import (
+    EvaluationManifest,
+    EvaluationValidationError,
+    TruthArtifact,
+    build_evaluation_plan,
+)
+from pr_agent.algo.checkpoint_evaluation_cocos import CocosCorpusLock, validate_cocos_story_corpus
 
 _MAX_EVALUATION_ARTIFACT_BYTES = 10_000_000
 

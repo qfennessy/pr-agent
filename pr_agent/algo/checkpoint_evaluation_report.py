@@ -16,31 +16,37 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
 
-from pr_agent.algo.checkpoint_evaluation import (EvaluationArmKind,
-                                                 EvaluationCohort,
-                                                 EvaluationManifest,
-                                                 EvaluationRunRecord,
-                                                 EvaluationRunState,
-                                                 EvaluationValidationError,
-                                                 FindingLifecycleState,
-                                                 FindingSeverity,
-                                                 MeasurementStatus,
-                                                 TruthArtifact, content_hash,
-                                                 validate_run_model_telemetry)
-from pr_agent.algo.checkpoint_evaluation_cocos import (
-    COCOS_ADAPTER_SCHEMA_VERSION, CocosCorpusInventory)
-from pr_agent.algo.checkpoint_evaluation_execution import (
-    EvaluationArtifactInventory, EvaluationArtifactStore)
-from pr_agent.algo.checkpoint_evaluation_scoring import (GateComparator,
-                                                         GateRule,
-                                                         MatchedArmScorecard,
-                                                         RolloutGateDecision,
-                                                         ScoreMetric,
-                                                         evaluate_rollout_gate,
-                                                         score_matched_arms)
+from pr_agent.algo.checkpoint_evaluation import (
+    EvaluationArmKind,
+    EvaluationCohort,
+    EvaluationManifest,
+    EvaluationRunRecord,
+    EvaluationRunState,
+    EvaluationValidationError,
+    FindingLifecycleState,
+    FindingSeverity,
+    MeasurementStatus,
+    TruthArtifact,
+    content_hash,
+    validate_run_model_telemetry,
+)
+from pr_agent.algo.checkpoint_evaluation_cocos import COCOS_ADAPTER_SCHEMA_VERSION, CocosCorpusInventory
+from pr_agent.algo.checkpoint_evaluation_execution import EvaluationArtifactInventory, EvaluationArtifactStore
+from pr_agent.algo.checkpoint_evaluation_scoring import (
+    GateComparator,
+    GateRule,
+    MatchedArmScorecard,
+    RolloutGateDecision,
+    ScoreMetric,
+    evaluate_rollout_gate,
+    score_matched_arms,
+)
 from pr_agent.algo.checkpoint_shadow_journal import (
-    DeveloperTimeBasis, ShadowJournalRecord, load_shadow_journal,
-    shadow_journal_inventory_complete)
+    DeveloperTimeBasis,
+    ShadowJournalRecord,
+    load_shadow_journal,
+    shadow_journal_inventory_complete,
+)
 from pr_agent.algo.review_snapshot import ReviewEvent
 
 PILOT_REPORT_SCHEMA_VERSION = "checkpoint-evaluation-pilot-report-v1"

@@ -17,8 +17,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
-from pr_agent.algo.checkpoint_evaluation import (EvaluationValidationError,
-                                                 content_hash)
+from pr_agent.algo.checkpoint_evaluation import EvaluationValidationError, content_hash
 from pr_agent.algo.local_artifact_io import read_regular_file_without_symlinks
 from pr_agent.algo.review_snapshot import ReviewEvent
 

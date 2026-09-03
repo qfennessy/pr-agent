@@ -22,20 +22,21 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
-from pr_agent.algo.checkpoint_evaluation import (CheckpointCase,
-                                                 CheckpointTruth,
-                                                 EvaluationArm,
-                                                 EvaluationCohort,
-                                                 EvaluationManifest,
-                                                 EvaluationValidationError,
-                                                 TruthArtifact,
-                                                 _answer_only_paths,
-                                                 _freeze_json, _thaw_json,
-                                                 content_hash)
-from pr_agent.algo.checkpoint_evaluation_cocos import \
-    CHECKPOINT_CONTROL_SCHEMA_VERSION
-from pr_agent.algo.local_artifact_io import (
-    _open_parent_directory, read_regular_file_without_symlinks)
+from pr_agent.algo.checkpoint_evaluation import (
+    CheckpointCase,
+    CheckpointTruth,
+    EvaluationArm,
+    EvaluationCohort,
+    EvaluationManifest,
+    EvaluationValidationError,
+    TruthArtifact,
+    _answer_only_paths,
+    _freeze_json,
+    _thaw_json,
+    content_hash,
+)
+from pr_agent.algo.checkpoint_evaluation_cocos import CHECKPOINT_CONTROL_SCHEMA_VERSION
+from pr_agent.algo.local_artifact_io import _open_parent_directory, read_regular_file_without_symlinks
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewSnapshot
 from pr_agent.git_providers.plain_diff_provider import parse_plain_diff
 

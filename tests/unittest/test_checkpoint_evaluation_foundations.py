@@ -8,45 +8,63 @@ from pathlib import Path
 
 import pytest
 
-from pr_agent.algo.checkpoint_evaluation import (CheckpointCase,
-                                                 CheckpointTruth,
-                                                 EvaluationArm,
-                                                 EvaluationArmKind,
-                                                 EvaluationCohort,
-                                                 EvaluationManifest,
-                                                 EvaluationModelIdentity,
-                                                 EvaluationRunRecord,
-                                                 EvaluationRunState,
-                                                 EvaluationStageModelIdentity,
-                                                 EvaluationStagePlan,
-                                                 EvaluationStageRun,
-                                                 EvaluationValidationError,
-                                                 FindingLifecycleState,
-                                                 FindingSeverity, FindingTruth,
-                                                 GateStatus, MeasurementStatus,
-                                                 NumericMeasurement,
-                                                 ObservedFinding,
-                                                 TruthArtifact, content_hash)
+from pr_agent.algo.checkpoint_evaluation import (
+    CheckpointCase,
+    CheckpointTruth,
+    EvaluationArm,
+    EvaluationArmKind,
+    EvaluationCohort,
+    EvaluationManifest,
+    EvaluationModelIdentity,
+    EvaluationRunRecord,
+    EvaluationRunState,
+    EvaluationStageModelIdentity,
+    EvaluationStagePlan,
+    EvaluationStageRun,
+    EvaluationValidationError,
+    FindingLifecycleState,
+    FindingSeverity,
+    FindingTruth,
+    GateStatus,
+    MeasurementStatus,
+    NumericMeasurement,
+    ObservedFinding,
+    TruthArtifact,
+    content_hash,
+)
 from pr_agent.algo.checkpoint_evaluation_cocos import (
-    CHECKPOINT_CONTROL_SCHEMA_VERSION, CocosCorpusLock,
-    validate_cocos_story_corpus)
+    CHECKPOINT_CONTROL_SCHEMA_VERSION,
+    CocosCorpusLock,
+    validate_cocos_story_corpus,
+)
 from pr_agent.algo.checkpoint_evaluation_execution import (
-    EvaluationArtifactStore, OutputCapability, PaidExecutionRequest,
-    PaidExecutionStatus, PaidPlanItemBudget, evaluate_output_permission,
-    evaluate_paid_execution)
-from pr_agent.algo.checkpoint_evaluation_scoring import (GateComparator,
-                                                         GateRule,
-                                                         GateRuleResult,
-                                                         RolloutGateDecision,
-                                                         ScoreMetric,
-                                                         _paired_interval,
-                                                         evaluate_rollout_gate,
-                                                         score_matched_arms)
+    EvaluationArtifactStore,
+    OutputCapability,
+    PaidExecutionRequest,
+    PaidExecutionStatus,
+    PaidPlanItemBudget,
+    evaluate_output_permission,
+    evaluate_paid_execution,
+)
+from pr_agent.algo.checkpoint_evaluation_scoring import (
+    GateComparator,
+    GateRule,
+    GateRuleResult,
+    RolloutGateDecision,
+    ScoreMetric,
+    _paired_interval,
+    evaluate_rollout_gate,
+    score_matched_arms,
+)
 from pr_agent.algo.checkpoint_shadow_journal import (
-    ShadowJournalEntry, ShadowJournalSessionSummary, ShadowJournalWriter,
-    ShadowSubmitStatus, _append_private_line, load_shadow_journal)
-from pr_agent.algo.review_snapshot import (ReviewEvent, ReviewResultState,
-                                           ReviewSnapshotResult)
+    ShadowJournalEntry,
+    ShadowJournalSessionSummary,
+    ShadowJournalWriter,
+    ShadowSubmitStatus,
+    _append_private_line,
+    load_shadow_journal,
+)
+from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshotResult
 from pr_agent.algo.run_details import RunDetails
 from pr_agent.cli import run
 

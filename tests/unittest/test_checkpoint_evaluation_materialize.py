@@ -7,13 +7,9 @@ from dataclasses import replace
 import pytest
 
 import pr_agent.algo.checkpoint_evaluation_materialize as materialize_module
-from pr_agent.algo.checkpoint_evaluation import (EvaluationArm,
-                                                 EvaluationArmKind,
-                                                 EvaluationValidationError)
-from pr_agent.algo.checkpoint_evaluation_snapshot import \
-    load_review_snapshot_artifact
-from pr_agent.algo.review_snapshot import (CoverageIssue, ReviewEvent,
-                                           ReviewSnapshot)
+from pr_agent.algo.checkpoint_evaluation import EvaluationArm, EvaluationArmKind, EvaluationValidationError
+from pr_agent.algo.checkpoint_evaluation_snapshot import load_review_snapshot_artifact
+from pr_agent.algo.review_snapshot import CoverageIssue, ReviewEvent, ReviewSnapshot
 
 CHECKPOINT_CONTROL_MATERIALIZATION_SCHEMA_VERSION = (
     materialize_module.CHECKPOINT_CONTROL_MATERIALIZATION_SCHEMA_VERSION

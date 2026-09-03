@@ -8,20 +8,24 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-from pr_agent.algo.checkpoint_evaluation import (EVALUATION_SCHEMA_VERSION,
-                                                 CheckpointCase,
-                                                 CheckpointTruth,
-                                                 EvaluationArmKind,
-                                                 EvaluationCohort,
-                                                 EvaluationManifest,
-                                                 EvaluationRunRecord,
-                                                 EvaluationRunState,
-                                                 EvaluationValidationError,
-                                                 FindingLifecycleState,
-                                                 FindingSeverity, GateStatus,
-                                                 MeasurementStatus,
-                                                 TruthArtifact, content_hash,
-                                                 validate_run_model_telemetry)
+from pr_agent.algo.checkpoint_evaluation import (
+    EVALUATION_SCHEMA_VERSION,
+    CheckpointCase,
+    CheckpointTruth,
+    EvaluationArmKind,
+    EvaluationCohort,
+    EvaluationManifest,
+    EvaluationRunRecord,
+    EvaluationRunState,
+    EvaluationValidationError,
+    FindingLifecycleState,
+    FindingSeverity,
+    GateStatus,
+    MeasurementStatus,
+    TruthArtifact,
+    content_hash,
+    validate_run_model_telemetry,
+)
 from pr_agent.algo.review_snapshot import ReviewEvent
 
 _TWO_SIDED_95_T_CRITICAL = (

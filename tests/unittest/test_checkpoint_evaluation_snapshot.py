@@ -3,13 +3,9 @@ import json
 
 import pytest
 
-from pr_agent.algo.checkpoint_evaluation import (CheckpointCase,
-                                                 EvaluationCohort,
-                                                 EvaluationValidationError)
-from pr_agent.algo.checkpoint_evaluation_snapshot import \
-    load_review_snapshot_artifact
-from pr_agent.algo.review_snapshot import (CoverageIssue, ReviewEvent,
-                                           ReviewSnapshot)
+from pr_agent.algo.checkpoint_evaluation import CheckpointCase, EvaluationCohort, EvaluationValidationError
+from pr_agent.algo.checkpoint_evaluation_snapshot import load_review_snapshot_artifact
+from pr_agent.algo.review_snapshot import CoverageIssue, ReviewEvent, ReviewSnapshot
 
 
 def _snapshot(*, deterministic_results=()) -> ReviewSnapshot:

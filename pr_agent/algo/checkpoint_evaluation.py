@@ -17,8 +17,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
 
-from pr_agent.algo.review_snapshot import (ReviewEvent, ReviewResultState,
-                                           ReviewSnapshotResult)
+from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshotResult
 from pr_agent.algo.run_details import RunDetails, SpecialistRunDetails
 
 EVALUATION_SCHEMA_VERSION = "checkpoint-evaluation-v2"

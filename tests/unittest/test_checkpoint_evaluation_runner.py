@@ -5,29 +5,37 @@ from decimal import Decimal
 
 import pytest
 
-from pr_agent.algo.checkpoint_evaluation import (CheckpointCase, EvaluationArm,
-                                                 EvaluationArmKind,
-                                                 EvaluationCohort,
-                                                 EvaluationManifest,
-                                                 EvaluationRunRecord,
-                                                 EvaluationRunState,
-                                                 EvaluationStageModelIdentity,
-                                                 EvaluationStagePlan,
-                                                 EvaluationStageRun,
-                                                 EvaluationValidationError,
-                                                 MeasurementStatus,
-                                                 NumericMeasurement,
-                                                 deployment_identity_hash)
+from pr_agent.algo.checkpoint_evaluation import (
+    CheckpointCase,
+    EvaluationArm,
+    EvaluationArmKind,
+    EvaluationCohort,
+    EvaluationManifest,
+    EvaluationRunRecord,
+    EvaluationRunState,
+    EvaluationStageModelIdentity,
+    EvaluationStagePlan,
+    EvaluationStageRun,
+    EvaluationValidationError,
+    MeasurementStatus,
+    NumericMeasurement,
+    deployment_identity_hash,
+)
 from pr_agent.algo.checkpoint_evaluation_execution import (
-    EvaluationArtifactStore, PaidExecutionRequest, PaidPlanItemBudget,
-    evaluate_paid_execution)
+    EvaluationArtifactStore,
+    PaidExecutionRequest,
+    PaidPlanItemBudget,
+    evaluate_paid_execution,
+)
 from pr_agent.algo.checkpoint_evaluation_runner import (
-    ModelTelemetryShape, ProductionArmBinding, ProductionArmResult,
-    ProductionDependencyUnavailable, ProductionEvaluationRunner,
-    failed_production_arm_result)
-from pr_agent.algo.review_snapshot import (ReviewEvent, ReviewResultState,
-                                           ReviewSnapshot,
-                                           ReviewSnapshotResult)
+    ModelTelemetryShape,
+    ProductionArmBinding,
+    ProductionArmResult,
+    ProductionDependencyUnavailable,
+    ProductionEvaluationRunner,
+    failed_production_arm_result,
+)
+from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshot, ReviewSnapshotResult
 from pr_agent.algo.run_details import RunDetails, SpecialistRunDetails
 
 
