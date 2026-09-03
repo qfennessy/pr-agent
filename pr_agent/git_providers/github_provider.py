@@ -17,23 +17,37 @@ from retry.api import retry_call
 from starlette_context import context
 
 from ..algo.file_filter import filter_ignored
-from ..algo.git_patch_processing import (extract_hunk_headers,
-                                         iter_git_patch_lines,
-                                         strip_git_line_ending)
-from ..algo.inline_comment_dedup import (body_fingerprint, body_with_markers,
-                                         code_fingerprint,
-                                         get_inline_comment_store, has_marker)
+from ..algo.git_patch_processing import extract_hunk_headers, iter_git_patch_lines, strip_git_line_ending
+from ..algo.inline_comment_dedup import (
+    body_fingerprint,
+    body_with_markers,
+    code_fingerprint,
+    get_inline_comment_store,
+    has_marker,
+)
 from ..algo.language_handler import is_valid_file
 from ..algo.types import EDIT_TYPE
-from ..algo.utils import (Range, clip_tokens, comment_matches_pr_review_identity,
-                          find_line_number_of_relevant_line_in_file, get_pr_review_comment_identifiers,
-                          load_large_diff, set_file_languages)
+from ..algo.utils import (
+    Range,
+    clip_tokens,
+    comment_matches_pr_review_identity,
+    find_line_number_of_relevant_line_in_file,
+    get_pr_review_comment_identifiers,
+    load_large_diff,
+    set_file_languages,
+)
 from ..config_loader import get_settings
 from ..log import get_logger
 from ..servers.utils import RateLimitExceeded
-from .git_provider import (MAX_FILES_ALLOWED_FULL, FilePatchInfo, GitProvider,
-                           IncrementalPR, get_cached_global_settings,
-                           is_own_persistent_comment_for_identities)
+from .git_provider import (
+    MAX_FILES_ALLOWED_FULL,
+    FilePatchInfo,
+    GitProvider,
+    IncrementalPR,
+    get_cached_global_settings,
+    is_own_persistent_comment_for_identities,
+    redact_credentials,
+)
 
 
 def _next_page_url(headers: dict) -> str:
@@ -79,7 +93,10 @@ class GithubProvider(GitProvider):
         if pr_url and 'pull' in pr_url:
             self.set_pr(pr_url)
             self.pr_commits = list(self.pr.get_commits())
-            self.last_commit_id = self.pr_commits[-1]
+            if self.pr_commits:
+                self.last_commit_id = self.pr_commits[-1]
+            else:
+                self.last_commit_id = self._get_repo().get_commit(self.pr.head.sha)
             self.pr_url = self.get_pr_url() # pr_url for github actions can be as api.github.com, so we need to get the url from the pr object
         elif pr_url and 'issue' in pr_url: #url is an issue
             self.issue_main = self._get_issue_handle(pr_url)
@@ -114,6 +131,9 @@ class GithubProvider(GitProvider):
     def is_supported(self, capability: str) -> bool:
         if capability == "push_code" and get_settings().config.restricted_mode:
             return False
+        return True
+
+    def supports_line_question_history(self) -> bool:
         return True
 
     def _get_owner_and_repo_path(self, given_url: str) -> str:
@@ -166,7 +186,7 @@ class GithubProvider(GitProvider):
             scheme_and_netloc = self.base_url_html
             desired_branch = self.repo_obj.default_branch
         if not all([scheme_and_netloc, owner, repo]): #"else": Not invoked from a PR context,but no provided git url for context
-            get_logger().error(f"Unable to get canonical url parts since missing context (PR or explicit git url)")
+            get_logger().error("Unable to get canonical url parts since missing context (PR or explicit git url)")
             return ("", "")
 
         prefix = f"{scheme_and_netloc}/{owner}/{repo}/blob/{desired_branch}"
@@ -432,7 +452,7 @@ class GithubProvider(GitProvider):
                 try:
                     names_original = [file.filename for file in files_original]
                     names_new = [file.filename for file in files]
-                    get_logger().info(f"Filtered out [ignore] files for pull request:", extra=
+                    get_logger().info("Filtered out [ignore] files for pull request:", extra=
                     {"files": names_original,
                      "filtered_files": names_new})
                 except Exception:
@@ -477,7 +497,7 @@ class GithubProvider(GitProvider):
                     if counter_valid >= MAX_FILES_ALLOWED_FULL and patch and not self.incremental.is_incremental:
                         avoid_load = True
                         if counter_valid == MAX_FILES_ALLOWED_FULL:
-                            get_logger().info(f"Too many files in PR, will avoid loading full content for rest of files")
+                            get_logger().info("Too many files in PR, will avoid loading full content for rest of files")
 
                     if avoid_load:
                         new_file_content_str = ""
@@ -686,7 +706,7 @@ class GithubProvider(GitProvider):
             self._check_run_ids[name] = data["id"]
             return True
         except Exception:
-            get_logger().warning(f"Failed to create check run, falling back to comment")
+            get_logger().warning("Failed to create check run, falling back to comment")
             return False
 
     def _find_existing_check_run(self, check_run_name: str, head_sha: str) -> Optional[int]:
@@ -814,7 +834,7 @@ class GithubProvider(GitProvider):
                     store.add(body_fp)
                     store.add(code_fp)
         except Exception as e:
-            get_logger().info(f"Initially failed to publish inline comments as committable")
+            get_logger().info("Initially failed to publish inline comments as committable")
 
             if (getattr(e, "status", None) == 422 and not disable_fallback):
                 pass  # continue to try _publish_inline_comments_fallback_with_verification
@@ -830,22 +850,22 @@ class GithubProvider(GitProvider):
     def get_review_thread_comments(self, comment_id: int) -> list[dict]:
         """
         Retrieves all comments in the same thread as the given comment.
-        
+
         Args:
             comment_id: Review comment ID
-                
+
         Returns:
             List of comments in the same thread
         """
         try:
             # Fetch all comments with a single API call
             all_comments = list(self.pr.get_comments())
-            
+
             # Find the target comment by ID
             target_comment = next((c for c in all_comments if c.id == comment_id), None)
             if not target_comment:
                 return []
-        
+
             # Get root comment id
             root_comment_id = target_comment.raw_data.get("in_reply_to_id", target_comment.id)
             # Build the thread - include the root comment and all replies to it
@@ -853,12 +873,12 @@ class GithubProvider(GitProvider):
                 c for c in all_comments if
                 c.id == root_comment_id or c.raw_data.get("in_reply_to_id") == root_comment_id
             ]
-        
-        
+
+
             return thread_comments
-                
+
         except Exception as e:
-            get_logger().exception(f"Failed to get review comments for an inline ask command", artifact={"comment_id": comment_id, "error": e})
+            get_logger().exception("Failed to get review comments for an inline ask command", artifact={"comment_id": comment_id, "error": e})
             return []
 
     def supports_thread_resolution(self) -> bool:
@@ -995,14 +1015,31 @@ class GithubProvider(GitProvider):
 
         # try to publish one by one the invalid comments as a one-line code comment
         if invalid_comments and get_settings().github.try_fix_invalid_inline_comments:
-            fixed_comments_as_one_liner = self._try_fix_invalid_inline_comments(
-                [comment for comment, _ in invalid_comments])
+            invalid_comments_list = [comment for comment, _ in invalid_comments]
+            fixed_comments_as_one_liner = self._try_fix_invalid_inline_comments(invalid_comments_list)
             for comment in fixed_comments_as_one_liner:
                 try:
                     self.publish_inline_comments([comment], disable_fallback=True)
                     get_logger().info(f"Published invalid comment as a single line comment: {comment}")
                 except:
                     get_logger().error(f"Failed to publish invalid comment as a single line comment: {comment}")
+
+            dropped_count = len(invalid_comments) - len(fixed_comments_as_one_liner)
+            if dropped_count > 0:
+                dropped_paths = [c.get("path") for c, _ in invalid_comments]
+                for fixed_c in fixed_comments_as_one_liner:
+                    fixed_path = fixed_c.get("path")
+                    if fixed_path in dropped_paths:
+                        dropped_paths.remove(fixed_path)
+                get_logger().warning(
+                    f"Dropped {dropped_count} invalid comments that could not be fixed. Paths: {dropped_paths}"
+                )
+        elif invalid_comments:
+            dropped_paths = [c.get("path") for c, _ in invalid_comments]
+            get_logger().warning(
+                f"Dropped {len(invalid_comments)} invalid comments "
+                f"(try_fix_invalid_inline_comments is off). Paths: {dropped_paths}"
+            )
 
     def _verify_code_comment(self, comment: dict):
         is_verified = False
@@ -1129,7 +1166,7 @@ class GithubProvider(GitProvider):
                     "Failed to edit github comment due to permission restrictions",
                     artifact={"error": e})
             else:
-                get_logger().exception(f"Failed to edit github comment", artifact={"error": e})
+                get_logger().exception("Failed to edit github comment", artifact={"error": e})
 
     def edit_comment_from_comment_id(self, comment_id: int, body: str):
         try:
@@ -1447,7 +1484,9 @@ class GithubProvider(GitProvider):
         if self.deployment_type == 'app':
             try:
                 private_key = get_settings().github.private_key
-                app_id = get_settings().github.app_id
+                # The app id is an integer in the settings toml, but PyJWT >=2.11 requires a
+                # string `iss` claim, and PyGithub 1.59 passes it through raw (#2955).
+                app_id = str(get_settings().github.app_id)
             except AttributeError as e:
                 raise ValueError("GitHub app ID and private key are required when using GitHub app deployment") from e
             if not self.installation_id:
@@ -1601,12 +1640,9 @@ class GithubProvider(GitProvider):
 
     def get_line_link(self, relevant_file: str, relevant_line_start: int, relevant_line_end: int = None) -> str:
         sha_file = hashlib.sha256(relevant_file.encode('utf-8')).hexdigest()
-        if relevant_line_end is not None and relevant_line_start is not None:
-            try:
-                if int(relevant_line_end) < int(relevant_line_start):
-                    relevant_line_end = relevant_line_start
-            except (TypeError, ValueError):
-                relevant_line_end = None
+        relevant_line_start, relevant_line_end = self._normalize_line_range(
+            relevant_line_start, relevant_line_end
+        )
         if relevant_line_start == -1:
             link = f"{self.base_url_html}/{self.repo}/pull/{self.pr_num}/files#diff-{sha_file}"
         elif relevant_line_end:
@@ -1853,18 +1889,19 @@ class GithubProvider(GitProvider):
             get_logger().error("Either missing auth token or missing base url")
             return None
         if scheme not in github_base_url:
-            get_logger().error(f"Base url: {github_base_url} is missing prefix: {scheme}")
+            get_logger().error(f"Base url: {redact_credentials(github_base_url)} is missing prefix: {scheme}")
             return None
         github_com = github_base_url.split(scheme)[1]  # e.g. 'github.com' or github.<org>.com
         if not github_com:
-            get_logger().error(f"Base url: {github_base_url} has an empty base url")
+            get_logger().error(f"Base url: {redact_credentials(github_base_url)} has an empty base url")
             return None
         if github_com not in repo_url_to_clone:
-            get_logger().error(f"url to clone: {repo_url_to_clone} does not contain {github_com}")
+            get_logger().error(f"url to clone: {redact_credentials(repo_url_to_clone)} "
+                               f"does not contain {redact_credentials(github_base_url)}")
             return None
         repo_full_name = repo_url_to_clone.split(github_com)[-1]
         if not repo_full_name:
-            get_logger().error(f"url to clone: {repo_url_to_clone} is malformed")
+            get_logger().error(f"url to clone: {redact_credentials(repo_url_to_clone)} is malformed")
             return None
 
         clone_url = scheme

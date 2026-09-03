@@ -2,30 +2,34 @@ import datetime as _dt
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from pr_agent.algo.utils import PRReviewIdentity
 from pr_agent.git_providers import AzureDevopsProvider
-from pr_agent.git_providers.azuredevops_provider import (
-    _AzureCommitAdapter,
-    _to_naive_utc,
-)
+from pr_agent.git_providers.azuredevops_provider import _AzureCommitAdapter, _to_naive_utc
 from pr_agent.git_providers.git_provider import IncrementalPR
 
+_UNSET = object()
 
-def _raw_commit(commit_id, comment, author_date, parents=None):
+
+def _raw_commit(commit_id, comment, author_date, parents=None, committer_date=_UNSET):
     raw = MagicMock()
     raw.commit_id = commit_id
     raw.comment = comment
     raw.author = MagicMock()
     raw.author.date = author_date
+    raw.committer = MagicMock()
+    raw.committer.date = author_date if committer_date is _UNSET else committer_date
     raw.parents = parents or []
     return raw
 
 
-def _comment(body, published_date):
+def _comment(body, published_date, last_updated_date=None):
     c = MagicMock()
     c.body = body
     c.content = body
     c.published_date = published_date
+    c.last_updated_date = last_updated_date
     c.thread_id = 7
     return c
 
@@ -54,6 +58,7 @@ class TestAzureCommitAdapter:
         assert adapter.commit_id == "abc123"
         assert adapter.commit.message == "fix bug"
         assert adapter.commit.author.date.tzinfo is None
+        assert adapter.commit.committer.date.tzinfo is None
         assert adapter.parents == ["p1"]
 
     def test_handles_missing_author(self):
@@ -61,9 +66,11 @@ class TestAzureCommitAdapter:
         raw.commit_id = "x"
         raw.comment = ""
         raw.author = None
+        raw.committer = None
         raw.parents = None
         adapter = _AzureCommitAdapter(raw)
         assert adapter.commit.author.date is None
+        assert adapter.commit.committer.date is None
         assert adapter.parents == []
 
 
@@ -106,6 +113,57 @@ class TestGetIncrementalCommits:
         result = provider.get_previous_review(full=True, incremental=False)
 
         assert result is marked
+
+    def test_supports_review_and_suggestions_kinds(self):
+        provider = self._make_provider()
+
+        assert provider.supports_incremental_kind("review") is True
+        assert provider.supports_incremental_kind("suggestions") is True
+        assert provider.supports_incremental_kind("unknown") is False
+
+    @pytest.mark.parametrize("suggestions_header", [
+        "## PR Code Suggestions ✨",
+        "## Unanchored Code Suggestions",
+    ])
+    def test_suggestions_kind_anchors_on_latest_improve_comment(self, suggestions_header):
+        provider = self._make_provider()
+        old = _raw_commit("old", "seen", _dt.datetime(2024, 5, 1), parents=["base"])
+        new = _raw_commit("new", "added", _dt.datetime(2024, 6, 2), parents=["old"])
+        provider.azure_devops_client.get_pull_request_commits.return_value = [new, old]
+        provider.get_issue_comments = MagicMock(return_value=[
+            _comment("## PR Reviewer Guide", _dt.datetime(2024, 6, 2)),
+            _comment(suggestions_header, _dt.datetime(2024, 6, 1)),
+        ])
+        changes = MagicMock()
+        changes.changes = [{"item": {"path": "/new.py", "gitObjectType": "blob"}}]
+        provider.azure_devops_client.get_changes.return_value = changes
+        provider.azure_devops_client.get_commit_diffs.return_value = SimpleNamespace(
+            changes=changes.changes,
+            all_changes_included=True,
+        )
+        provider.azure_devops_client.get_pull_request_iterations.return_value = [SimpleNamespace(id=1)]
+        provider.azure_devops_client.get_pull_request_iteration_changes.return_value = SimpleNamespace(
+            change_entries=changes.changes,
+            next_skip=0,
+        )
+
+        provider.get_incremental_commits(IncrementalPR(True), kind="suggestions")
+
+        assert provider.incremental.is_incremental is True
+        assert provider.previous_review.body == suggestions_header
+        assert provider.incremental.last_seen_commit_sha == "old"
+        assert provider.unreviewed_files_map == {"/new.py": "/new.py"}
+
+    def test_persistent_comment_update_is_the_incremental_anchor(self):
+        provider = self._make_provider()
+        published = _dt.datetime(2024, 5, 1)
+        updated = _dt.datetime(2024, 6, 1)
+        comment = _comment("## PR Code Suggestions", published, updated)
+        provider.get_issue_comments = MagicMock(return_value=[comment])
+
+        anchor = provider._find_incremental_anchor(("## PR Code Suggestions",))
+
+        assert anchor.created_at == updated
 
     def test_populates_commits_range_and_files(self):
         provider = self._make_provider()
@@ -297,6 +355,30 @@ class TestGetIncrementalCommits:
         assert kwargs["base_version_descriptor"].base_version == "old1"
         assert kwargs["target_version_descriptor"].target_version == "new"
         provider.azure_devops_client.get_changes.assert_not_called()
+
+    def test_newly_pushed_commit_uses_committer_not_preserved_author_date(self):
+        provider = self._make_provider()
+        review_time = _dt.datetime(2024, 6, 1, tzinfo=_dt.timezone.utc)
+        old = _raw_commit("old", "seen", _dt.datetime(2024, 5, 1), parents=["base"])
+        cherry_pick = _raw_commit(
+            "new",
+            "cherry-picked",
+            _dt.datetime(2024, 4, 1),
+            parents=["old"],
+            committer_date=_dt.datetime(2024, 6, 2),
+        )
+        provider.azure_devops_client.get_pull_request_commits.return_value = [cherry_pick, old]
+        provider.get_issue_comments = MagicMock(return_value=[_comment("## PR Reviewer Guide", review_time)])
+        provider.azure_devops_client.get_commit_diffs.return_value = SimpleNamespace(
+            all_changes_included=True,
+            changes=[{"item": {"path": "/new.py", "gitObjectType": "blob"}}],
+        )
+
+        provider.get_incremental_commits(IncrementalPR(True))
+
+        assert provider.incremental.is_incremental is True
+        assert provider.incremental.last_seen_commit.sha == "old"
+        assert [commit.sha for commit in provider.incremental.commits_range] == ["new"]
 
     def test_incremental_resets_stale_diff_cache(self):
         # Regression for Qodo #1: switching a reused provider into incremental mode must

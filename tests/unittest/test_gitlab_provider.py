@@ -7,8 +7,7 @@ from gitlab import Gitlab
 from gitlab.exceptions import GitlabGetError
 from gitlab.v4.objects import ProjectFile, ProjectMergeRequest, ProjectMergeRequestManager
 
-from pr_agent.algo.utils import (PRCodeSuggestionsIdentity, PRReviewHeader,
-                                 PRReviewIdentity)
+from pr_agent.algo.utils import PRCodeSuggestionsIdentity, PRReviewHeader, PRReviewIdentity
 from pr_agent.git_providers.git_provider import IncrementalPR
 from pr_agent.git_providers.gitlab_provider import (
     GitLabProvider,
@@ -18,11 +17,16 @@ from pr_agent.git_providers.gitlab_provider import (
 )
 
 
-def _mock_settings(publish_review_as_thread=False, resolve_outdated_inline_threads=False):
+def _mock_settings(
+    publish_review_as_thread=False,
+    publish_improve_as_thread=False,
+    resolve_outdated_inline_threads=False,
+):
     """Settings stub whose .get() returns the GitLab thread flags and passes other keys through to the default."""
     settings = MagicMock()
     settings.get.side_effect = lambda key, default=None: {
         "GITLAB.PUBLISH_REVIEW_AS_THREAD": publish_review_as_thread,
+        "GITLAB.PUBLISH_IMPROVE_AS_THREAD": publish_improve_as_thread,
         "GITLAB.RESOLVE_OUTDATED_INLINE_THREADS": resolve_outdated_inline_threads,
     }.get(key, default)
     return settings
@@ -379,6 +383,12 @@ class TestGitLabProvider:
         assert gitlab_provider.get_line_link("src/app.py", 10, 12) == (
             "https://gitlab.com/group/repo/-/blob/feature/cache/src/app.py?ref_type=heads#L10-12"
         )
+        assert gitlab_provider.get_line_link("src/app.py", 10, 5) == (
+            "https://gitlab.com/group/repo/-/blob/feature/cache/src/app.py?ref_type=heads#L10-10"
+        )
+        assert gitlab_provider.get_line_link("src/app.py", 10, "not-a-number") == (
+            "https://gitlab.com/group/repo/-/blob/feature/cache/src/app.py?ref_type=heads#L10"
+        )
 
     def test_publish_description_with_none_title_leaves_title_unchanged(self, gitlab_provider):
         gitlab_provider.mr = MagicMock()
@@ -403,11 +413,29 @@ class TestGitLabProvider:
         assert gitlab_provider.mr.description == "Updated description"
         gitlab_provider.mr.save.assert_called_once()
 
-    @pytest.mark.parametrize("configured", [True, False])
-    def test_should_publish_review_as_thread_reflects_config(self, gitlab_provider, configured):
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [(True, True), (False, False), ("true", True), ("false", False)],
+    )
+    def test_should_publish_review_as_thread_reflects_config(self, gitlab_provider, configured, expected):
         with patch("pr_agent.git_providers.gitlab_provider.get_settings",
                    return_value=_mock_settings(publish_review_as_thread=configured)):
-            assert gitlab_provider.should_publish_review_as_thread() is configured
+            assert gitlab_provider.should_publish_review_as_thread() is expected
+
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [(True, True), (False, False), ("true", True), ("false", False)],
+    )
+    def test_should_publish_improve_as_thread_reflects_config(self, gitlab_provider, configured, expected):
+        with patch("pr_agent.git_providers.gitlab_provider.get_settings",
+                   return_value=_mock_settings(publish_improve_as_thread=configured)):
+            assert gitlab_provider.should_publish_improve_as_thread() is expected
+
+    @pytest.mark.parametrize(("resolvable", "expected"), [(True, True), (False, False), (None, False)])
+    def test_is_comment_thread_uses_resolvable_flag(self, gitlab_provider, resolvable, expected):
+        comment = SimpleNamespace(resolvable=resolvable, attributes={"resolvable": resolvable})
+
+        assert gitlab_provider.is_comment_thread(comment) is expected
 
     def test_should_publish_review_as_thread_defaults_false(self, gitlab_provider):
         # Key absent -> default False (the feature is opt-in).
@@ -752,6 +780,43 @@ class TestGitLabProvider:
         gitlab_provider.mr.discussions.list.side_effect = Exception("gitlab api error")
 
         gitlab_provider.unresolve_comment_thread(MagicMock(id=1))  # must not raise
+
+    @pytest.mark.parametrize("resolvable,resolved,should_resolve", [
+        (True, False, True),    # open thread -> resolve it
+        (True, True, False),    # already resolved -> leave
+        (False, False, False),  # not resolvable -> nothing to do
+    ])
+    def test_resolve_comment_thread(self, gitlab_provider, resolvable, resolved, should_resolve):
+        discussion = MagicMock()
+        discussion.attributes = {'notes': [{'id': 42, 'resolvable': resolvable, 'resolved': resolved}]}
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.mr.discussions.list.return_value = [discussion]
+
+        assert gitlab_provider.resolve_comment_thread(42) is should_resolve
+
+        if should_resolve:
+            assert discussion.resolved is True
+            discussion.save.assert_called_once()
+        else:
+            discussion.save.assert_not_called()
+
+    def test_resolve_comment_thread_ignores_unrelated_discussions(self, gitlab_provider):
+        # An open discussion that does not own our note must be left untouched.
+        other = MagicMock()
+        other.attributes = {'notes': [{'id': 1, 'resolvable': True, 'resolved': False}]}
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.mr.discussions.list.return_value = [other]
+
+        assert gitlab_provider.resolve_comment_thread(99) is False
+
+        other.save.assert_not_called()
+
+    def test_resolve_comment_thread_soft_fails(self, gitlab_provider):
+        # A GitLab API error while resolving must not raise.
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.mr.discussions.list.side_effect = Exception("gitlab api error")
+
+        assert gitlab_provider.resolve_comment_thread(1) is False
 
     def _prepare_outdated_cleanup(self, gitlab_provider, threads, own_user_id=_BOT_USER_ID,
                                   current_head_sha=_CURRENT_HEAD_SHA):

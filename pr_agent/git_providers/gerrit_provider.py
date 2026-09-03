@@ -107,9 +107,19 @@ def prepare_repo(url: urllib3.util.Url, project, refspec):
     repo_url = (f"{url.scheme}://{url.auth}@{url.host}:{url.port}/{project}")
 
     directory = pathlib.Path(mkdtemp())
-    clone(repo_url, directory)
-    fetch(repo_url, refspec, cwd=directory)
-    checkout(cwd=directory)
+    try:
+        clone(repo_url, directory)
+        fetch(repo_url, refspec, cwd=directory)
+        checkout(cwd=directory)
+    except BaseException:
+        try:
+            shutil.rmtree(directory)
+        except OSError as cleanup_error:
+            get_logger().warning(
+                "Failed to clean up temp repo at {} after setup failed: {}",
+                directory, cleanup_error
+            )
+        raise
     return directory
 
 
@@ -272,17 +282,20 @@ class GerritProvider(GitProvider):
 
         diff_files = []
         for diff_item in diffs:
-            if diff_item.a_blob is not None:
-                original_file_content_str = (
-                    diff_item.a_blob.data_stream.read().decode('utf-8')
-                )
-            else:
-                original_file_content_str = ""  # empty file
-            if diff_item.b_blob is not None:
-                new_file_content_str = diff_item.b_blob.data_stream.read(). \
-                    decode('utf-8')
-            else:
-                new_file_content_str = ""  # empty file
+            filename = diff_item.b_path or diff_item.a_path
+            try:
+                if diff_item.a_blob is not None:
+                    original_file_content_str = diff_item.a_blob.data_stream.read().decode("utf-8")
+                else:
+                    original_file_content_str = ""  # empty file
+                if diff_item.b_blob is not None:
+                    new_file_content_str = diff_item.b_blob.data_stream.read().decode("utf-8")
+                else:
+                    new_file_content_str = ""  # empty file
+                patch = diff_item.diff.decode("utf-8")
+            except UnicodeDecodeError as e:
+                get_logger().warning(f"Skipping non-UTF-8 file in Gerrit diff: {filename!r} ({e})")
+                continue
             edit_type = EDIT_TYPE.MODIFIED
             if diff_item.new_file:
                 edit_type = EDIT_TYPE.ADDED
@@ -294,8 +307,8 @@ class GerritProvider(GitProvider):
                 FilePatchInfo(
                     original_file_content_str,
                     new_file_content_str,
-                    diff_item.diff.decode('utf-8'),
-                    diff_item.b_path or diff_item.a_path,
+                    patch,
+                    filename,
                     edit_type=edit_type,
                     old_filename=None
                     if diff_item.a_path == diff_item.b_path
@@ -442,9 +455,36 @@ class GerritProvider(GitProvider):
         # but required by the interface
         pass
 
+    def cleanup(self):
+        """Remove the temporary cloned repository from disk."""
+        if self.repo_path and pathlib.Path(self.repo_path).exists():
+            try:
+                shutil.rmtree(self.repo_path)
+                get_logger().info("Cleaned up temp repo at {}", self.repo_path)
+            except (OSError, PermissionError) as e:
+                get_logger().warning(
+                    "Failed to clean up temp repo at {}: {}",
+                    self.repo_path, e
+                )
+
+    def __del__(self):
+        """Safety net: clean up temp repo if cleanup() was not called.
+
+        The server's finally block can only reach providers stored in
+        starlette_context. PRQuestions builds its own provider with
+        get_git_provider(), so an /ask request never registers there and
+        would leak its clone without this.
+        """
+        try:
+            self.cleanup()
+        except Exception as e:
+            get_logger().debug("Temp repo cleanup failed during __del__: {}", e)
+
     def remove_initial_comment(self):
-        # remove repo, cloned in previous steps
-        # shutil.rmtree(self.repo_path)
+        # Do NOT call cleanup() here — this method is invoked during the
+        # request lifecycle while the cloned repo is still needed by
+        # subsequent commands.  Actual cleanup happens in the server's
+        # finally block and in __del__ as a safety net.
         pass
 
     def remove_comment(self, comment):

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from pr_agent.algo.config_utils import parse_env_bool
+
 
 class ReviewDepth(str, Enum):
     QUICK = "quick"
@@ -309,16 +311,16 @@ def load_review_routing_configuration(section: Any) -> ReviewRoutingConfiguratio
     unknown_keys = sorted(str(key) for key in section if str(key) not in _CONFIGURATION_KEYS)
     errors.extend(f"unknown review_depth key: {key}" for key in unknown_keys)
 
-    enabled = section.get("enabled", False)
-    if not isinstance(enabled, bool):
+    enabled = parse_env_bool(section.get("enabled", False))
+    if enabled is None:
         errors.append("enabled must be a boolean")
         enabled = True
     if not enabled:
         return ReviewRoutingConfiguration()
 
     requested_depth = section.get("requested_depth", RequestedReviewDepth.AUTO.value)
-    consume_specialist = section.get("consume_specialist_escalation", False)
-    if not isinstance(consume_specialist, bool):
+    consume_specialist = parse_env_bool(section.get("consume_specialist_escalation", False))
+    if consume_specialist is None:
         errors.append("consume_specialist_escalation must be a boolean")
         consume_specialist = False
     specialist_depth = section.get("specialist_escalation_depth", ReviewDepth.DEEP.value)
@@ -426,7 +428,12 @@ def _budget_from_mapping(raw: Any, name: str, errors: list[str]) -> ReviewBudget
         return ReviewBudgetPolicy()
     unknown = sorted(str(key) for key in raw if str(key) not in _BUDGET_KEYS)
     errors.extend(f"unknown profiles.{name} key: {key}" for key in unknown)
-    return ReviewBudgetPolicy(**{key: raw.get(key) for key in _BUDGET_KEYS if key in raw})
+    values = {key: raw.get(key) for key in _BUDGET_KEYS if key in raw}
+    if "shadow_only" in values:
+        parsed_shadow_only = parse_env_bool(values["shadow_only"])
+        if parsed_shadow_only is not None:
+            values["shadow_only"] = parsed_shadow_only
+    return ReviewBudgetPolicy(**values)
 
 
 def _configuration_tuple(value: Any) -> Any:

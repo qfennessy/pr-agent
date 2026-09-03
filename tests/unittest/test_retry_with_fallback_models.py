@@ -15,8 +15,7 @@ from pr_agent.algo.pr_processing import retry_with_fallback_models
 from pr_agent.algo.run_details import get_run_details, init_run_details
 from pr_agent.algo.utils import ModelType
 from pr_agent.config_loader import get_settings
-from tests.unittest._settings_helpers import (SENTINEL, restore_settings,
-                                              snapshot_settings)
+from tests.unittest._settings_helpers import SENTINEL, restore_settings, snapshot_settings
 
 _TRACKED_KEYS = (
     "config.model",
@@ -168,7 +167,7 @@ def test_deployment_id_updated_per_attempt():
             ("primary-model", "deployment-primary"),
             ("fallback-1", "deployment-fb1"),
         ]
-        assert get_settings().get("openai.deployment_id", None) == "deployment-fb1"
+        assert get_settings().get("openai.deployment_id", None) == "deployment-primary"
     finally:
         _restore_settings(snapshot)
 
@@ -225,6 +224,36 @@ def test_concurrent_explicit_routes_do_not_leak_deployments_or_controls():
         _restore_settings(snapshot)
 
 
+def test_fallback_deployment_does_not_poison_the_next_retry():
+    snapshot = _snapshot_settings()
+    try:
+        get_settings().set("config.model", "primary-model")
+        get_settings().set("config.fallback_models", ["fallback-1"])
+        get_settings().set("openai.deployment_id", "deployment-primary")
+        get_settings().set("openai.fallback_deployments", ["deployment-fallback"])
+
+        observed = []
+
+        async def fake_f(model):
+            observed.append((model, get_settings().get("openai.deployment_id", None)))
+            if model == "primary-model":
+                raise RuntimeError("primary failed")
+            return "fallback-ok"
+
+        assert asyncio.run(retry_with_fallback_models(fake_f)) == "fallback-ok"
+        assert get_settings().get("openai.deployment_id") == "deployment-primary"
+        assert asyncio.run(retry_with_fallback_models(fake_f)) == "fallback-ok"
+
+        assert observed == [
+            ("primary-model", "deployment-primary"),
+            ("fallback-1", "deployment-fallback"),
+            ("primary-model", "deployment-primary"),
+            ("fallback-1", "deployment-fallback"),
+        ]
+    finally:
+        _restore_settings(snapshot)
+
+
 def test_attributed_route_failure_log_omits_provider_exception_text(monkeypatch):
     secret = "PRIVATE_REPOSITORY_EXCERPT_FROM_PROVIDER_ERROR"
     logger = MagicMock()
@@ -245,6 +274,27 @@ def test_attributed_route_failure_log_omits_provider_exception_text(monkeypatch)
     assert secret not in str(warning_call)
     assert "error" not in warning_call.kwargs["artifact"]
     assert warning_call.kwargs["artifact"]["error_class"] == "RuntimeError"
+
+
+def test_deployment_id_is_restored_when_retry_is_cancelled():
+    snapshot = _snapshot_settings()
+    try:
+        get_settings().set("config.model", "primary-model")
+        get_settings().set("config.fallback_models", ["fallback-1"])
+        get_settings().set("openai.deployment_id", "deployment-primary")
+        get_settings().set("openai.fallback_deployments", ["deployment-fallback"])
+
+        async def fake_f(model):
+            if model == "primary-model":
+                raise RuntimeError("primary failed")
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(retry_with_fallback_models(fake_f))
+
+        assert get_settings().get("openai.deployment_id") == "deployment-primary"
+    finally:
+        _restore_settings(snapshot)
 
 
 def test_weak_model_type_uses_weak_setting_and_forwards_identifier():

