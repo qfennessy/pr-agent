@@ -542,6 +542,8 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
             assert configured["config.use_repo_settings_file"] is False
             assert configured["config.use_global_settings_file"] is False
             assert configured["config.add_user_to_requests"] is False
+            assert configured["config.output_run_cost"] is True
+            assert configured["config.output_run_details"] is False
             assert configured["litellm.enable_callbacks"] is False
             assert configured["litellm.extra_headers"] == {}
             assert configured["otel.is_enabled"] is False

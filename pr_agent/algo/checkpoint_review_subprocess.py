@@ -603,7 +603,10 @@ async def _execute_review(
             settings.set("config.enable_ai_metadata", False)
             settings.set("config.add_user_to_requests", False)
             settings.set("config.output_relevant_configurations", False)
-            settings.set("config.output_run_cost", False)
+            # This flag also enables response-cost collection. Keep it on for
+            # evaluation telemetry; output_run_details and every publication sink
+            # remain disabled below, so no cost footer is rendered or published.
+            settings.set("config.output_run_cost", True)
             settings.set("config.output_run_details", False)
             settings.set("config.propagate_tool_errors", True)
             settings.set("litellm.enable_callbacks", False)
