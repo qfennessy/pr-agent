@@ -212,7 +212,7 @@ class PRReviewer:
         self._review_shadow_only = False
         self._force_no_publish = False
         self._structured_review_result = None
-        self._structured_execution_used = False
+        self._review_execution_started = False
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
             self.git_provider.get_pr_description(split_changes_walkthrough=True))
@@ -314,6 +314,7 @@ class PRReviewer:
         return incremental
 
     async def run(self) -> None:
+        self._review_execution_started = True
         init_run_details()
         record_review_profile(self._review_profile())
         progress_response = None
@@ -543,9 +544,9 @@ class PRReviewer:
 
         if not review_execution_is_isolated():
             raise RuntimeError("structured review execution requires an outer isolation boundary")
-        if getattr(self, "_structured_execution_used", False):
+        if getattr(self, "_review_execution_started", False):
             raise RuntimeError("structured review execution requires a fresh reviewer instance")
-        self._structured_execution_used = True
+        self._review_execution_started = True
 
         previous_force_no_publish = getattr(self, "_force_no_publish", False)
         related_tickets = copy.deepcopy(self.vars.get("related_tickets"))

@@ -6686,6 +6686,22 @@ async def test_structured_no_publish_run_rejects_reused_reviewer_after_failure()
 
 
 @pytest.mark.asyncio
+async def test_structured_no_publish_run_rejects_reviewer_after_ordinary_run_started():
+    reviewer = _make_prediction_reviewer()
+    reviewer.vars = {}
+    reviewer.git_provider.get_files.return_value = []
+    reviewer._prepare_route_after_empty_review_inventory = MagicMock()
+    reviewer._local_artifact_mutations_allowed = MagicMock(return_value=False)
+
+    await reviewer.run()
+
+    with isolate_review_execution(), pytest.raises(RuntimeError, match="fresh reviewer instance"):
+        await reviewer._run_structured_no_publish_once()
+
+    reviewer.git_provider.get_files.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_structured_no_publish_run_isolates_telemetry_and_shared_request_state(monkeypatch):
     git_provider = MagicMock()
     git_provider.get_files.return_value = ["app.py"]
