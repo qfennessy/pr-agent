@@ -50,6 +50,7 @@ from pr_agent.git_providers.git_provider import IncrementalPR
 from pr_agent.git_providers.gitea_provider import GiteaProvider
 from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.git_providers.gitlab_provider import GitLabProvider
+from pr_agent.git_providers.plain_diff_provider import PlainDiffGitProvider
 from pr_agent.tools.pr_reviewer import PRReviewer
 from tests.unittest._settings_helpers import restore_settings, snapshot_settings
 
@@ -1691,6 +1692,76 @@ async def test_frontier_without_verification_publishes_one_source_free_preflight
         "publish_labels",
     ):
         getattr(provider, method_name).assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_frontier_plain_diff_without_snapshot_identity_fails_before_every_model_call(
+    monkeypatch,
+):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = PlainDiffGitProvider.__new__(PlainDiffGitProvider)
+    provider.get_files = MagicMock(return_value=["src/service.py"])
+    provider.get_diff_files = MagicMock(return_value=[_route_file("src/service.py")])
+    provider.get_pr_head_sha = MagicMock(side_effect=AssertionError("must fail at preflight"))
+    provider.publish_structured_review = MagicMock()
+    provider.publish_comment = MagicMock()
+    provider.publish_persistent_comment = MagicMock()
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
+    reviewer._prepare_review_route = MagicMock()
+    reviewer._review_shadow_only = False
+    reviewer._prepare_pr_review = MagicMock(return_value="must not render")
+    reviewer._run_candidate_verification = AsyncMock()
+    reviewer.ai_handler = SimpleNamespace(azure=False, chat_completion=AsyncMock())
+    retry = AsyncMock()
+    extract_tickets = AsyncMock()
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", extract_tickets)
+    monkeypatch.setattr(pr_reviewer_module, "get_specialist_snapshot_context", lambda: None)
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.publish_output",
+        "pr_reviewer.enable_candidate_verification",
+        "pr_reviewer.enable_frontier_adjudication",
+    ))
+    try:
+        settings.config.publish_output = True
+        settings.pr_reviewer.enable_candidate_verification = True
+        settings.pr_reviewer.enable_frontier_adjudication = True
+
+        await reviewer.run()
+    finally:
+        restore_settings(snapshot)
+
+    failure = {
+        "enabled": True,
+        "status": "unavailable",
+        "failure": "stable_identity_unavailable",
+        "results": [],
+        "publication_safe": False,
+    }
+    provider.publish_structured_review.assert_called_once_with({
+        "review": {"key_issues_to_review": []},
+        "usage": {},
+        "metadata": {
+            "review_profile": "full",
+            "omitted_files": [],
+            "deleted_files": [],
+        },
+        "frontier_adjudication": failure,
+    })
+    provider.get_pr_head_sha.assert_not_called()
+    retry.assert_not_awaited()
+    extract_tickets.assert_not_awaited()
+    reviewer._run_candidate_verification.assert_not_awaited()
+    reviewer.ai_handler.chat_completion.assert_not_awaited()
+    reviewer._prepare_pr_review.assert_not_called()
+    provider.publish_comment.assert_not_called()
+    provider.publish_persistent_comment.assert_not_called()
 
 
 @pytest.mark.asyncio

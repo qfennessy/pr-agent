@@ -381,8 +381,8 @@ class PRReviewer:
                     }, source_free=True)
                     if getattr(self, "_review_shadow_only", False):
                         get_settings().data = {"artifact": ""}
-                    get_logger().error(
-                        "Frontier adjudication configuration is invalid",
+                    get_logger().warning(
+                        "Frontier adjudication preflight is unavailable",
                         artifact=self.frontier_adjudication_artifact,
                     )
                     return None
@@ -1847,6 +1847,24 @@ class PRReviewer:
 
     def _prepare_frontier_adjudication_config(self) -> bool:
         """Validate and freeze frontier configuration before any model dispatch."""
+
+        provider_head_method = getattr(type(self.git_provider), "get_pr_head_sha", None)
+        if (
+            get_specialist_snapshot_context() is None
+            and provider_head_method is GitProvider.get_pr_head_sha
+        ):
+            # A provider that inherits the base implementation has no refreshable
+            # identity to bind pre/post-call checks. Fail before the review and
+            # verifier model calls instead of paying for an unusable adjudication.
+            self._frontier_adjudication_config = None
+            self.frontier_adjudication_artifact = {
+                "enabled": True,
+                "status": "unavailable",
+                "failure": "stable_identity_unavailable",
+                "results": [],
+                "publication_safe": False,
+            }
+            return False
 
         try:
             config = load_frontier_adjudication_config(

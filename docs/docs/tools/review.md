@@ -513,6 +513,9 @@ make a frontier call.
 
 `enable_frontier_adjudication = true` requires `enable_candidate_verification = true`. If that prerequisite is missing,
 the review records an explicit `configuration_invalid` frontier artifact and makes no frontier call.
+Direct `plain-diff` runs also stop at preflight with `stable_identity_unavailable`: their input has no independently
+refreshable head identity for the mandatory before/after checks. A caller that needs local frontier adjudication must
+provide the immutable `ReviewSnapshot` context instead of relying on an unbound plain diff.
 
 ```toml
 [pr_reviewer]
