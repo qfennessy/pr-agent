@@ -517,7 +517,7 @@ async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubproces
         )
 
     from pr_agent.algo.ai_handlers.litellm_helpers import drain_litellm_callbacks
-    from pr_agent.algo.review_execution_context import isolate_review_execution
+    from pr_agent.algo.review_execution_context import isolate_review_execution, pin_review_prompt_date
     from pr_agent.algo.review_specialists import use_specialist_snapshot_context
     from pr_agent.algo.skills_loader import pin_skills_context
     from pr_agent.config_loader import get_settings
@@ -546,6 +546,7 @@ async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubproces
     with open(os.devnull, "w", encoding="utf-8") as sink, redirect_stdout(sink):
         with (
             isolate_review_execution(),
+            pin_review_prompt_date(""),
             pin_skills_context(skills_context),
             use_specialist_snapshot_context(snapshot, lambda: snapshot.snapshot_id),
         ):

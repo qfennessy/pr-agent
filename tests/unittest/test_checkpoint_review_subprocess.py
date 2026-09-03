@@ -13,7 +13,7 @@ import pytest
 
 from pr_agent.algo import checkpoint_review_subprocess as review_subprocess
 from pr_agent.algo.review_configuration import snapshot_review_configuration_hash
-from pr_agent.algo.review_execution_context import review_execution_is_isolated
+from pr_agent.algo.review_execution_context import get_review_prompt_date, review_execution_is_isolated
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewSnapshot
 from pr_agent.algo.review_specialists import get_specialist_snapshot_context
 from pr_agent.algo.skills_loader import get_skills_context
@@ -442,6 +442,7 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
         def __init__(self, pr_url):
             assert pr_url == "checkpoint-review-subprocess"
             assert review_execution_is_isolated() is True
+            assert get_review_prompt_date() == ""
             assert configured["plain_diff.disable_working_tree_enrichment"] is True
             assert configured["plain_diff.output_path"] is None
             assert configured["plain_diff.json_output_path"] is None
@@ -483,6 +484,7 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
     assert configured["plain_diff.suppress_stdout"] is True
     assert configured["plain_diff.repo_context_files"] == {}
     assert "caller-supplied context" in configured["pr_reviewer.extra_instructions"]
+    assert get_review_prompt_date() != ""
     drain.assert_awaited_once_with(timeout=review_subprocess._CALLBACK_DRAIN_TIMEOUT_SECONDS)
 
 

@@ -60,7 +60,7 @@ from pr_agent.algo.pr_processing import (
     retry_with_fallback_models,
 )
 from pr_agent.algo.repo_context import build_repo_context
-from pr_agent.algo.review_execution_context import review_execution_is_isolated
+from pr_agent.algo.review_execution_context import get_review_prompt_date, review_execution_is_isolated
 from pr_agent.algo.review_router import (
     ChangedFile,
     ChangeKind,
@@ -292,7 +292,7 @@ class PRReviewer:
             "is_ai_metadata": self._enable_ai_metadata,
             "related_tickets": [] if bugs_only else get_settings().get('related_tickets', []),
             'duplicate_prompt_examples': get_settings().config.get('duplicate_prompt_examples', False),
-            "date": datetime.datetime.now().strftime('%Y-%m-%d'),
+            "date": get_review_prompt_date(),
             "enable_candidate_verification": self._candidate_verification_enabled(),
             "ci_failure_context": json.dumps(self.ci_failure_context, ensure_ascii=False),
         }
