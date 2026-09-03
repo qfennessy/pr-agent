@@ -28,11 +28,15 @@ GITHUB_EXPLICIT_REFERENCE_PREFIX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 MARKDOWN_FENCED_CODE_PATTERN = re.compile(
-    r"^[ \t]*(?P<fence>`{3,}|~{3,})[^\n]*(?:\n|$).*?"
-    r"(?:^[ \t]*(?P=fence)[ \t]*(?=\n|$)|\Z)",
-    re.MULTILINE | re.DOTALL,
+    r"^[ \t]*(?P<marker>`{3,}|~{3,})[^\n]*(?:\n|$)",
+    re.MULTILINE,
 )
-MARKDOWN_INLINE_CODE_PATTERN = re.compile(r"`+[^`\n]*`+")
+MARKDOWN_FENCED_CODE_CLOSER_PATTERN = re.compile(
+    r"^[ \t]*(?P<marker>`+|~+)[ \t]*(?:\n|$)",
+    re.MULTILINE,
+)
+# Inline code is masked with a deterministic run scanner below. A backreference
+# regex can backtrack excessively on long, untrusted delimiter runs.
 # Option A: issue number at start of branch or after /, followed by - or end (e.g. feature/1-test-issue, 123-fix)
 BRANCH_ISSUE_PATTERN = re.compile(r"(?:^|/)(\d{1,6})(?=-|$)")
 
@@ -259,14 +263,92 @@ def extract_gitlab_ticket_references(pr_description, repo_path, gitlab_url):
     return references[:MAX_GITLAB_TICKETS]
 
 
+def _mask_markdown_range(masked_text, text, start, end):
+    for index in range(start, end):
+        if text[index] != "\n":
+            masked_text[index] = " "
+
+
+def _mask_markdown_inline_code(text):
+    """Mask matched backtick spans with a linear, delimiter-aware scan."""
+
+    masked_text = list(text)
+    line_start = 0
+    while line_start < len(text):
+        line_end = text.find("\n", line_start)
+        if line_end == -1:
+            line_end = len(text)
+
+        runs = []
+        index = line_start
+        while index < line_end:
+            if text[index] != "`":
+                index += 1
+                continue
+            run_end = index + 1
+            while run_end < line_end and text[run_end] == "`":
+                run_end += 1
+            runs.append((index, run_end, run_end - index))
+            index = run_end
+
+        next_same_run = [None] * len(runs)
+        last_run_by_length = {}
+        for index in range(len(runs) - 1, -1, -1):
+            delimiter_length = runs[index][2]
+            next_same_run[index] = last_run_by_length.get(delimiter_length)
+            last_run_by_length[delimiter_length] = index
+
+        cursor = line_start
+        run_index = 0
+        while run_index < len(runs):
+            opener_start, opener_end, _ = runs[run_index]
+            if opener_start < cursor:
+                run_index += 1
+                continue
+
+            closer_index = next_same_run[run_index]
+            if closer_index is None:
+                cursor = opener_end
+                run_index += 1
+                continue
+
+            _mask_markdown_range(masked_text, text, opener_start, runs[closer_index][1])
+            cursor = runs[closer_index][1]
+            run_index = closer_index + 1
+
+        if line_end == len(text):
+            break
+        line_start = line_end + 1
+
+    return "".join(masked_text)
+
+
 def _mask_markdown_code(text):
     """Replace Markdown code with spaces while retaining source offsets."""
 
-    def _mask(match):
-        return "".join("\n" if character == "\n" else " " for character in match.group(0))
+    masked_text = list(text)
+    cursor = 0
+    while True:
+        opener = MARKDOWN_FENCED_CODE_PATTERN.search(text, cursor)
+        if opener is None:
+            break
 
-    text = MARKDOWN_FENCED_CODE_PATTERN.sub(_mask, text)
-    return MARKDOWN_INLINE_CODE_PATTERN.sub(_mask, text)
+        marker = opener.group("marker")
+        closer = None
+        for candidate in MARKDOWN_FENCED_CODE_CLOSER_PATTERN.finditer(text, opener.end()):
+            candidate_marker = candidate.group("marker")
+            if candidate_marker[0] == marker[0] and len(candidate_marker) >= len(marker):
+                closer = candidate
+                break
+
+        end = closer.end() if closer is not None else len(text)
+        _mask_markdown_range(masked_text, text, opener.start(), end)
+
+        cursor = end
+        if closer is None:
+            break
+
+    return _mask_markdown_inline_code("".join(masked_text))
 
 
 def _parse_github_issue_reference_url(ticket_url):
@@ -276,15 +358,34 @@ def _parse_github_issue_reference_url(ticket_url):
     except (AttributeError, TypeError, ValueError):
         return None
 
-    path_parts = [part for part in parsed.path.split("/") if part]
-    if len(path_parts) < 4 or path_parts[-2] != "issues" or not path_parts[-1].isdigit():
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
-    owner, repo = path_parts[-4], path_parts[-3]
+
+    path = parsed.path
+    is_github_api_path = path.startswith("/api/v3/")
+    if is_github_api_path:
+        path = path[len("/api/v3"):]
+
+    path_parts = path.split("/")
+    if path_parts and path_parts[-1] == "":
+        path_parts.pop()
+    is_api_url = parsed.hostname == "api.github.com" or is_github_api_path
+    if not is_api_url and len(path_parts) == 5 and path_parts[0] == "" and path_parts[3] == "issues":
+        owner, repo, issue_number = path_parts[1], path_parts[2], path_parts[4]
+    elif is_api_url and len(path_parts) == 6:
+        if path_parts[0] != "" or path_parts[1] != "repos" or path_parts[4] != "issues":
+            return None
+        owner, repo, issue_number = path_parts[2], path_parts[3], path_parts[5]
+    else:
+        return None
+
+    if not issue_number.isdigit():
+        return None
     if not GITHUB_OWNER_PATTERN.fullmatch(owner) or "--" in owner:
         return None
     if not GITHUB_REPOSITORY_COMPONENT_PATTERN.fullmatch(repo) or repo in {".", ".."}:
         return None
-    return (_normalize_github_host(ticket_url), owner.casefold(), repo.casefold(), int(path_parts[-1]))
+    return (_normalize_github_host(ticket_url), owner.casefold(), repo.casefold(), int(issue_number))
 
 
 def _has_explicit_github_reference_prefix(text, match_start, previous_match_end):
@@ -513,9 +614,10 @@ async def extract_tickets(git_provider):
             if tickets:
 
                 for ticket in tickets:
-                    repo_name, original_issue_number = git_provider._parse_issue_url(ticket)
-
+                    repo_name = ticket
+                    original_issue_number = "unknown"
                     try:
+                        repo_name, original_issue_number = git_provider._parse_issue_url(ticket)
                         repo_obj = _get_repo_obj_for_ticket(git_provider, ticket, repo_name, repo_obj_cache)
                         issue_main = repo_obj.get_issue(original_issue_number)
                     except Exception as e:

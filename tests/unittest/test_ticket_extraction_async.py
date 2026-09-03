@@ -314,6 +314,22 @@ class TestGithubExplicitReferenceParsing:
             "https://github.com/org/repo/issues/5/", "org/repo"
         ) == ["https://github.com/org/repo/issues/5"]
 
+    @pytest.mark.parametrize(
+        ("url", "base_url"),
+        [
+            ("https://api.github.com/repos/org/repo/issues/6", "https://github.com"),
+            ("https://github.enterprise.local/api/v3/repos/acme/repo/issues/7", "https://github.enterprise.local"),
+        ],
+    )
+    def test_github_api_issue_urls_are_supported(self, url, base_url):
+        assert extract_ticket_links_from_pr_description(url, "org/repo", base_url) == [url]
+
+    def test_extra_path_segments_in_issue_url_are_rejected_without_losing_valid_ticket(self):
+        description = "Fixes #2 and see https://github.com/org/repo/wiki/issues/7"
+        assert extract_ticket_links_from_pr_description(description, "org/repo") == [
+            "https://github.com/org/repo/issues/2"
+        ]
+
     def test_github_dot_com_url_is_ignored_on_enterprise(self):
         assert extract_ticket_links_from_pr_description(
             "https://github.com/org/repo/issues/5",
@@ -342,6 +358,31 @@ https://github.com/org/repo/issues/10
 ```
 """
         assert extract_ticket_links_from_pr_description(description, "org/repo") == []
+
+    def test_inline_code_uses_matching_backtick_delimiter_length(self):
+        description = "`` `Fixes #8` `` and Fixes #2"
+        assert extract_ticket_links_from_pr_description(description, "org/repo") == [
+            "https://github.com/org/repo/issues/2"
+        ]
+
+    def test_inline_code_masks_longer_inner_backtick_runs(self):
+        description = "`References #8 `` remains code` and Fixes #2"
+        assert extract_ticket_links_from_pr_description(description, "org/repo") == [
+            "https://github.com/org/repo/issues/2"
+        ]
+
+    def test_unclosed_long_inline_delimiter_does_not_hide_later_reference(self):
+        description = "prefix " + "`" * 3000 + " and Fixes #2"
+        assert extract_ticket_links_from_pr_description(description, "org/repo") == [
+            "https://github.com/org/repo/issues/2"
+        ]
+
+    @pytest.mark.parametrize(("opener", "closer"), [("```", "````"), ("~~~", "~~~~")])
+    def test_fenced_code_accepts_a_longer_matching_closer(self, opener, closer):
+        description = f"{opener}markdown\nFixes #8\n{closer}\nFixes #2"
+        assert extract_ticket_links_from_pr_description(description, "org/repo") == [
+            "https://github.com/org/repo/issues/2"
+        ]
 
     @pytest.mark.parametrize(
         "malformed",
@@ -601,6 +642,29 @@ class TestGetIssueFailureIsolated:
         assert result is not None
         ids = [t["ticket_id"] for t in result]
         assert ids == [2]
+
+    def test_issue_url_parse_failure_does_not_break_other_tickets(self, settings_snapshot, monkeypatch):
+        repo_obj = _FakeRepoObj({
+            2: _FakeIssue(2, title="Two"),
+            3: _FakeIssue(3, title="Three"),
+        })
+        provider = _make_github_provider(
+            user_description="Fixes #2",
+            repo_obj=repo_obj,
+        )
+
+        def _ticket_candidates(*_args):
+            return [
+                "https://github.com/org/repo/issues/2",
+                "https://github.com/org/repo/wiki/issues/7",
+                "https://github.com/org/repo/issues/3",
+            ]
+
+        monkeypatch.setattr(tpc, "extract_ticket_links_from_pr_description", _ticket_candidates)
+
+        result = asyncio.run(extract_tickets(provider))
+
+        assert [ticket["ticket_id"] for ticket in result] == [2, 3]
 
 
 # ---------------------------------------------------------------------------
