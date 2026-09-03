@@ -592,11 +592,18 @@ async def _handle_worker_request(
 async def _stop_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
-    process.terminate()
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        await process.wait()
+        return
     try:
         await asyncio.wait_for(process.wait(), timeout=1.0)
     except asyncio.TimeoutError:
-        process.kill()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
         await process.wait()
 
 

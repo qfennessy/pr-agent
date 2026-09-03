@@ -119,6 +119,20 @@ class _AbnormalExitProcess(_FakeProcess):
         return self.returncode
 
 
+class _ExitBeforeTerminateProcess(_FakeProcess):
+    def __init__(self):
+        super().__init__(b"")
+        self.waited = False
+
+    def terminate(self):
+        raise ProcessLookupError
+
+    async def wait(self):
+        self.waited = True
+        self.returncode = 0
+        return self.returncode
+
+
 @pytest.mark.asyncio
 async def test_parent_refuses_without_spawning(monkeypatch):
     spawn = AsyncMock()
@@ -232,6 +246,16 @@ async def test_parent_terminates_worker_on_timeout(monkeypatch):
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.TIMEOUT
     assert outcome.failure_reason_code == "worker_timeout"
     assert process.terminated is True
+
+
+@pytest.mark.asyncio
+async def test_stop_process_reaps_worker_that_exits_before_terminate():
+    process = _ExitBeforeTerminateProcess()
+
+    await review_subprocess._stop_process(process)
+
+    assert process.waited is True
+    assert process.returncode == 0
 
 
 @pytest.mark.asyncio
