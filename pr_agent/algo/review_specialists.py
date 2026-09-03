@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_request_context import AIModelRoute
+from pr_agent.algo.config_utils import parse_env_bool
 from pr_agent.algo.git_patch_processing import (
     RE_HUNK_HEADER,
     iter_git_patch_lines,
@@ -452,7 +453,7 @@ def specialists_enabled() -> bool:
     """Cheap gate used before constructing any specialist object."""
 
     section = get_settings().get("specialist_pipeline", {}) or {}
-    return section.get("enabled", False) is True
+    return parse_env_bool(section.get("enabled", False)) is True
 
 
 def _positive_int(value: Any, key: str) -> int:

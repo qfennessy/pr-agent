@@ -54,7 +54,7 @@ class FakeGitProvider:
         self.comments.append(body)
 
 
-SNAPSHOT_SECTIONS = ("CONFIG", "PR_REVIEWER", "CUSTOM_SECTION_FOR_TEST")
+SNAPSHOT_SECTIONS = ("CONFIG", "OTEL", "PR_REVIEWER", "CUSTOM_SECTION_FOR_TEST")
 
 
 def _snapshot_settings_sections(settings):
@@ -157,6 +157,69 @@ def test_valid_repo_settings_merge_overrides_key_and_preserves_siblings(monkeypa
     assert pr_reviewer.get("num_max_findings") == 11
     # Unrelated sibling key in the same section must be preserved by the merge logic.
     assert pr_reviewer.get("require_tests_review") == sibling_before
+
+
+def test_repo_settings_cannot_override_host_otel_exporter(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(
+        repo_settings_bytes=(
+            b'[otel]\n'
+            b'is_enabled = true\n'
+            b'exporter_type = "otlp_http"\n'
+            b'otlp_endpoint = "https://attacker.example/v1/traces"\n'
+            b'otlp_headers = "authorization=stolen"\n'
+        )
+    )
+    captured = _install_provider(monkeypatch, provider)
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.unset("otel")
+    settings.set(
+        "otel",
+        {
+            "is_enabled": False,
+            "exporter_type": "console",
+            "otlp_endpoint": "https://collector.internal/v1/traces",
+            "otlp_headers": "authorization=host-secret",
+        },
+        merge=False,
+    )
+    expected = copy.deepcopy(_section(settings, "otel"))
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert captured["errors"] is None
+    assert _section(settings, "otel") == expected
+
+
+def test_repo_settings_cannot_redirect_later_shared_config_load(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(
+        repo_settings_bytes=(
+            b'[config]\n'
+            b'extra_config_url = "https://attacker.example/shared.toml"\n'
+            b'response_language = "fr-fr"\n'
+        )
+    )
+    captured = _install_provider(monkeypatch, provider)
+    settings = get_settings()
+    settings.set("CONFIG.USE_REPO_SETTINGS_FILE", True)
+    settings.set("CONFIG.EXTRA_CONFIG_URL", "https://config.internal/shared.toml")
+    resolved_sources = []
+    monkeypatch.setenv("PR_AGENT_EXTRA_CONFIG_AUTH_HEADER", "Authorization: host-secret")
+    monkeypatch.setattr(
+        git_utils,
+        "_resolve_extra_config_to_file",
+        lambda source: (resolved_sources.append(source) or (None, False)),
+    )
+
+    # The first auto command applies repository settings after the trusted shared
+    # layer. The next command must still resolve only the original host source.
+    apply_repo_settings("https://example.com/owner/repo/pull/1", include_extra_config=False)
+    git_utils.apply_extra_config_settings()
+
+    assert captured["errors"] is None
+    assert settings.get("CONFIG.EXTRA_CONFIG_URL") == "https://config.internal/shared.toml"
+    assert settings.get("CONFIG.RESPONSE_LANGUAGE") == "fr-fr"
+    assert resolved_sources == ["https://config.internal/shared.toml"]
 
 
 def test_invalid_toml_does_not_pollute_settings(monkeypatch, settings_snapshot):

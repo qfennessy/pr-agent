@@ -2,8 +2,9 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
+from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.git_providers.codecommit_provider import CodeCommitFile, CodeCommitProvider, PullRequestCCMimic
+from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
 
 
 class TestCodeCommitFile:
@@ -27,6 +28,74 @@ class TestCodeCommitFile:
 
 
 class TestCodeCommitProvider:
+    @staticmethod
+    def _make_diff_provider(git_files):
+        provider = object.__new__(CodeCommitProvider)
+        provider.repo_name = "my_test_repo"
+        provider.pr = PullRequestCCMimic("Encoding test", [])
+        provider.pr.destination_commit = "destination-commit"
+        provider.pr.source_commit = "source-commit"
+        provider.diff_files = None
+        provider.git_files = git_files
+        provider.codecommit_client = MagicMock()
+        return provider
+
+    @staticmethod
+    def _make_same_path_multi_target_provider():
+        provider = object.__new__(CodeCommitProvider)
+        provider.repo_name = "source-repository"
+        provider.pr_num = 321
+        provider.diff_files = None
+        provider.codecommit_client = MagicMock()
+        provider.pr = PullRequestCCMimic(
+            "Multi-target PR",
+            [],
+            targets=[
+                MagicMock(
+                    repository_name="source-repository",
+                    source_commit="source-commit-1",
+                    destination_commit="destination-commit-1",
+                ),
+                MagicMock(
+                    repository_name="destination-repository",
+                    source_commit="source-commit-2",
+                    destination_commit="destination-commit-2",
+                ),
+            ],
+        )
+        provider.git_files = [
+            CodeCommitFile(
+                "shared.py",
+                "before-1",
+                "shared.py",
+                "after-1",
+                EDIT_TYPE.MODIFIED,
+                repository_name="source-repository",
+                source_commit="source-commit-1",
+                destination_commit="destination-commit-1",
+            ),
+            CodeCommitFile(
+                "shared.py",
+                "before-2",
+                "shared.py",
+                "after-2",
+                EDIT_TYPE.MODIFIED,
+                repository_name="destination-repository",
+                source_commit="source-commit-2",
+                destination_commit="destination-commit-2",
+            ),
+        ]
+        contents = {
+            ("source-repository", "destination-commit-1"): b"header\nold one\n",
+            ("source-repository", "source-commit-1"): b"header\nnew one\n",
+            ("destination-repository", "destination-commit-2"): b"a\nb\nc\nd\nold two\n",
+            ("destination-repository", "source-commit-2"): b"a\nb\nc\nd\nnew two\n",
+        }
+        provider.codecommit_client.get_file.side_effect = (
+            lambda repository, _path, commit: contents[(repository, commit)]
+        )
+        return provider
+
     def test_get_diff_files_includes_deleted_file(self):
         provider = object.__new__(CodeCommitProvider)
         provider.repo_name = "my_test_repo"
@@ -50,6 +119,348 @@ class TestCodeCommitProvider:
         assert provider.codecommit_client.get_file.call_args_list == [
             call("my_test_repo", "deleted.py", "destination-commit")
         ]
+
+    @pytest.mark.parametrize(
+        ("non_utf8_file", "invalid_path", "invalid_commit"),
+        [
+            (CodeCommitFile("", "", "added.py", "after-id", EDIT_TYPE.ADDED), "added.py", "source-commit"),
+            (CodeCommitFile("deleted.py", "before-id", "", "", EDIT_TYPE.DELETED), "deleted.py", "destination-commit"),
+            (
+                CodeCommitFile("modified.py", "before-id", "modified.py", "after-id", EDIT_TYPE.MODIFIED),
+                "modified.py",
+                "destination-commit",
+            ),
+            (
+                CodeCommitFile("modified.py", "before-id", "modified.py", "after-id", EDIT_TYPE.MODIFIED),
+                "modified.py",
+                "source-commit",
+            ),
+            (
+                CodeCommitFile("old.py", "before-id", "new.py", "after-id", EDIT_TYPE.RENAMED),
+                "old.py",
+                "destination-commit",
+            ),
+        ],
+    )
+    def test_get_diff_files_skips_non_utf8_file_and_keeps_utf8_sibling(
+        self,
+        non_utf8_file,
+        invalid_path,
+        invalid_commit,
+    ):
+        valid_file = CodeCommitFile("good.py", "before-id", "good.py", "after-id", EDIT_TYPE.MODIFIED)
+        provider = self._make_diff_provider([non_utf8_file, valid_file])
+
+        def get_file(_repo_name, path, commit):
+            if path == invalid_path and commit == invalid_commit:
+                return b"\xffinvalid\n"
+            return b"before\n" if commit == "destination-commit" else b"after\n"
+
+        provider.codecommit_client.get_file.side_effect = get_file
+
+        diff_files = provider.get_diff_files()
+
+        assert [diff_file.filename for diff_file in diff_files] == ["good.py"]
+        assert diff_files[0].base_file == "before\n"
+        assert diff_files[0].head_file == "after\n"
+        assert "-before" in diff_files[0].patch
+        assert "+after" in diff_files[0].patch
+        assert diff_files[0].edit_type == EDIT_TYPE.MODIFIED
+        assert provider.diff_files is diff_files
+
+    def test_get_diff_files_filters_invalid_extension_before_fetching_content(self):
+        ignored_file = CodeCommitFile("image.png", "before-id", "image.png", "after-id", EDIT_TYPE.MODIFIED)
+        valid_file = CodeCommitFile("good.py", "before-id", "good.py", "after-id", EDIT_TYPE.MODIFIED)
+        provider = self._make_diff_provider([ignored_file, valid_file])
+        provider.codecommit_client.get_file.side_effect = (
+            lambda _repo_name, _path, commit: b"before\n" if commit == "destination-commit" else b"after\n"
+        )
+
+        diff_files = provider.get_diff_files()
+
+        assert [diff_file.filename for diff_file in diff_files] == ["good.py"]
+        assert provider.codecommit_client.get_file.call_args_list == [
+            call("my_test_repo", "good.py", "destination-commit"),
+            call("my_test_repo", "good.py", "source-commit"),
+        ]
+
+    def test_get_diff_files_does_not_swallow_client_errors(self):
+        file = CodeCommitFile("file.py", "before-id", "file.py", "after-id", EDIT_TYPE.MODIFIED)
+        provider = self._make_diff_provider([file])
+        provider.codecommit_client.get_file.side_effect = ValueError("AWS request failed")
+
+        with pytest.raises(ValueError, match="AWS request failed"):
+            provider.get_diff_files()
+
+    def test_get_files_includes_differences_from_every_pull_request_target(self):
+        provider = object.__new__(CodeCommitProvider)
+        provider.repo_name = "source-repository"
+        provider.pr_num = 321
+        provider.diff_files = None
+        provider.git_files = None
+        provider.codecommit_client = MagicMock()
+
+        first_target = MagicMock(
+            repository_name="source-repository",
+            source_commit="source-commit-1",
+            source_branch="feature/one",
+            destination_commit="destination-commit-1",
+            destination_branch="main",
+        )
+        second_target = MagicMock(
+            repository_name="destination-repository",
+            source_commit="source-commit-2",
+            source_branch="feature/two",
+            destination_commit="destination-commit-2",
+            destination_branch="release",
+        )
+        provider.codecommit_client.get_pr.return_value = MagicMock(
+            title="Multi-target PR",
+            description="Review both targets",
+            targets=[first_target, second_target],
+        )
+        provider.codecommit_client.get_differences.side_effect = [
+            [MagicMock(before_blob_path="one.py", before_blob_id="before-1",
+                       after_blob_path="one.py", after_blob_id="after-1", change_type="M")],
+            [MagicMock(before_blob_path="two.py", before_blob_id="before-2",
+                       after_blob_path="two.py", after_blob_id="after-2", change_type="M")],
+        ]
+
+        provider.pr = provider._get_pr()
+        files = provider.get_files()
+
+        assert [target.repository_name for target in provider.pr.targets] == [
+            "source-repository", "destination-repository"
+        ]
+        assert [file.filename for file in files] == ["one.py", "two.py"]
+        assert [(file.repository_name, file.destination_commit, file.source_commit) for file in files] == [
+            ("source-repository", "destination-commit-1", "source-commit-1"),
+            ("destination-repository", "destination-commit-2", "source-commit-2"),
+        ]
+        assert provider.codecommit_client.get_differences.call_args_list == [
+            call("source-repository", "destination-commit-1", "source-commit-1"),
+            call("destination-repository", "destination-commit-2", "source-commit-2"),
+        ]
+
+        provider.codecommit_client.get_file.side_effect = (
+            lambda repository, path, commit: {
+                ("source-repository", "one.py", "destination-commit-1"): b"before one\n",
+                ("source-repository", "one.py", "source-commit-1"): b"after one\n",
+                ("destination-repository", "two.py", "destination-commit-2"): b"before two\n",
+                ("destination-repository", "two.py", "source-commit-2"): b"after two\n",
+            }[(repository, path, commit)]
+        )
+        diff_files = provider.get_diff_files()
+
+        assert [(file.filename, file.base_file, file.head_file) for file in diff_files] == [
+            ("one.py", "before one\n", "after one\n"),
+            ("two.py", "before two\n", "after two\n"),
+        ]
+
+    def test_publish_comment_uses_every_pull_request_target(self):
+        provider = object.__new__(CodeCommitProvider)
+        provider.repo_name = "source-repository"
+        provider.pr_num = 321
+        provider.codecommit_client = MagicMock()
+        provider.pr = PullRequestCCMimic(
+            "Multi-target PR",
+            [],
+            targets=[
+                MagicMock(
+                    repository_name="source-repository",
+                    source_commit="source-commit-1",
+                    destination_commit="destination-commit-1",
+                ),
+                MagicMock(
+                    repository_name="destination-repository",
+                    source_commit="source-commit-2",
+                    destination_commit="destination-commit-2",
+                ),
+            ],
+        )
+
+        provider.publish_comment("Review\ncomment")
+
+        assert provider.codecommit_client.publish_comment.call_args_list == [
+            call(
+                repo_name="source-repository",
+                pr_number=321,
+                destination_commit="destination-commit-1",
+                source_commit="source-commit-1",
+                comment="Review\n\ncomment",
+            ),
+            call(
+                repo_name="destination-repository",
+                pr_number=321,
+                destination_commit="destination-commit-2",
+                source_commit="source-commit-2",
+                comment="Review\n\ncomment",
+            ),
+        ]
+
+    @pytest.mark.parametrize("failed_target", [0, 1])
+    def test_publish_comment_isolates_partial_target_failure_without_retry(self, failed_target):
+        provider = self._make_same_path_multi_target_provider()
+        effects = [None, None]
+        effects[failed_target] = RuntimeError("target unavailable")
+        provider.codecommit_client.publish_comment.side_effect = effects
+
+        assert provider.publish_comment("Review") is None
+        assert provider.codecommit_client.publish_comment.call_count == 2
+
+    def test_publish_comment_raises_when_every_target_fails(self):
+        provider = self._make_same_path_multi_target_provider()
+        provider.codecommit_client.publish_comment.side_effect = RuntimeError("all unavailable")
+
+        with pytest.raises(ValueError, match="Cannot publish comment"):
+            provider.publish_comment("Review")
+
+        assert provider.codecommit_client.publish_comment.call_count == 2
+
+    def test_publish_code_suggestion_uses_target_that_contains_file(self):
+        provider = object.__new__(CodeCommitProvider)
+        provider.repo_name = "source-repository"
+        provider.pr_num = 321
+        provider.diff_files = None
+        provider.codecommit_client = MagicMock()
+        provider.pr = PullRequestCCMimic(
+            "Multi-target PR",
+            [],
+            targets=[
+                MagicMock(
+                    repository_name="source-repository",
+                    source_commit="source-commit-1",
+                    destination_commit="destination-commit-1",
+                ),
+                MagicMock(
+                    repository_name="destination-repository",
+                    source_commit="source-commit-2",
+                    destination_commit="destination-commit-2",
+                ),
+            ],
+        )
+        provider.git_files = [
+            CodeCommitFile(
+                "two.py",
+                "before-2",
+                "two.py",
+                "after-2",
+                EDIT_TYPE.MODIFIED,
+                repository_name="destination-repository",
+                source_commit="source-commit-2",
+                destination_commit="destination-commit-2",
+            )
+        ]
+
+        assert provider.publish_code_suggestions([
+            {
+                "body": "Use a constant",
+                "relevant_file": "two.py",
+                "relevant_lines_start": 4,
+            }
+        ]) is True
+
+        provider.codecommit_client.publish_comment.assert_called_once_with(
+            repo_name="destination-repository",
+            pr_number=321,
+            destination_commit="destination-commit-2",
+            source_commit="source-commit-2",
+            comment="Use a constant",
+            annotation_file="two.py",
+            annotation_line=4,
+        )
+
+    def test_publish_code_suggestion_uses_qualified_same_path_target(self):
+        provider = self._make_same_path_multi_target_provider()
+        diff_files = provider.get_diff_files()
+
+        assert len({file.filename for file in diff_files}) == 2
+        assert all(file.filename.startswith("__codecommit_target__/") for file in diff_files)
+        assert [file.head_file for file in diff_files] == [
+            "header\nnew one\n",
+            "a\nb\nc\nd\nnew two\n",
+        ]
+        suggestions_tool = object.__new__(PRCodeSuggestions)
+        suggestions_tool.git_provider = provider
+        assert suggestions_tool._validate_suggestion(
+            diff_files[1].filename, 5, 5, "new two"
+        ) == (True, "", True)
+        assert suggestions_tool._validate_suggestion(
+            diff_files[1].filename, 5, 5, "new one"
+        ) == (False, "the existing code does not match the anchored range", True)
+
+        assert provider.publish_code_suggestions([
+            {
+                "body": "Use a constant",
+                "relevant_file": diff_files[1].filename,
+                "relevant_lines_start": 5,
+            }
+        ]) is True
+
+        provider.codecommit_client.publish_comment.assert_called_once_with(
+            repo_name="destination-repository",
+            pr_number=321,
+            destination_commit="destination-commit-2",
+            source_commit="source-commit-2",
+            comment="Use a constant",
+            annotation_file="shared.py",
+            annotation_line=5,
+        )
+
+    def test_publish_code_suggestion_fails_closed_for_ambiguous_same_path(self):
+        provider = self._make_same_path_multi_target_provider()
+
+        assert provider.publish_code_suggestions([
+            {
+                "body": "Use a constant",
+                "relevant_file": "shared.py",
+                "relevant_lines_start": 2,
+            }
+        ]) is False
+
+        provider.codecommit_client.publish_comment.assert_not_called()
+
+    def test_publish_code_suggestions_isolates_target_failure(self):
+        provider = self._make_same_path_multi_target_provider()
+        diff_files = provider.get_diff_files()
+        provider.codecommit_client.publish_comment.side_effect = [RuntimeError("first target unavailable"), None]
+
+        assert provider.publish_code_suggestions([
+            {
+                "body": "First suggestion",
+                "relevant_file": diff_files[0].filename,
+                "relevant_lines_start": 2,
+            },
+            {
+                "body": "Second suggestion",
+                "relevant_file": diff_files[1].filename,
+                "relevant_lines_start": 5,
+            },
+        ]) is True
+
+        assert provider.codecommit_client.publish_comment.call_count == 2
+        assert provider.codecommit_client.publish_comment.call_args_list[1] == call(
+            repo_name="destination-repository",
+            pr_number=321,
+            destination_commit="destination-commit-2",
+            source_commit="source-commit-2",
+            comment="Second suggestion",
+            annotation_file="shared.py",
+            annotation_line=5,
+        )
+
+    def test_publish_code_suggestions_reports_total_target_failure(self):
+        provider = self._make_same_path_multi_target_provider()
+        diff_files = provider.get_diff_files()
+        provider.codecommit_client.publish_comment.side_effect = RuntimeError("target unavailable")
+
+        assert provider.publish_code_suggestions([
+            {
+                "body": "Use a constant",
+                "relevant_file": diff_files[0].filename,
+                "relevant_lines_start": 2,
+            }
+        ]) is False
 
     def test_get_title(self):
         # Test that the get_title() function returns the PR title

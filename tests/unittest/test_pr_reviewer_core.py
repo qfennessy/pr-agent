@@ -1,15 +1,14 @@
+import asyncio
+import threading
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pr_agent.algo.inline_comment_dedup import (body_with_markers,
-                                                get_inline_comment_store,
-                                                key_issue_fingerprint)
 from pr_agent.algo.ai_request_context import AIModelRoute, get_ai_request_options
-from pr_agent.algo.pr_processing import (PRDiffCoverage,
-                                         retry_with_fallback_models)
+from pr_agent.algo.inline_comment_dedup import body_with_markers, get_inline_comment_store, key_issue_fingerprint
+from pr_agent.algo.pr_processing import PRDiffCoverage, retry_with_fallback_models
 from pr_agent.algo.review_router import (
     ChangedFile,
     ChangeKind,
@@ -24,24 +23,20 @@ from pr_agent.algo.review_specialists import (
     SpecialistState,
     unavailable_specialist_batch,
 )
-from pr_agent.algo.run_details import (get_run_details, init_run_details,
-                                       record_model_used)
+from pr_agent.algo.run_details import get_run_details, init_run_details, record_model_used
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
-from pr_agent.algo.utils import (PRReviewHeader, PRReviewIdentity,
-                                 convert_to_markdown_v2,
-                                 show_run_details)
+from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity, convert_to_markdown_v2, show_run_details
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
 from pr_agent.git_providers.bitbucket_provider import BitbucketProvider
 from pr_agent.git_providers.bitbucket_server_provider import BitbucketServerProvider
 from pr_agent.git_providers.gerrit_provider import GerritProvider
-from pr_agent.git_providers.gitea_provider import GiteaProvider
 from pr_agent.git_providers.git_provider import IncrementalPR
+from pr_agent.git_providers.gitea_provider import GiteaProvider
 from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.git_providers.gitlab_provider import GitLabProvider
 from pr_agent.tools.pr_reviewer import PRReviewer
-from tests.unittest._settings_helpers import (restore_settings,
-                                              snapshot_settings)
+from tests.unittest._settings_helpers import restore_settings, snapshot_settings
 
 # _prepare_prediction now rejects output it cannot parse, so the model's answer can fall
 # back to another model instead of failing after every retry is spent.
@@ -5251,6 +5246,43 @@ def test_set_review_labels_replaces_stale_review_labels_and_keeps_user_labels():
         settings.pr_reviewer.enable_review_labels_security = original["enable_review_labels_security"]
 
 
+def test_set_review_labels_skips_providers_without_label_support():
+    settings = get_settings()
+    original = {
+        "publish_output": settings.config.publish_output,
+        "require_estimate_effort_to_review": settings.pr_reviewer.require_estimate_effort_to_review,
+        "require_security_review": settings.pr_reviewer.require_security_review,
+        "enable_review_labels_effort": settings.pr_reviewer.enable_review_labels_effort,
+        "enable_review_labels_security": settings.pr_reviewer.enable_review_labels_security,
+    }
+    settings.config.publish_output = True
+    settings.pr_reviewer.require_estimate_effort_to_review = True
+    settings.pr_reviewer.require_security_review = True
+    settings.pr_reviewer.enable_review_labels_effort = True
+    settings.pr_reviewer.enable_review_labels_security = True
+    git_provider = MagicMock()
+    git_provider.is_supported.return_value = False
+    reviewer = _make_reviewer(git_provider)
+    data = {
+        "review": {
+            "estimated_effort_to_review_[1-5]": "3, moderate",
+            "security_concerns": "yes",
+        }
+    }
+
+    try:
+        reviewer.set_review_labels(data)
+
+        git_provider.get_pr_labels.assert_not_called()
+        git_provider.publish_labels.assert_not_called()
+    finally:
+        settings.config.publish_output = original["publish_output"]
+        settings.pr_reviewer.require_estimate_effort_to_review = original["require_estimate_effort_to_review"]
+        settings.pr_reviewer.require_security_review = original["require_security_review"]
+        settings.pr_reviewer.enable_review_labels_effort = original["enable_review_labels_effort"]
+        settings.pr_reviewer.enable_review_labels_security = original["enable_review_labels_security"]
+
+
 def test_get_user_answers_collects_question_and_answer_from_issue_comments():
     git_provider = MagicMock()
     git_provider.get_issue_comments.return_value = [
@@ -5445,6 +5477,39 @@ def test_init_maps_user_question_and_answer_to_correct_prompt_vars(monkeypatch):
     assert reviewer.vars["answer_str"] == "/answer Because it fixes production."
 
 
+@pytest.mark.parametrize(("configured", "expected"), [("true", True), ("false", False)])
+def test_init_normalizes_optional_review_flag_strings(monkeypatch, configured, expected):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = MagicMock()
+    provider.get_languages.return_value = {}
+    provider.get_files.return_value = []
+    provider.get_pr_description.return_value = ("desc", [])
+    monkeypatch.setattr(pr_reviewer_module, "get_git_provider_with_context", lambda pr_url: provider)
+    monkeypatch.setattr(pr_reviewer_module, "get_main_pr_language", lambda languages, files: "Python")
+    monkeypatch.setattr(pr_reviewer_module, "TokenHandler", MagicMock())
+    settings_snapshot = snapshot_settings([
+        "pr_reviewer.require_risk_assessment",
+        "pr_reviewer.require_merge_recommendation",
+        "pr_reviewer.require_priority_files",
+    ])
+    try:
+        get_settings().set("pr_reviewer.require_risk_assessment", configured)
+        get_settings().set("pr_reviewer.require_merge_recommendation", configured)
+        get_settings().set("pr_reviewer.require_priority_files", configured)
+
+        reviewer = PRReviewer(
+            "https://example/pr/1",
+            ai_handler=lambda: SimpleNamespace(main_pr_language=None),
+        )
+    finally:
+        restore_settings(settings_snapshot)
+
+    assert reviewer.vars["require_risk_assessment"] is expected
+    assert reviewer.vars["require_merge_recommendation"] is expected
+    assert reviewer.vars["require_priority_files"] is expected
+
+
 def _build_answer_mode_reviewer(monkeypatch, issue_comments):
     """Drive the real ``PRReviewer.__init__`` in answer mode over ``issue_comments``."""
     from pr_agent.tools import pr_reviewer as pr_reviewer_module
@@ -5558,3 +5623,84 @@ def test_unparsable_prediction_is_rejected_so_the_fallback_model_runs(prediction
             reviewer._reject_unparsable_prediction("openai/some-model")
     else:
         reviewer._reject_unparsable_prediction("openai/some-model")
+
+
+async def _render_review_capturing_push(reviewer, publish_output):
+    reviewer.prediction = "review: {}"
+    reviewer.remaining_files_list = []
+    reviewer.git_provider.get_diff_files.return_value = []
+    reviewer.git_provider.is_supported.return_value = False
+    reviewer.set_review_labels = MagicMock()
+
+    settings = get_settings()
+    original_publish_output = settings.config.publish_output
+    try:
+        settings.config.publish_output = publish_output
+        with (
+            patch("pr_agent.tools.pr_reviewer.load_yaml", return_value={"review": {"score": "1"}}),
+            patch("pr_agent.tools.pr_reviewer.github_action_output"),
+            patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", return_value="original review"),
+            patch("pr_agent.tools.pr_reviewer.push_outputs") as push,
+        ):
+            markdown = reviewer._prepare_pr_review()
+            await reviewer._push_prepared_review_output(markdown)
+        return push
+    finally:
+        settings.config.publish_output = original_publish_output
+
+
+@pytest.mark.asyncio
+async def test_prepare_pr_review_does_not_push_outputs_on_a_dry_run():
+    # publish_output=false is used by the CLI and by mosaico's dispatch to render a review
+    # without touching the PR; it must not reach an external sink either.
+    push = await _render_review_capturing_push(_make_prediction_reviewer(), publish_output=False)
+    push.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_prepare_pr_review_pushes_outputs_when_publishing():
+    push = await _render_review_capturing_push(_make_prediction_reviewer(), publish_output=True)
+    push.assert_called_once()
+    assert push.call_args.args[0] == "review"
+    assert push.call_args.kwargs["payload"] == {"score": "1"}
+    assert push.call_args.kwargs["markdown"] == "original review"
+
+
+@pytest.mark.asyncio
+async def test_prepare_pr_review_does_not_push_outputs_for_shadow_only_route():
+    reviewer = _make_prediction_reviewer()
+    reviewer._review_shadow_only = True
+
+    push = await _render_review_capturing_push(reviewer, publish_output=True)
+
+    push.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_push_outputs_does_not_block_review_event_loop():
+    reviewer = _make_prediction_reviewer()
+    reviewer._prepared_push_output_payload = {"score": "1"}
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_push(*args, **kwargs):
+        started.set()
+        release.wait(timeout=2)
+
+    settings = get_settings()
+    original_publish_output = settings.config.publish_output
+    try:
+        settings.config.publish_output = True
+        with patch("pr_agent.tools.pr_reviewer.push_outputs", side_effect=blocking_push):
+            task = asyncio.create_task(reviewer._push_prepared_review_output("review"))
+            for _ in range(1000):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert started.is_set()
+            assert not task.done(), "synchronous sink work blocked the event loop"
+            release.set()
+            await asyncio.wait_for(task, timeout=2)
+    finally:
+        release.set()
+        settings.config.publish_output = original_publish_output

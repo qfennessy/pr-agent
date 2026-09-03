@@ -46,16 +46,40 @@ FORBIDDEN_ARGS = [
     "--config.shared_secret=xxx",
     "--config.app_name=evil",
     "--config.analytics_folder=/tmp",
+    "--config.extra_config_url=https://evil.example/shared.toml",
+    '--config={"extra_config_url": "https://evil.example/shared.toml"}',
+    r'--config={"extra_config\u005furl": "https://evil.example/shared.toml"}',
     # double-underscore variants of the above
     "--github__webhook_secret=secret",
     "--github_app__private_key=xxx",
     "--litellm__api_base=https://evil.example",
+    # push_outputs sinks: a PR comment must not be able to enable the feature,
+    # redirect the review to another host, or pick the file the run appends to
+    "--push_outputs.enable=true",
+    '--push_outputs.channels=["webhook"]',
+    "--push_outputs.webhook_url=https://evil.example/collect",
+    "--push_outputs.slack_webhook_url=https://evil.example/slack",
+    "--push_outputs.file_path=/etc/cron.d/pwn",
+    "--PUSH_OUTPUTS.WEBHOOK_URL=https://evil.example/collect",
+    "--push_outputs__webhook_url=https://evil.example/collect",
+    # whole-section form: the dotted entries above do not cover it
+    '--push_outputs={"enable": true, "channels": ["webhook"], "webhook_url": "https://evil.example"}',
+    # OTEL exporter selection, endpoints, and headers are host-only. PR commands
+    # must not redirect telemetry or inject collector credentials.
+    "--otel.is_enabled=true",
+    "--otel.exporter_type=otlp_http",
+    "--otel.otlp_endpoint=https://evil.example/v1/traces",
+    "--otel.otlp_headers=authorization=secret",
+    "--OTEL__OTLP_ENDPOINT=https://evil.example/v1/traces",
+    '--otel={"is_enabled": true, "otlp_endpoint": "https://evil.example"}',
 ]
 
 
 ALLOWED_ARGS_SINGLE = [
     "--pr_reviewer.num_code_suggestions=3",
     "--pr_reviewer.require_tests_review=true",
+    "--skills.enabled=true",
+    "--skills.max_skills_tokens=1000",
     "--config.response_language=zh-tw",
     "--pr_description.publish_labels=false",
     # non-flag arguments are not validated against the forbidden list
@@ -66,6 +90,14 @@ ALLOWED_ARGS_SINGLE = [
 ]
 
 
+HOST_ONLY_ARGS = [
+    "--skills.paths=/etc",
+    "--skills__paths=/etc",
+    "--skills.unknown=value",
+    "--skills={paths:[/etc]}",
+]
+
+
 @pytest.mark.parametrize("forbidden", FORBIDDEN_ARGS)
 def test_validate_user_args_rejects_forbidden(forbidden):
     ok, offending = CliArgs.validate_user_args([forbidden])
@@ -73,6 +105,13 @@ def test_validate_user_args_rejects_forbidden(forbidden):
     assert isinstance(offending, str) and offending, (
         f"Expected an offending-token string for {forbidden!r}, got {offending!r}"
     )
+
+
+@pytest.mark.parametrize("host_only", HOST_ONLY_ARGS)
+def test_validate_user_args_rejects_keys_not_in_repo_allowlist(host_only):
+    ok, offending = CliArgs.validate_user_args([host_only])
+    assert ok is False
+    assert offending.lstrip('.') in host_only.lower().replace('__', '.')
 
 
 @pytest.mark.parametrize("allowed", ALLOWED_ARGS_SINGLE)
@@ -115,7 +154,7 @@ async def test_handle_request_uses_real_validator_to_block_forbidden(monkeypatch
 
     notify = Mock()
 
-    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url: None)
+    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url, **kwargs: None)
 
     def _fail_update_settings(args):
         raise AssertionError(

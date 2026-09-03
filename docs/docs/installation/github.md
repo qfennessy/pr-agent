@@ -669,7 +669,7 @@ Allowing you to automate the review process on your private or public repositori
    > only when your team is comfortable with AI-driven thread resolution.
    > The feature is opt-in and defaults to off.
 
-2) Generate a random secret for your app, and save it for later. For example, you can use:
+2) Generate a random secret for your app, and save it for later. The webhook secret is required: if `GITHUB.WEBHOOK_SECRET` is not configured, the server rejects every incoming webhook with HTTP 403. For example, you can use:
 
 ```bash
 WEBHOOK_SECRET=$(python -c "import secrets; print(secrets.token_hex(10))")
@@ -696,7 +696,7 @@ cp pr_agent/settings/.secrets_template.toml pr_agent/settings/.secrets.toml
 - Your OpenAI key.
 - Copy your app's private key to the private_key field.
 - Copy your app's ID to the app_id field.
-- Copy your app's webhook secret to the webhook_secret field.
+- Copy your app's webhook secret to the webhook_secret field (required).
 - Set deployment_type to 'app' in [configuration.toml](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml)
 
     > The .secrets.toml file is not copied to the Docker image by default, and is only used for local development.
@@ -805,7 +805,7 @@ CONFIG__SECRET_PROVIDER=aws_secrets_manager
 
 ### AWS CodeCommit Setup
 
-Not all features have been added to CodeCommit yet.  As of right now, CodeCommit has been implemented to run the PR-Agent CLI on the command line, using AWS credentials stored in environment variables.  (More features will be added in the future.)  The following is a set of instructions to have PR-Agent do a review of your CodeCommit pull request from the command line:
+Not all features have been added to CodeCommit yet.  As of right now, CodeCommit has been implemented to run the PR-Agent CLI on the command line, using AWS credentials stored in environment variables.  CodeCommit pull requests with multiple targets are reviewed across every target repository and commit comparison; single-target pull requests keep the same behavior.  The following is a set of instructions to have PR-Agent do a review of your CodeCommit pull request from the command line:
 
 1. Create an IAM user that you will use to read CodeCommit pull requests and post comments
     - Note: That user should have CLI access only, not Console access

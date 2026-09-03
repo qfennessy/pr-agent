@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import datetime
 import json
@@ -29,6 +30,7 @@ from pr_agent.algo.candidate_verification import (
     telemetry_safe_artifact,
     validated_specialist_prioritization,
 )
+from pr_agent.algo.config_utils import parse_env_bool
 from pr_agent.algo.git_patch_processing import iter_git_patch_lines, split_git_file_lines
 from pr_agent.algo.inline_comment_dedup import (
     InlineCommentStore,
@@ -90,6 +92,7 @@ from pr_agent.algo.utils import (
     get_model,
     github_action_output,
     load_yaml,
+    push_outputs,
     show_relevant_configurations,
     show_run_details,
 )
@@ -186,10 +189,10 @@ class PRReviewer:
         if (self.pr_description_files and get_settings().get("config.is_auto_command", False) and
                 get_settings().get("config.enable_ai_metadata", False)):
             add_ai_metadata_to_diff_files(self.git_provider, self.pr_description_files)
-            get_logger().debug(f"AI metadata added to the this command")
+            get_logger().debug("AI metadata added to the this command")
         else:
             get_settings().set("config.enable_ai_metadata", False)
-            get_logger().debug(f"AI metadata is disabled for this command")
+            get_logger().debug("AI metadata is disabled for this command")
 
         bugs_only = self.review_profile == "bugs_only"
         self.ci_failure_context = (
@@ -229,6 +232,18 @@ class PRReviewer:
             ),
             "require_estimate_contribution_time_cost": (
                 not bugs_only and get_settings().pr_reviewer.require_estimate_contribution_time_cost
+            ),
+            "require_risk_assessment": (
+                not bugs_only
+                and parse_env_bool(get_settings().pr_reviewer.get("require_risk_assessment", False)) is True
+            ),
+            "require_merge_recommendation": (
+                not bugs_only
+                and parse_env_bool(get_settings().pr_reviewer.get("require_merge_recommendation", False)) is True
+            ),
+            "require_priority_files": (
+                not bugs_only
+                and parse_env_bool(get_settings().pr_reviewer.get("require_priority_files", False)) is True
             ),
             'require_can_be_split_review': not bugs_only and get_settings().pr_reviewer.require_can_be_split_review,
             'require_security_review': not bugs_only and get_settings().pr_reviewer.require_security_review,
@@ -371,7 +386,8 @@ class PRReviewer:
                 await self._run_candidate_verification()
 
             pr_review = self._prepare_pr_review()
-            get_logger().debug(f"PR output", artifact=pr_review)
+            await self._push_prepared_review_output(pr_review)
+            get_logger().debug("PR output", artifact=pr_review)
 
             should_publish = get_settings().config.publish_output and self._should_publish_review_no_suggestions(pr_review)
             if not should_publish:
@@ -1248,7 +1264,7 @@ class PRReviewer:
             self.deleted_files_list = []
 
         if self.patches_diff:
-            get_logger().debug(f"PR diff", diff=self.patches_diff)
+            get_logger().debug("PR diff", diff=self.patches_diff)
             if specialists_enabled() and not getattr(self, "_specialists_started", False):
                 await self._run_shadow_specialists_once()
             self.prediction = await self._get_prediction(model)
@@ -1727,8 +1743,8 @@ class PRReviewer:
         return load_yaml(
             self.prediction.strip(),
             keys_fix_yaml=["ticket_compliance_check", "estimated_effort_to_review_[1-5]:",
-                           "security_concerns:", "key_issues_to_review:", "relevant_file:",
-                           "relevant_line:", "suggestion:"],
+                           "risk_level:", "merge_recommendation:", "security_concerns:",
+                           "key_issues_to_review:", "relevant_file:", "relevant_line:", "suggestion:"],
             first_key="review",
             last_key="security_concerns",
         )
@@ -2252,6 +2268,7 @@ class PRReviewer:
         Prepare the PR review by processing the AI prediction and generating a markdown-formatted text that summarizes
         the feedback.
         """
+        self._prepared_push_output_payload = None
         data = copy.deepcopy(getattr(self, "verified_review_data", None)) or self._parse_review_prediction()
 
         if not isinstance(data, dict) or 'review' not in data:
@@ -2360,14 +2377,29 @@ class PRReviewer:
                 get_settings().get('config', {}).get('output_run_details', False)):
             markdown_text += show_run_details(self.git_provider.is_supported("gfm_markdown"))
 
+        # Snapshot sink data while rendering, then let the async run path await the synchronous
+        # channel implementation in a worker thread. This keeps request event loops responsive
+        # without making synchronous push_outputs callers fire-and-forget.
+        self._prepared_push_output_payload = copy.deepcopy(data.get('review', {}))
+
         # Add custom labels from the review prediction (effort, security)
         if self._provider_mutations_allowed() and self._review_profile() != "bugs_only":
             self.set_review_labels(data)
 
-        if markdown_text == None or len(markdown_text) == 0:
+        if markdown_text is None or len(markdown_text) == 0:
             markdown_text = ""
 
         return markdown_text
+
+    async def _push_prepared_review_output(self, markdown_text: str) -> None:
+        payload = copy.deepcopy(getattr(self, "_prepared_push_output_payload", None))
+        if payload is None or not self._provider_mutations_allowed() or not get_settings().config.publish_output:
+            return
+        try:
+            await asyncio.to_thread(push_outputs, "review", payload=payload, markdown=markdown_text)
+        except Exception as e:
+            # push_outputs is defensive, but keep an executor/runtime failure non-fatal too.
+            get_logger().warning(f"push_outputs dispatch failed: {type(e).__name__}")
 
     def _maximum_generated_findings(self) -> int:
         limit = getattr(self, "_review_max_findings", None)
@@ -2648,8 +2680,9 @@ class PRReviewer:
         if not get_settings().pr_reviewer.require_security_review:
             get_settings().pr_reviewer.enable_review_labels_security = False # we did not generate this output
 
-        if (get_settings().pr_reviewer.enable_review_labels_security or
-                get_settings().pr_reviewer.enable_review_labels_effort):
+        if ((get_settings().pr_reviewer.enable_review_labels_security or
+                get_settings().pr_reviewer.enable_review_labels_effort) and
+                self.git_provider.is_supported("get_labels")):
             try:
                 review_labels = []
                 if get_settings().pr_reviewer.enable_review_labels_effort:
