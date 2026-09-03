@@ -117,6 +117,37 @@ PR Feedback:
         with pytest.raises(DuplicateYamlKeyError):
             load_yaml(response, reject_duplicate_keys=True)
 
+    def test_strict_duplicate_rejection_scans_past_internal_blank_lines(self):
+        response = (
+            "Here is the requested verifier response:\n"
+            "verification:\n"
+            "  decisions:\n"
+            "    - candidate_id: candidate-1\n"
+            "      verdict: verified\n"
+            "      relevant_file: src/service.py\n"
+            "      start_line: 12\n"
+            "      end_line: 12\n"
+            "      issue_header: Verified bug\n"
+            "      issue_content: The changed code has a verified defect.\n"
+            "      normalized_severity: high\n"
+            "      disputed: true\n"
+            "      evidence_status: complete\n"
+            "      unresolved_questions: []\n"
+            "      trigger: The changed branch executes.\n"
+            "      impact: The request fails.\n"
+            "      evidence_paths: [src/service.py]\n"
+            "\n"
+            "      disputed: false\n"
+        )
+
+        with pytest.raises(DuplicateYamlKeyError):
+            load_yaml(
+                response,
+                first_key="verification",
+                last_key="decisions",
+                reject_duplicate_keys=True,
+            )
+
     # Tests that a fenced block whose info string is separated by a space
     # (CommonMark allows whitespace after the opening fence) parses the same
     # as the flush form.

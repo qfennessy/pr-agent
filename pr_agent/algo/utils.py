@@ -1227,7 +1227,11 @@ def try_fix_yaml(response_text: str,
         if index_start == -1:
             index_start = response_text.find(f"{first_key}:")
         index_last_code = response_text.rfind(f"{last_key}:")
-        index_end = response_text.find("\n\n", index_last_code) # look for newlines after last_key
+        index_end = (
+            len(response_text)
+            if reject_duplicate_keys
+            else response_text.find("\n\n", index_last_code)
+        )  # look for newlines after last_key
         if index_end == -1:
             index_end = len(response_text)
         response_text_copy = response_text[index_start:index_end].strip()
