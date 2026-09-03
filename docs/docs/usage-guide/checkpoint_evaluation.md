@@ -24,11 +24,15 @@ claims to the immutable manifest. Every entry remains unavailable until all its 
 blocker contracts are implemented. An unavailable arm has no adapter, cannot claim hard-cost-cap
 enforcement, and stops production preflight before the artifact store or any model client is touched.
 
-Issue #27 must still complete the finding contracts, no-publish review facade, hard cost-cap
-enforcement, candidate-source contract, and frontier stage telemetry needed to integrate the
-production orchestration delivered by issues #26, #12, #11, #9, and #33. A frozen target-repository
-replay and one week of live shadow evidence are also required before any rollout gate can grant
-permission.
+The general-review arm now has a versioned configuration-bundle contract and an isolated
+no-publish replay seam. It remains unavailable until snapshot capture securely persists and reloads
+the original bundle, and until the finding-fingerprint contract and hard cost-cap enforcement are
+implemented. This first replay contract is deliberately limited to the standard OpenAI route and
+rejects candidate verification, specialist routing, custom endpoints, and frontier adjudication.
+Issue #27 must still complete those contracts and the source/telemetry contracts needed to integrate
+the production orchestration delivered by issues #26, #12, #11, #9, and #33. A frozen
+target-repository replay and one week of live shadow evidence are also required before any rollout
+gate can grant permission.
 
 ## Artifact boundary
 
@@ -77,6 +81,22 @@ The evaluation artifacts above contain no source text, full diff, secret, hidden
 provider request identifier, or credential. The separate serialized `ReviewSnapshot` is
 source-bearing, stays in local source storage outside published artifact directories, and is
 referenced by its exact byte hash.
+
+The separate `checkpoint-review-configuration-v1` bundle is also local and model-visible. It
+stores the exact allowlisted general-review settings, resolved skill text, resolved repository
+context in prompt order with its rendering line budget, pinned prompt date, package and installed
+dependency versions, plus a hash of the executable review code and default settings. It accounts
+explicitly for every supported setting as present or missing, rejects unknown or case-colliding
+data, and revalidates its content hash and runtime identity before use.
+Credentials, callback configuration, telemetry headers, and output sinks have no bundle fields.
+The isolated worker disables publication, callback and OpenTelemetry delivery, push outputs, and
+run-detail printing before importing the reviewer. It also passes only the standard OpenAI runtime
+credential and a minimal process environment; proxy, endpoint, Dynaconf, and other provider
+controls are not inherited. The bundle can be sent through the bounded local worker pipe, but it is
+not yet attached to the snapshot artifact path and is not part of a source-free manifest, journal,
+or pilot report. Existing provider-neutral local-pair snapshots retain their legacy hash path when
+no bundle is supplied; that compatibility path is not an immutable production replay and cannot
+make the production binding available.
 
 Production bindings declare their telemetry shape. The deterministic arm must be model-free,
 the general-review arm must name one selected pinned model, and specialist, verified-specialist,

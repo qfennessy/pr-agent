@@ -12,14 +12,28 @@ from unittest.mock import AsyncMock
 import pytest
 
 from pr_agent.algo import checkpoint_review_subprocess as review_subprocess
-from pr_agent.algo.review_configuration import snapshot_review_configuration_hash
+from pr_agent.algo.review_configuration import (
+    materialize_review_configuration,
+    snapshot_review_configuration_hash,
+)
 from pr_agent.algo.review_execution_context import get_review_prompt_date, review_execution_is_isolated
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewSnapshot
 from pr_agent.algo.review_specialists import get_specialist_snapshot_context
 from pr_agent.algo.skills_loader import get_skills_context
 
+_USE_DEFAULT_CONFIGURATION = object()
 
-def _snapshot() -> ReviewSnapshot:
+
+def _configuration(*, skills_context=None, repo_context_files=None, repo_context_max_lines=None):
+    return materialize_review_configuration(
+        skills_context,
+        repo_context_files or {},
+        repo_context_max_lines=repo_context_max_lines,
+    )
+
+
+def _snapshot(*, review_configuration=None) -> ReviewSnapshot:
+    configuration = review_configuration or _configuration()
     return ReviewSnapshot(
         event=ReviewEvent.PRE_COMMIT,
         repository_root="/private/checkpoint/repository",
@@ -36,14 +50,22 @@ def _snapshot() -> ReviewSnapshot:
         ),
         policy_version="policy-v1",
         created_at="2026-09-03T12:00:00Z",
+        review_configuration_hash=configuration.configuration_hash,
     )
 
 
-def _request_bytes(snapshot: ReviewSnapshot, *, allow_model_execution: bool = True) -> bytes:
+def _request_bytes(
+    snapshot: ReviewSnapshot,
+    *,
+    review_configuration=_USE_DEFAULT_CONFIGURATION,
+    allow_model_execution: bool = True,
+) -> bytes:
+    configuration = _configuration() if review_configuration is _USE_DEFAULT_CONFIGURATION else review_configuration
     return json.dumps({
         "schema_version": review_subprocess.CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION,
         "allow_model_execution": allow_model_execution,
         "snapshot": snapshot.to_dict(),
+        "review_configuration": None if configuration is None else configuration.to_dict(),
     }).encode("utf-8")
 
 
@@ -170,6 +192,13 @@ async def test_parent_uses_current_interpreter_without_a_shell(monkeypatch):
     spawn = AsyncMock(return_value=process)
     monkeypatch.setenv("PYTHONPATH", "/attacker-controlled-checkout")
     monkeypatch.setenv("PYTHONHOME", "/attacker-controlled-runtime")
+    monkeypatch.setenv("PR_AGENT_CONFIG__MODEL", "attacker-model")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=secret")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://attacker.invalid")
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-credential")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "unrelated-credential")
+    monkeypatch.setenv("HTTPS_PROXY", "https://attacker.invalid")
+    monkeypatch.setenv("AWS_USE_IMDS", "true")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
 
     outcome = await review_subprocess.run_checkpoint_review_subprocess(
@@ -195,8 +224,47 @@ async def test_parent_uses_current_interpreter_without_a_shell(monkeypatch):
     assert kwargs["cwd"] == review_subprocess._TRUSTED_PACKAGE_ROOT
     assert "PYTHONPATH" not in kwargs["env"]
     assert "PYTHONHOME" not in kwargs["env"]
+    assert "PR_AGENT_CONFIG__MODEL" not in kwargs["env"]
+    assert "OTEL_EXPORTER_OTLP_HEADERS" not in kwargs["env"]
+    assert "OPENAI_API_BASE" not in kwargs["env"]
+    assert "HTTPS_PROXY" not in kwargs["env"]
+    assert "AWS_USE_IMDS" not in kwargs["env"]
+    assert kwargs["env"]["OPENAI_API_KEY"] == "provider-credential"
+    assert "ANTHROPIC_API_KEY" not in kwargs["env"]
     assert process.stdin.closed is True
-    assert json.loads(process.stdin.written)["allow_model_execution"] is True
+    request = json.loads(process.stdin.written)
+    assert request["allow_model_execution"] is True
+    assert request["review_configuration"] is None
+
+
+@pytest.mark.asyncio
+async def test_parent_preserves_legacy_cli_snapshot_hash_without_inventing_a_bundle(monkeypatch):
+    snapshot = replace(
+        _snapshot(),
+        review_configuration_hash=snapshot_review_configuration_hash(get_skills_context(), {}),
+    )
+    process = _FakeProcess(review_subprocess._encode_worker_outcome(_completed_outcome(snapshot)))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+
+    outcome = await review_subprocess.run_checkpoint_review_subprocess(
+        snapshot,
+        allow_model_execution=True,
+    )
+
+    assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
+    assert json.loads(process.stdin.written)["review_configuration"] is None
+
+
+def test_worker_environment_prefers_effective_settings_credential(monkeypatch):
+    class FakeSettings:
+        @staticmethod
+        def get(key, default=None):
+            return "settings-credential" if key == "openai.key" else default
+
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-credential")
+    monkeypatch.setattr("pr_agent.config_loader.get_settings", lambda: FakeSettings())
+
+    assert review_subprocess._worker_environment()["OPENAI_API_KEY"] == "settings-credential"
 
 
 def test_isolated_worker_bootstrap_ignores_untrusted_import_paths(tmp_path):
@@ -329,6 +397,19 @@ async def test_worker_refuses_permission_without_calling_executor():
 
 
 @pytest.mark.asyncio
+async def test_worker_rejects_oversized_request_before_decoding():
+    executor = AsyncMock()
+
+    outcome = await review_subprocess._handle_worker_request(
+        b"x" * (review_subprocess.MAX_REVIEW_SUBPROCESS_REQUEST_BYTES + 1),
+        executor=executor,
+    )
+
+    assert outcome.failure_reason_code == "request_too_large"
+    executor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_worker_rejects_unknown_request_fields_before_execution():
     payload = json.loads(_request_bytes(_snapshot()))
     payload["unexpected"] = "source text"
@@ -391,7 +472,7 @@ async def test_worker_rejects_answer_only_snapshot_data_before_execution():
 
 @pytest.mark.asyncio
 async def test_worker_does_not_leak_execution_exception_text():
-    async def fail(_snapshot):
+    async def fail(_snapshot, _review_configuration):
         raise RuntimeError("source line and credential")
 
     outcome = await review_subprocess._handle_worker_request(
@@ -407,32 +488,54 @@ async def test_worker_does_not_leak_execution_exception_text():
 
 @pytest.mark.asyncio
 async def test_worker_executes_valid_request_and_binds_snapshot():
-    snapshot = _snapshot()
+    configuration = _configuration()
+    snapshot = _snapshot(review_configuration=configuration)
     executor = AsyncMock(return_value=_completed_outcome(snapshot))
 
     outcome = await review_subprocess._handle_worker_request(
-        _request_bytes(snapshot),
+        _request_bytes(snapshot, review_configuration=configuration),
         executor=executor,
     )
 
     assert outcome.snapshot_id == snapshot.snapshot_id
     executor.assert_awaited_once()
     assert executor.await_args.args[0].snapshot_id == snapshot.snapshot_id
+    assert executor.await_args.args[1].configuration_hash == configuration.configuration_hash
+
+
+@pytest.mark.asyncio
+async def test_worker_accepts_legacy_cli_snapshot_without_a_bundle():
+    snapshot = replace(
+        _snapshot(),
+        review_configuration_hash=snapshot_review_configuration_hash(get_skills_context(), {}),
+        changed_paths=(),
+        diff="",
+    )
+
+    outcome = await review_subprocess._execute_review(snapshot, None)
+
+    assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
 
 
 @pytest.mark.asyncio
 async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_sinks(monkeypatch):
-    snapshot = replace(_snapshot(), review_configuration_hash="sha256:" + "b" * 64)
-    configured = {}
-    drain = AsyncMock()
-    monkeypatch.setattr(
-        review_subprocess,
-        "_current_review_configuration",
-        lambda: (snapshot.review_configuration_hash, "pinned skill content"),
+    configuration = _configuration(
+        skills_context="pinned skill content",
+        repo_context_files={"CLAUDE.md": "pinned repository context"},
+        repo_context_max_lines=7,
     )
+    snapshot = _snapshot(review_configuration=configuration)
+    configured = {"anthropic.key": "unrelated-secret", "openrouter.key": "unrelated-secret"}
+    drain = AsyncMock()
 
     class FakeSettings:
-        def set(self, key, value):
+        def unset(self, key, **_kwargs):
+            prefix = f"{key}."
+            for configured_key in tuple(configured):
+                if configured_key.casefold().startswith(prefix.casefold()):
+                    configured.pop(configured_key)
+
+        def set(self, key, value, **_kwargs):
             configured[key] = value
 
         def get(self, key, default=None):
@@ -446,7 +549,20 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
             assert configured["plain_diff.disable_working_tree_enrichment"] is True
             assert configured["plain_diff.output_path"] is None
             assert configured["plain_diff.json_output_path"] is None
+            assert configured["plain_diff.repo_context_files"] == {
+                "CLAUDE.md": "pinned repository context"
+            }
+            assert configured["config.repo_context_files"] == ["CLAUDE.md"]
+            assert configured["config.repo_context_max_lines"] == 7
             assert configured["config.propagate_tool_errors"] is True
+            assert configured["config.use_repo_settings_file"] is False
+            assert configured["config.use_global_settings_file"] is False
+            assert configured["config.add_user_to_requests"] is False
+            assert configured["litellm.enable_callbacks"] is False
+            assert configured["litellm.extra_headers"] == {}
+            assert configured["otel.is_enabled"] is False
+            assert "anthropic.key" not in configured
+            assert "openrouter.key" not in configured
             assert get_skills_context() == "pinned skill content"
             specialist_context = get_specialist_snapshot_context()
             assert specialist_context is not None
@@ -476,13 +592,15 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
     monkeypatch.setattr("pr_agent.tools.pr_reviewer.PRReviewer", FakeReviewer)
     monkeypatch.setattr("pr_agent.algo.ai_handlers.litellm_helpers.drain_litellm_callbacks", drain)
 
-    outcome = await review_subprocess._execute_review(snapshot)
+    outcome = await review_subprocess._execute_review(snapshot, configuration)
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
     assert outcome.run_details["total_tokens"] == 15
     assert configured["config.publish_output"] is False
     assert configured["plain_diff.suppress_stdout"] is True
-    assert configured["plain_diff.repo_context_files"] == {}
+    assert configured["plain_diff.repo_context_files"] == {
+        "CLAUDE.md": "pinned repository context"
+    }
     assert "caller-supplied context" in configured["pr_reviewer.extra_instructions"]
     assert get_review_prompt_date() != ""
     drain.assert_awaited_once_with(timeout=review_subprocess._CALLBACK_DRAIN_TIMEOUT_SECONDS)
@@ -490,21 +608,22 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
 
 @pytest.mark.asyncio
 async def test_execution_passes_snapshot_intent_and_deterministic_evidence_to_reviewer(monkeypatch):
+    configuration = _configuration()
     snapshot = replace(
-        _snapshot(),
+        _snapshot(review_configuration=configuration),
         task_intent="focus on concurrency",
         deterministic_results=({"check": "lint", "status": "failed"},),
-        review_configuration_hash="sha256:" + "b" * 64,
     )
     configured = {"pr_reviewer.extra_instructions": "persistent rule"}
-    monkeypatch.setattr(
-        review_subprocess,
-        "_current_review_configuration",
-        lambda: (snapshot.review_configuration_hash, ""),
-    )
 
     class FakeSettings:
-        def set(self, key, value):
+        def unset(self, key, **_kwargs):
+            prefix = f"{key}."
+            for configured_key in tuple(configured):
+                if configured_key.casefold().startswith(prefix.casefold()):
+                    configured.pop(configured_key)
+
+        def set(self, key, value, **_kwargs):
             configured[key] = value
 
         def get(self, key, default=None):
@@ -528,29 +647,27 @@ async def test_execution_passes_snapshot_intent_and_deterministic_evidence_to_re
         AsyncMock(),
     )
 
-    outcome = await review_subprocess._execute_review(snapshot)
+    outcome = await review_subprocess._execute_review(snapshot, configuration)
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
 
 
 @pytest.mark.asyncio
 async def test_execution_refuses_unverified_review_configuration():
-    outcome = await review_subprocess._execute_review(_snapshot())
+    configuration = _configuration()
+    snapshot = replace(_snapshot(review_configuration=configuration), review_configuration_hash=None)
+    outcome = await review_subprocess._execute_review(snapshot, configuration)
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.FAILED
     assert outcome.failure_reason_code == "review_configuration_unverified"
 
 
 @pytest.mark.asyncio
-async def test_execution_refuses_mismatched_review_configuration(monkeypatch):
-    snapshot = replace(_snapshot(), review_configuration_hash="sha256:" + "a" * 64)
-    monkeypatch.setattr(
-        review_subprocess,
-        "_current_review_configuration",
-        lambda: ("sha256:" + "b" * 64, ""),
-    )
+async def test_execution_refuses_mismatched_review_configuration():
+    configuration = _configuration()
+    snapshot = replace(_snapshot(review_configuration=configuration), review_configuration_hash="sha256:" + "a" * 64)
 
-    outcome = await review_subprocess._execute_review(snapshot)
+    outcome = await review_subprocess._execute_review(snapshot, configuration)
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.FAILED
     assert outcome.failure_reason_code == "review_configuration_mismatch"
@@ -566,7 +683,7 @@ def test_configuration_hash_does_not_import_cli_logging(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", reject_cli_import)
 
-    configuration_hash, _skills_context = review_subprocess._current_review_configuration()
+    configuration_hash = review_subprocess._current_review_configuration().configuration_hash
 
     assert review_subprocess._SNAPSHOT_ID_PATTERN.fullmatch(configuration_hash)
 
@@ -584,16 +701,11 @@ def test_configuration_hash_ignores_foreign_cwd_version(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_empty_snapshot_completes_without_constructing_reviewer(monkeypatch):
+    configuration = _configuration()
     snapshot = replace(
-        _snapshot(),
+        _snapshot(review_configuration=configuration),
         changed_paths=(),
         diff="",
-        review_configuration_hash="sha256:" + "b" * 64,
-    )
-    monkeypatch.setattr(
-        review_subprocess,
-        "_current_review_configuration",
-        lambda: (snapshot.review_configuration_hash, ""),
     )
 
     class UnexpectedReviewer:
@@ -602,7 +714,7 @@ async def test_empty_snapshot_completes_without_constructing_reviewer(monkeypatc
 
     monkeypatch.setattr("pr_agent.tools.pr_reviewer.PRReviewer", UnexpectedReviewer)
 
-    outcome = await review_subprocess._execute_review(snapshot)
+    outcome = await review_subprocess._execute_review(snapshot, configuration)
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
     assert outcome.review == {"review": {"key_issues_to_review": []}}

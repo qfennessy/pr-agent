@@ -18,7 +18,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Awaitable, Callable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
 
 from pr_agent.algo.review_snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
@@ -28,10 +28,13 @@ from pr_agent.algo.review_snapshot import (
     snapshot_review_instructions,
 )
 
-CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION = "checkpoint-review-subprocess-v1"
+if TYPE_CHECKING:
+    from pr_agent.algo.review_configuration import ReviewConfigurationBundle
+
+CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION = "checkpoint-review-subprocess-v2"
 DEFAULT_REVIEW_SUBPROCESS_TIMEOUT_SECONDS = 180.0
 MAX_REVIEW_SUBPROCESS_TIMEOUT_SECONDS = 900.0
-MAX_REVIEW_SUBPROCESS_REQUEST_BYTES = 10_250_000
+MAX_REVIEW_SUBPROCESS_REQUEST_BYTES = 12_250_000
 MAX_REVIEW_SUBPROCESS_OUTPUT_BYTES = 2_000_000
 _CALLBACK_DRAIN_TIMEOUT_SECONDS = 5.0
 _TRUSTED_PACKAGE_ROOT = str(Path(__file__).resolve().parents[2])
@@ -48,6 +51,41 @@ _PYTHON_IMPORT_ENVIRONMENT_KEYS = frozenset({
     "PYTHONSTARTUP",
     "PYTHONUSERBASE",
 })
+_WORKER_PROCESS_ENVIRONMENT_KEYS = frozenset({
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+})
+_WORKER_CREDENTIAL_SECTIONS = (
+    "anthropic",
+    "aws",
+    "azure_ad",
+    "codestral",
+    "cohere",
+    "dashscope",
+    "databricks",
+    "deepinfra",
+    "deepseek",
+    "google_ai_studio",
+    "groq",
+    "huggingface",
+    "mistral",
+    "moonshot",
+    "ollama",
+    "openai",
+    "openrouter",
+    "replicate",
+    "sambanova",
+    "vertexai",
+    "xai",
+    "xiaomi_mimo",
+    "zai",
+)
 _FAILURE_REASON_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SNAPSHOT_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ANSWER_ONLY_KEYS = frozenset({
@@ -68,7 +106,7 @@ _ANSWER_ONLY_KEYS = frozenset({
     "truth",
     "verdict",
 })
-_REQUEST_FIELDS = {"allow_model_execution", "schema_version", "snapshot"}
+_REQUEST_FIELDS = {"allow_model_execution", "review_configuration", "schema_version", "snapshot"}
 _OUTCOME_FIELDS = {
     "failure_reason_code",
     "latency_seconds",
@@ -172,6 +210,7 @@ class CheckpointReviewSubprocessOutcome:
 @dataclass(frozen=True)
 class _CheckpointReviewSubprocessRequest:
     snapshot: ReviewSnapshot
+    review_configuration: Optional["ReviewConfigurationBundle"]
     allow_model_execution: bool
     schema_version: str = CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION
 
@@ -180,6 +219,12 @@ class _CheckpointReviewSubprocessRequest:
             raise ValueError("unsupported checkpoint review subprocess request version")
         if not isinstance(self.snapshot, ReviewSnapshot):
             raise TypeError("checkpoint review subprocess request requires a ReviewSnapshot")
+        from pr_agent.algo.review_configuration import ReviewConfigurationBundle
+
+        if self.review_configuration is not None and not isinstance(
+            self.review_configuration, ReviewConfigurationBundle
+        ):
+            raise TypeError("checkpoint review subprocess request requires a ReviewConfigurationBundle")
         if not isinstance(self.allow_model_execution, bool):
             raise TypeError("allow_model_execution must be a boolean")
 
@@ -188,6 +233,9 @@ class _CheckpointReviewSubprocessRequest:
             "schema_version": self.schema_version,
             "allow_model_execution": self.allow_model_execution,
             "snapshot": self.snapshot.to_dict(),
+            "review_configuration": (
+                None if self.review_configuration is None else self.review_configuration.to_dict()
+            ),
         }
 
 
@@ -357,8 +405,18 @@ def _request_from_dict(payload: Mapping[str, Any]) -> _CheckpointReviewSubproces
         raise ValueError("unsupported_request_version")
     if not isinstance(payload.get("allow_model_execution"), bool):
         raise ValueError("invalid_model_execution_permission")
+    from pr_agent.algo.review_configuration import ReviewConfigurationBundle
+
+    serialized_configuration = payload.get("review_configuration")
+    review_configuration = (
+        None
+        if serialized_configuration is None
+        else ReviewConfigurationBundle.from_dict(serialized_configuration)
+    )
+
     return _CheckpointReviewSubprocessRequest(
         snapshot=_snapshot_from_dict(payload.get("snapshot")),
+        review_configuration=review_configuration,
         allow_model_execution=payload["allow_model_execution"],
         schema_version=payload["schema_version"],
     )
@@ -468,20 +526,44 @@ def _failure_outcome(
     )
 
 
-def _current_review_configuration() -> tuple[str, str]:
-    """Render and identify the source-free effective configuration once."""
+def _current_review_configuration() -> "ReviewConfigurationBundle":
+    """Materialize the current allowlisted general-review configuration once."""
+
+    from pr_agent.algo.review_configuration import materialize_review_configuration
+
+    return materialize_review_configuration(repo_context_files={})
+
+
+def _current_legacy_review_configuration() -> tuple[str, str]:
+    """Render the provider-neutral identity used by existing local snapshots."""
 
     from pr_agent.algo.review_configuration import snapshot_review_configuration_hash
     from pr_agent.algo.skills_loader import get_skills_context
 
     skills_context = get_skills_context()
-    return (
-        snapshot_review_configuration_hash(skills_context, repo_context_files={}),
-        skills_context,
-    )
+    return snapshot_review_configuration_hash(skills_context, repo_context_files={}), skills_context
 
 
-async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubprocessOutcome:
+def _worker_environment() -> dict[str, str]:
+    """Pass only process plumbing and the supported provider credential."""
+
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _WORKER_PROCESS_ENVIRONMENT_KEYS and key not in _PYTHON_IMPORT_ENVIRONMENT_KEYS
+    }
+    from pr_agent.config_loader import get_settings
+
+    api_key = get_settings().get("openai.key", None) or os.environ.get("OPENAI_API_KEY")
+    if isinstance(api_key, str) and api_key:
+        environment["OPENAI_API_KEY"] = api_key
+    return environment
+
+
+async def _execute_review(
+    snapshot: ReviewSnapshot,
+    review_configuration: Optional["ReviewConfigurationBundle"],
+) -> CheckpointReviewSubprocessOutcome:
     """Import and run production review code only after request validation."""
 
     expected_configuration_hash = snapshot.review_configuration_hash
@@ -494,14 +576,32 @@ async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubproces
             "review_configuration_unverified",
             snapshot_id=snapshot.snapshot_id,
         )
-    try:
-        actual_configuration_hash, skills_context = _current_review_configuration()
-    except Exception:
-        return _failure_outcome(
-            CheckpointReviewSubprocessState.FAILED,
-            "review_configuration_unverified",
-            snapshot_id=snapshot.snapshot_id,
-        )
+    if review_configuration is None:
+        try:
+            actual_configuration_hash, skills_context = _current_legacy_review_configuration()
+        except Exception:
+            return _failure_outcome(
+                CheckpointReviewSubprocessState.FAILED,
+                "review_configuration_unverified",
+                snapshot_id=snapshot.snapshot_id,
+            )
+        prompt_date = ""
+        repo_context_files: Mapping[str, str] = {}
+        repo_context_max_lines = None
+    else:
+        try:
+            review_configuration.require_compatible_runtime()
+        except Exception:
+            return _failure_outcome(
+                CheckpointReviewSubprocessState.FAILED,
+                "review_configuration_unverified",
+                snapshot_id=snapshot.snapshot_id,
+            )
+        actual_configuration_hash = review_configuration.configuration_hash
+        skills_context = review_configuration.skills_context
+        prompt_date = review_configuration.prompt_date
+        repo_context_files = review_configuration.repo_context_files
+        repo_context_max_lines = review_configuration.repo_context_max_lines
     if not hmac.compare_digest(actual_configuration_hash, expected_configuration_hash):
         return _failure_outcome(
             CheckpointReviewSubprocessState.FAILED,
@@ -516,48 +616,80 @@ async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubproces
             latency_seconds=0.0,
         )
 
-    from pr_agent.algo.ai_handlers.litellm_helpers import drain_litellm_callbacks
+    from contextlib import nullcontext
+
+    from pr_agent.algo.review_configuration import replay_review_configuration
     from pr_agent.algo.review_execution_context import isolate_review_execution, pin_review_prompt_date
     from pr_agent.algo.review_specialists import use_specialist_snapshot_context
     from pr_agent.algo.skills_loader import pin_skills_context
     from pr_agent.config_loader import get_settings
-    from pr_agent.tools.pr_reviewer import PRReviewer
-
-    settings = get_settings()
-    settings.set("config.git_provider", "plain-diff")
-    settings.set("config.publish_output", False)
-    settings.set("config.publish_output_progress", False)
-    settings.set("config.enable_ai_metadata", False)
-    settings.set("config.propagate_tool_errors", True)
-    settings.set("plain_diff.content", snapshot.diff)
-    settings.set("plain_diff.output_path", None)
-    settings.set("plain_diff.json_output_path", None)
-    settings.set("plain_diff.suppress_stdout", True)
-    settings.set("plain_diff.disable_working_tree_enrichment", True)
-    settings.set("plain_diff.repo_context_files", {})
-    settings.set("related_tickets", [])
-    existing_instructions = str(settings.get("pr_reviewer.extra_instructions", "") or "")
-    settings.set(
-        "pr_reviewer.extra_instructions",
-        snapshot_review_instructions(snapshot, existing_instructions),
-    )
 
     started = time.monotonic()
     with open(os.devnull, "w", encoding="utf-8") as sink, redirect_stdout(sink):
-        with (
-            isolate_review_execution(),
-            pin_review_prompt_date(""),
-            pin_skills_context(skills_context),
-            use_specialist_snapshot_context(snapshot, lambda: snapshot.snapshot_id),
-        ):
-            reviewer = PRReviewer("checkpoint-review-subprocess")
-            # PlainDiffGitProvider enables its normal stdout publication setting
-            # during construction. Re-close it inside this isolated worker.
-            settings.set("config.publish_output", False)
+        settings = get_settings()
+        for section in _WORKER_CREDENTIAL_SECTIONS:
             try:
-                execution = await reviewer._run_structured_no_publish_once()
-            finally:
-                await drain_litellm_callbacks(timeout=_CALLBACK_DRAIN_TIMEOUT_SECONDS)
+                settings.unset(section, force=True)
+            except KeyError:
+                pass
+        configuration_context = (
+            nullcontext() if review_configuration is None else replay_review_configuration(review_configuration)
+        )
+        with configuration_context:
+            settings.set("config.git_provider", "plain-diff")
+            settings.set("config.cli_mode", False)
+            settings.set("config.use_repo_settings_file", False)
+            settings.set("config.use_global_settings_file", False)
+            settings.set("config.extra_config_url", "")
+            settings.set("config.publish_output", False)
+            settings.set("config.publish_output_progress", False)
+            settings.set("config.enable_ai_metadata", False)
+            settings.set("config.add_user_to_requests", False)
+            settings.set("config.output_relevant_configurations", False)
+            settings.set("config.output_run_cost", False)
+            settings.set("config.output_run_details", False)
+            settings.set("config.propagate_tool_errors", True)
+            settings.set("litellm.enable_callbacks", False)
+            settings.set("litellm.success_callback", [], merge=False)
+            settings.set("litellm.failure_callback", [], merge=False)
+            settings.set("litellm.service_callback", [], merge=False)
+            settings.set("litellm.extra_headers", {}, merge=False)
+            settings.set("litellm.turn_off_message_logging", True)
+            settings.set("otel.is_enabled", False)
+            settings.set("push_outputs", {}, merge=False)
+            settings.set("plain_diff.content", snapshot.diff)
+            settings.set("plain_diff.output_path", None)
+            settings.set("plain_diff.json_output_path", None)
+            settings.set("plain_diff.suppress_stdout", True)
+            settings.set("plain_diff.disable_working_tree_enrichment", True)
+            settings.set("plain_diff.repo_context_files", dict(repo_context_files))
+            settings.set("config.repo_context_files", list(repo_context_files))
+            if repo_context_max_lines is not None:
+                settings.set("config.repo_context_max_lines", repo_context_max_lines)
+            settings.set("related_tickets", [])
+            existing_instructions = str(settings.get("pr_reviewer.extra_instructions", "") or "")
+            settings.set(
+                "pr_reviewer.extra_instructions",
+                snapshot_review_instructions(snapshot, existing_instructions),
+            )
+
+            from pr_agent.algo.ai_handlers.litellm_helpers import drain_litellm_callbacks
+            from pr_agent.tools.pr_reviewer import PRReviewer
+
+            with (
+                isolate_review_execution(),
+                pin_review_prompt_date(prompt_date),
+                pin_skills_context(skills_context),
+                use_specialist_snapshot_context(snapshot, lambda: snapshot.snapshot_id),
+            ):
+                reviewer = PRReviewer("checkpoint-review-subprocess")
+                # PlainDiffGitProvider enables its normal stdout publication setting
+                # during construction. Re-close it inside this isolated worker.
+                settings.set("config.publish_output", False)
+                try:
+                    execution = await reviewer._run_structured_no_publish_once()
+                finally:
+                    await drain_litellm_callbacks(timeout=_CALLBACK_DRAIN_TIMEOUT_SECONDS)
     latency_seconds = max(0.0, time.monotonic() - started)
     review = None if execution.review is None else _validated_json_object(execution.review, "review")
     return CheckpointReviewSubprocessOutcome(
@@ -572,7 +704,9 @@ async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubproces
 async def _handle_worker_request(
     raw: bytes,
     *,
-    executor: Callable[[ReviewSnapshot], Awaitable[CheckpointReviewSubprocessOutcome]] = _execute_review,
+    executor: Callable[
+        [ReviewSnapshot, Optional["ReviewConfigurationBundle"]], Awaitable[CheckpointReviewSubprocessOutcome]
+    ] = _execute_review,
 ) -> CheckpointReviewSubprocessOutcome:
     """Validate a worker request completely before entering the execution seam."""
 
@@ -589,7 +723,7 @@ async def _handle_worker_request(
             snapshot_id=request.snapshot.snapshot_id,
         )
     try:
-        outcome = await executor(request.snapshot)
+        outcome = await executor(request.snapshot, request.review_configuration)
     except Exception:
         return _failure_outcome(
             CheckpointReviewSubprocessState.FAILED,
@@ -655,6 +789,7 @@ async def _exchange_with_worker(
 async def run_checkpoint_review_subprocess(
     snapshot: ReviewSnapshot,
     *,
+    review_configuration: Optional["ReviewConfigurationBundle"] = None,
     allow_model_execution: bool = False,
     timeout_seconds: float = DEFAULT_REVIEW_SUBPROCESS_TIMEOUT_SECONDS,
 ) -> CheckpointReviewSubprocessOutcome:
@@ -679,11 +814,33 @@ async def run_checkpoint_review_subprocess(
         raise ValueError("timeout_seconds must be finite and within the supported bound")
 
     from pr_agent.algo.checkpoint_evaluation_materialize import review_snapshot_canonical_bytes
+    from pr_agent.algo.review_configuration import (
+        ReviewConfigurationBundle,
+        review_configuration_canonical_bytes,
+    )
 
     try:
+        if review_configuration is not None and not isinstance(review_configuration, ReviewConfigurationBundle):
+            raise TypeError("review_configuration must be a ReviewConfigurationBundle")
+        if review_configuration is not None and not hmac.compare_digest(
+            review_configuration.configuration_hash, snapshot.review_configuration_hash or ""
+        ):
+            return _failure_outcome(
+                CheckpointReviewSubprocessState.FAILED,
+                "review_configuration_mismatch",
+                snapshot_id=snapshot.snapshot_id,
+            )
         canonical_snapshot = _decode_json_object(
             review_snapshot_canonical_bytes(snapshot),
             "snapshot",
+        )
+        canonical_review_configuration = (
+            None
+            if review_configuration is None
+            else _decode_json_object(
+                review_configuration_canonical_bytes(review_configuration),
+                "review_configuration",
+            )
         )
     except (TypeError, ValueError, RecursionError):
         return _failure_outcome(
@@ -696,6 +853,7 @@ async def run_checkpoint_review_subprocess(
             "schema_version": CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION,
             "allow_model_execution": True,
             "snapshot": canonical_snapshot,
+            "review_configuration": canonical_review_configuration,
         },
         allow_nan=False,
         ensure_ascii=True,
@@ -709,11 +867,6 @@ async def run_checkpoint_review_subprocess(
             snapshot_id=snapshot.snapshot_id,
         )
     try:
-        worker_environment = {
-            key: value
-            for key, value in os.environ.items()
-            if key not in _PYTHON_IMPORT_ENVIRONMENT_KEYS
-        }
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-I",
@@ -725,7 +878,7 @@ async def run_checkpoint_review_subprocess(
             stdout=asyncio.subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             cwd=_TRUSTED_PACKAGE_ROOT,
-            env=worker_environment,
+            env=_worker_environment(),
         )
     except (OSError, subprocess.SubprocessError):
         return _failure_outcome(
