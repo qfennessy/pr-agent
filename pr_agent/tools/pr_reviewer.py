@@ -580,10 +580,7 @@ class PRReviewer:
             return False
         if self._review_profile() == "bugs_only":
             return bool(pr_review.strip())
-        return (
-            get_settings().pr_reviewer.get('publish_output_no_suggestions', True)
-            or "No major issues detected" not in pr_review
-        )
+        return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
 
     def _provider_mutations_allowed(self) -> bool:
         """Keep a shadow-only route observational, including cleanup and progress updates."""
@@ -1243,7 +1240,6 @@ class PRReviewer:
         if isinstance(fallback_models, str):
             fallback_models = [model.strip() for model in fallback_models.split(",") if model.strip()]
         models = (primary, *tuple(fallback_models or ()))
-
         def deployment_setting(key: str) -> str | None:
             value = get_settings().get(key, None)
             if value is None or value == "":
@@ -1429,7 +1425,6 @@ class PRReviewer:
                         "Specialist shadow batch is unavailable because the provider has no stable head identity"
                     )
                     return
-
                 def current_identity():
                     return self.git_provider.get_pr_head_sha(refresh=True)
             specialist_input = build_specialist_input(
@@ -1750,8 +1745,8 @@ class PRReviewer:
             unresolved_questions = decision.get("unresolved_questions")
             if (verdict == "verified" and not isinstance(unresolved_questions, list)) or (
                 unresolved_questions is not None and (
-                    not isinstance(unresolved_questions, list)
-                    or any(not isinstance(question, str) or not question.strip() for question in unresolved_questions)
+                not isinstance(unresolved_questions, list)
+                or any(not isinstance(question, str) or not question.strip() for question in unresolved_questions)
                 )
             ):
                 return "invalid_unresolved_questions"
@@ -2924,7 +2919,7 @@ class PRReviewer:
             incremental_review_markdown_text = f"Starting from commit {last_commit_url}"
 
         markdown_text = convert_to_markdown_v2(data, self.git_provider.is_supported("gfm_markdown"),
-                                               incremental_review_markdown_text,
+                                            incremental_review_markdown_text,
                                                git_provider=self.git_provider,
                                                files=self.git_provider.get_diff_files(),
                                                review_profile=self._review_profile())
@@ -3258,9 +3253,9 @@ class PRReviewer:
             return
 
         if not get_settings().pr_reviewer.require_estimate_effort_to_review:
-            get_settings().pr_reviewer.enable_review_labels_effort = False  # we did not generate this output
+            get_settings().pr_reviewer.enable_review_labels_effort = False # we did not generate this output
         if not get_settings().pr_reviewer.require_security_review:
-            get_settings().pr_reviewer.enable_review_labels_security = False  # we did not generate this output
+            get_settings().pr_reviewer.enable_review_labels_security = False # we did not generate this output
 
         if ((get_settings().pr_reviewer.enable_review_labels_security or
                 get_settings().pr_reviewer.enable_review_labels_effort) and
@@ -3278,16 +3273,11 @@ class PRReviewer:
                     elif isinstance(estimated_effort, int):
                         estimated_effort_number = estimated_effort
                     else:
-                        get_logger().warning(
-                            f"Unexpected type for estimated_effort: {type(estimated_effort)}"
-                        )
+                        get_logger().warning(f"Unexpected type for estimated_effort: {type(estimated_effort)}")
                     if estimated_effort_number is not None:
                         estimated_effort_number = max(1, min(5, int(estimated_effort_number)))
                         review_labels.append(f'Review effort {estimated_effort_number}/5')
-                if (
-                    get_settings().pr_reviewer.enable_review_labels_security
-                    and get_settings().pr_reviewer.require_security_review
-                ):
+                if get_settings().pr_reviewer.enable_review_labels_security and get_settings().pr_reviewer.require_security_review:
                     security_concerns = data['review']['security_concerns']  # yes, because ...
                     security_concerns_bool = 'yes' in security_concerns.lower() or 'true' in security_concerns.lower()
                     if security_concerns_bool:
@@ -3298,11 +3288,9 @@ class PRReviewer:
                     current_labels = []
                 get_logger().debug(f"Current labels:\n{current_labels}")
                 if current_labels:
-                    current_labels_filtered = [
-                        label for label in current_labels
-                        if not label.lower().startswith('review effort')
-                        and not label.lower().startswith('possible security concern')
-                    ]
+                    current_labels_filtered = [label for label in current_labels if
+                                               not label.lower().startswith('review effort') and not label.lower().startswith(
+                                                   'possible security concern')]
                 else:
                     current_labels_filtered = []
                 new_labels = review_labels + current_labels_filtered
@@ -3325,7 +3313,5 @@ class PRReviewer:
                 self.git_provider.publish_comment("Auto-approved PR")
         else:
             get_logger().info("Auto-approval option is disabled")
-            self.git_provider.publish_comment(
-                "Auto-approval option for PR-Agent is disabled. You can enable it via a "
-                "[configuration file](https://github.com/Codium-ai/pr-agent/blob/main/docs/REVIEW.md#auto-approval-1)"
-            )
+            self.git_provider.publish_comment("Auto-approval option for PR-Agent is disabled. "
+                                              "You can enable it via a [configuration file](https://github.com/Codium-ai/pr-agent/blob/main/docs/REVIEW.md#auto-approval-1)")
