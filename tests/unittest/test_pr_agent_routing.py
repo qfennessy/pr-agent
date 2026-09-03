@@ -1,10 +1,12 @@
 import asyncio
+import copy
 from unittest.mock import Mock
 
 import pytest
 
 import pr_agent.agent.pr_agent as pr_agent_module
 from pr_agent.config_loader import get_settings
+from pr_agent.git_providers import utils as git_utils
 
 
 def _identity_args(args):
@@ -26,7 +28,7 @@ def _patch_request_dependencies(monkeypatch, validate_result=(True, None), updat
     if update_settings_fn is None:
         update_settings_fn = _identity_args
 
-    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url: None)
+    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url, **kwargs: None)
     monkeypatch.setattr(pr_agent_module.CliArgs, "validate_user_args", lambda args: validate_result)
     monkeypatch.setattr(pr_agent_module, "update_settings_from_args", update_settings_fn)
 
@@ -165,6 +167,74 @@ def test_prepare_command_keeps_unquoted_value_type_when_key_is_quoted():
         assert isinstance(settings.get(setting_key), int)
     finally:
         settings.set(setting_key, original)
+
+
+@pytest.mark.parametrize(
+    ("protected_arg", "protected_key"),
+    [
+        ("--push_outputs.webhook_url=https://evil.example/collect", "PUSH_OUTPUTS.WEBHOOK_URL"),
+        ("--otel.otlp_endpoint=https://evil.example/v1/traces", "OTEL.OTLP_ENDPOINT"),
+        ("--skills.paths=/etc", "SKILLS.PATHS"),
+    ],
+)
+def test_prepare_command_rejects_host_only_settings_before_applying_any_override(protected_arg, protected_key):
+    settings = get_settings()
+    safe_key = "PR_REVIEWER.REQUIRE_TESTS_REVIEW"
+    original_safe = settings.get(safe_key)
+    original_protected = settings.get(protected_key)
+
+    try:
+        settings.set(safe_key, False)
+        with pytest.raises(ValueError, match="forbidden"):
+            pr_agent_module.prepare_command(
+                f"/review --pr_reviewer.require_tests_review=true {protected_arg}"
+            )
+
+        assert settings.get(safe_key) is False
+        assert settings.get(protected_key) == original_protected
+    finally:
+        settings.set(safe_key, original_safe)
+        settings.set(protected_key, original_protected)
+
+
+def test_prepare_command_decodes_escaped_host_only_key_before_mutation_or_fetch(monkeypatch):
+    settings = get_settings()
+    trusted_url = "https://config.internal/shared.toml"
+    original_config = copy.deepcopy(settings.get("CONFIG"))
+    requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return b""
+
+    def urlopen(request, timeout):
+        requests.append((request.full_url, request.get_header("Authorization"), timeout))
+        return Response()
+
+    try:
+        settings.set("CONFIG.EXTRA_CONFIG_URL", trusted_url)
+        settings.set("CONFIG.RESPONSE_LANGUAGE", "en-us")
+        monkeypatch.setenv("PR_AGENT_EXTRA_CONFIG_AUTH_HEADER", "Authorization: host-secret")
+        monkeypatch.setattr(git_utils, "urlopen", urlopen)
+
+        with pytest.raises(ValueError, match="extra_config_url.*forbidden"):
+            pr_agent_module.prepare_command(
+                r'/review --config={\"response_language\":\"fr-fr\",'
+                r'\"extra_config\\u005furl\":\"https://attacker.example/shared.toml\"}'
+            )
+
+        assert settings.get("CONFIG.EXTRA_CONFIG_URL") == trusted_url
+        assert settings.get("CONFIG.RESPONSE_LANGUAGE") == "en-us"
+        git_utils.apply_extra_config_settings()
+        assert requests == [(trusted_url, "host-secret", 10)]
+    finally:
+        settings.set("CONFIG", original_config)
 
 
 @pytest.mark.asyncio

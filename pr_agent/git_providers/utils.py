@@ -12,27 +12,15 @@ from dynaconf.loaders import env_loader
 from starlette_context import context
 
 from pr_agent.config_loader import get_settings
-from pr_agent.custom_merge_loader import (MAX_TOML_SIZE_IN_BYTES,
-                                          validate_file_security)
+from pr_agent.config_security import REPO_HOST_ONLY_KEYS_BY_SECTION, REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION
+from pr_agent.custom_merge_loader import MAX_TOML_SIZE_IN_BYTES, validate_file_security
 from pr_agent.git_providers import get_git_provider_with_context
 from pr_agent.log import get_logger
 
-# Sections that touch host-level capabilities and so cannot be fully configured
-# from a repo's .pr_agent.toml. For each section listed here, only the keys in
-# its allowlist may be overridden by repo settings; every other key is dropped
-# with a warning.
-#
-# skills: `enabled` and `max_skills_tokens` are safe per-repo preferences (a repo
-# can opt in to, or size, the host's admin-curated skill library). `paths` is NOT
-# overridable: it points at the PR-Agent host's filesystem, so letting a repo set
-# it would allow a malicious repo to read sensitive host files (e.g. ~/.ssh/*)
-# into the LLM prompt. `paths` therefore stays host-only.
-_REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION = {
-    "skills": frozenset({"enabled", "max_skills_tokens"}),
-}
-
 _MAX_EXTRA_CONFIG_BYTES = 1 * 1024 * 1024  # 1 MB cap for a remote .toml
 _FETCH_TIMEOUT_SECONDS = 10
+_EXTRA_CONFIG_CONTEXT_KEY = "pr_agent_extra_config_source"
+_EXTRA_CONFIG_SOURCE_UNSET = object()
 # Bare Windows drive-letter paths (e.g. "C:\\shared.toml", "D:/cfg.toml").
 # urlparse() would otherwise interpret the drive letter as a URL scheme.
 _WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -242,36 +230,52 @@ def _apply_settings_from_file(path: str, label: str):
 
 def apply_extra_config_settings():
     """Apply the configured shared settings layer before repository settings."""
+    os.environ["AUTO_CAST_FOR_DYNACONF"] = "false"
     extra_source = get_settings().get("CONFIG.EXTRA_CONFIG_URL", None)
-    if isinstance(extra_source, str) and extra_source.strip():
-        extra_path, extra_is_temp = _resolve_extra_config_to_file(extra_source)
-        if extra_path:
-            try:
-                # _apply_settings_from_file() re-applies env-var overrides
-                # itself, so env precedence is restored before the provider
-                # is constructed below.
-                _apply_settings_from_file(extra_path, label="extra")
-            finally:
-                if extra_is_temp:
-                    try:
-                        os.remove(extra_path)
-                    except Exception as e:
-                        get_logger().error(
-                            f"Failed to remove temp extra config {extra_path}: {e}"
-                        )
-    elif extra_source is not None and not isinstance(extra_source, str):
-        get_logger().warning(
-            "Ignoring CONFIG.EXTRA_CONFIG_URL: expected str, got "
-            f"{type(extra_source).__name__}"
-        )
+    try:
+        if context.get(_EXTRA_CONFIG_CONTEXT_KEY, _EXTRA_CONFIG_SOURCE_UNSET) == extra_source:
+            return
+    except Exception:
+        # CLI and direct-library callers run without Starlette request context.
+        pass
+
+    try:
+        if isinstance(extra_source, str) and extra_source.strip():
+            extra_path, extra_is_temp = _resolve_extra_config_to_file(extra_source)
+            if extra_path:
+                try:
+                    # _apply_settings_from_file() re-applies env-var overrides
+                    # itself, so env precedence is restored before the provider
+                    # is constructed below.
+                    _apply_settings_from_file(extra_path, label="extra")
+                finally:
+                    if extra_is_temp:
+                        try:
+                            os.remove(extra_path)
+                        except Exception as e:
+                            get_logger().error(
+                                f"Failed to remove temp extra config {extra_path}: {e}"
+                            )
+        elif extra_source is not None and not isinstance(extra_source, str):
+            get_logger().warning(
+                "Ignoring CONFIG.EXTRA_CONFIG_URL: expected str, got "
+                f"{type(extra_source).__name__}"
+            )
+    finally:
+        try:
+            context[_EXTRA_CONFIG_CONTEXT_KEY] = extra_source
+        except Exception:
+            # No request context for CLI/direct callers; intentionally leave uncached.
+            pass
 
 
-def apply_repo_settings(pr_url):
+def apply_repo_settings(pr_url, *, include_extra_config=True):
     os.environ["AUTO_CAST_FOR_DYNACONF"] = "false"
 
     # Provider initialisers need external provider settings before construction.
     # Hosted repository settings are applied afterwards and retain precedence.
-    apply_extra_config_settings()
+    if include_extra_config:
+        apply_extra_config_settings()
 
     git_provider = get_git_provider_with_context(pr_url)
 
@@ -368,7 +372,8 @@ def _apply_repo_settings_file(repo_settings_file):
         if not isinstance(contents, dict) or not contents:
             get_logger().debug(f"Skipping non-table or empty section: {section}")
             continue
-        allowed_keys = _REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION.get(section.lower())
+        allowed_keys = REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION.get(section.lower())
+        host_only_keys = REPO_HOST_ONLY_KEYS_BY_SECTION.get(section.lower(), ())
         if allowed_keys is not None:
             rejected = [k for k in contents if k.lower() not in allowed_keys]
             if rejected:
@@ -377,6 +382,15 @@ def _apply_repo_settings_file(repo_settings_file):
                     f"settings; only {sorted(allowed_keys)} may be set per-repo for this section"
                 )
             contents = {k: v for k, v in contents.items() if k.lower() in allowed_keys}
+            if not contents:
+                continue
+        elif host_only_keys:
+            rejected = [k for k in contents if k.lower() in host_only_keys]
+            if rejected:
+                get_logger().warning(
+                    f"Ignoring host-only key(s) {rejected} in section [{section}] from repo settings"
+                )
+            contents = {k: v for k, v in contents.items() if k.lower() not in host_only_keys}
             if not contents:
                 continue
         section_dict = copy.deepcopy(get_settings().as_dict().get(section.upper(), {}))

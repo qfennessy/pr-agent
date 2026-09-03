@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import copy
 import difflib
 import hashlib
@@ -13,11 +12,12 @@ import sys
 import textwrap
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Iterable, List, Tuple, TypedDict
+from urllib.parse import quote, unquote, urlparse
 
 import html2text
 import requests
@@ -26,16 +26,35 @@ from pydantic import BaseModel
 from starlette_context import context
 
 from pr_agent.algo import MAX_TOKENS
-from pr_agent.algo.git_patch_processing import (extract_hunk_headers,
-                                                extract_hunk_lines_from_patch,
-                                                iter_git_patch_lines,
-                                                split_git_file_lines,
-                                                strip_git_line_ending)
+from pr_agent.algo.git_patch_processing import (
+    extract_hunk_headers,
+    extract_hunk_lines_from_patch,
+    iter_git_patch_lines,
+    split_git_file_lines,
+    strip_git_line_ending,
+)
 from pr_agent.algo.run_details import get_run_details
 from pr_agent.algo.token_handler import TokenEncoder
 from pr_agent.algo.types import FilePatchInfo
-from pr_agent.config_loader import get_settings, global_settings
+from pr_agent.config_loader import get_settings, get_verbosity_level, global_settings
 from pr_agent.log import get_logger
+
+_ENCODED_USER_TEXT_PREFIX = "__pr_agent_encoded_text__:"
+
+
+def encode_user_text_arg(value: str) -> str:
+    return _ENCODED_USER_TEXT_PREFIX + quote(value, safe="")
+
+
+def decode_user_text_args(args: List[str] | None) -> str:
+    if not args:
+        return ""
+    return " ".join(
+        unquote(arg[len(_ENCODED_USER_TEXT_PREFIX):])
+        if arg.startswith(_ENCODED_USER_TEXT_PREFIX)
+        else arg
+        for arg in args
+    )
 
 
 def get_model(model_type: str = "model_weak") -> str:
@@ -85,8 +104,15 @@ class PRCodeSuggestionsHeader(str, Enum):
 class PRCodeSuggestionsIdentity(str, Enum):
     SUMMARY = "<!-- pr-agent:improve:summary -->"
     NO_SUGGESTIONS = "<!-- pr-agent:improve:no-suggestions -->"
+    UNANCHORED = "<!-- pr-agent:improve:unanchored -->"
 
 
+_ALL_COMMENT_IDENTITIES = (
+    *(identity.value for identity in PRReviewIdentity),
+    PRCodeSuggestionsIdentity.SUMMARY.value,
+    PRCodeSuggestionsIdentity.NO_SUGGESTIONS.value,
+    PRCodeSuggestionsIdentity.UNANCHORED.value,
+)
 _REVIEW_IDENTITY_HEADER_LINES = 5
 _MARKDOWN_PUNCTUATION_ESCAPE_TABLE = str.maketrans(
     {character: f"\\{character}" for character in string.punctuation}
@@ -163,6 +189,14 @@ def comment_matches_pr_review_identity(
     )):
         return False
     return comment_matches_any_identity(body, identities)
+
+
+def comment_carries_other_identity(body: str, identity_marker: str | None) -> bool:
+    """Return whether the comment carries a different hidden identity."""
+    return comment_matches_any_identity(
+        body,
+        [identity for identity in _ALL_COMMENT_IDENTITIES if identity != identity_marker],
+    )
 
 
 def get_pr_review_comment_identifiers(
@@ -301,6 +335,9 @@ def convert_to_markdown_v2(output_data: dict,
         "Estimated effort to review [1-5]": "⏱️",
         "Contribution time cost estimate": "⏳",
         "Ticket compliance check": "🎫",
+        "Risk level": "⚠️",
+        "Merge recommendation": "✅",
+        "Review priority files": "📂",
     }
     markdown_text = ""
     markdown_text += f"{format_pr_review_header(incremental=bool(incremental_review))}\n\n"
@@ -310,7 +347,7 @@ def convert_to_markdown_v2(output_data: dict,
         return ""
 
     if review_profile != "bugs_only" and get_settings().get("pr_reviewer.enable_intro_text", False):
-        markdown_text += f"Here are some key observations to aid the review process:\n\n"
+        markdown_text += "Here are some key observations to aid the review process:\n\n"
 
     if gfm_supported:
         markdown_text += "<table>\n"
@@ -318,7 +355,7 @@ def convert_to_markdown_v2(output_data: dict,
     review_data = {k: v for k, v in output_data["review"].items() if k != "todo_summary"}
     for key, value in review_data.items():
         if value is None or value == '' or value == {} or value == []:
-            if key.lower() not in ['can_be_split', 'key_issues_to_review']:
+            if key.lower() not in ['can_be_split', 'key_issues_to_review', 'review_priority_files']:
                 continue
         key_nice = key.replace('_', ' ').capitalize()
         emoji = emojis.get(key_nice, "")
@@ -337,20 +374,20 @@ def convert_to_markdown_v2(output_data: dict,
             white_bars = '⚪' * (5 - value_int)
             value = f"{value_int} {blue_bars}{white_bars}"
             if gfm_supported:
-                markdown_text += f"<tr><td>"
+                markdown_text += "<tr><td>"
                 markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong>: {value}"
-                markdown_text += f"</td></tr>\n"
+                markdown_text += "</td></tr>\n"
             else:
                 markdown_text += f"### {emoji} {key_nice}: {value}\n\n"
         elif 'relevant tests' in key_nice.lower():
             value = str(value).strip().lower()
             if gfm_supported:
-                markdown_text += f"<tr><td>"
+                markdown_text += "<tr><td>"
                 if is_value_no(value):
                     markdown_text += f"{emoji}&nbsp;<strong>No relevant tests</strong>"
                 else:
                     markdown_text += f"{emoji}&nbsp;<strong>PR contains tests</strong>"
-                markdown_text += f"</td></tr>\n"
+                markdown_text += "</td></tr>\n"
             else:
                 if is_value_no(value):
                     markdown_text += f'### {emoji} No relevant tests\n\n'
@@ -371,7 +408,7 @@ def convert_to_markdown_v2(output_data: dict,
                 avg = _expand_minute_suffix(value['average_case'])
                 worst = _expand_minute_suffix(value['worst_case'])
                 markdown_text += f"{best} | {avg} | {worst}"
-                markdown_text += f"</td></tr>\n"
+                markdown_text += "</td></tr>\n"
             else:
                 markdown_text += f"### {emoji} Contribution time estimate (best, average, worst case): "
                 best = _expand_minute_suffix(value['best_case'])
@@ -380,14 +417,14 @@ def convert_to_markdown_v2(output_data: dict,
                 markdown_text += f"{best} | {avg} | {worst}\n\n"
         elif 'security concerns' in key_nice.lower():
             if gfm_supported:
-                markdown_text += f"<tr><td>"
+                markdown_text += "<tr><td>"
                 if is_value_no(value):
                     markdown_text += f"{emoji}&nbsp;<strong>No security concerns identified</strong>"
                 else:
                     markdown_text += f"{emoji}&nbsp;<strong>Security concerns</strong><br><br>\n\n"
                     value = emphasize_header(value.strip())
                     markdown_text += f"{value}"
-                markdown_text += f"</td></tr>\n"
+                markdown_text += "</td></tr>\n"
             else:
                 if is_value_no(value):
                     markdown_text += f'### {emoji} No security concerns identified\n\n'
@@ -395,11 +432,52 @@ def convert_to_markdown_v2(output_data: dict,
                     markdown_text += f"### {emoji} Security concerns\n\n"
                     value = emphasize_header(value.strip(), only_markdown=True)
                     markdown_text += f"{value}\n\n"
+        elif 'risk level' in key_nice.lower():
+            risk_value = str(value).strip().lower().replace("_", " ")
+            risk_display = risk_value.capitalize() if risk_value else "Unknown"
+            if gfm_supported:
+                markdown_text += "<tr><td>"
+                markdown_text += f"{emoji}&nbsp;<strong>Risk level</strong>: {risk_display}"
+                markdown_text += "</td></tr>\n"
+            else:
+                markdown_text += f"### {emoji} Risk level: {risk_display}\n\n"
+        elif 'merge recommendation' in key_nice.lower():
+            recommendation = str(value).strip().replace("_", " ")
+            recommendation_display = recommendation.capitalize() if recommendation else "Unknown"
+            if gfm_supported:
+                markdown_text += "<tr><td>"
+                markdown_text += f"{emoji}&nbsp;<strong>Merge recommendation</strong>: {recommendation_display}"
+                markdown_text += "</td></tr>\n"
+            else:
+                markdown_text += f"### {emoji} Merge recommendation: {recommendation_display}\n\n"
+        elif 'review priority files' in key_nice.lower():
+            priority_files = []
+            if isinstance(value, list):
+                priority_files = [str(priority_file).strip() for priority_file in value if str(priority_file).strip()]
+            if gfm_supported:
+                markdown_text += "<tr><td>"
+                if not priority_files:
+                    markdown_text += f"{emoji}&nbsp;<strong>Priority files</strong>: None"
+                else:
+                    markdown_text += f"{emoji}&nbsp;<strong>Priority files</strong>\n<br><br>\n"
+                    markdown_text += "<ul>\n"
+                    for priority_file in priority_files:
+                        markdown_text += f"<li>{priority_file}</li>\n"
+                    markdown_text += "</ul>\n"
+                markdown_text += "</td></tr>\n"
+            else:
+                if not priority_files:
+                    markdown_text += f"### {emoji} Priority files: None\n\n"
+                else:
+                    markdown_text += f"### {emoji} Priority files\n\n"
+                    for priority_file in priority_files:
+                        markdown_text += f"- {priority_file}\n"
+                    markdown_text += "\n"
         elif 'todo sections' in key_nice.lower():
             if gfm_supported:
                 markdown_text += "<tr><td>"
                 if is_value_no(value):
-                    markdown_text += f"✅&nbsp;<strong>No TODO sections</strong>"
+                    markdown_text += "✅&nbsp;<strong>No TODO sections</strong>"
                 else:
                     markdown_todo_items = format_todo_items(value, git_provider, gfm_supported)
                     markdown_text += f"{emoji}&nbsp;<strong>TODO sections</strong>\n<br><br>\n"
@@ -407,29 +485,29 @@ def convert_to_markdown_v2(output_data: dict,
                 markdown_text += "</td></tr>\n"
             else:
                 if is_value_no(value):
-                    markdown_text += f"### ✅ No TODO sections\n\n"
+                    markdown_text += "### ✅ No TODO sections\n\n"
                 else:
                     markdown_todo_items = format_todo_items(value, git_provider, gfm_supported)
                     markdown_text += f"### {emoji} TODO sections\n\n"
                     markdown_text += markdown_todo_items
         elif 'can be split' in key_nice.lower():
             if gfm_supported:
-                markdown_text += f"<tr><td>"
+                markdown_text += "<tr><td>"
                 markdown_text += process_can_be_split(emoji, value)
-                markdown_text += f"</td></tr>\n"
+                markdown_text += "</td></tr>\n"
         elif 'key issues to review' in key_nice.lower():
             # value is a list of issues
             if is_value_no(value):
                 if gfm_supported:
-                    markdown_text += f"<tr><td>"
+                    markdown_text += "<tr><td>"
                     markdown_text += f"{emoji}&nbsp;<strong>No major issues detected</strong>"
-                    markdown_text += f"</td></tr>\n"
+                    markdown_text += "</td></tr>\n"
                 else:
                     markdown_text += f"### {emoji} No major issues detected\n\n"
             else:
                 issues = value
                 if gfm_supported:
-                    markdown_text += f"<tr><td>"
+                    markdown_text += "<tr><td>"
                     # markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong><br><br>\n\n"
                     section_title = (
                         "Introduced defects" if review_profile == "bugs_only" else "Recommended focus areas for review"
@@ -487,12 +565,12 @@ def convert_to_markdown_v2(output_data: dict,
                     except Exception as e:
                         get_logger().exception(f"Failed to process 'Recommended focus areas for review': {e}")
                 if gfm_supported:
-                    markdown_text += f"</td></tr>\n"
+                    markdown_text += "</td></tr>\n"
         else:
             if gfm_supported:
-                markdown_text += f"<tr><td>"
+                markdown_text += "<tr><td>"
                 markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong>: {value}"
-                markdown_text += f"</td></tr>\n"
+                markdown_text += "</td></tr>\n"
             else:
                 markdown_text += f"### {emoji} {key_nice}: {value}\n\n"
 
@@ -563,7 +641,7 @@ def ticket_markdown_logic(emoji, markdown_text, value, gfm_supported) -> str:
                                                                           '').strip()
 
                 if not fully_compliant_str and not not_compliant_str and not requires_further_human_verification:
-                    get_logger().debug(f"Ticket compliance has no requirements",
+                    get_logger().debug("Ticket compliance has no requirements",
                                        artifact={'ticket_url': ticket_url})
                     continue
 
@@ -596,7 +674,7 @@ def ticket_markdown_logic(emoji, markdown_text, value, gfm_supported) -> str:
 
                 # for debugging
                 if requires_further_human_verification:
-                    get_logger().debug(f"Ticket compliance requires further human verification",
+                    get_logger().debug("Ticket compliance requires further human verification",
                                        artifact={'ticket_url': ticket_url,
                                                  'requires_further_human_verification': requires_further_human_verification,
                                                  'compliance_level': ticket_compliance_level})
@@ -633,10 +711,10 @@ def ticket_markdown_logic(emoji, markdown_text, value, gfm_supported) -> str:
 
         # editing table row for ticket compliance analysis
         if gfm_supported:
-            markdown_text += f"<tr><td>\n\n"
+            markdown_text += "<tr><td>\n\n"
             markdown_text += f"**{emoji} Ticket compliance analysis {compliance_emoji}**\n\n"
             markdown_text += ticket_compliance_str
-            markdown_text += f"</td></tr>\n"
+            markdown_text += "</td></tr>\n"
         else:
             markdown_text += f"### {emoji} Ticket compliance analysis {compliance_emoji}\n\n"
             markdown_text += ticket_compliance_str + "\n\n"
@@ -660,11 +738,11 @@ def process_can_be_split(emoji, value):
                 title = split.get('title', '')
                 relevant_files = split.get('relevant_files', [])
                 markdown_text += f"<details><summary>\nSub-PR theme: <b>{title}</b></summary>\n\n"
-                markdown_text += f"___\n\nRelevant files:\n\n"
+                markdown_text += "___\n\nRelevant files:\n\n"
                 for file in relevant_files:
                     markdown_text += f"- {file}\n"
-                markdown_text += f"___\n\n"
-                markdown_text += f"</details>\n\n"
+                markdown_text += "___\n\n"
+                markdown_text += "</details>\n\n"
 
                 # markdown_text += f"#### Sub-PR theme: {title}\n\n"
                 # markdown_text += f"Relevant files:\n\n"
@@ -721,7 +799,7 @@ def parse_code_suggestion(code_suggestion: dict, i: int = 0, gfm_supported: bool
                     markdown_text += (f"<tr><td>{sub_key} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</td>"
                                       f"<td>\n\n<strong>\n\n{sub_value.strip()}\n\n</strong>\n</td></tr>")
                 elif sub_key.lower() == 'relevant_line':
-                    markdown_text += f"<tr><td>relevant line</td>"
+                    markdown_text += "<tr><td>relevant line</td>"
                     sub_value_list = sub_value.split('](')
                     relevant_line = sub_value_list[0].lstrip('`').lstrip('[')
                     if len(sub_value_list) > 1:
@@ -876,7 +954,7 @@ def load_large_diff(filename, new_file_content_str: str, original_file_content_s
         new_file_content_str = (new_file_content_str or "").rstrip(" \t\n") + "\n"
         diff = difflib.unified_diff(list(iter_git_patch_lines(original_file_content_str)),
                                     list(iter_git_patch_lines(new_file_content_str)))
-        if get_settings().config.verbosity_level >= 2 and show_warning:
+        if get_verbosity_level() >= 2 and show_warning:
             get_logger().info(f"File was modified, but no patch was found. Manually creating patch: {filename}.")
         patch = ''.join(diff)
         return patch
@@ -984,11 +1062,13 @@ def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", l
         data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key,
                             response_text_original=response_text_original_sanitized)
         if not data:
-            get_logger().error(f"Failed to parse AI prediction after fallbacks",
+            get_logger().error("Failed to parse AI prediction after fallbacks",
                                artifact={'response_text': response_text})
         else:
-            get_logger().info(f"Successfully parsed AI prediction after fallbacks",
+            get_logger().info("Successfully parsed AI prediction after fallbacks",
                               artifact={'response_text': response_text})
+    if data is None:
+        return {}
     return data
 
 
@@ -1014,7 +1094,7 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load('\n'.join(response_text_lines_copy))
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after adding |-\n")
+            get_logger().info("Successfully parsed AI prediction after adding |-\n")
             return data
     except:
         pass
@@ -1025,7 +1105,7 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load(response_text_copy)
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after replacing | with |2")
+            get_logger().info("Successfully parsed AI prediction after replacing | with |2")
             return data
     except:
         pass
@@ -1039,7 +1119,7 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load('\n'.join(response_text_lines_copy))
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after replacing | with |2 and adding spaces")
+            get_logger().info("Successfully parsed AI prediction after replacing | with |2 and adding spaces")
             return data
     except:
         pass
@@ -1055,7 +1135,7 @@ def try_fix_yaml(response_text: str,
         try:
             data = yaml.safe_load(snippet_text)
             if data is not None:
-                get_logger().info(f"Successfully parsed AI prediction after extracting yaml snippet")
+                get_logger().info("Successfully parsed AI prediction after extracting yaml snippet")
                 return data
         except Exception as e:
             get_logger().debug(f"Failed to parse AI prediction after extracting yaml snippet: {e}")
@@ -1066,7 +1146,7 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load(response_text_copy)
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after removing curly brackets")
+            get_logger().info("Successfully parsed AI prediction after removing curly brackets")
             return data
     except:
         pass
@@ -1083,12 +1163,17 @@ def try_fix_yaml(response_text: str,
         index_end = response_text.find("\n\n", index_last_code) # look for newlines after last_key
         if index_end == -1:
             index_end = len(response_text)
-        response_text_copy = response_text[index_start:index_end].strip().strip('```yaml').strip('`').strip()
+        response_text_copy = response_text[index_start:index_end].strip()
+        for fence in ("\n```yaml", "\n```yml"):
+            if response_text_copy[-len(fence):].lower() == fence:
+                response_text_copy = response_text_copy[: -len(fence)]
+                break
+        response_text_copy = response_text_copy.strip("`").strip()
         if response_text_copy:
             try:
                 data = yaml.safe_load(response_text_copy)
                 if data is not None:
-                    get_logger().info(f"Successfully parsed AI prediction after extracting yaml snippet")
+                    get_logger().info("Successfully parsed AI prediction after extracting yaml snippet")
                     return data
             except:
                 pass
@@ -1101,7 +1186,7 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load('\n'.join(response_text_lines_copy))
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after removing leading '+'")
+            get_logger().info("Successfully parsed AI prediction after removing leading '+'")
             return data
     except:
         pass
@@ -1152,7 +1237,7 @@ def try_fix_yaml(response_text: str,
         try:
             data = yaml.safe_load(response_text_copy)
             if data is not None:
-                get_logger().info(f"Successfully parsed AI prediction after replacing tabs with spaces")
+                get_logger().info("Successfully parsed AI prediction after replacing tabs with spaces")
                 return data
         except:
             pass
@@ -1176,7 +1261,7 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load(response_text_copy)
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after adding indent for sections of code blocks")
+            get_logger().info("Successfully parsed AI prediction after adding indent for sections of code blocks")
             return data
     except:
         pass
@@ -1187,7 +1272,7 @@ def try_fix_yaml(response_text: str,
     try:
         data = yaml.safe_load(response_text_copy)
         if data is not None:
-            get_logger().info(f"Successfully parsed AI prediction after removing pipe chars")
+            get_logger().info("Successfully parsed AI prediction after removing pipe chars")
             return data
     except:
         pass
@@ -1280,9 +1365,11 @@ def get_max_tokens(model):
     Get the maximum number of tokens allowed for a model.
     logic:
     (1) If the model is in './pr_agent/algo/__init__.py', use the value from there.
-    (2) else, the user needs to define explicitly 'config.custom_model_max_tokens'
+    (2) else if 'config.custom_model_max_tokens' is set to a positive value, use it.
+    (3) else, fall back to litellm.get_model_info(model)["max_input_tokens"].
+    (4) else, raise an error.
 
-    For both cases, we further limit the number of tokens to 'config.max_model_tokens' if it is set.
+    For all cases, we further limit the number of tokens to 'config.max_model_tokens' if it is set.
     This aims to improve the algorithmic quality, as the AI model degrades in performance when the input is too long.
     """
     settings = get_settings()
@@ -1292,8 +1379,29 @@ def get_max_tokens(model):
     elif custom_max_tokens > 0:
         max_tokens_model = custom_max_tokens
     else:
-        get_logger().error(f"Model {model} is not defined in MAX_TOKENS in ./pr_agent/algo/__init__.py and no custom_model_max_tokens is set")
-        raise Exception(f"Ensure {model} is defined in MAX_TOKENS in ./pr_agent/algo/__init__.py or set a positive value for it in config.custom_model_max_tokens")
+        # Fallback: ask LiteLLM for the model's metadata before giving up.
+        max_tokens_model = 0
+        import litellm
+        try:
+            model_info = litellm.get_model_info(model)
+        except Exception:
+            get_logger().debug(f"litellm.get_model_info could not resolve model '{model}'")
+            model_info = None
+        if model_info:
+            litellm_max = model_info.get("max_input_tokens")
+            if litellm_max and int(litellm_max) > 0:
+                max_tokens_model = int(litellm_max)
+                get_logger().debug(f"Resolved max_input_tokens for '{model}' from litellm: {max_tokens_model}")
+
+        if max_tokens_model <= 0:
+            get_logger().error(
+                f"Model {model} is not defined in MAX_TOKENS in ./pr_agent/algo/__init__.py"
+                f" and no custom_model_max_tokens is set"
+            )
+            raise Exception(
+                f"Ensure {model} is defined in MAX_TOKENS in ./pr_agent/algo/__init__.py"
+                f" or set a positive value for it in config.custom_model_max_tokens"
+            )
 
     max_model_tokens = _as_int(settings.config.max_model_tokens) if settings.config.max_model_tokens else 0
     if max_model_tokens > 0:
@@ -1468,18 +1576,26 @@ def find_line_number_of_relevant_line_in_file(diff_files: List[FilePatchInfo],
                     relevant_line_in_file = matches_difflib[0]
 
 
-                for i, line in enumerate(patch_lines):
-                    if line.startswith('@@'):
-                        delta = 0
-                        match = re_hunk_header.match(line)
-                        section_header, size1, size2, start1, start2 = extract_hunk_headers(match)
-                    elif not line.startswith('-'):
-                        delta += 1
+                def scan_patch_lines(is_match):
+                    scan_delta = 0
+                    scan_start2 = 0
+                    for i, line in enumerate(patch_lines):
+                        if line.startswith('@@'):
+                            scan_delta = 0
+                            header_match = re_hunk_header.match(line)
+                            *_, scan_start2 = extract_hunk_headers(header_match)
+                        elif not line.startswith('-'):
+                            scan_delta += 1
 
-                    if relevant_line_in_file in line and line[0] != '-':
-                        position = i
-                        absolute_position = start2 + delta - 1
-                        break
+                        if not line.startswith('-') and is_match(line):
+                            return i, scan_start2 + scan_delta - 1
+                    return -1, absolute_position
+
+                position, absolute_position = scan_patch_lines(
+                    lambda line: line == relevant_line_in_file or line[1:] == relevant_line_in_file)
+                if position == -1:
+                    position, absolute_position = scan_patch_lines(
+                        lambda line: relevant_line_in_file in line)
 
                 if position == -1 and relevant_line_in_file[0] == '+':
                     no_plus_line = relevant_line_in_file[1:].lstrip()
@@ -1574,6 +1690,86 @@ def github_action_output(output_data: dict, key_name: str):
     return
 
 
+def _push_outputs_sink_url(cfg: dict, key: str) -> str:
+    """Return cfg[key] if it is an absolute https URL with a host, else "" (with a warning).
+
+    Requiring https keeps the review text, which can quote private code, off plaintext
+    transports. The host is not restricted: self-hosted collectors and Slack-compatible
+    endpoints (Mattermost, Rocket.Chat) are legitimate targets.
+    """
+    url = cfg.get(key) or ''
+    if not url:
+        return ''
+    parsed = urlparse(url)
+    if parsed.scheme != 'https' or not parsed.hostname:
+        # Log the key, never the value: a webhook URL is itself the credential.
+        get_logger().warning(f"push_outputs: ignoring {key}, expected an absolute https:// URL")
+        return ''
+    return url
+
+
+def push_outputs(message_type: str, payload: dict | None = None, markdown: str | None = None) -> None:
+    """Emit a tool's output to external sinks, without calling any git-provider API.
+
+    Controlled by the [push_outputs] config section (disabled by default). Supported channels:
+    "stdout" (one JSON line), "file" (append JSONL), "webhook" (POST the generic record),
+    "slack" (POST {"text": ...} to a Slack Incoming Webhook). Non-fatal: never raises.
+    """
+    try:
+        cfg = get_settings().get('push_outputs', {}) or {}
+        enable = cfg.get('enable', False)
+        if isinstance(enable, str):  # env vars arrive as strings; treat "false"/"0"/"no"/"" as off
+            enable = enable.lower().strip() not in ("false", "0", "no", "")
+        if not enable:
+            return
+
+        channels = cfg.get('channels', []) or []
+        record = {
+            "type": message_type,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "payload": payload or {},
+        }
+        if markdown is not None:
+            record["markdown"] = markdown
+    except Exception as e:
+        get_logger().warning(f"push_outputs setup failed: {type(e).__name__}")
+        return
+
+    # Keep local channels first and isolate every sink so one failed delivery cannot prevent the
+    # remaining configured channels. Log only the channel and exception type: requests errors can
+    # embed a secret-bearing URL in their text.
+    for channel in ("stdout", "file", "webhook", "slack"):
+        if channel not in channels:
+            continue
+        try:
+            if channel == "stdout":
+                print(json.dumps(record, ensure_ascii=False))
+            elif channel == "file":
+                file_path = cfg.get('file_path', 'pr-agent-outputs/reviews.jsonl')
+                folder = os.path.dirname(file_path)
+                if folder:
+                    os.makedirs(folder, exist_ok=True)
+                with open(file_path, 'a', encoding='utf-8') as fh:
+                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            elif channel == "webhook":
+                webhook_url = _push_outputs_sink_url(cfg, 'webhook_url')
+                if webhook_url:
+                    # Never follow a redirect from a configured sink to another host.
+                    response = requests.post(webhook_url, json=record, timeout=5, allow_redirects=False)
+                    response.raise_for_status()
+            else:
+                # Slack Incoming Webhooks accept {"text": ...} directly, no relay service needed.
+                slack_webhook_url = _push_outputs_sink_url(cfg, 'slack_webhook_url')
+                if slack_webhook_url:
+                    text = markdown if markdown is not None else json.dumps(payload or {}, ensure_ascii=False)
+                    response = requests.post(
+                        slack_webhook_url, json={"text": text}, timeout=5, allow_redirects=False
+                    )
+                    response.raise_for_status()
+        except Exception as e:
+            get_logger().warning(f"push_outputs {channel} failed: {type(e).__name__}")
+
+
 def _render_setting_value(value) -> str:
     """Render a settings value as YAML, so nested values do not become Python reprs."""
     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -1604,7 +1800,7 @@ def show_relevant_configurations(relevant_section: str) -> str:
     markdown_text = ""
     markdown_text += "\n<hr>\n<details> <summary><strong>🛠️ Relevant configurations:</strong></summary> \n\n"
     markdown_text +="<br>These are the relevant [configurations](https://github.com/Codium-ai/pr-agent/blob/main/pr_agent/settings/configuration.toml) for this tool:\n\n"
-    markdown_text += f"**[config**]\n```yaml\n\n"
+    markdown_text += "**[config**]\n```yaml\n\n"
     for key, value in get_settings().config.items():
         if key.lower() in skip_keys_lower:
             continue
@@ -1794,7 +1990,7 @@ def process_description(description_full: str) -> Tuple[str, List]:
                         if '<code>...</code>' in file_data:
                             pass # PR with many files. some did not get analyzed
                         else:
-                            get_logger().warning(f"Failed to parse description", artifact={'description': file_data})
+                            get_logger().warning("Failed to parse description", artifact={'description': file_data})
                 except Exception as e:
                     get_logger().exception(f"Failed to process description: {e}", artifact={'description': file_data})
 

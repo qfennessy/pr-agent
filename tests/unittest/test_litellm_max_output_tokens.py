@@ -11,12 +11,10 @@ import openai
 import pytest
 
 import pr_agent.algo.ai_handlers.litellm_ai_handler as litellm_handler
-from pr_agent.algo.ai_request_context import (AIModelRoute, AIRequestOptions,
-                                              use_ai_request_options)
+from pr_agent.algo.ai_request_context import AIModelRoute, AIRequestOptions, use_ai_request_options
 from pr_agent.algo.pr_processing import retry_with_fallback_models
 from pr_agent.config_loader import get_settings
-from tests.unittest._settings_helpers import (restore_settings,
-                                              snapshot_settings)
+from tests.unittest._settings_helpers import restore_settings, snapshot_settings
 
 # Environment variables that LiteLLMAIHandler.__init__ reads or mutates: the AWS
 # credential path (entered when AWS_USE_IMDS is set) writes the AWS_* variables,
@@ -162,6 +160,18 @@ class TestMaxOutputTokens:
         })
         assert kwargs["max_tokens"] == 4096
         assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+
+    @pytest.mark.asyncio
+    async def test_extended_thinking_string_false_keeps_generic_cap(self, monkeypatch):
+        kwargs = await _run(monkeypatch, "claude-3-7-sonnet-20250219", {
+            "max_output_tokens": 12000,
+            "enable_claude_extended_thinking": "false",
+            "extended_thinking_budget_tokens": "invalid",
+            "extended_thinking_max_output_tokens": -1,
+        })
+
+        assert kwargs["max_tokens"] == 12000
+        assert "thinking" not in kwargs
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

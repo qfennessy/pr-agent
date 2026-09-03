@@ -758,6 +758,7 @@ class TestLeftSideSelection:
 
         assert selected == ""
 
+
 class TestTrailingDeletionOnlyHunk:
     """Render a hunk containing only deleted lines whether or not another hunk follows
     it. A PR that empties a file produces exactly this shape."""

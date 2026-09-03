@@ -131,6 +131,26 @@ def test_missing_or_disabled_runtime_configuration_preserves_legacy_policy():
     assert load_review_routing_configuration({"enabled": False}).policy is None
 
 
+def test_runtime_configuration_normalizes_environment_boolean_strings():
+    configuration = load_review_routing_configuration(_configuration(
+        enabled="true",
+        consume_specialist_escalation="true",
+        profiles={
+            "quick": {"shadow_only": "false"},
+            "standard": {"shadow_only": "false"},
+            "deep": {"shadow_only": "true"},
+        },
+    ))
+    decision = route_review(
+        _request(_file(), requested_depth=RequestedReviewDepth.DEEP),
+        configuration.policy,
+    )
+
+    assert configuration.consume_specialist_escalation is True
+    assert decision.policy_valid is True
+    assert decision.applied_budget.shadow_only is True
+
+
 def test_repository_default_profiles_form_a_valid_enabled_policy():
     section = deepcopy(dict(get_settings().review_depth))
     section["enabled"] = True

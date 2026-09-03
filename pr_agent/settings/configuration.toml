@@ -26,6 +26,7 @@ use_repo_settings_file=true
 use_global_settings_file=true
 extra_config_url="" # optional URL or path to an additional .pr_agent.toml merged before the repo-local config; also settable via --extra_config_url or PR_AGENT_EXTRA_CONFIG_URL. See docs/docs/usage-guide/configuration_options.md#external-configuration-url.
 disable_auto_feedback = false
+enable_auto_approval = false # when true, /review may auto-approve a PR via auto_approve_logic(); that caller is currently commented out
 ai_timeout=120 # 2 minutes
 skip_keys = []
 custom_reasoning_model = false # when true, disables system messages and temperature controls for models that don't support chat-style inputs
@@ -57,7 +58,7 @@ output_run_details=false # if true, append an agent run details section (model, 
 output_run_cost=false # if true, collect estimated LiteLLM API cost and include it inside the enabled run details section
 large_patch_policy = "clip" # "clip", "skip"
 duplicate_prompt_examples = false
-# Persistent inline comments (issue #2037): when true, the GitHub and GitLab providers
+# Persistent inline comments (issue #2037): when true, the GitHub, GitLab, and Azure DevOps providers
 # fingerprint each inline comment, embed the fingerprint as an HTML marker, and skip
 # re-posting suggestions already present on the PR/MR across runs.
 persistent_inline_comments = false
@@ -89,6 +90,11 @@ reasoning_effort = "medium" # "none", "minimal", "low", "medium", "high", "xhigh
 enable_claude_extended_thinking = false # Set to true to enable extended thinking feature
 extended_thinking_budget_tokens = 2048
 extended_thinking_max_output_tokens = 4096
+# Adaptive thinking for Claude Opus 4.7/4.8 and Claude 5 models. When enabled,
+# these models receive thinking={"type": "adaptive"} and an output_config effort.
+# Do not add adaptive-only models to claude_extended_thinking_models_override;
+# when both features are enabled, adaptive thinking takes precedence.
+enable_claude_adaptive_thinking = false
 # Optional: override the built-in list of Claude models that receive the extended-thinking payload.
 # When non-empty, this list fully replaces the built-in defaults (see CLAUDE_EXTENDED_THINKING_MODELS
 # in pr_agent/algo/__init__.py). Leave empty to use the defaults.
@@ -139,6 +145,10 @@ require_security_review=true
 require_estimate_contribution_time_cost=false
 require_todo_scan=false
 require_ticket_analysis_review=true
+# Opt-in structured assessment fields. Each adds one field to the review output and to the model's output schema.
+require_risk_assessment=false # ask the model for an overall risk level (low/medium/high)
+require_merge_recommendation=false # ask the model for a merge recommendation (safe_to_merge/merge_with_caution/changes_required)
+require_priority_files=false # ask the model which files a human should inspect first
 # general options
 publish_output_no_suggestions=true # Set to "false" if you only need the reviewer's remarks (not labels, not "security audit", etc.) and want to avoid noisy "No major issues detected" comments.
 persistent_comment=true
@@ -428,6 +438,8 @@ expand_submodule_diffs = false
 feedback_on_draft_pr = false
 # Post the /review summary as a resolvable thread (discussion) instead of a plain note.
 publish_review_as_thread = false
+# Post the /improve suggestions comment as a resolvable thread (discussion) instead of a plain note.
+publish_improve_as_thread = false
 # When pr_code_suggestions.commitable_code_suggestions is true, queue each suggestion as a GitLab draft
 # note and publish them all together in one batch (like GitLab's own "start a review" flow) instead of
 # posting each as its own live discussion - and its own notification - as soon as it's created.
@@ -446,6 +458,11 @@ push_commands = [
 ]
 # Configure SSL validation for GitLab. Can be either set to the path of a custom CA or disabled entirely.
 # ssl_verify = true
+# Auto-trigger commands when the bot is assigned as a reviewer on an MR
+handle_reviewer_assignment = false
+reviewer_commands = [
+    "/review",
+]
 
 [gitea]
 url = "https://gitea.com"
@@ -476,6 +493,7 @@ pr_commands = [
     "/improve --pr_code_suggestions.commitable_code_suggestions=true",
 ]
 avoid_full_files = false
+request_timeout = 30 # positive seconds for connection and response-read inactivity timeouts
 
 [local]
 # LocalGitProvider settings - uncomment to use paths other than default
@@ -558,6 +576,9 @@ output_token_budget = 800
 minimum_confidence = 0.6
 
 [gerrit]
+# set both to require basic auth on the gerrit webhook endpoint; leave both empty to keep it open
+webhook_username = ""
+webhook_password = ""
 # endpoint to the gerrit service
 # url = "ssh://gerrit.example.com:29418"
 # user for gerrit authentication
@@ -584,6 +605,7 @@ enable_callbacks = false
 success_callback = []
 failure_callback = []
 service_callback = []
+turn_off_message_logging = false # set true to keep prompt/response content (the whole PR diff) out of callback payloads; strongly recommended with the "otel" callback
 # Optional: forward a fixed custom_llm_provider to LiteLLM, so a raw hosted model id
 # (e.g. "claude-sonnet-4-5") reaches the provider unchanged instead of being rewritten
 # by LiteLLM's prefix inference. Empty = let LiteLLM infer the provider from the model name.
@@ -615,10 +637,23 @@ allow_fallbacks = true # when provider_order is set, allow routing beyond the li
 # Model-specific support varies; mandatory reasoning models reject "none".
 reasoning_effort = ""
 # A positive value overrides global effort and non-none OpenRouter-specific efforts.
-# Explicit openrouter.reasoning_effort = "none" keeps reasoning disabled.
+# Explicit openrouter.reasoning_effort = "none" keeps reasoning disabled, except on
+# Grok 4.5/4.6: there "none" is clamped to the lowest supported
+# effort first, so a positive budget wins over it.
 # Some providers require max_tokens to be greater than the reasoning budget.
 reasoning_max_tokens = 0
 max_tokens = 0 # hard cap on completion tokens for the request; 0 = unset
+
+[otel]
+# Keys map to settings.get("OTEL.*") via section-key dot notation.
+is_enabled = false # disabled by default; set to true to enable telemetry
+exporter_type = "console" # "console", "otlp", or "none"
+service_name = "pr-agent"
+environment = "development" # "development", "staging", "production", etc.
+otlp_timeout = 3 # seconds; hard deadline per OTLP export call (incl. retries). Bounds CLI-exit/request stalls when the collector is unreachable; batches slower than this are dropped.
+otlp_protocol = "http" # "http" (default; exporter ships with pr-agent) or "grpc" (requires the otel-grpc extra: pip install pr-agent[otel-grpc])
+include_pr_url = false # set to true to attach PR URLs to spans (may expose private repo names)
+include_error_details = false # set to true to attach exception messages and rejected-command text to spans (may expose PR URLs, repo names, or other request content)
 
 [pr_similar_issue]
 skip_comments = false
@@ -649,7 +684,8 @@ uri = "./lancedb"
 
 [skills]
 # Agent skills (SKILL.md) support: discovers SKILL.md files from the configured
-# filesystem paths and injects their content into review/improve/describe prompts.
+# filesystem paths and injects their content into review/improve/describe and
+# top-level /ask prompts.
 # Sibling *.md files in the skill directory tree (e.g. references/guide.md) are
 # inlined alongside SKILL.md. PR-Agent supports text-only skills: scripts/ and
 # assets/ subdirectories are skipped because PR-Agent uses a single-shot model
@@ -694,8 +730,16 @@ request_timeout = 10 # seconds allowed for each Asana task API request
 default_comment_status = "closed"
 
 [azure_devops_server]
+agent_identity = "" # empty: discover the identity from earlier agent comments on the PR
 pr_commands = [
     "/describe",
     "/review",
     "/improve",
 ]
+
+[push_outputs] # push tool outputs to external sinks without calling git-provider APIs (disabled by default)
+enable = false
+channels = [] # any of: "stdout", "file", "webhook", "slack". Nothing is emitted until a channel is listed here
+file_path = "pr-agent-outputs/reviews.jsonl" # used by the "file" channel
+webhook_url = "" # used by the "webhook" channel: generic JSON POST target. Must be an absolute https:// URL
+slack_webhook_url = "" # used by the "slack" channel: a Slack Incoming Webhook URL. Must be an absolute https:// URL
