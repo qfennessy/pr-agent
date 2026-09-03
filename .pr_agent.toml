@@ -57,3 +57,13 @@ file_save_debounce_ms = 1500
 worktree_idle_seconds = 15
 max_concurrency = 2
 cancel_stale_snapshots = true
+
+[checkpoint_evaluation]
+# Keep this disabled evaluation configuration mirrored with configuration.toml.
+enabled = false
+allow_paid_execution = false
+shadow_journal_enabled = false
+publish_output = false
+paid_cost_cap_usd = 0.0
+shadow_journal_path = ""
+shadow_journal_max_queue_entries = 256

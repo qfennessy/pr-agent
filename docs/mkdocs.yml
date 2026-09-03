@@ -26,6 +26,7 @@ nav:
     - Additional Configurations: 'usage-guide/additional_configurations.md'
     - Plain-Diff Mode: 'usage-guide/plain_diff_mode.md'
     - Local Snapshot Review: 'usage-guide/local_snapshot_review.md'
+    - Checkpoint Evaluation Planning: 'usage-guide/checkpoint_evaluation.md'
     - Local Git Provider: 'usage-guide/local_git_provider.md'
     - Frequently Asked Questions: 'faq/index.md'
   - Tools:

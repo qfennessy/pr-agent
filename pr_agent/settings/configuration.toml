@@ -524,6 +524,21 @@ worktree_idle_seconds = 15
 max_concurrency = 2
 cancel_stale_snapshots = true
 
+[checkpoint_evaluation]
+# Evaluation planning is credential-free. Production replay, shadow recording, and
+# developer-visible output remain disabled until their issue #27 rollout gates pass.
+enabled = false
+allow_paid_execution = false
+shadow_journal_enabled = false
+publish_output = false
+# Zero is deliberately non-authorizing. Each paid run must supply and freeze a
+# positive cap after projected cost and provider credentials are known.
+paid_cost_cap_usd = 0.0
+# Empty means no shadow artifact may be opened. When explicitly enabled, use a
+# private path outside the source tree (normally below the Git common directory).
+shadow_journal_path = ""
+shadow_journal_max_queue_entries = 256
+
 [specialist_pipeline]
 # Disabled shadow infrastructure. Enabled roles record validated evidence but never
 # change review depth, diff selection, findings, labels, publication, or approval.
