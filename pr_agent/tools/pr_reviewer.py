@@ -2043,6 +2043,18 @@ class PRReviewer:
             for item in decisions
             if isinstance(item, dict) and item.get("candidate_id")
         }
+        collision_sensitive_identities = set()
+        for candidate in candidates:
+            decision = decision_by_candidate.get(candidate.get("candidate_id"), {})
+            if (
+                candidate.get("sensitive_path") is not True
+                or decision.get("verdict") != "rejected"
+                or decision.get("reason") != "trusted_identity_collision"
+            ):
+                continue
+            identity = verified_finding_identity(candidate)
+            if identity is not None:
+                collision_sensitive_identities.add(identity)
         route_decision = getattr(self, "review_route_decision", None)
         risk_policy_version = (
             route_decision.policy_version if route_decision is not None else "review-router-unavailable"
@@ -2062,7 +2074,9 @@ class PRReviewer:
                     "publication_safe": False,
                 })
                 continue
-            candidate = matching_candidates[0]
+            candidate = dict(matching_candidates[0])
+            if identity in collision_sensitive_identities:
+                candidate["sensitive_path"] = True
             decision = decision_by_candidate.get(candidate.get("candidate_id"), {})
             severity, signals = self._frontier_signals(
                 candidate,

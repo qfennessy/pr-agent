@@ -2619,6 +2619,224 @@ async def test_frontier_adjudication_binds_the_accepted_sensitive_candidate_on_i
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reverse_inputs", [False, True], ids=["model-first", "sensitive-first"])
+async def test_rejected_sensitive_collision_elevates_only_identity_equivalent_accepted_model(
+    monkeypatch,
+    reverse_inputs,
+):
+    from pr_agent.algo.candidate_verification import verified_finding_identity
+
+    def candidate(
+        candidate_id,
+        path,
+        anchor,
+        *,
+        sensitive,
+        title,
+        content,
+        trigger,
+        impact,
+    ):
+        return {
+            "candidate_id": candidate_id,
+            "candidate_type": "sensitive_path_audit" if sensitive else "model_finding",
+            "sensitive_path": sensitive,
+            "relevant_file": path,
+            "issue_header": title,
+            "issue_content": content,
+            "trigger": trigger,
+            "impact": impact,
+            "start_line": 4,
+            "end_line": 4,
+            "side": "new",
+            "_changed_anchor_shape": anchor,
+            "_changed_anchor_ordinal": 1,
+            "_trusted_defect_ordinal": 1,
+            "_trusted_lineage_key": f"file:{path}",
+        }
+
+    accepted_model = candidate(
+        "model-equivalent",
+        "src/service.py",
+        "return service.fetch(value)",
+        sensitive=False,
+        title="Accepted model finding",
+        content="The accepted model explanation remains authoritative.",
+        trigger="An attacker supplies another tenant's id.",
+        impact="Another tenant's record is returned.",
+    )
+    equivalent_sensitive = candidate(
+        "sensitive-equivalent",
+        "src/service.py",
+        "return service.fetch(value)",
+        sensitive=True,
+        title="Rejected sensitive audit",
+        content="This rejected description must not replace the accepted finding.",
+        trigger="Rejected sensitive trigger.",
+        impact="Rejected sensitive impact.",
+    )
+    unrelated_model = candidate(
+        "model-unrelated",
+        "src/ordinary.py",
+        "return ordinary(value)",
+        sensitive=False,
+        title="Unrelated accepted model finding",
+        content="This medium finding does not independently require frontier.",
+        trigger="An ordinary request is made.",
+        impact="An ordinary response is returned.",
+    )
+    unrelated_sensitive = candidate(
+        "sensitive-unrelated",
+        "src/secrets.py",
+        "return secrets.fetch(value)",
+        sensitive=True,
+        title="Unrelated rejected sensitive audit",
+        content="This rejection must not elevate another identity.",
+        trigger="An unrelated sensitive request is made.",
+        impact="An unrelated secret could be returned.",
+    )
+    equivalent_identity = verified_finding_identity(accepted_model)
+    assert equivalent_identity == verified_finding_identity(equivalent_sensitive)
+    unrelated_model_identity = verified_finding_identity(unrelated_model)
+    assert unrelated_model_identity != verified_finding_identity(unrelated_sensitive)
+
+    findings = [
+        {
+            "root_cause_id": equivalent_identity[0],
+            "trusted_stable_key": equivalent_identity[1],
+            "relevant_file": accepted_model["relevant_file"],
+            "issue_header": accepted_model["issue_header"],
+            "issue_content": accepted_model["issue_content"],
+            "trigger": accepted_model["trigger"],
+            "impact": accepted_model["impact"],
+            "start_line": 4,
+            "end_line": 4,
+            "side": "new",
+        },
+        {
+            "root_cause_id": unrelated_model_identity[0],
+            "trusted_stable_key": unrelated_model_identity[1],
+            "relevant_file": unrelated_model["relevant_file"],
+            "issue_header": unrelated_model["issue_header"],
+            "issue_content": unrelated_model["issue_content"],
+            "trigger": unrelated_model["trigger"],
+            "impact": unrelated_model["impact"],
+            "start_line": 4,
+            "end_line": 4,
+            "side": "new",
+        },
+    ]
+    candidates = [
+        accepted_model,
+        equivalent_sensitive,
+        unrelated_model,
+        unrelated_sensitive,
+    ]
+    evidence = [
+        {
+            "candidate_id": item["candidate_id"],
+            "evidence_id": f'evidence-{item["candidate_id"]}',
+            "source": "changed_head",
+            "path": item["relevant_file"],
+            "side": "new",
+            "start_line": 4,
+            "end_line": 4,
+            "content": item["_changed_anchor_shape"],
+        }
+        for item in candidates
+    ]
+    decisions = [
+        {
+            "candidate_id": "model-equivalent",
+            "verdict": "verified",
+            "normalized_severity": "medium",
+        },
+        {
+            "candidate_id": "sensitive-equivalent",
+            "verdict": "rejected",
+            "reason": "trusted_identity_collision",
+        },
+        {
+            "candidate_id": "model-unrelated",
+            "verdict": "verified",
+            "normalized_severity": "medium",
+        },
+        {
+            "candidate_id": "sensitive-unrelated",
+            "verdict": "rejected",
+            "reason": "trusted_identity_collision",
+        },
+    ]
+    if reverse_inputs:
+        candidates.reverse()
+        evidence.reverse()
+        decisions.reverse()
+    originals = copy.deepcopy((findings, candidates, evidence, decisions))
+
+    config = SimpleNamespace(
+        max_calls=2,
+        stage_timeout_seconds=1,
+        configuration_hash="sha256:configuration",
+        prompt_hash="sha256:prompt",
+        policy_version="frontier-policy-v1",
+    )
+    result = MagicMock()
+    result.to_telemetry_dict.return_value = {
+        "stable_finding_id": equivalent_identity[1],
+        "state": "confirmed",
+        "publication_safe": False,
+    }
+    run_frontier = AsyncMock(return_value=result)
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.load_frontier_adjudication_config",
+        lambda *args, **kwargs: config,
+    )
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.get_specialist_snapshot_context",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.run_frontier_adjudication",
+        run_frontier,
+    )
+    reviewer = _make_reviewer()
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
+    route_decision = reviewer._prepare_review_route()
+    reviewer.ai_handler = SimpleNamespace(azure=False)
+    reviewer.git_provider.get_pr_head_sha.return_value = "head-sha"
+
+    await reviewer._run_frontier_adjudications(findings, candidates, evidence, decisions)
+
+    assert route_decision.routing_enabled is False
+    run_frontier.assert_awaited_once()
+    adjudication_request = run_frontier.await_args.args[0]
+    assert adjudication_request.candidate.stable_finding_id == equivalent_identity[1]
+    assert adjudication_request.candidate.path == "src/service.py"
+    assert adjudication_request.candidate.title == accepted_model["issue_header"]
+    assert adjudication_request.candidate.explanation == accepted_model["issue_content"]
+    assert adjudication_request.candidate.trigger == accepted_model["trigger"]
+    assert adjudication_request.candidate.impact == accepted_model["impact"]
+    assert adjudication_request.candidate.verified_severity.value == "medium"
+    assert adjudication_request.signals.sensitive is True
+    assert adjudication_request.signals.severe is False
+    assert adjudication_request.signals.deterministic_forced is True
+    assert adjudication_request.signals.deterministic_severity_floor.value == "high"
+    assert adjudication_request.signals.reasons == (
+        "deterministic_sensitive_route:candidate_verification",
+    )
+    assert [item.evidence_id for item in adjudication_request.evidence] == [
+        "evidence-model-equivalent",
+    ]
+    assert [item.content for item in adjudication_request.evidence] == [
+        accepted_model["_changed_anchor_shape"],
+    ]
+    assert reviewer.frontier_adjudication_artifact["status"] == "complete"
+    assert (findings, candidates, evidence, decisions) == originals
+
+
+@pytest.mark.asyncio
 async def test_frontier_adjudication_prioritizes_deterministic_risk_before_call_budget(
         monkeypatch):
     from pr_agent.algo.candidate_verification import verified_finding_identity
