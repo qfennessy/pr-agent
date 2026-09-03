@@ -28,11 +28,18 @@ GITHUB_EXPLICIT_REFERENCE_PREFIX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 MARKDOWN_FENCED_CODE_PATTERN = re.compile(
-    r"^[ \t]*(?P<fence>`{3,}|~{3,})[^\n]*(?:\n|$).*?"
-    r"(?:^[ \t]*(?P=fence)[ \t]*(?=\n|$)|\Z)",
-    re.MULTILINE | re.DOTALL,
+    r"^[ \t]*(?P<marker>`{3,}|~{3,})[^\n]*(?:\n|$)",
+    re.MULTILINE,
 )
-MARKDOWN_INLINE_CODE_PATTERN = re.compile(r"`+[^`\n]*`+")
+MARKDOWN_FENCED_CODE_CLOSER_PATTERN = re.compile(
+    r"^[ \t]*(?P<marker>`+|~+)[ \t]*(?:\n|$)",
+    re.MULTILINE,
+)
+MARKDOWN_INLINE_CODE_PATTERN = re.compile(
+    r"(?<!`)(?P<delimiter>`+)"
+    r"(?:(?!\n)(?!(?P=delimiter))[\s\S])*?"
+    r"(?P=delimiter)(?!`)",
+)
 # Option A: issue number at start of branch or after /, followed by - or end (e.g. feature/1-test-issue, 123-fix)
 BRANCH_ISSUE_PATTERN = re.compile(r"(?:^|/)(\d{1,6})(?=-|$)")
 
@@ -262,11 +269,34 @@ def extract_gitlab_ticket_references(pr_description, repo_path, gitlab_url):
 def _mask_markdown_code(text):
     """Replace Markdown code with spaces while retaining source offsets."""
 
+    masked_text = list(text)
+    cursor = 0
+    while True:
+        opener = MARKDOWN_FENCED_CODE_PATTERN.search(text, cursor)
+        if opener is None:
+            break
+
+        marker = opener.group("marker")
+        closer = None
+        for candidate in MARKDOWN_FENCED_CODE_CLOSER_PATTERN.finditer(text, opener.end()):
+            candidate_marker = candidate.group("marker")
+            if candidate_marker[0] == marker[0] and len(candidate_marker) >= len(marker):
+                closer = candidate
+                break
+
+        end = closer.end() if closer is not None else len(text)
+        for index in range(opener.start(), end):
+            if text[index] != "\n":
+                masked_text[index] = " "
+
+        cursor = end
+        if closer is None:
+            break
+
     def _mask(match):
         return "".join("\n" if character == "\n" else " " for character in match.group(0))
 
-    text = MARKDOWN_FENCED_CODE_PATTERN.sub(_mask, text)
-    return MARKDOWN_INLINE_CODE_PATTERN.sub(_mask, text)
+    return MARKDOWN_INLINE_CODE_PATTERN.sub(_mask, "".join(masked_text))
 
 
 def _parse_github_issue_reference_url(ticket_url):
@@ -276,15 +306,23 @@ def _parse_github_issue_reference_url(ticket_url):
     except (AttributeError, TypeError, ValueError):
         return None
 
-    path_parts = [part for part in parsed.path.split("/") if part]
-    if len(path_parts) < 4 or path_parts[-2] != "issues" or not path_parts[-1].isdigit():
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
-    owner, repo = path_parts[-4], path_parts[-3]
+
+    path_parts = parsed.path.split("/")
+    if path_parts and path_parts[-1] == "":
+        path_parts.pop()
+    if len(path_parts) != 5 or path_parts[0] != "" or path_parts[3] != "issues":
+        return None
+
+    owner, repo, issue_number = path_parts[1], path_parts[2], path_parts[4]
+    if not issue_number.isdigit():
+        return None
     if not GITHUB_OWNER_PATTERN.fullmatch(owner) or "--" in owner:
         return None
     if not GITHUB_REPOSITORY_COMPONENT_PATTERN.fullmatch(repo) or repo in {".", ".."}:
         return None
-    return (_normalize_github_host(ticket_url), owner.casefold(), repo.casefold(), int(path_parts[-1]))
+    return (_normalize_github_host(ticket_url), owner.casefold(), repo.casefold(), int(issue_number))
 
 
 def _has_explicit_github_reference_prefix(text, match_start, previous_match_end):
@@ -513,9 +551,10 @@ async def extract_tickets(git_provider):
             if tickets:
 
                 for ticket in tickets:
-                    repo_name, original_issue_number = git_provider._parse_issue_url(ticket)
-
+                    repo_name = ticket
+                    original_issue_number = "unknown"
                     try:
+                        repo_name, original_issue_number = git_provider._parse_issue_url(ticket)
                         repo_obj = _get_repo_obj_for_ticket(git_provider, ticket, repo_name, repo_obj_cache)
                         issue_main = repo_obj.get_issue(original_issue_number)
                     except Exception as e:
