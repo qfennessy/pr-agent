@@ -428,6 +428,8 @@ output sink, and returns only structured review data plus bounded run telemetry.
 settings, callbacks, credentials, and environment mutations die with the child process.
 
 This is still not a runnable production evaluation arm. General-review findings do not yet expose
-the normalized fingerprint/severity contract required by `ProductionArmResult`, and paid calls do
-not yet have an enforceable pre-call dollar cap. Those blockers remain fail-closed for general
-review and the full cascade.
+the normalized fingerprint/severity contract required by `ProductionArmResult`, effective review
+configuration does not yet have an immutable child-process replay contract, and paid calls do not
+yet have an enforceable pre-call dollar cap. The worker refuses execution when it cannot reproduce
+the snapshot's source-free configuration hash. Those blockers remain fail-closed for general review
+and the full cascade.

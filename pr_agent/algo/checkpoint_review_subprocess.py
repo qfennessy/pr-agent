@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import math
 import os
@@ -452,8 +453,41 @@ def _failure_outcome(
     )
 
 
+def _current_review_configuration_hash() -> str:
+    """Recompute the source-free effective configuration identity in the worker."""
+
+    from pr_agent.cli import _snapshot_review_configuration_hash
+
+    return _snapshot_review_configuration_hash(repo_context_files={})
+
+
 async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubprocessOutcome:
     """Import and run production review code only after request validation."""
+
+    expected_configuration_hash = snapshot.review_configuration_hash
+    if (
+        not isinstance(expected_configuration_hash, str)
+        or not _SNAPSHOT_ID_PATTERN.fullmatch(expected_configuration_hash)
+    ):
+        return _failure_outcome(
+            CheckpointReviewSubprocessState.FAILED,
+            "review_configuration_unverified",
+            snapshot_id=snapshot.snapshot_id,
+        )
+    try:
+        actual_configuration_hash = _current_review_configuration_hash()
+    except Exception:
+        return _failure_outcome(
+            CheckpointReviewSubprocessState.FAILED,
+            "review_configuration_unverified",
+            snapshot_id=snapshot.snapshot_id,
+        )
+    if not hmac.compare_digest(actual_configuration_hash, expected_configuration_hash):
+        return _failure_outcome(
+            CheckpointReviewSubprocessState.FAILED,
+            "review_configuration_mismatch",
+            snapshot_id=snapshot.snapshot_id,
+        )
 
     from pr_agent.algo.ai_handlers.litellm_helpers import drain_litellm_callbacks
     from pr_agent.algo.review_execution_context import isolate_review_execution
@@ -465,6 +499,7 @@ async def _execute_review(snapshot: ReviewSnapshot) -> CheckpointReviewSubproces
     settings.set("config.publish_output", False)
     settings.set("config.publish_output_progress", False)
     settings.set("config.enable_ai_metadata", False)
+    settings.set("config.propagate_tool_errors", True)
     settings.set("plain_diff.content", snapshot.diff)
     settings.set("plain_diff.output_path", None)
     settings.set("plain_diff.json_output_path", None)

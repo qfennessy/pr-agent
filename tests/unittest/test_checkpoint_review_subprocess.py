@@ -352,9 +352,14 @@ async def test_worker_executes_valid_request_and_binds_snapshot():
 
 @pytest.mark.asyncio
 async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_sinks(monkeypatch):
-    snapshot = _snapshot()
+    snapshot = replace(_snapshot(), review_configuration_hash="sha256:" + "b" * 64)
     configured = {}
     drain = AsyncMock()
+    monkeypatch.setattr(
+        review_subprocess,
+        "_current_review_configuration_hash",
+        lambda: snapshot.review_configuration_hash,
+    )
 
     class FakeSettings:
         def set(self, key, value):
@@ -370,6 +375,7 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
             assert configured["plain_diff.disable_working_tree_enrichment"] is True
             assert configured["plain_diff.output_path"] is None
             assert configured["plain_diff.json_output_path"] is None
+            assert configured["config.propagate_tool_errors"] is True
 
         async def _run_structured_no_publish_once(self):
             assert review_execution_is_isolated() is True
@@ -411,8 +417,14 @@ async def test_execution_passes_snapshot_intent_and_deterministic_evidence_to_re
         _snapshot(),
         task_intent="focus on concurrency",
         deterministic_results=({"check": "lint", "status": "failed"},),
+        review_configuration_hash="sha256:" + "b" * 64,
     )
     configured = {"pr_reviewer.extra_instructions": "persistent rule"}
+    monkeypatch.setattr(
+        review_subprocess,
+        "_current_review_configuration_hash",
+        lambda: snapshot.review_configuration_hash,
+    )
 
     class FakeSettings:
         def set(self, key, value):
@@ -442,3 +454,26 @@ async def test_execution_passes_snapshot_intent_and_deterministic_evidence_to_re
     outcome = await review_subprocess._execute_review(snapshot)
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_execution_refuses_unverified_review_configuration():
+    outcome = await review_subprocess._execute_review(_snapshot())
+
+    assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.FAILED
+    assert outcome.failure_reason_code == "review_configuration_unverified"
+
+
+@pytest.mark.asyncio
+async def test_execution_refuses_mismatched_review_configuration(monkeypatch):
+    snapshot = replace(_snapshot(), review_configuration_hash="sha256:" + "a" * 64)
+    monkeypatch.setattr(
+        review_subprocess,
+        "_current_review_configuration_hash",
+        lambda: "sha256:" + "b" * 64,
+    )
+
+    outcome = await review_subprocess._execute_review(snapshot)
+
+    assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.FAILED
+    assert outcome.failure_reason_code == "review_configuration_mismatch"
