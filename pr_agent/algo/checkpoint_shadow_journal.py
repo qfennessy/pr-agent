@@ -33,6 +33,7 @@ _REASON_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REVIEW_DEPTHS = {"quick", "standard", "deep"}
 SHADOW_JOURNAL_RECORD_SCHEMA_VERSION = "checkpoint-shadow-journal-record-v2"
+SHADOW_JOURNAL_SESSION_BOUNDARY_SCHEMA_VERSION = "checkpoint-shadow-session-boundary-v1"
 
 
 def _reject_unknown_fields(name: str, value: Mapping[str, Any], allowed: set[str]) -> None:
@@ -474,6 +475,79 @@ def _append_private_line(path: Path, payload: bytes) -> None:
             if chunk_size == 0:
                 raise EvaluationValidationError("could not complete shadow journal append")
             written += chunk_size
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _session_boundary_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.session-open")
+
+
+def _write_session_boundary(path: Path, records: tuple[ShadowJournalRecord, ...]) -> Path:
+    boundary_path = _session_boundary_path(path)
+    boundary_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_metadata = boundary_path.parent.lstat()
+    if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+        raise EvaluationValidationError("shadow journal parent must be a real directory")
+    if parent_metadata.st_uid != os.geteuid() or parent_metadata.st_mode & 0o077:
+        raise EvaluationValidationError("shadow journal parent must be private to the current user")
+    identity = {
+        "schema_version": SHADOW_JOURNAL_SESSION_BOUNDARY_SCHEMA_VERSION,
+        "next_sequence": len(records) + 1,
+        "prior_record_id": records[-1].record_id if records else None,
+    }
+    payload = json.dumps(
+        {**identity, "boundary_id": content_hash(identity)},
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(boundary_path, flags, 0o600)
+    except FileExistsError as exc:
+        raise EvaluationValidationError("shadow journal has an unsealed writer session") from exc
+    try:
+        written = 0
+        while written < len(payload):
+            chunk_size = os.write(descriptor, payload[written:])
+            if chunk_size == 0:
+                raise EvaluationValidationError("could not persist shadow journal session boundary")
+            written += chunk_size
+        os.fsync(descriptor)
+        parent_descriptor = os.open(boundary_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    except (OSError, EvaluationValidationError):
+        try:
+            boundary_path.unlink()
+        except OSError:
+            pass  # Best-effort cleanup must not hide the original persistence failure.
+        raise
+    finally:
+        os.close(descriptor)
+    return boundary_path
+
+
+def _clear_session_boundary(boundary_path: Path) -> None:
+    metadata = boundary_path.lstat()
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise EvaluationValidationError("shadow journal session boundary must be a private regular file")
+    boundary_path.unlink()
+    descriptor = os.open(boundary_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
@@ -481,6 +555,9 @@ def _append_private_line(path: Path, payload: bytes) -> None:
 def load_shadow_journal(path: str | Path) -> tuple[ShadowJournalRecord, ...]:
     """Parse a private NDJSON journal and validate its immutable sequence."""
     path = Path(path)
+    boundary_path = _session_boundary_path(path)
+    if os.path.lexists(boundary_path):
+        raise EvaluationValidationError("shadow journal has an unsealed writer session")
     if not path.exists():
         return ()
     metadata = path.lstat()
@@ -534,12 +611,14 @@ class ShadowJournalWriter:
         self._submit_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         existing = load_shadow_journal(self.path) if self.enabled else ()
+        self._session_boundary_path: Optional[Path] = None
         self._next_sequence = len(existing) + 1
         self._last_submitted_monotonic: Optional[float] = None
         self._submitted_entry_count = 0
         self._queued_entry_count = 0
         self._dropped_entry_count = 0
         if self.enabled:
+            self._session_boundary_path = _write_session_boundary(self.path, existing)
             self._thread = threading.Thread(target=self._drain, name="pr-agent-shadow-journal", daemon=True)
             self._thread.start()
 
@@ -633,17 +712,26 @@ class ShadowJournalWriter:
         with self._close_lock:
             with self._submit_lock:
                 self._closed.set()
-                if self._thread.is_alive() and not self._stop_enqueued.is_set():
-                    try:
-                        self._queue.put(self._STOP, timeout=timeout_seconds)
-                    except queue.Full:
-                        return False
-                    self._stop_enqueued.set()
+            if self._thread.is_alive() and not self._stop_enqueued.is_set():
+                try:
+                    self._queue.put(self._STOP, timeout=timeout_seconds)
+                except queue.Full:
+                    return False
+                self._stop_enqueued.set()
             if not self._thread.is_alive():
-                return not self._failed.is_set() and self._dropped_entry_count == 0
-            self._thread.join(timeout_seconds)
+                stopped = True
+            else:
+                self._thread.join(timeout_seconds)
+                stopped = not self._thread.is_alive()
+            if stopped and not self._failed.is_set() and self._session_boundary_path is not None:
+                try:
+                    _clear_session_boundary(self._session_boundary_path)
+                except (OSError, EvaluationValidationError):
+                    self._failed.set()
+                else:
+                    self._session_boundary_path = None
             return (
-                not self._thread.is_alive()
+                stopped
                 and not self._failed.is_set()
                 and self._dropped_entry_count == 0
             )

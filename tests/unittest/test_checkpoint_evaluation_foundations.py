@@ -921,6 +921,92 @@ def test_shadow_journal_shutdown_cannot_acknowledge_a_late_submission(tmp_path):
     assert not (tmp_path / "shutdown-race.ndjson").exists()
 
 
+def test_shadow_journal_reopen_persists_unsealed_boundary_before_first_acknowledgement(
+    tmp_path,
+    monkeypatch,
+):
+    case = _case("case", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
+    manifest = _manifest((case,), (_arm("deterministic", EvaluationArmKind.DETERMINISTIC),))
+    entry = ShadowJournalEntry.from_run_record(
+        _record(manifest, case, "deterministic"),
+        arm=manifest.arms[0],
+        event=case.event,
+        policy_hash=manifest.policy_hash,
+        configuration_hash=manifest.configuration_hash,
+    )
+    path = tmp_path / "reopened-shadow.ndjson"
+    first_writer = ShadowJournalWriter(path, enabled=True)
+    assert first_writer.submit(entry) is ShadowSubmitStatus.QUEUED
+    assert first_writer.close() is True
+    sealed_records = load_shadow_journal(path)
+
+    reopened_writer = ShadowJournalWriter(path, enabled=True)
+    boundary_path = tmp_path / ".reopened-shadow.ndjson.session-open"
+    boundary = json.loads(boundary_path.read_text(encoding="utf-8"))
+    assert boundary["next_sequence"] == 2
+    assert boundary["prior_record_id"] == sealed_records[-1].record_id
+
+    def failed_append(journal_path, payload):
+        raise OSError("simulated reopened journal failure")
+
+    monkeypatch.setattr(
+        "pr_agent.algo.checkpoint_shadow_journal._append_private_line",
+        failed_append,
+    )
+    assert reopened_writer.submit(entry) is ShadowSubmitStatus.QUEUED
+    assert reopened_writer.close() is False
+    with pytest.raises(EvaluationValidationError, match="unsealed writer session"):
+        load_shadow_journal(path)
+
+
+def test_shadow_journal_close_releases_submit_lock_while_waiting_for_queue(tmp_path, monkeypatch):
+    case = _case("case", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
+    manifest = _manifest((case,), (_arm("deterministic", EvaluationArmKind.DETERMINISTIC),))
+    entry = ShadowJournalEntry.from_run_record(
+        _record(manifest, case, "deterministic"),
+        arm=manifest.arms[0],
+        event=case.event,
+        policy_hash=manifest.policy_hash,
+        configuration_hash=manifest.configuration_hash,
+    )
+    path = tmp_path / "full-queue-close.ndjson"
+    writer = ShadowJournalWriter(path, enabled=True, max_queue_entries=1)
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    def blocked_first_append(journal_path, payload):
+        if not worker_started.is_set():
+            worker_started.set()
+            assert release_worker.wait(2)
+        _append_private_line(journal_path, payload)
+
+    monkeypatch.setattr(
+        "pr_agent.algo.checkpoint_shadow_journal._append_private_line",
+        blocked_first_append,
+    )
+    assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
+    writer._queue.join()
+    assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
+    assert worker_started.wait(1)
+    assert writer.submit(entry) is ShadowSubmitStatus.QUEUED
+
+    close_results = []
+    closer = threading.Thread(target=lambda: close_results.append(writer.close(timeout_seconds=2)))
+    closer.start()
+    assert writer._closed.wait(1)
+    late_statuses = []
+    late_submitter = threading.Thread(target=lambda: late_statuses.append(writer.submit(entry)))
+    late_submitter.start()
+    late_submitter.join(0.2)
+
+    assert not late_submitter.is_alive()
+    assert late_statuses == [ShadowSubmitStatus.CLOSED]
+    release_worker.set()
+    closer.join(2)
+    assert close_results == [True]
+    assert not (tmp_path / ".full-queue-close.ndjson.session-open").exists()
+
+
 def test_scorer_reports_lineage_lifecycle_events_stages_cohorts_and_paired_uncertainty():
     root = _case("root", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
     child = _case("child", EvaluationCohort.HOLDOUT, ReviewEvent.WORKTREE_IDLE, 30, parent="root")

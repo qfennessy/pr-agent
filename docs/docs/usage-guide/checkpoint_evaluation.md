@@ -173,6 +173,11 @@ identity hash, and each priced-cost model key against the same frozen arm.
 code calls only bounded `put_nowait`; a daemon worker appends source-free NDJSON in the
 background. A full queue or write failure drops telemetry rather than delaying or failing
 a save. Explicit shutdown may flush the queue, but the save path never waits for disk.
+Enabling a writer first durably creates a private, source-free session-open boundary tied to
+the prior journal tail. Until clean shutdown removes that boundary, report loading rejects the
+journal, so a crash before the first queued record reaches disk cannot leave an older sealed
+inventory looking current. Shutdown marks submission closed under the submission lock, releases
+the lock, and only then waits for queue capacity; concurrent checkpoints return `CLOSED` immediately.
 Each accepted entry is wrapped by the writer with a contiguous sequence, UTC ingestion time,
 and writer-owned monotonic developer-time basis. Reports derive duration and cost-hour evidence
 only from parsed, identity-checked journal records; caller-supplied timestamps or elapsed-time
@@ -284,7 +289,8 @@ Live shadow evidence follows the same two-step boundary. `ShadowJournalRecord` b
 `ShadowJournalEntry` content id to the writer-stamped ingestion time in UTC, contiguous sequence,
 and writer-owned monotonic developer-time
 denominator. The last record in each writer session also binds the writer-owned submission,
-retention, drop, and failure summary. `build_shadow_pilot_acceptance()` verifies the journal entries use the exact manifest
+retention, drop, and failure summary. An outstanding durable session-open boundary rejects parsing
+before acceptance can be generated. `build_shadow_pilot_acceptance()` verifies the journal entries use the exact manifest
 policy, configuration, target arm, aggregate model identity, required stage plan, primary/fallback
 route, deployment identity, prompt/configuration/schema versions, cost model identities, and journal
 schema. It also rejects negative aggregate or stage latency, token, cost, or developer-time
