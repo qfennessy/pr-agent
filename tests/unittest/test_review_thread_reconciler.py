@@ -1042,11 +1042,85 @@ def test_mark_fixed_projects_prior_copy_mutations_into_later_update_inventory():
         ReviewThreadActionKind.UPDATE,
         ReviewThreadActionKind.RESOLVE,
     ]
+    assert plan.actions[2].depends_on_action_id == plan.actions[1].action_id
     projected_by_id = {thread.thread_id: thread for thread in plan.actions[2].expected_threads}
     assert projected_by_id["thread-1"].is_resolved is True
     assert projected_by_id["thread-1"].resolved_by_viewer_bot is True
     assert FIXED_THREAD_NOTICE in projected_by_id["thread-1"].root_comment.body
     assert projected_by_id["thread-2"] == second
+
+
+@pytest.mark.parametrize(
+    ("provider_outcomes", "expected_states", "expected_calls"),
+    [
+        (
+            (
+                ReviewThreadActionOutcome(
+                    kind=ReviewThreadActionKind.UPDATE,
+                    state=ReviewThreadActionState.FAILED,
+                    expected_head_sha="head-1",
+                    current_head_sha="head-1",
+                    failure_kind=ReviewThreadFailureKind.PROVIDER_FAILURE,
+                    reason="update failed",
+                ),
+            ),
+            (
+                ReviewThreadActionState.FAILED,
+                ReviewThreadActionState.NOT_EXECUTED,
+                ReviewThreadActionState.NOT_EXECUTED,
+                ReviewThreadActionState.NOT_EXECUTED,
+            ),
+            ("update",),
+        ),
+        (
+            (
+                ReviewThreadActionOutcome(
+                    kind=ReviewThreadActionKind.UPDATE,
+                    state=ReviewThreadActionState.APPLIED,
+                    expected_head_sha="head-1",
+                    current_head_sha="head-1",
+                ),
+                ReviewThreadActionOutcome(
+                    kind=ReviewThreadActionKind.RESOLVE,
+                    state=ReviewThreadActionState.FAILED,
+                    expected_head_sha="head-1",
+                    current_head_sha="head-1",
+                    failure_kind=ReviewThreadFailureKind.PROVIDER_FAILURE,
+                    reason="resolve failed",
+                ),
+            ),
+            (
+                ReviewThreadActionState.APPLIED,
+                ReviewThreadActionState.FAILED,
+                ReviewThreadActionState.NOT_EXECUTED,
+                ReviewThreadActionState.NOT_EXECUTED,
+            ),
+            ("update", "resolve"),
+        ),
+    ],
+)
+def test_mark_fixed_does_not_consume_projected_inventory_after_predecessor_failure(
+    provider_outcomes,
+    expected_states,
+    expected_calls,
+):
+    identity = _identity()
+    plan = plan_review_thread_actions(
+        (),
+        (
+            _snapshot(identity, thread_id="thread-1"),
+            _snapshot(identity, thread_id="thread-2", database_id=20),
+        ),
+        "head-1",
+        obsolete_policy="mark_fixed",
+        authoritative_absence=True,
+    )
+    provider = _MutationProvider(provider_outcomes)
+
+    outcome = execute_review_thread_action_plan(plan, provider)
+
+    assert tuple(result.state for result in outcome.action_outcomes) == expected_states
+    assert tuple(call[0] for call in provider.calls) == expected_calls
 
 
 def test_duplicate_desired_identity_is_rejected():

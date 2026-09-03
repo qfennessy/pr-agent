@@ -842,6 +842,7 @@ def plan_review_thread_actions(
         if finding_id in desired_by_id:
             continue
         projected_by_id = {thread.thread_id: thread for thread in matches}
+        previous_cleanup_action_id: Optional[str] = None
         for thread in matches:
             projected_thread = projected_by_id[thread.thread_id]
             projected_set = tuple(projected_by_id[item.thread_id] for item in matches)
@@ -872,14 +873,16 @@ def plan_review_thread_actions(
             elif obsolete_policy == "mark_fixed" and safe_to_mutate and root and root.database_id:
                 marked_body = body_with_fixed_thread_notice(root.body)
                 if marked_body == root.body.rstrip():
-                    add(
+                    resolve = add(
                         ReviewThreadActionKind.RESOLVE,
                         finding_id,
                         "visible_fixed_state_already_present",
                         thread_id=thread.thread_id,
                         root_comment_id=root.database_id,
+                        depends_on_action_id=previous_cleanup_action_id,
                         expected_thread=projected_thread,
                     )
+                    previous_cleanup_action_id = resolve.action_id
                     projected_by_id[thread.thread_id] = _thread_after_viewer_resolution(projected_thread)
                 else:
                     updated_thread = _thread_with_root_body(projected_thread, marked_body)
@@ -890,10 +893,11 @@ def plan_review_thread_actions(
                         thread_id=thread.thread_id,
                         root_comment_id=root.database_id,
                         body=marked_body,
+                        depends_on_action_id=previous_cleanup_action_id,
                         expected_thread=projected_thread,
                         expected_threads=projected_set,
                     )
-                    add(
+                    resolve = add(
                         ReviewThreadActionKind.RESOLVE,
                         finding_id,
                         "resolve_after_visible_fixed_state",
@@ -902,6 +906,7 @@ def plan_review_thread_actions(
                         depends_on_action_id=update.action_id,
                         expected_thread=updated_thread,
                     )
+                    previous_cleanup_action_id = resolve.action_id
                     projected_by_id[thread.thread_id] = _thread_after_viewer_resolution(updated_thread)
             else:
                 add(ReviewThreadActionKind.SKIP, finding_id, "obsolete_thread_preserved", thread_id=thread.thread_id)
