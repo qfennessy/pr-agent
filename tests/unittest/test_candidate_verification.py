@@ -6222,9 +6222,9 @@ async def test_verification_failure_suppresses_false_clean_publication(
     "duplicate_routing_field",
     [
         "      normalized_severity: high\n      normalized_severity: medium\n"
-        "      disputed: false\n",
+        + "      disputed: false\n",
         "      normalized_severity: medium\n      disputed: true\n"
-        "      disputed: false\n",
+        + "      disputed: false\n",
     ],
     ids=["normalized-severity", "disputed"],
 )
