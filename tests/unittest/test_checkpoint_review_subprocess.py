@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from pr_agent.algo import checkpoint_review_subprocess as review_subprocess
+from pr_agent.algo.review_configuration import snapshot_review_configuration_hash
 from pr_agent.algo.review_execution_context import review_execution_is_isolated
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewSnapshot
 from pr_agent.algo.review_specialists import get_specialist_snapshot_context
@@ -566,6 +567,17 @@ def test_configuration_hash_does_not_import_cli_logging(monkeypatch):
     configuration_hash, _skills_context = review_subprocess._current_review_configuration()
 
     assert review_subprocess._SNAPSHOT_ID_PATTERN.fullmatch(configuration_hash)
+
+
+def test_configuration_hash_ignores_foreign_cwd_version(monkeypatch, tmp_path):
+    expected = snapshot_review_configuration_hash("", repo_context_files={})
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "attacker-project"\nversion = "999.0.0"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert snapshot_review_configuration_hash("", repo_context_files={}) == expected
 
 
 @pytest.mark.asyncio

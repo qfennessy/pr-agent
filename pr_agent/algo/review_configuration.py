@@ -2,10 +2,29 @@
 
 import hashlib
 import json
+import tomllib
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
 from pr_agent.algo.skills_loader import get_skills_context
-from pr_agent.algo.utils import get_version
 from pr_agent.config_loader import get_settings
+
+_PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _runtime_version() -> str:
+    """Resolve the PR-Agent version without consulting the caller's cwd."""
+
+    try:
+        return version("pr-agent")
+    except PackageNotFoundError:
+        try:
+            with (_PACKAGE_ROOT / "pyproject.toml").open("rb") as file:
+                project = tomllib.load(file).get("project", {})
+            package_version = project.get("version")
+        except (OSError, tomllib.TOMLDecodeError):
+            package_version = None
+        return package_version if isinstance(package_version, str) else "unknown"
 
 
 def snapshot_review_configuration_hash(
@@ -44,7 +63,7 @@ def snapshot_review_configuration_hash(
     all_settings = settings.as_dict()
     all_settings.pop("PLAIN_DIFF", None)
     effective = {
-        "runtime_version": get_version(),
+        "runtime_version": _runtime_version(),
         "skills_context_sha256": hashlib.sha256(
             (get_skills_context() if skills_context is None else skills_context).encode("utf-8")
         ).hexdigest(),
