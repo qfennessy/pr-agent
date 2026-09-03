@@ -1721,6 +1721,11 @@ async def test_frontier_plain_diff_without_snapshot_identity_fails_before_every_
     monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", retry)
     monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", extract_tickets)
     monkeypatch.setattr(pr_reviewer_module, "get_specialist_snapshot_context", lambda: None)
+    monkeypatch.setattr(
+        pr_reviewer_module,
+        "load_frontier_adjudication_config",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
 
     settings = get_settings()
     snapshot = snapshot_settings((
@@ -1762,6 +1767,76 @@ async def test_frontier_plain_diff_without_snapshot_identity_fails_before_every_
     reviewer._prepare_pr_review.assert_not_called()
     provider.publish_comment.assert_not_called()
     provider.publish_persistent_comment.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_identity",
+    [None, "", "   ", True, 7],
+    ids=["missing", "empty", "whitespace", "boolean", "number"],
+)
+async def test_frontier_invalid_cached_provider_identity_fails_before_every_model_call(
+    monkeypatch,
+    invalid_identity,
+):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    provider = GithubProvider.__new__(GithubProvider)
+    provider.last_commit_id = (
+        None if invalid_identity is None else SimpleNamespace(sha=invalid_identity)
+    )
+    provider.get_files = MagicMock(return_value=["src/service.py"])
+    provider.get_diff_files = MagicMock(return_value=[_route_file("src/service.py")])
+    cached_identity = provider.get_pr_head_sha
+    provider.get_pr_head_sha = MagicMock(wraps=cached_identity)
+    reviewer = _make_prediction_reviewer(provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer.review_routing_configuration = load_review_routing_configuration({"enabled": False})
+    reviewer._prepare_review_route = MagicMock()
+    reviewer._review_shadow_only = False
+    reviewer._prepare_pr_review = MagicMock(return_value="must not render")
+    reviewer._run_candidate_verification = AsyncMock()
+    reviewer.ai_handler = SimpleNamespace(azure=False, chat_completion=AsyncMock())
+    retry = AsyncMock()
+    extract_tickets = AsyncMock()
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", extract_tickets)
+    monkeypatch.setattr(pr_reviewer_module, "get_specialist_snapshot_context", lambda: None)
+    monkeypatch.setattr(
+        pr_reviewer_module,
+        "load_frontier_adjudication_config",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+
+    settings = get_settings()
+    snapshot = snapshot_settings((
+        "config.publish_output",
+        "pr_reviewer.enable_candidate_verification",
+        "pr_reviewer.enable_frontier_adjudication",
+    ))
+    try:
+        settings.config.publish_output = False
+        settings.pr_reviewer.enable_candidate_verification = True
+        settings.pr_reviewer.enable_frontier_adjudication = True
+
+        await reviewer.run()
+    finally:
+        restore_settings(snapshot)
+
+    assert reviewer.frontier_adjudication_artifact == {
+        "enabled": True,
+        "status": "unavailable",
+        "failure": "stable_identity_unavailable",
+        "results": [],
+        "publication_safe": False,
+    }
+    provider.get_pr_head_sha.assert_called_once_with(refresh=False)
+    retry.assert_not_awaited()
+    extract_tickets.assert_not_awaited()
+    reviewer._run_candidate_verification.assert_not_awaited()
+    reviewer.ai_handler.chat_completion.assert_not_awaited()
+    reviewer._prepare_pr_review.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2721,9 +2796,15 @@ async def test_frontier_adjudication_binds_the_accepted_sensitive_candidate_on_i
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reverse_inputs", [False, True], ids=["model-first", "sensitive-first"])
-async def test_rejected_sensitive_collision_elevates_only_identity_equivalent_accepted_model(
+@pytest.mark.parametrize(
+    "sensitive_rejection_reason",
+    ["trusted_identity_collision", "rejected_by_verifier"],
+    ids=["identity-collision", "verifier-rejection"],
+)
+async def test_rejected_sensitive_candidate_elevates_only_identity_equivalent_accepted_model(
     monkeypatch,
     reverse_inputs,
+    sensitive_rejection_reason,
 ):
     from pr_agent.algo.candidate_verification import verified_finding_identity
 
@@ -2855,7 +2936,7 @@ async def test_rejected_sensitive_collision_elevates_only_identity_equivalent_ac
         {
             "candidate_id": "sensitive-equivalent",
             "verdict": "rejected",
-            "reason": "trusted_identity_collision",
+            "reason": sensitive_rejection_reason,
         },
         {
             "candidate_id": "model-unrelated",
@@ -2865,7 +2946,7 @@ async def test_rejected_sensitive_collision_elevates_only_identity_equivalent_ac
         {
             "candidate_id": "sensitive-unrelated",
             "verdict": "rejected",
-            "reason": "trusted_identity_collision",
+            "reason": sensitive_rejection_reason,
         },
     ]
     if reverse_inputs:

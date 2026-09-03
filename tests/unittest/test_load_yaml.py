@@ -5,7 +5,7 @@ import pytest
 import yaml
 from yaml.scanner import ScannerError
 
-from pr_agent.algo.utils import load_yaml
+from pr_agent.algo.utils import DuplicateYamlKeyError, load_yaml
 from pr_agent.log import get_logger
 
 
@@ -101,6 +101,21 @@ PR Feedback:
             assert not any("Preprocessing/sanitization removed all content" in m for m in captured)
         finally:
             get_logger().remove(sink_id)
+
+    def test_strict_duplicate_rejection_survives_fenced_snippet_repair(self):
+        response = (
+            "Here is the requested verifier response:\n"
+            "```yaml\n"
+            "verification:\n"
+            "  decisions:\n"
+            "    - candidate_id: candidate-1\n"
+            "      normalized_severity: high\n"
+            "      normalized_severity: medium\n"
+            "```"
+        )
+
+        with pytest.raises(DuplicateYamlKeyError):
+            load_yaml(response, reject_duplicate_keys=True)
 
     # Tests that a fenced block whose info string is separated by a space
     # (CommonMark allows whitespace after the opening fence) parses the same

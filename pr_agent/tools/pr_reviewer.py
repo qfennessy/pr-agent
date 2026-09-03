@@ -31,6 +31,7 @@ from pr_agent.algo.candidate_verification import (
     validated_specialist_prioritization,
     verified_finding_identity,
 )
+from pr_agent.algo.config_utils import parse_env_bool
 from pr_agent.algo.frontier_adjudication import (
     FrontierAdjudicationRequest,
     FrontierCandidate,
@@ -42,7 +43,6 @@ from pr_agent.algo.frontier_adjudication import (
     normalize_severity,
     run_frontier_adjudication,
 )
-from pr_agent.algo.config_utils import parse_env_bool
 from pr_agent.algo.git_patch_processing import iter_git_patch_lines, split_git_file_lines
 from pr_agent.algo.inline_comment_dedup import (
     InlineCommentStore,
@@ -1848,24 +1848,6 @@ class PRReviewer:
     def _prepare_frontier_adjudication_config(self) -> bool:
         """Validate and freeze frontier configuration before any model dispatch."""
 
-        provider_head_method = getattr(type(self.git_provider), "get_pr_head_sha", None)
-        if (
-            get_specialist_snapshot_context() is None
-            and provider_head_method is GitProvider.get_pr_head_sha
-        ):
-            # A provider that inherits the base implementation has no refreshable
-            # identity to bind pre/post-call checks. Fail before the review and
-            # verifier model calls instead of paying for an unusable adjudication.
-            self._frontier_adjudication_config = None
-            self.frontier_adjudication_artifact = {
-                "enabled": True,
-                "status": "unavailable",
-                "failure": "stable_identity_unavailable",
-                "results": [],
-                "publication_safe": False,
-            }
-            return False
-
         try:
             config = load_frontier_adjudication_config(
                 get_settings().pr_reviewer,
@@ -1878,6 +1860,31 @@ class PRReviewer:
                 "enabled": True,
                 "status": "configuration_invalid",
                 "failure": "invalid_configuration",
+                "results": [],
+                "publication_safe": False,
+            }
+            return False
+
+        snapshot_context = get_specialist_snapshot_context()
+        provider_head_method = getattr(type(self.git_provider), "get_pr_head_sha", None)
+        if snapshot_context is None and provider_head_method is GitProvider.get_pr_head_sha:
+            # A provider that inherits the base implementation has no refreshable
+            # identity to bind pre/post-call checks. Fail before the review and
+            # verifier model calls instead of paying for an unusable adjudication.
+            preflight_snapshot_id = None
+        elif snapshot_context is not None:
+            preflight_snapshot_id = snapshot_context.snapshot.snapshot_id
+        else:
+            try:
+                preflight_snapshot_id = self.git_provider.get_pr_head_sha(refresh=False)
+            except Exception:
+                preflight_snapshot_id = None
+        if not isinstance(preflight_snapshot_id, str) or not preflight_snapshot_id.strip():
+            self._frontier_adjudication_config = None
+            self.frontier_adjudication_artifact = {
+                "enabled": True,
+                "status": "unavailable",
+                "failure": "stable_identity_unavailable",
                 "results": [],
                 "publication_safe": False,
             }
@@ -2062,18 +2069,13 @@ class PRReviewer:
             for item in decisions
             if isinstance(item, dict) and item.get("candidate_id")
         }
-        collision_sensitive_identities = set()
+        deterministic_sensitive_identities = set()
         for candidate in candidates:
-            decision = decision_by_candidate.get(candidate.get("candidate_id"), {})
-            if (
-                candidate.get("sensitive_path") is not True
-                or decision.get("verdict") != "rejected"
-                or decision.get("reason") != "trusted_identity_collision"
-            ):
+            if candidate.get("sensitive_path") is not True:
                 continue
             identity = verified_finding_identity(candidate)
             if identity is not None:
-                collision_sensitive_identities.add(identity)
+                deterministic_sensitive_identities.add(identity)
         route_decision = getattr(self, "review_route_decision", None)
         risk_policy_version = (
             route_decision.policy_version if route_decision is not None else "review-router-unavailable"
@@ -2094,7 +2096,7 @@ class PRReviewer:
                 })
                 continue
             candidate = dict(matching_candidates[0])
-            if identity in collision_sensitive_identities:
+            if identity in deterministic_sensitive_identities:
                 candidate["sensitive_path"] = True
             decision = decision_by_candidate.get(candidate.get("candidate_id"), {})
             severity, signals = self._frontier_signals(
