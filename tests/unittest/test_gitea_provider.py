@@ -377,7 +377,7 @@ class TestGiteaProvider:
         provider.repo_api = MagicMock()
 
         assert provider.get_pr_head_sha() == "cached-head-sha"
-        assert provider.sha == "cached-head-sha"
+        assert provider.sha == " cached-head-sha "
         provider.repo_api.get_pull_request.assert_not_called()
 
     @pytest.mark.parametrize("sha", [None, "", "   ", 123])
@@ -387,23 +387,24 @@ class TestGiteaProvider:
         provider.repo_api = MagicMock()
 
         assert provider.get_pr_head_sha() is None
-        assert provider.sha == ""
+        assert provider.sha is sha
         provider.repo_api.get_pull_request.assert_not_called()
 
-    def test_get_pr_head_sha_refreshes_pr_and_cached_sha(self):
+    def test_get_pr_head_sha_refreshes_head_without_replacing_cached_state(self):
         provider = GiteaProvider.__new__(GiteaProvider)
         provider.owner = "owner"
         provider.repo = "repo"
         provider.pr_number = 123
         provider.sha = "old-head-sha"
-        provider.pr = MagicMock(head=MagicMock(sha="old-head-sha"))
+        cached_pr = MagicMock(head=MagicMock(sha="old-head-sha"))
+        provider.pr = cached_pr
         provider.repo_api = MagicMock()
         refreshed_pr = MagicMock(head=MagicMock(sha=" new-head-sha "))
         provider.repo_api.get_pull_request.return_value = refreshed_pr
 
         assert provider.get_pr_head_sha(refresh=True) == "new-head-sha"
-        assert provider.pr is refreshed_pr
-        assert provider.sha == "new-head-sha"
+        assert provider.pr is cached_pr
+        assert provider.sha == "old-head-sha"
         provider.repo_api.get_pull_request.assert_called_once_with(
             owner="owner",
             repo="repo",
@@ -425,11 +426,14 @@ class TestGiteaProvider:
         provider.repo = "repo"
         provider.pr_number = 123
         provider.sha = "old-head-sha"
+        cached_pr = MagicMock(head=MagicMock(sha="old-head-sha"))
+        provider.pr = cached_pr
         provider.repo_api = MagicMock()
         provider.repo_api.get_pull_request.return_value = MagicMock(head=head)
 
         assert provider.get_pr_head_sha(refresh=True) is None
-        assert provider.sha == ""
+        assert provider.pr is cached_pr
+        assert provider.sha == "old-head-sha"
 
 
 class TestGiteaProviderPRCommits:

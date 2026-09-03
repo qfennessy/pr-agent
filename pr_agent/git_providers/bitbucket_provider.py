@@ -638,10 +638,8 @@ class BitbucketProvider(GitProvider):
         return self.pr.source_branch
 
     def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
-        if refresh:
-            self.pr = self._get_pr()
-
-        source = (getattr(self.pr, "data", None) or {}).get("source") or {}
+        pr = self._get_pr() if refresh else self.pr
+        source = (getattr(pr, "data", None) or {}).get("source") or {}
         commit = source.get("commit") or {}
         head_sha = commit.get("hash")
         if not isinstance(head_sha, str) or not head_sha.strip():

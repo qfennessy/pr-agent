@@ -3,12 +3,18 @@ import copy
 import json
 import threading
 from dataclasses import replace
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from pr_agent.algo.ai_request_context import AIModelRoute, get_ai_request_options
+from pr_agent.algo.frontier_adjudication import (
+    FRONTIER_OUTPUT_SCHEMA_VERSION,
+    FrontierAdjudicationConfig,
+    FrontierModelIdentity,
+)
 from pr_agent.algo.inline_comment_dedup import body_with_markers, get_inline_comment_store, key_issue_fingerprint
 from pr_agent.algo.pr_processing import PRDiffCoverage, retry_with_fallback_models
 from pr_agent.algo.review_router import (
@@ -31,6 +37,7 @@ from pr_agent.algo.run_details import (
     record_adjudication_result,
     record_ai_call,
     record_model_used,
+    record_provider_request_attempt,
 )
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity, convert_to_markdown_v2, show_run_details
@@ -268,6 +275,57 @@ def _remaining_rich_routing_provider(provider_type, old_path, new_path, detailed
     provider.is_supported = MagicMock(return_value=True)
     provider.get_pr_labels = MagicMock(return_value=[])
     return provider
+
+
+def _frontier_identity_provider(provider_type, cached_sha, refreshed_sha):
+    """Build one real provider instance with only its documented PR identity API mocked."""
+
+    if provider_type is AzureDevopsProvider:
+        provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+        provider.pr = SimpleNamespace(
+            last_merge_source_commit=SimpleNamespace(commit_id=cached_sha)
+        )
+        provider.workspace_slug = "project"
+        provider.pr_num = 17
+        provider.azure_devops_client = MagicMock()
+        refresh = provider.azure_devops_client.get_pull_request_by_id
+        refresh.return_value = SimpleNamespace(
+            last_merge_source_commit=SimpleNamespace(commit_id=refreshed_sha)
+        )
+    elif provider_type is BitbucketProvider:
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.pr = SimpleNamespace(
+            data={"source": {"commit": {"hash": cached_sha}}}
+        )
+        refresh = MagicMock(return_value=SimpleNamespace(
+            data={"source": {"commit": {"hash": refreshed_sha}}}
+        ))
+        provider.repo = SimpleNamespace(
+            pullrequests=SimpleNamespace(get=refresh)
+        )
+        provider.pr_num = 17
+    elif provider_type is BitbucketServerProvider:
+        provider = BitbucketServerProvider.__new__(BitbucketServerProvider)
+        provider.pr = SimpleNamespace(fromRef={"latestCommit": cached_sha})
+        provider.workspace_slug = "project"
+        provider.repo_slug = "repository"
+        provider.pr_num = 17
+        provider.bitbucket_client = MagicMock()
+        refresh = provider.bitbucket_client.get_pull_request
+        refresh.return_value = {"fromRef": {"latestCommit": refreshed_sha}}
+    else:
+        provider = GiteaProvider.__new__(GiteaProvider)
+        provider.sha = cached_sha
+        provider.owner = "owner"
+        provider.repo = "repository"
+        provider.pr_number = 17
+        provider.repo_api = MagicMock()
+        refresh = provider.repo_api.get_pull_request
+        refresh.return_value = SimpleNamespace(
+            head=SimpleNamespace(sha=refreshed_sha)
+        )
+
+    return provider, refresh
 
 
 @pytest.mark.asyncio
@@ -1839,6 +1897,166 @@ async def test_invalid_frontier_preflight_publishes_one_source_free_failure_arti
         "publish_labels",
     ):
         getattr(provider, method_name).assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_type",
+    [
+        AzureDevopsProvider,
+        BitbucketProvider,
+        BitbucketServerProvider,
+        GiteaProvider,
+    ],
+    ids=["azure-devops", "bitbucket-cloud", "bitbucket-server", "gitea"],
+)
+@pytest.mark.parametrize(
+    ("refreshed_sha", "expected_state", "expected_failure", "expected_calls"),
+    [
+        (" head-1 ", "confirmed", None, ["frontier-primary"]),
+        (" head-2 ", "stale", "stale_snapshot", []),
+    ],
+    ids=["unchanged", "changed"],
+)
+async def test_frontier_adjudication_uses_real_provider_head_identity_contracts(
+    monkeypatch,
+    provider_type,
+    refreshed_sha,
+    expected_state,
+    expected_failure,
+    expected_calls,
+):
+    from pr_agent.algo.candidate_verification import verified_finding_identity
+
+    class TelemetryHandler:
+        supports_frontier_adjudication_telemetry = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def chat_completion(self, model, system, user, temperature):
+            self.calls.append(model)
+            record_provider_request_attempt()
+            record_ai_call(
+                usage={
+                    "prompt_tokens": 12,
+                    "completion_tokens": 8,
+                    "total_tokens": 20,
+                },
+                model=model,
+                cost_usd=Decimal("0.01"),
+                provider="provider-primary",
+                model_revision="revision-primary",
+            )
+            return json.dumps({
+                "schema_version": FRONTIER_OUTPUT_SCHEMA_VERSION,
+                "decision": "confirm",
+                "normalized_severity": "high",
+                "confidence": 0.9,
+                "evidence_citations": ["evidence-1"],
+                "unresolved_questions": [],
+            }), "stop"
+
+    provider, refresh = _frontier_identity_provider(
+        provider_type,
+        " head-1 ",
+        refreshed_sha,
+    )
+    handler = TelemetryHandler()
+    config = FrontierAdjudicationConfig(
+        enabled=True,
+        route=AIModelRoute(
+            models=("frontier-primary",),
+            deployments=(None,),
+            timeout_seconds=0.5,
+            model_retries=1,
+            provider_retries=0,
+            max_output_tokens=256,
+            collect_cost=True,
+        ),
+        model_identities=(FrontierModelIdentity(
+            model="frontier-primary",
+            provider="provider-primary",
+            revision="revision-primary",
+        ),),
+        system_prompt=(
+            "Adjudicate {{ input_schema_version }} into {{ output_schema_version }}."
+        ),
+        user_prompt="Evidence: {{ adjudication_input_json }}",
+        stage_timeout_seconds=1,
+        max_calls=1,
+    )
+    candidate = {
+        "candidate_id": "candidate-1",
+        "candidate_type": "sensitive_path_audit",
+        "sensitive_path": True,
+        "relevant_file": "src/auth.py",
+        "issue_header": "Authorization bypass",
+        "issue_content": "The authorization guard can be skipped.",
+        "trigger": "Pass an unowned object id.",
+        "impact": "Another tenant's object is returned.",
+        "start_line": 10,
+        "end_line": 10,
+        "side": "new",
+        "_changed_anchor_shape": "return object_by_id(value)",
+        "_changed_anchor_ordinal": 1,
+        "_trusted_defect_ordinal": 1,
+        "_trusted_lineage_key": "file:src/auth.py",
+    }
+    root_cause_id, stable_finding_id = verified_finding_identity(candidate)
+    finding = {
+        "root_cause_id": root_cause_id,
+        "trusted_stable_key": stable_finding_id,
+        "relevant_file": "src/auth.py",
+        "issue_header": "Authorization bypass",
+        "issue_content": "The authorization guard can be skipped.",
+        "trigger": "Pass an unowned object id.",
+        "impact": "Another tenant's object is returned.",
+        "start_line": 10,
+        "end_line": 10,
+        "side": "new",
+    }
+    evidence = [{
+        "candidate_id": "candidate-1",
+        "evidence_id": "evidence-1",
+        "source": "changed_head",
+        "path": "src/auth.py",
+        "side": "new",
+        "start_line": 10,
+        "end_line": 10,
+        "content": "return object_by_id(value)",
+    }]
+    decisions = [{
+        "candidate_id": "candidate-1",
+        "verdict": "verified",
+        "normalized_severity": "high",
+    }]
+    init_run_details()
+    reviewer = _make_reviewer(provider)
+    reviewer.ai_handler = handler
+    reviewer.review_route_decision = None
+    reviewer._frontier_adjudication_config = config
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.get_specialist_snapshot_context",
+        lambda: None,
+    )
+
+    await reviewer._run_frontier_adjudications(
+        [finding],
+        [candidate],
+        evidence,
+        decisions,
+    )
+
+    result = reviewer.frontier_adjudication_artifact["results"][0]
+    assert result["state"] == expected_state
+    assert result["failure_reason"] == expected_failure
+    assert handler.calls == expected_calls
+    assert "stable_identity_unavailable" not in repr(
+        reviewer.frontier_adjudication_artifact
+    )
+    assert refresh.call_count == (2 if expected_state == "confirmed" else 1)
+    assert provider.get_pr_head_sha(refresh=False) == "head-1"
 
 
 @pytest.mark.asyncio

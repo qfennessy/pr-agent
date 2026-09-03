@@ -111,9 +111,10 @@ class TestAzureDevopsProviderRepoContext:
         provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
         provider.workspace_slug = "my-project"
         provider.pr_num = 1
-        provider.pr = SimpleNamespace(
+        cached_pr = SimpleNamespace(
             last_merge_source_commit=SimpleNamespace(commit_id="old-head-sha")
         )
+        provider.pr = cached_pr
         refreshed_pr = SimpleNamespace(
             last_merge_source_commit=SimpleNamespace(commit_id="new-head-sha")
         )
@@ -121,7 +122,7 @@ class TestAzureDevopsProviderRepoContext:
         provider.azure_devops_client.get_pull_request_by_id.return_value = refreshed_pr
 
         assert provider.get_pr_head_sha(refresh=True) == "new-head-sha"
-        assert provider.pr is refreshed_pr
+        assert provider.pr is cached_pr
         provider.azure_devops_client.get_pull_request_by_id.assert_called_once_with(
             pull_request_id=1,
             project="my-project",

@@ -33,14 +33,15 @@ class TestBitbucketProvider:
         assert provider.get_pr_head_sha() == "cached-head-sha"
         provider._get_pr.assert_not_called()
 
-    def test_get_pr_head_sha_refreshes_source_commit_and_cache(self):
+    def test_get_pr_head_sha_refreshes_source_commit_without_replacing_cached_pr(self):
         provider = BitbucketProvider.__new__(BitbucketProvider)
-        provider.pr = MagicMock(data={"source": {"commit": {"hash": "old-head-sha"}}})
+        original_pr = MagicMock(data={"source": {"commit": {"hash": "old-head-sha"}}})
+        provider.pr = original_pr
         refreshed_pr = MagicMock(data={"source": {"commit": {"hash": "new-head-sha"}}})
         provider._get_pr = MagicMock(return_value=refreshed_pr)
 
         assert provider.get_pr_head_sha(refresh=True) == "new-head-sha"
-        assert provider.pr is refreshed_pr
+        assert provider.pr is original_pr
         provider._get_pr.assert_called_once_with()
 
     @pytest.mark.parametrize(
@@ -354,14 +355,15 @@ class TestBitbucketServerProvider:
         assert provider.get_pr_head_sha() == "cached-head-sha"
         provider._get_pr.assert_not_called()
 
-    def test_get_pr_head_sha_refreshes_source_commit_and_cache(self):
+    def test_get_pr_head_sha_refreshes_source_commit_without_replacing_cached_pr(self):
         provider = BitbucketServerProvider.__new__(BitbucketServerProvider)
-        provider.pr = MagicMock(fromRef={"latestCommit": "old-head-sha"})
+        original_pr = MagicMock(fromRef={"latestCommit": "old-head-sha"})
+        provider.pr = original_pr
         refreshed_pr = MagicMock(fromRef={"latestCommit": "new-head-sha"})
         provider._get_pr = MagicMock(return_value=refreshed_pr)
 
         assert provider.get_pr_head_sha(refresh=True) == "new-head-sha"
-        assert provider.pr is refreshed_pr
+        assert provider.pr is original_pr
         provider._get_pr.assert_called_once_with()
 
     @pytest.mark.parametrize(
