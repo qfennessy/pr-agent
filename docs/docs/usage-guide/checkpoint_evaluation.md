@@ -414,3 +414,10 @@ checkpoint controls and serialized snapshots; run the
 frozen paid replay within an authorized cap; collect at least one week of opt-in live shadow
 telemetry; publish the pilot inventory, scorecard, budgets, and gate decisions; and prove
 that the cascade beats the incumbent before enabling local advice or GitHub publication.
+
+Production review orchestration also exposes `PRReviewer.run_structured_no_publish()` for
+evaluation adapters. It returns the same enriched structured review payload and request-local
+run telemetry while forcing provider publication, GitHub Action output, external output sinks,
+and process-local rendered artifacts off. Model routing, ticket context, and telemetry stay
+isolated from concurrent or sequential requests. The remaining inventory blockers continue to
+keep every production arm unavailable until their full contracts are implemented.

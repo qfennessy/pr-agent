@@ -4,7 +4,7 @@ import datetime
 import json
 import re
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, List, Mapping, Optional, Tuple
 
@@ -60,6 +60,7 @@ from pr_agent.algo.pr_processing import (
     retry_with_fallback_models,
 )
 from pr_agent.algo.repo_context import build_repo_context
+from pr_agent.algo.review_execution_context import isolate_review_execution
 from pr_agent.algo.review_router import (
     ChangedFile,
     ChangeKind,
@@ -86,9 +87,11 @@ from pr_agent.algo.review_specialists import (
     validate_specialist_output,
 )
 from pr_agent.algo.run_details import (
+    RunDetails,
     adjudication_runs_to_dict,
     get_run_details,
     init_run_details,
+    isolate_run_details,
     record_review_profile,
     record_review_route,
 )
@@ -135,6 +138,14 @@ _GENERIC_CI_EVIDENCE_TERMS = {
     "assert", "assertion", "build", "check", "error", "errors", "fail", "failed", "failure", "failures",
     "job", "test", "tests", "unit",
 }
+
+
+@dataclass(frozen=True)
+class StructuredReviewExecution:
+    """Provider-neutral output from one forced no-publish review run."""
+
+    review: Optional[Mapping[str, Any]]
+    run_details: Optional[RunDetails]
 
 
 class PRReviewer:
@@ -199,6 +210,8 @@ class PRReviewer:
         self._review_max_verification_candidates = None
         self._review_max_published_findings = None
         self._review_shadow_only = False
+        self._force_no_publish = False
+        self._structured_review_result = None
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
             self.git_provider.get_pr_description(split_changes_walkthrough=True))
@@ -315,7 +328,7 @@ class PRReviewer:
                         # rebases or force-pushes. Preserve real/unknown routing evidence
                         # before the threshold/no-new-commit early return.
                         self._prepare_review_route()
-                    if getattr(self, "_review_shadow_only", False):
+                    if self._local_artifact_mutations_allowed() and getattr(self, "_review_shadow_only", False):
                         get_settings().data = {"artifact": ""}
                     return None
                 if (
@@ -339,7 +352,7 @@ class PRReviewer:
                             "Incremental Review Skipped\n"
                             f"No files were changed since the [previous PR Review]({previous_review_url})"
                         )
-                    if getattr(self, "_review_shadow_only", False):
+                    if self._local_artifact_mutations_allowed() and getattr(self, "_review_shadow_only", False):
                         get_settings().data = {"artifact": ""}
                     return None
 
@@ -353,7 +366,7 @@ class PRReviewer:
             if not self.git_provider.get_files():
                 if not route_prepared:
                     self._prepare_route_after_empty_review_inventory()
-                if getattr(self, "_review_shadow_only", False):
+                if self._local_artifact_mutations_allowed() and getattr(self, "_review_shadow_only", False):
                     get_settings().data = {"artifact": ""}
                 get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
                 return None
@@ -372,14 +385,14 @@ class PRReviewer:
                     self._publish_structured_review_data({
                         "review": {"key_issues_to_review": []},
                     }, source_free=True)
-                    if getattr(self, "_review_shadow_only", False):
+                    if self._local_artifact_mutations_allowed() and getattr(self, "_review_shadow_only", False):
                         get_settings().data = {"artifact": ""}
                     return None
                 if not self._prepare_frontier_adjudication_config():
                     self._publish_structured_review_data({
                         "review": {"key_issues_to_review": []},
                     }, source_free=True)
-                    if getattr(self, "_review_shadow_only", False):
+                    if self._local_artifact_mutations_allowed() and getattr(self, "_review_shadow_only", False):
                         get_settings().data = {"artifact": ""}
                     get_logger().warning(
                         "Frontier adjudication preflight is unavailable",
@@ -388,7 +401,7 @@ class PRReviewer:
                     return None
             if self._specialist_escalation_consumption_enabled():
                 await self._run_guarded_specialist_escalation()
-            if getattr(self, "_review_shadow_only", False):
+            if self._local_artifact_mutations_allowed() and getattr(self, "_review_shadow_only", False):
                 # Shadow output is consumed through the same request-local artifact
                 # channel as local, health, and MOSAICO runs. Clear any value left by
                 # an earlier command so a failed/unavailable shadow attempt cannot be
@@ -438,9 +451,16 @@ class PRReviewer:
 
             pr_review = self._prepare_pr_review()
             await self._push_prepared_review_output(pr_review)
-            get_logger().debug("PR output", artifact=pr_review)
+            if self._local_artifact_mutations_allowed():
+                get_logger().debug("PR output", artifact=pr_review)
+            else:
+                get_logger().debug("Structured no-publish review prepared")
 
-            should_publish = get_settings().config.publish_output and self._should_publish_review_no_suggestions(pr_review)
+            should_publish = (
+                get_settings().config.publish_output
+                and self._provider_mutations_allowed()
+                and self._should_publish_review_no_suggestions(pr_review)
+            )
             if not should_publish:
                 self._clear_stale_persistent_bugs_only_review()
                 reason = "Review output is not published"
@@ -449,7 +469,8 @@ class PRReviewer:
                 elif get_settings().config.publish_output:
                     reason += ": no major issues detected."
                 get_logger().info(reason)
-                get_settings().data = {"artifact": pr_review}
+                if self._local_artifact_mutations_allowed():
+                    get_settings().data = {"artifact": pr_review}
                 return
 
             # publish the review
@@ -513,6 +534,30 @@ class PRReviewer:
                 except Exception as e:
                     get_logger().exception(f"Failed to publish review failure result, error: {e}")
 
+    async def run_structured_no_publish(self) -> StructuredReviewExecution:
+        """Run production review orchestration while forcing review output sinks closed."""
+
+        previous_force_no_publish = getattr(self, "_force_no_publish", False)
+        related_tickets = copy.deepcopy(self.vars.get("related_tickets"))
+        had_related_tickets = "related_tickets" in self.vars
+        self._force_no_publish = True
+        self._structured_review_result = None
+        try:
+            self.vars["related_tickets"] = []
+            with isolate_review_execution(), isolate_run_details():
+                await self.run()
+                return StructuredReviewExecution(
+                    review=copy.deepcopy(self._structured_review_result),
+                    run_details=copy.deepcopy(get_run_details()),
+                )
+        finally:
+            self._force_no_publish = previous_force_no_publish
+            self._structured_review_result = None
+            if had_related_tickets:
+                self.vars["related_tickets"] = related_tickets
+            else:
+                self.vars.pop("related_tickets", None)
+
     def _should_publish_review_no_suggestions(self, pr_review: str) -> bool:
         if (
             self._candidate_verification_blocks_publication()
@@ -521,11 +566,21 @@ class PRReviewer:
             return False
         if self._review_profile() == "bugs_only":
             return bool(pr_review.strip())
-        return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
+        return (
+            get_settings().pr_reviewer.get('publish_output_no_suggestions', True)
+            or "No major issues detected" not in pr_review
+        )
 
     def _provider_mutations_allowed(self) -> bool:
         """Keep a shadow-only route observational, including cleanup and progress updates."""
-        return not getattr(self, "_review_shadow_only", False)
+        return not (
+            getattr(self, "_review_shadow_only", False)
+            or getattr(self, "_force_no_publish", False)
+        )
+
+    def _local_artifact_mutations_allowed(self) -> bool:
+        """Keep forced structured execution from mutating process-local output state."""
+        return not getattr(self, "_force_no_publish", False)
 
     def _review_profile(self) -> str:
         """Return the selected profile, defaulting legacy/test instances to full review."""
@@ -1174,6 +1229,7 @@ class PRReviewer:
         if isinstance(fallback_models, str):
             fallback_models = [model.strip() for model in fallback_models.split(",") if model.strip()]
         models = (primary, *tuple(fallback_models or ()))
+
         def deployment_setting(key: str) -> str | None:
             value = get_settings().get(key, None)
             if value is None or value == "":
@@ -1359,6 +1415,7 @@ class PRReviewer:
                         "Specialist shadow batch is unavailable because the provider has no stable head identity"
                     )
                     return
+
                 def current_identity():
                     return self.git_provider.get_pr_head_sha(refresh=True)
             specialist_input = build_specialist_input(
@@ -1679,8 +1736,8 @@ class PRReviewer:
             unresolved_questions = decision.get("unresolved_questions")
             if (verdict == "verified" and not isinstance(unresolved_questions, list)) or (
                 unresolved_questions is not None and (
-                not isinstance(unresolved_questions, list)
-                or any(not isinstance(question, str) or not question.strip() for question in unresolved_questions)
+                    not isinstance(unresolved_questions, list)
+                    or any(not isinstance(question, str) or not question.strip() for question in unresolved_questions)
                 )
             ):
                 return "invalid_unresolved_questions"
@@ -2745,8 +2802,12 @@ class PRReviewer:
     ) -> None:
         """Publish one isolated, provider-neutral review snapshot."""
 
+        capture_structured_review = getattr(self, "_force_no_publish", False)
         structured_publisher = getattr(self.git_provider, "publish_structured_review", None)
-        if not self._provider_mutations_allowed() or not callable(structured_publisher):
+        if (
+            not capture_structured_review
+            and (not self._provider_mutations_allowed() or not callable(structured_publisher))
+        ):
             return
         # Deep-copy the data: dict(data) is shallow, so structured_data["review"]
         # would alias data["review"], which _prepare_pr_review mutates later.
@@ -2795,6 +2856,11 @@ class PRReviewer:
         specialist_shadow_result = getattr(self, "specialist_shadow_result", None)
         if not source_free and specialist_shadow_result is not None:
             structured_data["metadata"]["specialist_shadow"] = specialist_shadow_result.to_dict()
+        if capture_structured_review:
+            self._structured_review_result = copy.deepcopy(structured_data)
+
+        if not self._provider_mutations_allowed() or not callable(structured_publisher):
+            return
         structured_publisher(structured_data)
 
     def _prepare_pr_review(self) -> str:
@@ -2820,7 +2886,8 @@ class PRReviewer:
         if candidate_verification_blocked:
             return ""
 
-        github_action_output(data, 'review')
+        if self._provider_mutations_allowed():
+            github_action_output(data, 'review')
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
         if 'key_issues_to_review' in data['review']:
@@ -2843,7 +2910,7 @@ class PRReviewer:
             incremental_review_markdown_text = f"Starting from commit {last_commit_url}"
 
         markdown_text = convert_to_markdown_v2(data, self.git_provider.is_supported("gfm_markdown"),
-                                            incremental_review_markdown_text,
+                                               incremental_review_markdown_text,
                                                git_provider=self.git_provider,
                                                files=self.git_provider.get_diff_files(),
                                                review_profile=self._review_profile())
@@ -3177,9 +3244,9 @@ class PRReviewer:
             return
 
         if not get_settings().pr_reviewer.require_estimate_effort_to_review:
-            get_settings().pr_reviewer.enable_review_labels_effort = False # we did not generate this output
+            get_settings().pr_reviewer.enable_review_labels_effort = False  # we did not generate this output
         if not get_settings().pr_reviewer.require_security_review:
-            get_settings().pr_reviewer.enable_review_labels_security = False # we did not generate this output
+            get_settings().pr_reviewer.enable_review_labels_security = False  # we did not generate this output
 
         if ((get_settings().pr_reviewer.enable_review_labels_security or
                 get_settings().pr_reviewer.enable_review_labels_effort) and
@@ -3197,11 +3264,16 @@ class PRReviewer:
                     elif isinstance(estimated_effort, int):
                         estimated_effort_number = estimated_effort
                     else:
-                        get_logger().warning(f"Unexpected type for estimated_effort: {type(estimated_effort)}")
+                        get_logger().warning(
+                            f"Unexpected type for estimated_effort: {type(estimated_effort)}"
+                        )
                     if estimated_effort_number is not None:
                         estimated_effort_number = max(1, min(5, int(estimated_effort_number)))
                         review_labels.append(f'Review effort {estimated_effort_number}/5')
-                if get_settings().pr_reviewer.enable_review_labels_security and get_settings().pr_reviewer.require_security_review:
+                if (
+                    get_settings().pr_reviewer.enable_review_labels_security
+                    and get_settings().pr_reviewer.require_security_review
+                ):
                     security_concerns = data['review']['security_concerns']  # yes, because ...
                     security_concerns_bool = 'yes' in security_concerns.lower() or 'true' in security_concerns.lower()
                     if security_concerns_bool:
@@ -3212,9 +3284,11 @@ class PRReviewer:
                     current_labels = []
                 get_logger().debug(f"Current labels:\n{current_labels}")
                 if current_labels:
-                    current_labels_filtered = [label for label in current_labels if
-                                               not label.lower().startswith('review effort') and not label.lower().startswith(
-                                                   'possible security concern')]
+                    current_labels_filtered = [
+                        label for label in current_labels
+                        if not label.lower().startswith('review effort')
+                        and not label.lower().startswith('possible security concern')
+                    ]
                 else:
                     current_labels_filtered = []
                 new_labels = review_labels + current_labels_filtered
@@ -3237,5 +3311,7 @@ class PRReviewer:
                 self.git_provider.publish_comment("Auto-approved PR")
         else:
             get_logger().info("Auto-approval option is disabled")
-            self.git_provider.publish_comment("Auto-approval option for PR-Agent is disabled. "
-                                              "You can enable it via a [configuration file](https://github.com/Codium-ai/pr-agent/blob/main/docs/REVIEW.md#auto-approval-1)")
+            self.git_provider.publish_comment(
+                "Auto-approval option for PR-Agent is disabled. You can enable it via a "
+                "[configuration file](https://github.com/Codium-ai/pr-agent/blob/main/docs/REVIEW.md#auto-approval-1)"
+            )

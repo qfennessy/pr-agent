@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 
+from pr_agent.algo.review_execution_context import review_execution_is_isolated
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import AzureDevopsProvider, GithubProvider, GitLabProvider
 from pr_agent.log import get_logger
@@ -662,7 +663,8 @@ async def extract_and_cache_pr_tickets(git_provider, vars):
     if not get_settings().get('pr_reviewer.require_ticket_analysis_review', False):
         return
 
-    related_tickets = get_settings().get('related_tickets', [])
+    isolated_execution = review_execution_is_isolated()
+    related_tickets = [] if isolated_execution else get_settings().get('related_tickets', [])
 
     if not related_tickets:
         tickets_content = await extract_tickets(git_provider)
@@ -680,7 +682,8 @@ async def extract_and_cache_pr_tickets(git_provider, vars):
                               artifact={"tickets": related_tickets})
 
             vars['related_tickets'] = related_tickets
-            get_settings().set('related_tickets', related_tickets)
+            if not isolated_execution:
+                get_settings().set('related_tickets', related_tickets)
     else:
         get_logger().info("Using cached tickets", artifact={"tickets": related_tickets})
         vars['related_tickets'] = related_tickets

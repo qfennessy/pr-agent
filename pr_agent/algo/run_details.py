@@ -8,11 +8,12 @@ stay isolated between concurrent requests.
 """
 
 import time
+from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any, Mapping, Optional
+from typing import Any, Iterator, Mapping, Optional
 
 from pr_agent.algo.ai_request_context import get_ai_request_options
 
@@ -297,6 +298,17 @@ def init_run_details() -> RunDetails:
 def get_run_details() -> Optional[RunDetails]:
     """Return the collector for the current run, or None if not initialized."""
     return _run_details.get()
+
+
+@contextmanager
+def isolate_run_details() -> Iterator[None]:
+    """Install an empty request-local telemetry slot and restore the caller's slot."""
+
+    token = _run_details.set(None)
+    try:
+        yield
+    finally:
+        _run_details.reset(token)
 
 
 def _get_specialist_details(attribution: str) -> Optional[SpecialistRunDetails]:
