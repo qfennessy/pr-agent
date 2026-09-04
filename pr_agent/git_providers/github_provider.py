@@ -275,6 +275,10 @@ MAX_CI_CHECK_RUNS = 100
 
 
 class GithubProvider(GitProvider):
+    # None until a filtering pass records the result, so callers that need a
+    # complete inventory of changed files fail closed rather than assume none.
+    excluded_diff_file_paths: Optional[tuple[str, ...]] = None
+
     def __init__(self, pr_url: Optional[str] = None):
         self.repo_obj = None
         try:
@@ -291,6 +295,7 @@ class GithubProvider(GitProvider):
         self.issue_main = None
         self.github_user_id = None
         self.diff_files = None
+        self.excluded_diff_file_paths = None
         self.git_files = None
         self.incremental = IncrementalPR(False)
         self._routing_incremental_files = None
@@ -653,6 +658,12 @@ class GithubProvider(GitProvider):
             # filter files using [ignore] patterns
             files_original = self.get_files()
             files = filter_ignored(files_original)
+            # Ignored paths never reach the model, so record them for callers that
+            # must know whether the reviewed inventory was complete.
+            kept_names = {file.filename for file in files}
+            self.excluded_diff_file_paths = tuple(sorted(
+                file.filename for file in files_original if file.filename not in kept_names
+            ))
             if files_original != files:
                 try:
                     names_original = [file.filename for file in files_original]

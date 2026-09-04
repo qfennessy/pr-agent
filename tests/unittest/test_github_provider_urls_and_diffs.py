@@ -634,3 +634,34 @@ class TestGetDiffFilesRename:
         original_content_call = spy.call_args_list[-1]
         assert original_content_call.args[1] == "prev-sha"
         assert original_content_call.kwargs.get("path") == "old_dir/module.py"
+
+
+class TestExcludedDiffFilePaths:
+    """[ignore] patterns drop changed files entirely, so callers must be able to see that."""
+
+    def test_unknown_until_a_filtering_pass_runs(self):
+        p = _make_provider_for_diff([])
+        assert p.excluded_diff_file_paths is None
+
+    def test_empty_tuple_when_nothing_is_filtered(self, patched_helpers):
+        p = _make_provider_for_diff([_make_file("kept.py", "modified")])
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+
+        p.get_diff_files()
+
+        assert p.excluded_diff_file_paths == ()
+
+    def test_records_the_paths_that_ignore_patterns_removed(self):
+        kept = _make_file("kept.py", "modified")
+        dropped = _make_file("vendor/generated.py", "modified")
+        other = _make_file("docs/notes.md", "modified")
+        p = _make_provider_for_diff([kept, dropped, other])
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+        mod = "pr_agent.git_providers.github_provider"
+        with patch(f"{mod}.filter_ignored", side_effect=lambda fs: [kept]), patch(
+            f"{mod}.is_valid_file", return_value=True
+        ), patch(f"{mod}.load_large_diff", return_value="LARGE_DIFF"):
+            diffs = p.get_diff_files()
+
+        assert [d.filename for d in diffs] == ["kept.py"]
+        assert p.excluded_diff_file_paths == ("docs/notes.md", "vendor/generated.py")

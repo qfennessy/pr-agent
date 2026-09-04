@@ -240,6 +240,7 @@ def _reviewer(provider, *, artifact=None, incremental=False, remaining_files=())
         "publication_safe": True,
         "first_pass_generation_complete": True,
         "reviewed_patches_complete": True,
+        "reviewed_file_inventory_complete": True,
         "proposed_candidate_count": 1,
         "verified_count": 1,
         "finding_limit_dropped": 0,
@@ -545,6 +546,7 @@ def test_complete_full_clean_run_may_resolve_an_obsolete_bot_owned_thread():
         "publication_safe": True,
         "first_pass_generation_complete": True,
         "reviewed_patches_complete": True,
+        "reviewed_file_inventory_complete": True,
         "proposed_candidate_count": 0,
         "verified_count": 0,
         "finding_limit_dropped": 0,
@@ -563,6 +565,7 @@ def test_incremental_clean_run_cannot_resolve_an_obsolete_thread():
         "publication_safe": True,
         "first_pass_generation_complete": True,
         "reviewed_patches_complete": True,
+        "reviewed_file_inventory_complete": True,
         "proposed_candidate_count": 0,
         "verified_count": 0,
         "finding_limit_dropped": 0,
@@ -580,6 +583,7 @@ def test_omitted_or_budgeted_findings_make_absence_non_authoritative():
         "publication_safe": True,
         "first_pass_generation_complete": True,
         "reviewed_patches_complete": True,
+        "reviewed_file_inventory_complete": True,
         "proposed_candidate_count": 1,
         "verified_count": 1,
         "finding_limit_dropped": 0,
@@ -612,6 +616,7 @@ def test_generation_cap_saturation_and_malformed_counts_make_absence_non_authori
         "publication_safe": True,
         "first_pass_generation_complete": True,
         "reviewed_patches_complete": True,
+        "reviewed_file_inventory_complete": True,
         "proposed_candidate_count": proposed_count,
         "verified_count": published_count,
         "finding_limit_dropped": 0,
@@ -632,6 +637,7 @@ def test_incomplete_or_missing_first_pass_completion_makes_absence_non_authorita
         "status": "complete",
         "publication_safe": True,
         "reviewed_patches_complete": True,
+        "reviewed_file_inventory_complete": True,
         "proposed_candidate_count": 1,
         "verified_count": 1,
         "finding_limit_dropped": 0,
@@ -650,6 +656,7 @@ def test_truncated_or_missing_patch_evidence_makes_absence_non_authoritative(pat
         "status": "complete",
         "publication_safe": True,
         "first_pass_generation_complete": True,
+        "reviewed_file_inventory_complete": True,
         "proposed_candidate_count": 1,
         "verified_count": 1,
         "finding_limit_dropped": 0,
@@ -669,6 +676,7 @@ def test_truncated_patch_clean_run_cannot_resolve_an_obsolete_thread():
         "publication_safe": True,
         "first_pass_generation_complete": True,
         "reviewed_patches_complete": False,
+        "reviewed_file_inventory_complete": True,
         "proposed_candidate_count": 0,
         "verified_count": 0,
         "finding_limit_dropped": 0,
@@ -686,6 +694,7 @@ def test_applied_route_generation_cap_controls_authoritative_absence():
         "publication_safe": True,
         "first_pass_generation_complete": True,
         "reviewed_patches_complete": True,
+        "reviewed_file_inventory_complete": True,
         "proposed_candidate_count": 2,
         "verified_count": 2,
         "finding_limit_dropped": 0,
@@ -713,6 +722,7 @@ def test_saturated_run_reconciles_current_finding_without_resolving_absent_threa
         "publication_safe": True,
         "first_pass_generation_complete": True,
         "reviewed_patches_complete": True,
+        "reviewed_file_inventory_complete": True,
         "proposed_candidate_count": 1,
         "verified_count": 1,
         "finding_limit_dropped": 0,
@@ -888,3 +898,43 @@ def test_active_non_github_provider_preserves_legacy_inline_path_despite_github_
 
     reviewer._apply_review_thread_lifecycle.assert_not_called()
     reviewer._publish_key_issues_as_inline_comments.assert_called_once()
+
+
+@pytest.mark.parametrize("inventory_complete", [False, None])
+def test_ignored_changed_files_make_absence_non_authoritative(inventory_complete):
+    """[ignore] patterns drop files before diff_files, so they never reach remaining_files_list."""
+
+    artifact = {
+        "status": "complete",
+        "publication_safe": True,
+        "first_pass_generation_complete": True,
+        "reviewed_patches_complete": True,
+        "proposed_candidate_count": 1,
+        "verified_count": 1,
+        "finding_limit_dropped": 0,
+    }
+    if inventory_complete is not None:
+        artifact["reviewed_file_inventory_complete"] = inventory_complete
+    reviewer = _reviewer(_Provider(), artifact=artifact)
+
+    with patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_Settings()):
+        assert reviewer._review_thread_absence_is_authoritative(1) is False
+
+
+def test_ignored_file_clean_run_cannot_resolve_an_obsolete_thread():
+    provider = _Provider((_snapshot(),))
+    reviewer = _reviewer(provider, artifact={
+        "status": "no_candidates",
+        "publication_safe": True,
+        "first_pass_generation_complete": True,
+        "reviewed_patches_complete": True,
+        "reviewed_file_inventory_complete": False,
+        "proposed_candidate_count": 0,
+        "verified_count": 0,
+        "finding_limit_dropped": 0,
+    })
+
+    _apply(reviewer, [], settings=_Settings(obsolete_policy="resolve"))
+
+    assert _mutation_calls(provider) == []
+    assert reviewer.review_thread_reconciliation_artifact["authoritative_absence"] is False

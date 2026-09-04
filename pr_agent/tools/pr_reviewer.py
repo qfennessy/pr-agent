@@ -2402,6 +2402,13 @@ class PRReviewer:
                 getattr(diff_file, "patch_is_complete", False) is True
                 for diff_file in diff_files
             )
+            # [ignore] patterns drop changed files before diff_files is built, so
+            # they never appear in remaining_files_list either. A provider that does
+            # not report its exclusions leaves this unknown, which fails closed.
+            excluded_paths = getattr(self.git_provider, "excluded_diff_file_paths", None)
+            artifact["reviewed_file_inventory_complete"] = (
+                isinstance(excluded_paths, tuple) and not excluded_paths
+            )
             candidates, candidate_rejections = prepare_candidates(
                 review_data,
                 diff_files,
@@ -3125,6 +3132,7 @@ class PRReviewer:
             or artifact.get("status") not in {"complete", "no_candidates"}
             or artifact.get("first_pass_generation_complete") is not True
             or artifact.get("reviewed_patches_complete") is not True
+            or artifact.get("reviewed_file_inventory_complete") is not True
             or bool(getattr(incremental, "is_incremental", False))
             or bool(getattr(self, "_review_shadow_only", False))
             or bool(getattr(self, "remaining_files_list", []))
