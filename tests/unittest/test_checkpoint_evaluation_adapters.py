@@ -125,6 +125,24 @@ def test_adapter_retains_omitted_file_as_unavailable_coverage():
     assert result.failure_reason_code == "production_coverage_unavailable"
 
 
+def test_adapter_retains_deleted_file_as_unavailable_coverage():
+    snapshot = _snapshot()
+    outcome = _outcome(snapshot, {
+        "review": {"key_issues_to_review": []},
+        "metadata": {"deleted_files": ["example.py", "example.py"]},
+    })
+
+    result = adapt_checkpoint_review_outcome(snapshot, EvaluationArmKind.GENERAL_REVIEW, outcome)
+
+    assert result.snapshot_result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert [(issue.reason, issue.path) for issue in result.snapshot_result.coverage_issues] == [
+        ("deleted_file_unsupported", "example.py"),
+    ]
+    assert result.findings == ()
+    assert result.terminal is False
+    assert result.failure_reason_code == "production_coverage_unavailable"
+
+
 def test_verified_adapter_converts_uncovered_clean_stage_to_coverage_unavailable():
     snapshot = _snapshot()
     details = RunDetails(start_time=0.0, finish_time=0.25)

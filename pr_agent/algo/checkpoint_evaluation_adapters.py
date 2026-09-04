@@ -108,6 +108,7 @@ def _coverage_issues(
 
     metadata = review.get("metadata")
     omitted_files = []
+    deleted_files = []
     if metadata is not None:
         if not isinstance(metadata, Mapping):
             raise EvaluationValidationError("production review output has invalid metadata")
@@ -117,13 +118,23 @@ def _coverage_issues(
             or any(not isinstance(path, str) or not path for path in omitted_files)
         ):
             raise EvaluationValidationError("production review output has invalid omitted-file coverage")
-    unexpected_paths = set(omitted_files) - set(snapshot.changed_paths)
+        deleted_files = metadata.get("deleted_files", [])
+        if (
+            not isinstance(deleted_files, list)
+            or any(not isinstance(path, str) or not path for path in deleted_files)
+        ):
+            raise EvaluationValidationError("production review output has invalid deleted-file coverage")
+    unexpected_paths = (set(omitted_files) | set(deleted_files)) - set(snapshot.changed_paths)
     if unexpected_paths:
-        raise EvaluationValidationError("production review output names an unexpected omitted file")
+        raise EvaluationValidationError("production review output names an unexpected coverage path")
     issues = [
         CoverageIssue(reason="diff_compression_omitted", path=path)
         for path in sorted(set(omitted_files))
     ]
+    issues.extend(
+        CoverageIssue(reason="deleted_file_unsupported", path=path)
+        for path in sorted(set(deleted_files))
+    )
     if kind is EvaluationArmKind.VERIFIED_SPECIALISTS:
         issues.extend(
             CoverageIssue(reason="stage_coverage_unavailable", path=stage)
