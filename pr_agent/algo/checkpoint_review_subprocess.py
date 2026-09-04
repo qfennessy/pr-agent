@@ -13,8 +13,7 @@ import subprocess
 import sys
 import time
 from contextlib import redirect_stdout
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -33,11 +32,15 @@ from pr_agent.algo.review_snapshot import (
     ReviewSnapshot,
     snapshot_review_instructions,
 )
+from pr_agent.algo.run_details import (
+    deserialize_run_details_for_evaluation,
+    serialize_run_details_for_evaluation,
+)
 
 if TYPE_CHECKING:
     from pr_agent.algo.review_configuration import ReviewConfigurationBundle
 
-CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION = "checkpoint-review-subprocess-v3"
+CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION = "checkpoint-review-subprocess-v4"
 DEFAULT_REVIEW_SUBPROCESS_TIMEOUT_SECONDS = 180.0
 MAX_REVIEW_SUBPROCESS_TIMEOUT_SECONDS = 900.0
 MAX_REVIEW_SUBPROCESS_REQUEST_BYTES = 12_250_000
@@ -147,19 +150,6 @@ _SNAPSHOT_FIELDS = {
     "task_intent",
 }
 _COVERAGE_ISSUE_FIELDS = {"fingerprint", "path", "reason"}
-_RUN_DETAILS_FIELDS = {
-    "completion_tokens",
-    "duration_seconds",
-    "fallback_used",
-    "known_cost_call_count",
-    "model_costs_usd",
-    "model_used",
-    "num_ai_calls",
-    "prompt_tokens",
-    "review_profile",
-    "total_cost_usd",
-    "total_tokens",
-}
 
 
 class CheckpointReviewSubprocessState(str, Enum):
@@ -177,7 +167,7 @@ class CheckpointReviewSubprocessOutcome:
 
     state: CheckpointReviewSubprocessState
     snapshot_id: Optional[str]
-    review: Optional[Mapping[str, Any]] = None
+    review: Optional[Mapping[str, Any]] = field(default=None, repr=False)
     run_details: Optional[Mapping[str, Any]] = None
     latency_seconds: Optional[float] = None
     failure_reason_code: Optional[str] = None
@@ -434,72 +424,15 @@ def _request_from_dict(payload: Mapping[str, Any]) -> _CheckpointReviewSubproces
 
 
 def _validated_run_details(value: Any) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != _RUN_DETAILS_FIELDS:
-        raise ValueError("invalid_run_details_fields")
-    for field_name in ("model_used", "review_profile"):
-        field_value = value.get(field_name)
-        if field_value is not None and (not isinstance(field_value, str) or len(field_value) > 256):
-            raise ValueError(f"invalid_run_details_{field_name}")
-    if not isinstance(value.get("fallback_used"), bool):
-        raise ValueError("invalid_run_details_fallback_used")
-    for field_name in (
-        "completion_tokens",
-        "known_cost_call_count",
-        "num_ai_calls",
-        "prompt_tokens",
-        "total_tokens",
-    ):
-        field_value = value.get(field_name)
-        if not isinstance(field_value, int) or isinstance(field_value, bool) or not 0 <= field_value <= 10**12:
-            raise ValueError(f"invalid_run_details_{field_name}")
-    if value["known_cost_call_count"] > value["num_ai_calls"]:
-        raise ValueError("invalid_run_details_known_cost_call_count")
-    if not _is_non_negative_finite_number(value.get("duration_seconds")):
-        raise ValueError("invalid_run_details_duration_seconds")
-    model_costs = value.get("model_costs_usd")
-    if not isinstance(model_costs, Mapping) or len(model_costs) > 64:
-        raise ValueError("invalid_run_details_model_costs_usd")
-    validated_costs: dict[str, str] = {}
-    for model, cost in model_costs.items():
-        if not isinstance(model, str) or not model or len(model) > 256:
-            raise ValueError("invalid_run_details_model_costs_usd")
-        validated_costs[model] = _validated_decimal(cost, "model_costs_usd")
-    result = dict(value)
-    result["total_cost_usd"] = _validated_decimal(value.get("total_cost_usd"), "total_cost_usd")
-    result["model_costs_usd"] = validated_costs
-    return result
-
-
-def _validated_decimal(value: Any, label: str) -> str:
-    if not isinstance(value, str) or len(value) > 128:
-        raise ValueError(f"invalid_run_details_{label}")
-    try:
-        parsed = Decimal(value)
-    except InvalidOperation as exc:
-        raise ValueError(f"invalid_run_details_{label}") from exc
-    if not parsed.is_finite() or parsed < 0:
-        raise ValueError(f"invalid_run_details_{label}")
-    return value
+    return serialize_run_details_for_evaluation(
+        deserialize_run_details_for_evaluation(value)
+    )
 
 
 def _serialize_run_details(run_details: Any) -> Optional[dict[str, Any]]:
     if run_details is None:
         return None
-    return _validated_run_details({
-        "model_used": run_details.model_used,
-        "review_profile": run_details.review_profile,
-        "fallback_used": run_details.fallback_used,
-        "prompt_tokens": run_details.prompt_tokens,
-        "completion_tokens": run_details.completion_tokens,
-        "total_tokens": run_details.total_tokens,
-        "num_ai_calls": run_details.num_ai_calls,
-        "total_cost_usd": str(run_details.total_cost_usd),
-        "known_cost_call_count": run_details.known_cost_call_count,
-        "model_costs_usd": {
-            model: str(cost) for model, cost in run_details.model_costs_usd.items()
-        },
-        "duration_seconds": run_details.duration_seconds,
-    })
+    return serialize_run_details_for_evaluation(run_details)
 
 
 def _outcome_from_dict(payload: Mapping[str, Any]) -> CheckpointReviewSubprocessOutcome:

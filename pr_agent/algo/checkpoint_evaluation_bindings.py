@@ -88,8 +88,7 @@ _BLOCKERS: Mapping[EvaluationArmKind, tuple[str, ...]] = MappingProxyType({
         "deterministic_finding_contract_unavailable",
     ),
     EvaluationArmKind.GENERAL_REVIEW: (
-        "general_review_adapter_unavailable",
-        "finding_normalization_adapter_unavailable",
+        "general_review_severity_contract_unavailable",
         "hard_cost_cap_enforcement_unavailable",
     ),
     EvaluationArmKind.SPECIALISTS: (
@@ -97,13 +96,9 @@ _BLOCKERS: Mapping[EvaluationArmKind, tuple[str, ...]] = MappingProxyType({
         "hard_cost_cap_enforcement_unavailable",
     ),
     EvaluationArmKind.VERIFIED_SPECIALISTS: (
-        "verified_candidate_source_contract_unavailable",
         "hard_cost_cap_enforcement_unavailable",
     ),
     EvaluationArmKind.FULL_CASCADE: (
-        "general_review_adapter_unavailable",
-        "finding_normalization_adapter_unavailable",
-        "verified_candidate_source_contract_unavailable",
         "frontier_stage_telemetry_contract_unavailable",
         "frontier_decision_semantics_unavailable",
         "hard_cost_cap_enforcement_unavailable",
@@ -145,6 +140,13 @@ def _unavailable_binding(
     arm: EvaluationArm,
     readiness: ProductionBindingReadiness,
 ) -> ProductionArmBinding:
+    adapter = None
+    if arm.kind in {EvaluationArmKind.GENERAL_REVIEW, EvaluationArmKind.VERIFIED_SPECIALISTS}:
+        # Import lazily so the runner's provider-neutral contracts remain usable
+        # without importing the subprocess production seam.
+        from pr_agent.algo.checkpoint_evaluation_adapters import build_checkpoint_review_adapter
+
+        adapter = build_checkpoint_review_adapter(arm.kind)
     telemetry_shape = (
         ModelTelemetryShape.NONE
         if arm.kind is EvaluationArmKind.DETERMINISTIC
@@ -161,7 +163,7 @@ def _unavailable_binding(
         model_identities=arm.model_identities(),
         stage_plan=arm.stage_plan,
         telemetry_shape=telemetry_shape,
-        adapter=None,
+        adapter=adapter,
         available=False,
         enforces_hard_cost_cap=False,
         unavailable_reason=readiness.blocker_codes[0],

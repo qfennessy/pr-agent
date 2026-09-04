@@ -4,7 +4,7 @@ import datetime
 import json
 import re
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, List, Mapping, Optional, Tuple
 
@@ -101,6 +101,7 @@ from pr_agent.algo.run_details import (
     isolate_run_details,
     record_review_profile,
     record_review_route,
+    record_specialist_result,
 )
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.token_handler import TokenEncoder, TokenHandler
@@ -156,8 +157,8 @@ _GENERIC_CI_EVIDENCE_TERMS = {
 class StructuredReviewExecution:
     """Provider-neutral output from one forced no-publish review run."""
 
-    review: Optional[Mapping[str, Any]]
-    run_details: Optional[RunDetails]
+    review: Optional[Mapping[str, Any]] = field(repr=False)
+    run_details: Optional[RunDetails] = field(repr=False)
 
 
 class PRReviewer:
@@ -1648,13 +1649,18 @@ class PRReviewer:
             if root_cause_key in seen_root_causes:
                 continue
             seen_root_causes.add(root_cause_key)
-            normalized_issues.append({
+            normalized_issue = {
                 "relevant_file": relevant_file,
                 "issue_header": _BUG_FINDING_HEADERS[finding_type],
                 "issue_content": f"{issue_content}\n\n**Trigger:** {trigger}\n\n**Impact:** {impact}",
                 "start_line": start_line,
                 "end_line": end_line,
-            })
+            }
+            if getattr(self, "_force_no_publish", False):
+                normalized_issue.update({
+                    "root_cause": root_cause,
+                })
+            normalized_issues.append(normalized_issue)
             if len(normalized_issues) >= self._maximum_generated_findings():
                 break
         return {"review": {"key_issues_to_review": normalized_issues}}
@@ -2183,6 +2189,7 @@ class PRReviewer:
             "specialist_prioritization": {"status": "initializing"},
         }
         verifier_started = None
+        verification_config = None
         details_before = None
         self.candidate_verification_artifact = artifact
         try:
@@ -2713,7 +2720,36 @@ class PRReviewer:
                         "usd": str(details.total_cost_usd - details_before["total_cost_usd"])
                         if known_cost_delta > 0 else None,
                     }
+            if verification_config is not None:
+                self._record_candidate_verification_stage(verification_config, artifact)
             get_logger().info("Candidate verification finished", artifact=telemetry_safe_artifact(artifact))
+
+    @staticmethod
+    def _record_candidate_verification_stage(verification_config, artifact: Mapping[str, Any]) -> None:
+        """Finalize source-free verifier telemetry for checkpoint evaluation."""
+
+        status = str(artifact.get("status") or "unavailable").strip().lower()
+        state, failure_reason = {
+            "complete": ("success", None),
+            "no_candidates": ("not_required", None),
+            "partial": ("partial", "verification_coverage_partial"),
+            "candidate_validation_incomplete": ("partial", "candidate_validation_incomplete"),
+            "prompt_budget_exhausted": ("input_budget_exhausted", "prompt_budget_exhausted"),
+            "verifier_response_invalid": ("malformed_output", "verifier_response_invalid"),
+            "verifier_failed": ("provider_failure", "verifier_failed"),
+        }.get(status, ("unavailable", status or "verification_unavailable"))
+        explicit_failure = str(artifact.get("failure") or "").strip()
+        if failure_reason is not None and explicit_failure:
+            failure_reason = explicit_failure[:128]
+        record_specialist_result(
+            "candidate_verification",
+            prompt_version=verification_config.prompt_version,
+            input_schema_version=verification_config.input_schema_version,
+            schema_version=verification_config.output_schema_version,
+            state=state,
+            latency_seconds=float(artifact.get("verifier_latency_seconds") or 0.0),
+            failure_reason=failure_reason,
+        )
 
     def _publish_structured_review_data(
         self,

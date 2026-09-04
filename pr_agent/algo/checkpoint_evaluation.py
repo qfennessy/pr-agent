@@ -34,13 +34,16 @@ _SPECIALIST_STAGE_STATES = frozenset({
     "input_budget_exhausted",
     "low_confidence",
     "malformed_output",
+    "not_required",
+    "partial",
     "provider_failure",
     "stale",
     "success",
     "timeout",
     "unavailable",
 })
-_COMPLETE_SPECIALIST_STAGE_STATES = frozenset({"cached", "success"})
+_COMPLETE_SPECIALIST_STAGE_STATES = frozenset({"cached", "not_required", "success"})
+_PARTIAL_SPECIALIST_STAGE_STATES = frozenset({"partial"})
 _ANSWER_ONLY_KEYS = frozenset({
     "adjudication",
     "adjudication_hash",
@@ -1162,7 +1165,11 @@ class EvaluationStageRun:
         expected_coverage = (
             MeasurementStatus.COMPLETE
             if self.state in _COMPLETE_SPECIALIST_STAGE_STATES
-            else MeasurementStatus.UNAVAILABLE
+            else (
+                MeasurementStatus.PARTIAL
+                if self.state in _PARTIAL_SPECIALIST_STAGE_STATES
+                else MeasurementStatus.UNAVAILABLE
+            )
         )
         if self.coverage_status is not expected_coverage:
             raise EvaluationValidationError("stage run coverage_status contradicts its state")
@@ -1324,7 +1331,11 @@ class EvaluationStageRun:
         coverage_status = (
             MeasurementStatus.COMPLETE
             if state in _COMPLETE_SPECIALIST_STAGE_STATES
-            else MeasurementStatus.UNAVAILABLE
+            else (
+                MeasurementStatus.PARTIAL
+                if state in _PARTIAL_SPECIALIST_STAGE_STATES
+                else MeasurementStatus.UNAVAILABLE
+            )
         )
         for name in ("prompt_version", "input_schema_version", "schema_version"):
             value = getattr(details, name)
@@ -1687,6 +1698,7 @@ class EvaluationRunRecord:
         escalated: Optional[bool] = None,
         stage_latencies_seconds: Optional[Mapping[str, NumericMeasurement]] = None,
         failure_reason_code: Optional[str] = None,
+        no_model_execution: bool = False,
     ) -> "EvaluationRunRecord":
         """Bind shipped snapshot/run telemetry to one evaluation attempt."""
         if case not in manifest.cases:
@@ -1736,6 +1748,31 @@ class EvaluationRunRecord:
             cost_components.extend(stage.cost_usd for stage in stage_runs)
             token_measurement = _sum_measurements(token_components)
             cost_measurement = _sum_measurements(cost_components)
+        if no_model_execution:
+            if (
+                result.state is not ReviewResultState.NO_FINDINGS
+                or any(
+                    finding.lifecycle_state is FindingLifecycleState.ACTIVE
+                    for finding in findings
+                )
+                or not terminal
+                or retry_count
+                or result.cached
+                or escalated is not None
+                or stage_latencies_seconds
+                or details is None
+                or details.num_ai_calls
+                or details.has_token_usage
+                or details.known_cost_call_count
+                or details.total_cost_usd
+                or details.model_costs_usd
+                or details.specialist_runs
+                or details.adjudication_runs
+                or failure_reason_code is not None
+            ):
+                raise EvaluationValidationError("no-model run records must be zero-call successful executions")
+            token_measurement = NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+            cost_measurement = NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
         selected_model_id = (
             None
             if arm.kind is EvaluationArmKind.DETERMINISTIC
@@ -1785,6 +1822,26 @@ class EvaluationRunRecord:
         return record
 
 
+def _is_no_model_execution_record(record: EvaluationRunRecord) -> bool:
+    return (
+        record.state is EvaluationRunState.COMPLETED
+        and record.terminal
+        and record.snapshot_result_state is ReviewResultState.NO_FINDINGS
+        and not any(
+            finding.lifecycle_state is FindingLifecycleState.ACTIVE
+            for finding in record.findings
+        )
+        and record.tokens == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+        and record.cost_usd == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+        and not record.retry_count
+        and not record.cached
+        and record.escalated is None
+        and not record.stage_runs
+        and not record.stage_latencies_seconds
+        and record.failure_reason_code is None
+    )
+
+
 def validate_run_model_telemetry(
     arm: EvaluationArm,
     record: EvaluationRunRecord,
@@ -1807,6 +1864,8 @@ def validate_run_model_telemetry(
     missing = sorted(set(expected_by_stage) - set(actual_by_stage))
     unexpected = sorted(set(actual_by_stage) - set(expected_by_stage))
     if missing or unexpected:
+        if _is_no_model_execution_record(record) and missing and not unexpected:
+            return
         raise EvaluationValidationError(
             f"{context} stages do not match its frozen plan; missing={missing}, unexpected={unexpected}"
         )

@@ -269,6 +269,50 @@ def test_snapshot_result_adapter_preserves_partial_and_unavailable_telemetry():
     assert EvaluationRunRecord.from_dict(record.to_dict()) == record
 
 
+def test_snapshot_result_adapter_rejects_false_no_model_execution_claim():
+    case = _case("case", EvaluationCohort.HOLDOUT)
+    arm = EvaluationArm(
+        arm_id="general",
+        kind=EvaluationArmKind.GENERAL_REVIEW,
+        configuration_hash=_hash("general-configuration"),
+        prompt_hash=_hash("general-prompt"),
+        model_id="provider/model-version",
+        provider_id="provider/api-v1",
+        model_revision="2026-09-04.1",
+    )
+    manifest = _manifest(case, arms=(arm,))
+    result = ReviewSnapshotResult(
+        snapshot_id=case.snapshot_id,
+        state=ReviewResultState.NO_FINDINGS,
+        current_snapshot_id=case.snapshot_id,
+        review=None,
+        coverage_issues=(),
+        latency_seconds=0.5,
+    )
+    details = RunDetails(
+        model_used=arm.model_id,
+        prompt_tokens=7,
+        completion_tokens=3,
+        total_tokens=10,
+        num_ai_calls=1,
+        total_cost_usd=Decimal("0.01"),
+        known_cost_call_count=1,
+        model_costs_usd={arm.model_id: Decimal("0.01")},
+    )
+
+    with pytest.raises(EvaluationValidationError, match="zero-call successful"):
+        EvaluationRunRecord.from_snapshot_result(
+            manifest,
+            case,
+            arm,
+            result,
+            details,
+            attempt=1,
+            terminal=True,
+            no_model_execution=True,
+        )
+
+
 def test_score_keeps_failures_and_missing_pairs_in_denominators():
     defect = _case("defect", EvaluationCohort.HOLDOUT)
     control = _case("control", EvaluationCohort.CLEAN_CONTROL)

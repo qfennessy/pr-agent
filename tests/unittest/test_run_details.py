@@ -5,8 +5,11 @@ import pytest
 
 from pr_agent.algo.ai_request_context import AIRequestOptions, use_ai_request_options
 from pr_agent.algo.run_details import (
+    AdjudicationRunDetails,
     RunDetails,
+    SpecialistRunDetails,
     add_token_usage,
+    deserialize_run_details_for_evaluation,
     get_run_details,
     init_run_details,
     record_ai_call,
@@ -14,8 +17,72 @@ from pr_agent.algo.run_details import (
     record_review_profile,
     record_review_route,
     record_specialist_result,
+    serialize_run_details_for_evaluation,
     specialist_runs_to_dict,
 )
+
+
+def test_evaluation_round_trip_retains_source_free_stage_telemetry_only():
+    details = RunDetails(
+        model_used="main-model",
+        review_profile="bugs_only",
+        num_ai_calls=1,
+        total_cost_usd=Decimal("0.01"),
+        known_cost_call_count=1,
+        model_costs_usd={"main-model": Decimal("0.01")},
+        specialist_runs={
+            "candidate_verification": SpecialistRunDetails(
+                role="candidate_verification",
+                model_used="verifier-model",
+                prompt_version="prompt-v1",
+                input_schema_version="input-v1",
+                schema_version="output-v1",
+                state="success",
+                latency_seconds=0.4,
+                num_ai_calls=1,
+                output={"source": "must not cross the boundary"},
+            ),
+        },
+        adjudication_runs={
+            "sha256:" + "a" * 64: AdjudicationRunDetails(
+                finding_id="sha256:" + "a" * 64,
+                model_used="frontier-model",
+                provider="openai",
+                model_revision="revision-1",
+                prompt_version="prompt-v1",
+                input_schema_version="input-v1",
+                schema_version="output-v1",
+                state="confirmed",
+                latency_seconds=0.2,
+                cache_state="not_requested",
+            ),
+        },
+        start_time=0.0,
+        finish_time=1.5,
+    )
+
+    payload = serialize_run_details_for_evaluation(details)
+    restored = deserialize_run_details_for_evaluation(payload)
+
+    assert "source" not in repr(payload)
+    assert "output" not in payload["specialist_runs"]["candidate_verification"]
+    assert restored.specialist_runs["candidate_verification"].output is None
+    assert restored.specialist_runs["candidate_verification"].model_used == "verifier-model"
+    assert restored.adjudication_runs["sha256:" + "a" * 64].provider == "openai"
+    assert restored.duration_seconds == 1.5
+
+
+def test_evaluation_run_details_reject_unknown_nested_fields():
+    payload = serialize_run_details_for_evaluation(RunDetails(start_time=0.0, finish_time=1.0))
+    payload["specialist_runs"] = {
+        "candidate_verification": {
+            "role": "candidate_verification",
+            "source": "repository text",
+        },
+    }
+
+    with pytest.raises(ValueError, match="specialist run"):
+        deserialize_run_details_for_evaluation(payload)
 
 
 class _Usage:

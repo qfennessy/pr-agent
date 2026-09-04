@@ -42,6 +42,7 @@ from pr_agent.algo.checkpoint_evaluation_execution import (
     PaidExecutionRequest,
     evaluate_paid_execution,
 )
+from pr_agent.algo.checkpoint_evaluation_findings import derive_finding_lifecycle
 from pr_agent.algo.checkpoint_evaluation_snapshot import (
     LoadedReviewSnapshotAndConfiguration,
     load_review_snapshot_and_configuration_artifacts,
@@ -127,12 +128,15 @@ class ProductionArmResult:
     failure_reason_code: Optional[str] = None
     latency_measurement: Optional[NumericMeasurement] = None
     model_identity: Optional[ModelIdentity] = None
+    no_model_execution: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot_result, ReviewSnapshotResult):
             raise EvaluationValidationError("production arm result must use ReviewSnapshotResult")
         if self.run_details is not None and not isinstance(self.run_details, RunDetails):
             raise EvaluationValidationError("production arm telemetry must use RunDetails")
+        if not isinstance(self.no_model_execution, bool):
+            raise EvaluationValidationError("production no-model marker must be a boolean")
         if not isinstance(self.snapshot_result.state, ReviewResultState):
             raise EvaluationValidationError("production snapshot result state is invalid")
         latency = self.snapshot_result.latency_seconds
@@ -177,6 +181,23 @@ class ProductionArmResult:
             raise EvaluationValidationError("a findings result requires an active normalized finding")
         if self.snapshot_result.state is ReviewResultState.NO_FINDINGS and has_active_findings:
             raise EvaluationValidationError("a no-findings result may include only withdrawn findings")
+        if self.no_model_execution:
+            details = self.run_details
+            if (
+                self.snapshot_result.state is not ReviewResultState.NO_FINDINGS
+                or has_active_findings
+                or self.failure_state is not None
+                or self.model_identity is not None
+                or details is None
+                or details.num_ai_calls != 0
+                or details.has_token_usage
+                or details.known_cost_call_count != 0
+                or details.total_cost_usd != 0
+                or details.model_costs_usd
+                or details.specialist_runs
+                or details.adjudication_runs
+            ):
+                raise EvaluationValidationError("no-model production results must be empty successful executions")
         if (
             self.snapshot_result.state not in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
             and self.findings
@@ -251,8 +272,6 @@ class ProductionArmBinding:
             if self.unavailable_reason is not None:
                 raise EvaluationValidationError("an available production binding cannot have an unavailable reason")
         else:
-            if self.adapter is not None:
-                raise EvaluationValidationError("an unavailable production binding cannot expose an adapter")
             if not isinstance(self.unavailable_reason, str) or not self.unavailable_reason.strip():
                 raise EvaluationValidationError("an unavailable production binding requires an explicit reason")
 
@@ -348,8 +367,30 @@ class ProductionEvaluationRunner:
         bindings_by_arm_id = {
             arm.arm_id: preflight.bindings_by_kind[kind] for kind, arm in preflight.arms_by_kind.items()
         }
+        retained_terminal = {
+            (record.case_id, record.arm_id): record
+            for record in self.artifact_store.load_records(self.manifest)
+            if record.terminal
+        }
+
+        def lineage_depth(case: CheckpointCase) -> int:
+            depth = 0
+            current = case
+            while current.parent_case_id is not None:
+                depth += 1
+                current = cases_by_id[current.parent_case_id]
+            return depth
+
         records: list[EvaluationRunRecord] = []
-        for resume_item in self.artifact_store.resume_plan(self.manifest, self.paid_request):
+        resume_items = sorted(
+            self.artifact_store.resume_plan(self.manifest, self.paid_request),
+            key=lambda item: (
+                lineage_depth(cases_by_id[item.plan_item.case_id]),
+                item.plan_item.case_id,
+                item.plan_item.arm_id,
+            ),
+        )
+        for resume_item in resume_items:
             item = resume_item.plan_item
             case = cases_by_id[item.case_id]
             arm = arms_by_id[item.arm_id]
@@ -359,6 +400,11 @@ class ProductionEvaluationRunner:
             adapter = binding.adapter
             if adapter is None:  # guarded by preflight; keep the paid boundary explicit
                 raise ProductionDependencyUnavailable(f"{binding.kind.value} production adapter is unavailable")
+            parent_record = None
+            if case.parent_case_id is not None:
+                parent_record = retained_terminal.get((case.parent_case_id, arm.arm_id))
+                if parent_record is None or parent_record.state is not EvaluationRunState.COMPLETED:
+                    continue
             paid_budget = next(
                 (
                     budget
@@ -409,6 +455,23 @@ class ProductionEvaluationRunner:
             outcome = await adapter(snapshot, context)
             if not isinstance(outcome, ProductionArmResult):
                 raise EvaluationValidationError("production adapter returned an unsupported result type")
+            if case.parent_case_id is not None and outcome.snapshot_result.state in {
+                ReviewResultState.FINDINGS,
+                ReviewResultState.NO_FINDINGS,
+            }:
+                if parent_record is None or parent_record.state is not EvaluationRunState.COMPLETED:
+                    raise EvaluationValidationError(
+                        f"pair {case.case_id}/{arm.arm_id} requires a completed terminal parent record"
+                    )
+                outcome = replace(
+                    outcome,
+                    findings=derive_finding_lifecycle(
+                        outcome.findings,
+                        parent_record.findings,
+                        arm_id=arm.arm_id,
+                        parent_arm_id=parent_record.arm_id,
+                    ),
+                )
             record = _record_from_production_result(
                 self.manifest,
                 case,
@@ -431,6 +494,8 @@ class ProductionEvaluationRunner:
                 record = replace(record, terminal=True)
             self.artifact_store.append_record(self.manifest, record)
             records.append(record)
+            if record.terminal:
+                retained_terminal[(record.case_id, record.arm_id)] = record
         return ProductionEvaluationResult(self.manifest.manifest_id, tuple(records))
 
 
@@ -715,13 +780,17 @@ def _record_from_production_result(
         escalated=outcome.escalated,
         stage_latencies_seconds=outcome.stage_latencies_seconds,
         failure_reason_code=outcome.failure_reason_code,
+        no_model_execution=outcome.no_model_execution,
     )
+    no_model_execution = outcome.no_model_execution
+    if no_model_execution and snapshot.diff.strip():
+        raise EvaluationValidationError("only empty snapshots may claim no model execution")
     has_stage_runs = bool(record.stage_runs)
     if telemetry_shape is ModelTelemetryShape.NONE and has_stage_runs:
         raise EvaluationValidationError("deterministic production bindings cannot emit model stage telemetry")
     if telemetry_shape is ModelTelemetryShape.SINGLE_SELECTED and has_stage_runs:
         raise EvaluationValidationError("single-model production bindings cannot emit per-stage model telemetry")
-    if telemetry_shape is ModelTelemetryShape.PER_STAGE and not has_stage_runs:
+    if telemetry_shape is ModelTelemetryShape.PER_STAGE and not has_stage_runs and not no_model_execution:
         raise EvaluationValidationError("per-stage production bindings require model stage telemetry")
     replacements = {}
     if outcome.latency_measurement is not None:
@@ -737,6 +806,8 @@ def _record_from_production_result(
                 model_identity = arm.resolve_model_identity(details_model)
             elif has_stage_runs:
                 model_identity = (None, None, None)
+            elif no_model_execution:
+                model_identity = arm.resolve_model_identity(record.model_id)
             else:
                 raise EvaluationValidationError("model-backed results require an observed model identity")
         elif not arm.accepts_run_identity(*model_identity):

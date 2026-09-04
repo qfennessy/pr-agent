@@ -52,7 +52,7 @@ from pr_agent.git_providers.gitea_provider import GiteaProvider
 from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.git_providers.gitlab_provider import GitLabProvider
 from pr_agent.git_providers.plain_diff_provider import PlainDiffGitProvider
-from pr_agent.tools.pr_reviewer import PRReviewer
+from pr_agent.tools.pr_reviewer import PRReviewer, StructuredReviewExecution
 from tests.unittest._settings_helpers import restore_settings, snapshot_settings
 
 # _prepare_prediction now rejects output it cannot parse, so the model's answer can fall
@@ -5922,6 +5922,48 @@ def test_bugs_only_keeps_a_complete_defect_and_exposes_only_the_public_finding_s
         "start_line": 2,
         "end_line": 2,
     }]}}
+
+
+def test_bugs_only_forced_no_publish_retains_evaluation_identity_without_repr_leakage():
+    issue = _bugs_only_issue(issue_header="[P1] Tenant cache isolation")
+    reviewer, data = _bugs_only_reviewer(issue)
+    reviewer._force_no_publish = True
+
+    result = reviewer._normalize_bugs_only_review(data)
+
+    finding = result["review"]["key_issues_to_review"][0]
+    assert finding["root_cause"] == "The cache key omits the tenant identifier."
+    assert "normalized_severity" not in finding
+    execution = StructuredReviewExecution(review=result, run_details=None)
+    assert "cache key omits" not in repr(execution)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_state", "expected_failure"),
+    [
+        ("complete", "success", None),
+        ("no_candidates", "not_required", None),
+        ("partial", "partial", "verification_coverage_partial"),
+        ("verifier_response_invalid", "malformed_output", "verifier_response_invalid"),
+        ("verifier_failed", "provider_failure", "verifier_failed"),
+    ],
+)
+def test_candidate_verification_finalizes_evaluation_stage(status, expected_state, expected_failure):
+    init_run_details()
+    config = SimpleNamespace(
+        prompt_version="candidate-prompt-v1",
+        input_schema_version="candidate-input-v1",
+        output_schema_version="candidate-output-v1",
+    )
+
+    PRReviewer._record_candidate_verification_stage(config, {"status": status})
+
+    stage = get_run_details().specialist_runs["candidate_verification"]
+    assert stage.state == expected_state
+    assert stage.failure_reason == expected_failure
+    assert stage.prompt_version == "candidate-prompt-v1"
+    assert stage.input_schema_version == "candidate-input-v1"
+    assert stage.schema_version == "candidate-output-v1"
 
 
 @pytest.mark.parametrize("issue", [

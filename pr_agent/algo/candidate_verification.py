@@ -3559,6 +3559,8 @@ def apply_verification_decisions(
             result_records.append(record)
             continue
         finding["root_cause_id"], finding["trusted_stable_key"] = identity
+        if "normalized_severity" in record:
+            finding["normalized_severity"] = record["normalized_severity"]
         finding["_trusted_anchor_shape_id"] = anchor_shape_id
         finding["_trusted_anchor_shape_occurrence_count"] = anchor_occurrence_count
         finding["_trusted_same_anchor_candidate_count"] = same_anchor_candidate_count

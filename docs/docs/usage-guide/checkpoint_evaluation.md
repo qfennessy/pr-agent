@@ -21,16 +21,18 @@ shadow_journal_max_queue_entries = 256
 The credential-free plan reports a separate, versioned `production_binding_inventory`
 beside the frozen plan. Its own schema hash and content-derived inventory ID bind the readiness
 claims to the immutable manifest. Every entry remains unavailable until all its named source-free
-blocker contracts are implemented. An unavailable arm has no adapter, cannot claim hard-cost-cap
-enforcement, and stops production preflight before the artifact store or any model client is touched.
+blocker contracts are implemented. A completed adapter may remain dormant behind an unavailable
+binding; unavailable status or missing hard-cost-cap enforcement still stops production preflight
+before the artifact store or any model client is touched.
 
-The general-review arm now has a versioned configuration-bundle contract, atomic private
-snapshot/bundle persistence, and an isolated no-publish replay seam. Production preflight requires
-the exact artifact hashes and passes the validated immutable bundle to each adapter. The arm remains
-unavailable until an adapter connects that context to the replay seam, emits normalized findings,
-and enforces a genuine hard cost cap. This first replay contract is deliberately limited to the
-standard OpenAI route and rejects candidate verification, specialist routing, custom endpoints, and
-frontier adjudication.
+The general-review and verified-specialists arms now have dormant production adapters. They call the
+isolated no-publish replay seam with the exact immutable snapshot/configuration pair, preserve
+source-free per-stage telemetry across the subprocess protocol, and fail closed while joining trusted
+verifier identity to normalized severity. Evaluation-only root-cause metadata never changes the ordinary
+published finding shape, but the general-review arm remains blocked until production provides an explicit
+severity contract rather than an inferred default. Both bindings also remain unavailable until the model
+boundary can enforce a genuine pre-call dollar cap. The general replay contract remains limited to the
+standard OpenAI route; unsupported routes continue to fail configuration capture.
 Issue #27 must still complete those contracts and the source/telemetry contracts needed to integrate
 the production orchestration delivered by issues #26, #12, #11, #9, and #33. A frozen
 target-repository replay and one week of live shadow evidence are also required before any rollout
@@ -462,12 +464,17 @@ the complete request before importing model handlers, disables working-tree enri
 output sink, and returns only structured review data plus bounded run telemetry. Process-wide
 settings, callbacks, credentials, and environment mutations die with the child process.
 
-This is still not a runnable production evaluation arm. Preflight now loads each immutable
+This is still not an authorized runnable production evaluation. Preflight loads each immutable
 snapshot/configuration pair before artifact-store access and supplies the exact bundle in the frozen
 adapter context. Provider-neutral normalizers derive versioned general-review fingerprints, preserve
 trusted verified-finding keys, and compute active/withdrawn lifecycle transitions from parent
 checkpoints rather than model fields. They fail closed when production output omits durable root-cause
-identity or trusted severity instead of inferring either value from mutable prose or location. No
-production binding yet retains and joins that source metadata to subprocess output, and paid calls do
-not yet have an enforceable pre-call dollar cap. Full-cascade replay additionally needs the specialist
-and verification source contracts. Those blockers remain fail-closed.
+identity or trusted severity instead of accepting model-controlled fingerprints or location-derived
+identity. The subprocess protocol excludes source-bearing specialist output while retaining strict
+aggregate, specialist, verifier, and frontier telemetry. Parent checkpoints execute before children,
+and the runner derives withdrawals only from completed terminal parent records; children with unavailable
+parents are not reserved or executed. Clean empty-diff outcomes persist an unambiguous zero-call record
+with observed zero tokens and cost; missing telemetry after a model call remains unavailable. Paid
+calls still lack an enforceable pre-call dollar cap. General-review severity,
+deterministic/specialist finding contracts, and full-cascade frontier decision and aggregate-stage semantics
+also remain fail-closed.

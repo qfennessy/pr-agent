@@ -30,6 +30,7 @@ from pr_agent.algo.checkpoint_evaluation import (
     ObservedFinding,
     deployment_identity_hash,
 )
+from pr_agent.algo.checkpoint_evaluation_adapters import adapt_checkpoint_review_outcome
 from pr_agent.algo.checkpoint_evaluation_execution import (
     EvaluationArtifactStore,
     PaidExecutionRequest,
@@ -43,6 +44,10 @@ from pr_agent.algo.checkpoint_evaluation_runner import (
     ProductionDependencyUnavailable,
     ProductionEvaluationRunner,
     failed_production_arm_result,
+)
+from pr_agent.algo.checkpoint_review_subprocess import (
+    CheckpointReviewSubprocessOutcome,
+    CheckpointReviewSubprocessState,
 )
 from pr_agent.algo.checkpoint_stage_sources import CheckpointStageSources
 from pr_agent.algo.frontier_adjudication import FrontierAdjudicationConfig, FrontierModelIdentity
@@ -286,15 +291,17 @@ def _write_snapshot(
     *,
     parent_snapshot_id=None,
     changed_path="src/example.py",
+    diff=None,
     review_configuration=None,
 ) -> tuple[ReviewSnapshot, object, str]:
     review_configuration = review_configuration or _review_configuration()
+    diff = diff if diff is not None else "diff --git a/src/example.py b/src/example.py\n+value = 1\n"
     snapshot = ReviewSnapshot(
         event=ReviewEvent.FILE_SAVE,
         repository_root=str(tmp_path / "source-repository"),
         base_revision="base-revision",
-        changed_paths=(changed_path,),
-        diff="diff --git a/src/example.py b/src/example.py\n+value = 1\n",
+        changed_paths=(changed_path,) if changed_path else (),
+        diff=diff,
         policy_version="policy-v1",
         created_at="2026-08-30T12:00:00Z",
         review_configuration_hash=review_configuration.configuration_hash,
@@ -356,6 +363,260 @@ def _manifest(snapshot: ReviewSnapshot, artifact_hash: str, *, arms=None) -> Eva
         cases=(case,),
         arms=tuple(arms or (_arm(kind) for kind in EvaluationArmKind)),
     )
+
+
+@pytest.mark.asyncio
+async def test_runner_executes_parent_first_and_derives_withdrawal(tmp_path):
+    parent_snapshot, parent_path, parent_hash = _write_snapshot(tmp_path, "parent")
+    child_snapshot, child_path, child_hash = _write_snapshot(
+        tmp_path,
+        "child",
+        parent_snapshot_id=parent_snapshot.snapshot_id,
+        changed_path=None,
+        diff="",
+    )
+    arms = tuple(_arm(kind) for kind in EvaluationArmKind)
+    manifest = EvaluationManifest(
+        name="production-lineage",
+        corpus_hash=_hash("corpus"),
+        policy_hash=_hash("policy"),
+        configuration_hash=_hash("manifest-configuration"),
+        cases=(
+            CheckpointCase(
+                case_id="z-parent",
+                snapshot_id=parent_snapshot.snapshot_id,
+                snapshot_artifact_hash=parent_hash,
+                event=parent_snapshot.event,
+                cohort=EvaluationCohort.HOLDOUT,
+            ),
+            CheckpointCase(
+                case_id="a-child",
+                snapshot_id=child_snapshot.snapshot_id,
+                snapshot_artifact_hash=child_hash,
+                event=child_snapshot.event,
+                cohort=EvaluationCohort.HOLDOUT,
+                parent_case_id="z-parent",
+            ),
+        ),
+        arms=arms,
+    )
+    request, decision = _paid_authorization(manifest)
+    finding = ObservedFinding(
+        fingerprint=_hash("lineage-finding"),
+        severity=FindingSeverity.HIGH,
+        stage="general_review",
+    )
+    calls = []
+
+    def factory(arm):
+        async def adapter(snapshot, _context):
+            calls.append(snapshot.snapshot_id)
+            result = _success(arm, snapshot)
+            if (
+                arm.kind is EvaluationArmKind.GENERAL_REVIEW
+                and snapshot.snapshot_id == parent_snapshot.snapshot_id
+            ):
+                return replace(
+                    result,
+                    snapshot_result=replace(result.snapshot_result, state=ReviewResultState.FINDINGS),
+                    findings=(finding,),
+                )
+            if (
+                arm.kind is EvaluationArmKind.GENERAL_REVIEW
+                and snapshot.snapshot_id == child_snapshot.snapshot_id
+            ):
+                return adapt_checkpoint_review_outcome(
+                    snapshot,
+                    EvaluationArmKind.GENERAL_REVIEW,
+                    CheckpointReviewSubprocessOutcome(
+                        state=CheckpointReviewSubprocessState.COMPLETED,
+                        snapshot_id=snapshot.snapshot_id,
+                        review={"review": {"key_issues_to_review": []}},
+                        latency_seconds=0.0,
+                    ),
+                )
+            return result
+
+        return adapter
+
+    runner = ProductionEvaluationRunner(
+        manifest,
+        snapshot_paths={"z-parent": parent_path, "a-child": child_path},
+        review_configuration_artifact_hashes={
+            "z-parent": _configuration_artifact_hash(parent_path),
+            "a-child": _configuration_artifact_hash(child_path),
+        },
+        bindings=_bindings(manifest, factory),
+        artifact_store=EvaluationArtifactStore(tmp_path / "lineage-artifacts"),
+        paid_request=request,
+        paid_decision=decision,
+        evaluation_enabled=True,
+        allow_paid_execution=True,
+        publish_output=False,
+    )
+
+    result = await runner.run()
+
+    assert calls[:len(arms)] == [parent_snapshot.snapshot_id] * len(arms)
+    child = next(
+        record
+        for record in result.records
+        if record.case_id == "a-child" and record.arm_id == "arm-general_review"
+    )
+    assert child.findings == (replace(finding, lifecycle_state=FindingLifecycleState.WITHDRAWN),)
+    assert child.tokens == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+    assert child.cost_usd == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_reserve_or_execute_child_when_parent_failed(tmp_path):
+    parent_snapshot, parent_path, parent_hash = _write_snapshot(tmp_path, "failed-parent")
+    child_snapshot, child_path, child_hash = _write_snapshot(
+        tmp_path,
+        "blocked-child",
+        parent_snapshot_id=parent_snapshot.snapshot_id,
+        changed_path="src/blocked_child.py",
+    )
+    arms = tuple(_arm(kind) for kind in EvaluationArmKind)
+    manifest = EvaluationManifest(
+        name="failed-parent-lineage",
+        corpus_hash=_hash("corpus"),
+        policy_hash=_hash("policy"),
+        configuration_hash=_hash("manifest-configuration"),
+        cases=(
+            CheckpointCase(
+                case_id="parent",
+                snapshot_id=parent_snapshot.snapshot_id,
+                snapshot_artifact_hash=parent_hash,
+                event=parent_snapshot.event,
+                cohort=EvaluationCohort.HOLDOUT,
+            ),
+            CheckpointCase(
+                case_id="child",
+                snapshot_id=child_snapshot.snapshot_id,
+                snapshot_artifact_hash=child_hash,
+                event=child_snapshot.event,
+                cohort=EvaluationCohort.HOLDOUT,
+                parent_case_id="parent",
+            ),
+        ),
+        arms=arms,
+    )
+    request, decision = _paid_authorization(manifest)
+    calls = []
+
+    def factory(bound_arm):
+        async def adapter(snapshot, _context):
+            calls.append((snapshot.snapshot_id, bound_arm.kind))
+            if (
+                snapshot.snapshot_id == parent_snapshot.snapshot_id
+                and bound_arm.kind is EvaluationArmKind.GENERAL_REVIEW
+            ):
+                return failed_production_arm_result(
+                    snapshot,
+                    state=EvaluationRunState.PROVIDER_FAILURE,
+                    reason_code="provider_failure",
+                    latency_seconds=NumericMeasurement(MeasurementStatus.COMPLETE, 0.1),
+                    retry_count=0,
+                    run_details=RunDetails(
+                        model_used=bound_arm.model_id,
+                        num_ai_calls=1,
+                        total_cost_usd=Decimal("0.001"),
+                        known_cost_call_count=1,
+                        model_costs_usd={bound_arm.model_id: Decimal("0.001")},
+                        start_time=0.0,
+                        finish_time=0.1,
+                    ),
+                )
+            return _success(bound_arm, snapshot)
+
+        return adapter
+
+    artifact_store = EvaluationArtifactStore(tmp_path / "failed-parent-artifacts")
+    runner = ProductionEvaluationRunner(
+        manifest,
+        snapshot_paths={"parent": parent_path, "child": child_path},
+        review_configuration_artifact_hashes={
+            "parent": _configuration_artifact_hash(parent_path),
+            "child": _configuration_artifact_hash(child_path),
+        },
+        bindings=_bindings(manifest, factory),
+        artifact_store=artifact_store,
+        paid_request=request,
+        paid_decision=decision,
+        evaluation_enabled=True,
+        allow_paid_execution=True,
+        publish_output=False,
+    )
+
+    result = await runner.run()
+    records = result.records
+
+    assert (child_snapshot.snapshot_id, EvaluationArmKind.GENERAL_REVIEW) not in calls
+    assert any(
+        record.case_id == "parent"
+        and record.arm_id == "arm-general_review"
+        and record.state is EvaluationRunState.PROVIDER_FAILURE
+        for record in records
+    )
+    assert not any(
+        record.case_id == "child" and record.arm_id == "arm-general_review"
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_records_empty_snapshot_without_model_or_stage_calls(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(
+        tmp_path,
+        "empty-snapshot",
+        changed_path=None,
+        diff="",
+    )
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+
+    def factory(arm):
+        async def adapter(current_snapshot, _context):
+            if arm.kind is EvaluationArmKind.DETERMINISTIC:
+                return _success(arm, current_snapshot, details=False)
+            return adapt_checkpoint_review_outcome(
+                current_snapshot,
+                EvaluationArmKind.GENERAL_REVIEW,
+                CheckpointReviewSubprocessOutcome(
+                    state=CheckpointReviewSubprocessState.COMPLETED,
+                    snapshot_id=current_snapshot.snapshot_id,
+                    review={"review": {"key_issues_to_review": []}},
+                    latency_seconds=0.0,
+                ),
+            )
+
+        return adapter
+
+    runner = ProductionEvaluationRunner(
+        manifest,
+        snapshot_paths={"case-one": path},
+        review_configuration_artifact_hashes={"case-one": _configuration_artifact_hash(path)},
+        bindings=_bindings(manifest, factory),
+        artifact_store=EvaluationArtifactStore(tmp_path / "empty-snapshot-artifacts"),
+        paid_request=request,
+        paid_decision=decision,
+        evaluation_enabled=True,
+        allow_paid_execution=True,
+        publish_output=False,
+    )
+
+    result = await runner.run()
+
+    assert len(result.records) == len(EvaluationArmKind)
+    paid_records = tuple(
+        record for record in result.records if record.arm_id != "arm-deterministic"
+    )
+    assert all(record.state is EvaluationRunState.COMPLETED for record in paid_records)
+    assert all(record.tokens == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0) for record in paid_records)
+    assert all(record.cost_usd == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0) for record in paid_records)
+    assert all(record.model_id is not None and not record.stage_runs for record in paid_records)
+    assert all(EvaluationRunRecord.from_dict(record.to_dict()) == record for record in paid_records)
 
 
 def _paid_authorization(manifest: EvaluationManifest):
