@@ -11,6 +11,7 @@ from pr_agent.algo.candidate_verification import (
     candidate_verification_provider_controls_hash,
     parse_candidate_verification_config,
 )
+from pr_agent.algo.checkpoint_cost_authority import FrozenCostAuthority, ProviderMaximumCharge
 from pr_agent.algo.checkpoint_evaluation import (
     CheckpointCase,
     EvaluationArm,
@@ -124,6 +125,7 @@ def _stage_sources() -> CheckpointStageSources:
         )
         for role in SpecialistRole
     )
+
     def verifier(strict_output_policy: bool):
         return parse_candidate_verification_config(
             {},
@@ -463,6 +465,7 @@ async def test_zero_call_covered_snapshot_is_persistable_without_model_calls(tmp
         evaluation_enabled=True,
         allow_paid_execution=True,
         publish_output=False,
+        cost_authorities=_cost_authorities(manifest, request, {"case-one": snapshot_path}),
     )
 
     result = await runner.run()
@@ -588,6 +591,11 @@ async def test_runner_executes_parent_first_and_derives_withdrawal_only_for_comp
         evaluation_enabled=True,
         allow_paid_execution=True,
         publish_output=False,
+        cost_authorities=_cost_authorities(
+            manifest,
+            request,
+            {"z-parent": parent_path, "a-child": child_path},
+        ),
     )
 
     result = await runner.run()
@@ -694,6 +702,11 @@ async def test_runner_does_not_reserve_or_execute_child_when_parent_failed(tmp_p
         evaluation_enabled=True,
         allow_paid_execution=True,
         publish_output=False,
+        cost_authorities=_cost_authorities(
+            manifest,
+            request,
+            {"parent": parent_path, "child": child_path},
+        ),
     )
 
     result = await runner.run()
@@ -751,6 +764,7 @@ async def test_runner_records_empty_snapshot_without_model_or_stage_calls(tmp_pa
         evaluation_enabled=True,
         allow_paid_execution=True,
         publish_output=False,
+        cost_authorities=_cost_authorities(manifest, request, {"case-one": path}),
     )
 
     result = await runner.run()
@@ -788,6 +802,68 @@ def _paid_authorization(manifest: EvaluationManifest):
     )
     decision.require_authorized()
     return request, decision
+
+
+def _cost_authorities(manifest, request, snapshot_paths):
+    review_configuration_hashes = {
+        case_id: json.loads(path.read_text(encoding="utf-8"))["review_configuration_hash"]
+        for case_id, path in snapshot_paths.items()
+    }
+    budgets = {(budget.case_id, budget.arm_id): budget for budget in request.plan_item_budgets}
+    authorities = []
+    for case in manifest.cases:
+        for arm in manifest.arms:
+            if not arm.enabled or arm.model_id is None:
+                continue
+            routes = {
+                ("general_review", model_id, provider_id, model_revision, None)
+                for model_id, provider_id, model_revision in arm.aggregate_model_identities()
+                if model_id is not None and provider_id is not None and model_revision is not None
+            }
+            routes.update(
+                (
+                    stage.stage,
+                    identity.model_id,
+                    identity.provider_id,
+                    identity.model_revision,
+                    identity.deployment_id_hash,
+                )
+                for stage in arm.stage_plan
+                for identity in stage.model_route
+            )
+            budget = budgets[(case.case_id, arm.arm_id)]
+            authorities.append(
+                FrozenCostAuthority(
+                    manifest_id=manifest.manifest_id,
+                    paid_request_id=request.request_id,
+                    case_id=case.case_id,
+                    arm_id=arm.arm_id,
+                    snapshot_id=case.snapshot_id,
+                    arm_configuration_hash=arm.configuration_hash,
+                    review_configuration_hash=review_configuration_hashes[case.case_id],
+                    hard_cost_cap_usd=Decimal(str(budget.hard_cost_cap_per_attempt_usd)),
+                    authority_name="test-gateway-budget-service",
+                    authority_revision="test-rate-card-2026-09-04",
+                    authority_reference_hash=_hash("test-signed-gateway-contract"),
+                    expires_at="2099-01-01T00:00:00Z",
+                    quotes=tuple(
+                        ProviderMaximumCharge(
+                            stage=stage,
+                            model_id=model_id,
+                            provider_id=provider_id,
+                            model_revision=model_revision,
+                            deployment_id_hash=deployment_id_hash,
+                            max_output_tokens=4096,
+                            maximum_charge_usd=Decimal("0.001"),
+                        )
+                        for stage, model_id, provider_id, model_revision, deployment_id_hash in sorted(
+                            routes,
+                            key=repr,
+                        )
+                    ),
+                )
+            )
+    return tuple(authorities)
 
 
 def _success(arm: EvaluationArm, snapshot: ReviewSnapshot, *, details=True) -> ProductionArmResult:
@@ -941,10 +1017,12 @@ def _runner(
     decision,
     *,
     review_configuration_artifact_hashes=None,
+    cost_authorities=None,
 ):
+    snapshot_paths = {"case-one": snapshot_path}
     return ProductionEvaluationRunner(
         manifest,
-        snapshot_paths={"case-one": snapshot_path},
+        snapshot_paths=snapshot_paths,
         review_configuration_artifact_hashes=(
             {"case-one": _configuration_artifact_hash(snapshot_path)}
             if review_configuration_artifact_hashes is None
@@ -957,6 +1035,11 @@ def _runner(
         evaluation_enabled=True,
         allow_paid_execution=True,
         publish_output=False,
+        cost_authorities=(
+            _cost_authorities(manifest, request, snapshot_paths)
+            if cost_authorities is None
+            else cost_authorities
+        ),
     )
 
 
@@ -975,6 +1058,35 @@ class _NoCallStore:
     def append_record(self, _manifest, _record):
         self.calls.append("append_record")
         raise AssertionError("artifact store must not be touched")
+
+
+def test_missing_cost_authorities_stop_before_store_or_adapter_calls(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+    store = _NoCallStore()
+    adapter_calls = []
+
+    def factory(arm):
+        async def adapter(_snapshot, _context):
+            adapter_calls.append(arm.kind)
+            raise AssertionError("adapter must not be called")
+
+        return adapter
+
+    with pytest.raises(EvaluationValidationError, match="cover every model-backed pair"):
+        _runner(
+            manifest,
+            path,
+            _bindings(manifest, factory),
+            store,
+            request,
+            decision,
+            cost_authorities=(),
+        ).preflight()
+
+    assert store.calls == []
+    assert adapter_calls == []
 
 
 def test_stage_plan_without_private_sources_stops_before_store_calls(tmp_path):
@@ -1083,6 +1195,11 @@ def test_arm_stage_plan_accepts_snapshot_specific_verifier_evidence(tmp_path):
         evaluation_enabled=True,
         allow_paid_execution=True,
         publish_output=False,
+        cost_authorities=_cost_authorities(
+            manifest,
+            request,
+            {"case-one": first_path, "case-two": second_path},
+        ),
     )
 
     preflight = runner.preflight()

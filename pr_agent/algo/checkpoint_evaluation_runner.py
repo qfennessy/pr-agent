@@ -404,10 +404,10 @@ class ProductionEvaluationRunner:
             self.review_configuration_artifact_hashes,
         )
         _validate_loaded_stage_sources(arms_by_kind, loaded_pairs)
-        cost_authorities_by_pair = (
-            validate_cost_authorities(self.manifest, self.paid_request, self.cost_authorities)
-            if self.cost_authorities
-            else MappingProxyType({})
+        cost_authorities_by_pair = validate_cost_authorities(
+            self.manifest,
+            self.paid_request,
+            self.cost_authorities,
         )
         cases_by_id = {case.case_id: case for case in self.manifest.cases}
         arms_by_id = {arm.arm_id: arm for arm in self.manifest.arms if arm.enabled}
