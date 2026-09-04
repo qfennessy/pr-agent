@@ -6870,6 +6870,35 @@ async def test_structured_no_publish_run_returns_clean_result_for_authoritative_
 
 
 @pytest.mark.asyncio
+async def test_structured_no_publish_run_retains_coverage_when_processed_diff_is_empty(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["omitted.py", "deleted.py"]
+    git_provider.is_supported.return_value = True
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._prepare_review_route = MagicMock()
+
+    async def fake_retry(prepare_fn, model_type=None, model_route=None):
+        reviewer.prediction = None
+        reviewer.remaining_files_list = ["omitted.py"]
+        reviewer.deleted_files_list = ["deleted.py"]
+
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", AsyncMock())
+
+    with isolate_review_execution():
+        result = await reviewer._run_structured_no_publish_once()
+
+    assert result.review["review"]["key_issues_to_review"] == []
+    assert result.review["metadata"]["omitted_files"] == ["omitted.py"]
+    assert result.review["metadata"]["deleted_files"] == ["deleted.py"]
+    assert result.run_details.num_ai_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_structured_no_publish_run_requires_outer_isolation():
     reviewer = _make_prediction_reviewer()
     reviewer.vars = {}

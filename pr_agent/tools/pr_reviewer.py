@@ -460,6 +460,10 @@ class PRReviewer:
                     model_route=model_route,
                 )
             if not self.prediction:
+                if getattr(self, "_force_no_publish", False):
+                    self._publish_structured_review_data({
+                        "review": {"key_issues_to_review": []},
+                    })
                 return None
             candidate_verification_enabled = self._candidate_verification_enabled()
             if candidate_verification_enabled:

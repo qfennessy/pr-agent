@@ -401,18 +401,21 @@ def test_zero_call_empty_snapshot_has_complete_lifecycle_coverage():
 
 
 @pytest.mark.asyncio
-async def test_zero_call_empty_snapshot_with_coverage_is_persistable_without_model_calls(tmp_path):
+@pytest.mark.parametrize("pruned_diff", (False, True))
+async def test_zero_call_covered_snapshot_is_persistable_without_model_calls(tmp_path, pruned_diff):
     configuration = _review_configuration()
     snapshot = ReviewSnapshot(
         event=ReviewEvent.PRE_COMMIT,
         repository_root=str(tmp_path / "source-repository"),
         base_revision="a" * 40,
-        changed_paths=(),
-        diff="",
+        changed_paths=("example.py",) if pruned_diff else (),
+        diff=("diff --git a/example.py b/example.py\n+changed = True\n" if pruned_diff else ""),
         policy_version="policy-v1",
         created_at="2026-09-04T12:00:00Z",
         review_configuration_hash=configuration.configuration_hash,
-        coverage_issues=(CoverageIssue(reason="no_reviewable_diff"),),
+        coverage_issues=(
+            () if pruned_diff else (CoverageIssue(reason="no_reviewable_diff"),)
+        ),
     )
     payload = (json.dumps(snapshot.to_dict(), sort_keys=True, separators=(",", ":")) + "\n").encode()
     snapshot_path = tmp_path / "empty-covered.json"
@@ -435,7 +438,12 @@ async def test_zero_call_empty_snapshot_with_coverage_is_persistable_without_mod
                 CheckpointReviewSubprocessOutcome(
                     state=CheckpointReviewSubprocessState.COMPLETED,
                     snapshot_id=loaded_snapshot.snapshot_id,
-                    review={"review": {"key_issues_to_review": []}},
+                    review={
+                        "review": {"key_issues_to_review": []},
+                        "metadata": {
+                            "omitted_files": ["example.py"] if pruned_diff else [],
+                        },
+                    },
                     latency_seconds=0.0,
                 ),
             )

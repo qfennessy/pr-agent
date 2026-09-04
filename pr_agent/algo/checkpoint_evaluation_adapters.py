@@ -20,6 +20,7 @@ from pr_agent.algo.checkpoint_evaluation_runner import (
     PRE_EXECUTION_ZERO_COST_FAILURE_CODES,
     ProductionArmContext,
     ProductionArmResult,
+    _no_model_coverage_accounts_for_snapshot,
     failed_production_arm_result,
 )
 from pr_agent.algo.checkpoint_review_subprocess import (
@@ -224,16 +225,20 @@ def adapt_checkpoint_review_outcome(
         and not details.specialist_runs
         and not details.adjudication_runs
     )
+    coverage_issues = _coverage_issues(snapshot, kind, outcome.review, details)
     if no_model_execution:
-        if raw_findings or snapshot.diff.strip():
-            raise EvaluationValidationError("only empty-diff production results may have zero model execution")
+        if raw_findings:
+            raise EvaluationValidationError("zero-model production results cannot include findings")
+        if not _no_model_coverage_accounts_for_snapshot(snapshot, coverage_issues):
+            raise EvaluationValidationError(
+                "zero-model production results must account for every changed path"
+            )
         findings = ()
     else:
         if kind is EvaluationArmKind.GENERAL_REVIEW:
             findings = normalize_general_review_findings(raw_findings)
         else:
             findings = _verified_findings(outcome.review)
-    coverage_issues = _coverage_issues(snapshot, kind, outcome.review, details)
     result_state = (
         ReviewResultState.FINDINGS
         if findings

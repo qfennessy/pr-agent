@@ -2,7 +2,12 @@ import hashlib
 
 import pytest
 
-from pr_agent.algo.checkpoint_evaluation import EvaluationArmKind, EvaluationRunState, FindingSeverity
+from pr_agent.algo.checkpoint_evaluation import (
+    EvaluationArmKind,
+    EvaluationRunState,
+    EvaluationValidationError,
+    FindingSeverity,
+)
 from pr_agent.algo.checkpoint_evaluation_adapters import (
     adapt_checkpoint_review_outcome,
     build_checkpoint_review_adapter,
@@ -123,6 +128,43 @@ def test_adapter_treats_serialized_zero_call_empty_result_as_no_model_execution(
     assert result.snapshot_result.state is ReviewResultState.NO_FINDINGS
     assert result.no_model_execution is True
     assert result.findings == ()
+
+
+def test_adapter_retains_complete_pruned_diff_coverage_without_model_execution():
+    snapshot = _snapshot()
+    outcome = CheckpointReviewSubprocessOutcome(
+        state=CheckpointReviewSubprocessState.COMPLETED,
+        snapshot_id=snapshot.snapshot_id,
+        review={
+            "review": {"key_issues_to_review": []},
+            "metadata": {"omitted_files": ["example.py"]},
+        },
+        run_details=serialize_run_details_for_evaluation(RunDetails(start_time=0.0, finish_time=0.0)),
+        latency_seconds=0.0,
+    )
+
+    result = adapt_checkpoint_review_outcome(snapshot, EvaluationArmKind.GENERAL_REVIEW, outcome)
+
+    assert result.snapshot_result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert [(issue.reason, issue.path) for issue in result.snapshot_result.coverage_issues] == [
+        ("token_budget_omitted", "example.py"),
+    ]
+    assert result.no_model_execution is True
+    assert result.terminal is False
+
+
+def test_adapter_rejects_zero_model_execution_with_incomplete_pruned_diff_coverage():
+    snapshot = _snapshot()
+    outcome = CheckpointReviewSubprocessOutcome(
+        state=CheckpointReviewSubprocessState.COMPLETED,
+        snapshot_id=snapshot.snapshot_id,
+        review={"review": {"key_issues_to_review": []}},
+        run_details=serialize_run_details_for_evaluation(RunDetails(start_time=0.0, finish_time=0.0)),
+        latency_seconds=0.0,
+    )
+
+    with pytest.raises(EvaluationValidationError, match="account for every changed path"):
+        adapt_checkpoint_review_outcome(snapshot, EvaluationArmKind.GENERAL_REVIEW, outcome)
 
 
 def test_adapter_retains_omitted_file_as_unavailable_coverage():

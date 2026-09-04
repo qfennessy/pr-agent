@@ -68,6 +68,18 @@ PRE_EXECUTION_ZERO_COST_FAILURE_CODES = frozenset({
 })
 
 
+def _no_model_coverage_accounts_for_snapshot(
+    snapshot: ReviewSnapshot,
+    coverage_issues: Sequence[CoverageIssue],
+) -> bool:
+    """Require every changed path when a non-empty snapshot skipped model execution."""
+
+    if not snapshot.diff.strip():
+        return True
+    covered_paths = {issue.path for issue in coverage_issues if issue.path}
+    return bool(snapshot.changed_paths) and set(snapshot.changed_paths) <= covered_paths
+
+
 class ProductionDependencyUnavailable(EvaluationValidationError):
     """Raised before any production or artifact-store call when an arm is unavailable."""
 
@@ -811,8 +823,14 @@ def _record_from_production_result(
         no_model_execution=outcome.no_model_execution,
     )
     no_model_execution = outcome.no_model_execution
-    if no_model_execution and snapshot.diff.strip() and outcome.failure_state is None:
-        raise EvaluationValidationError("only empty successful snapshots may claim no model execution")
+    if (
+        no_model_execution
+        and outcome.failure_state is None
+        and not _no_model_coverage_accounts_for_snapshot(snapshot, result.coverage_issues)
+    ):
+        raise EvaluationValidationError(
+            "zero-model production results must account for every changed path"
+        )
     has_stage_runs = bool(record.stage_runs)
     if telemetry_shape is ModelTelemetryShape.NONE and has_stage_runs:
         raise EvaluationValidationError("deterministic production bindings cannot emit model stage telemetry")
