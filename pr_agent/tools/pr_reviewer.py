@@ -1473,10 +1473,16 @@ class PRReviewer:
             # Shadow infrastructure is observational. Configuration/provider failures
             # remain telemetry and can never block or alter the ordinary review.
             if pipeline is not None:
-                self.specialist_shadow_result = unavailable_specialist_batch(
-                    pipeline,
-                    failure_reason="specialist_batch_failed",
-                )
+                try:
+                    self.specialist_shadow_result = unavailable_specialist_batch(
+                        pipeline,
+                        failure_reason="specialist_batch_failed",
+                    )
+                except Exception as telemetry_exc:
+                    get_logger().debug(
+                        "Could not materialize failed specialist telemetry",
+                        artifact={"error_class": type(telemetry_exc).__name__},
+                    )
             get_logger().warning(
                 "Specialist shadow batch failed; continuing the ordinary review",
                 artifact={"error_class": type(exc).__name__},
