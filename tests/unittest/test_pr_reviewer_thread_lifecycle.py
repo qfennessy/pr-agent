@@ -694,11 +694,15 @@ def test_prepare_review_uses_lifecycle_instead_of_legacy_inline_publication():
         {"review": {"key_issues_to_review": [_finding()]}},
         "review",
     )
+    assert reviewer._prepared_push_output_payload == {
+        "key_issues_to_review": [_finding()],
+    }
 
 
-def test_threaded_bugs_only_finding_does_not_clear_the_persistent_review():
+def test_threaded_bugs_only_finding_clears_stale_comment_without_rewriting_the_check():
     provider = _Provider()
     provider.clear_persistent_review = MagicMock()
+    provider.clear_persistent_review_comment = MagicMock()
     reviewer = _reviewer(provider)
     reviewer.review_profile = "bugs_only"
     reviewer.verified_review_data = {"review": {"key_issues_to_review": [_finding()]}}
@@ -717,6 +721,10 @@ def test_threaded_bugs_only_finding_does_not_clear_the_persistent_review():
     assert rendered == ""
     assert reviewer._review_thread_lifecycle_threaded_findings is True
     provider.clear_persistent_review.assert_not_called()
+    provider.clear_persistent_review_comment.assert_called_once_with(
+        identity_marker="<!-- pr-agent:review:bugs-only -->",
+        name="bugs-only review",
+    )
 
 
 def test_disabled_setting_preserves_legacy_inline_path():

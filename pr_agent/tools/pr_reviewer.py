@@ -1388,13 +1388,17 @@ class PRReviewer:
         """Remove a prior persistent defect summary after a clean bugs-only rerun."""
         if (not self._provider_mutations_allowed() or
                 getattr(self, "_review_thread_lifecycle_blocks_summary", False) or
-                getattr(self, "_review_thread_lifecycle_threaded_findings", False) or
                 self._candidate_verification_blocks_publication() or
                 self._review_profile() != "bugs_only" or
                 not get_settings().config.publish_output or
                 not get_settings().pr_reviewer.persistent_comment or self.incremental.is_incremental):
             return
-        self.git_provider.clear_persistent_review(
+        clear_review = (
+            self.git_provider.clear_persistent_review_comment
+            if getattr(self, "_review_thread_lifecycle_threaded_findings", False)
+            else self.git_provider.clear_persistent_review
+        )
+        clear_review(
             identity_marker=PRReviewIdentity.BUGS_ONLY.value,
             name="bugs-only review",
         )
@@ -2940,6 +2944,7 @@ class PRReviewer:
                         issue.pop("normalized_severity", None)
         data = self._apply_finding_budget(data)
         data = self._apply_publication_budget(data)
+        output_data = data
         candidate_verification_blocked = self._candidate_verification_blocks_publication(
             data
         )
@@ -2949,22 +2954,22 @@ class PRReviewer:
             lifecycle_enabled
             and self._review_thread_lifecycle_provider_supported()
         )
-        lifecycle_data = data
+        lifecycle_data = output_data
         if (
             lifecycle_owns_inline_publication
             and not candidate_verification_blocked
             and self._provider_mutations_allowed()
             and get_settings().config.publish_output
         ):
-            lifecycle_data = self._apply_review_thread_lifecycle(data)
+            lifecycle_data = self._apply_review_thread_lifecycle(output_data)
 
-        self._publish_structured_review_data(data)
+        self._publish_structured_review_data(output_data)
 
         if candidate_verification_blocked or getattr(self, "_review_thread_lifecycle_blocks_summary", False):
             return ""
 
         if self._provider_mutations_allowed():
-            github_action_output(data, 'review')
+            github_action_output(output_data, 'review')
 
         data = lifecycle_data
 
@@ -3032,7 +3037,7 @@ class PRReviewer:
         # Snapshot sink data while rendering, then let the async run path await the synchronous
         # channel implementation in a worker thread. This keeps request event loops responsive
         # without making synchronous push_outputs callers fire-and-forget.
-        self._prepared_push_output_payload = copy.deepcopy(data.get('review', {}))
+        self._prepared_push_output_payload = copy.deepcopy(output_data.get('review', {}))
 
         # Add custom labels from the review prediction (effort, security)
         if self._provider_mutations_allowed() and self._review_profile() != "bugs_only":
