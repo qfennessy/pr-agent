@@ -380,3 +380,31 @@ def derive_finding_lifecycle(
     )
     result = (*current, *withdrawn)
     return tuple(sorted(result, key=lambda item: item.fingerprint))
+
+
+def carry_forward_active_findings(
+    current_findings: Sequence[ObservedFinding],
+    parent_findings: Sequence[ObservedFinding],
+    *,
+    arm_id: str,
+    parent_arm_id: str,
+) -> tuple[ObservedFinding, ...]:
+    """Retain unresolved parent findings when current checkpoint coverage is partial."""
+
+    normalized_arm_id = _validate_arm_id(arm_id, "arm_id")
+    if normalized_arm_id != _validate_arm_id(parent_arm_id, "parent_arm_id"):
+        raise EvaluationValidationError("finding lifecycle requires the same evaluation arm")
+    current = tuple(_validate_sequence(current_findings, "current findings"))
+    parent = tuple(_validate_sequence(parent_findings, "parent findings"))
+    if any(not isinstance(finding, ObservedFinding) for finding in (*current, *parent)):
+        raise EvaluationValidationError("finding lifecycle inputs must use ObservedFinding")
+    if any(finding.lifecycle_state is not FindingLifecycleState.ACTIVE for finding in current):
+        raise EvaluationValidationError("current normalized findings must be active")
+    current_fingerprints = {finding.fingerprint for finding in current}
+    unresolved = tuple(
+        finding
+        for finding in parent
+        if finding.lifecycle_state is FindingLifecycleState.ACTIVE
+        and finding.fingerprint not in current_fingerprints
+    )
+    return tuple(sorted((*current, *unresolved), key=lambda item: item.fingerprint))

@@ -43,6 +43,7 @@ from pr_agent.algo.checkpoint_evaluation_runner import (
     ProductionArmResult,
     ProductionDependencyUnavailable,
     ProductionEvaluationRunner,
+    _has_complete_lifecycle_coverage,
     failed_production_arm_result,
 )
 from pr_agent.algo.checkpoint_review_subprocess import (
@@ -365,6 +366,34 @@ def _manifest(snapshot: ReviewSnapshot, artifact_hash: str, *, arms=None) -> Eva
     )
 
 
+def test_zero_call_empty_snapshot_has_complete_lifecycle_coverage():
+    arm = _arm(EvaluationArmKind.VERIFIED_SPECIALISTS)
+    configuration = materialize_review_configuration(repo_context_files={})
+    snapshot = ReviewSnapshot(
+        event=ReviewEvent.PRE_COMMIT,
+        repository_root="/private/checkpoint/repository",
+        base_revision="a" * 40,
+        changed_paths=(),
+        diff="",
+        policy_version="policy-v1",
+        created_at="2026-09-04T12:00:00Z",
+        review_configuration_hash=configuration.configuration_hash,
+    )
+    outcome = adapt_checkpoint_review_outcome(
+        snapshot,
+        arm.kind,
+        CheckpointReviewSubprocessOutcome(
+            state=CheckpointReviewSubprocessState.COMPLETED,
+            snapshot_id=snapshot.snapshot_id,
+            review={"review": {"key_issues_to_review": []}},
+            latency_seconds=0.0,
+        ),
+    )
+
+    assert outcome.no_model_execution is True
+    assert _has_complete_lifecycle_coverage(arm, outcome) is True
+
+
 @pytest.mark.asyncio
 async def test_runner_executes_parent_first_and_derives_withdrawal_only_for_complete_coverage(tmp_path):
     parent_snapshot, parent_path, parent_hash = _write_snapshot(tmp_path, "parent")
@@ -496,7 +525,7 @@ async def test_runner_executes_parent_first_and_derives_withdrawal_only_for_comp
         for record in result.records
         if record.case_id == "a-child" and record.arm_id == "arm-verified_specialists"
     )
-    assert partial_child.findings == (finding,)
+    assert set(partial_child.findings) == {finding, missing_finding}
     assert next(
         stage for stage in partial_child.stage_runs if stage.stage == "candidate_verification"
     ).coverage_status is MeasurementStatus.PARTIAL

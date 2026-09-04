@@ -42,7 +42,10 @@ from pr_agent.algo.checkpoint_evaluation_execution import (
     PaidExecutionRequest,
     evaluate_paid_execution,
 )
-from pr_agent.algo.checkpoint_evaluation_findings import derive_finding_lifecycle
+from pr_agent.algo.checkpoint_evaluation_findings import (
+    carry_forward_active_findings,
+    derive_finding_lifecycle,
+)
 from pr_agent.algo.checkpoint_evaluation_snapshot import (
     LoadedReviewSnapshotAndConfiguration,
     load_review_snapshot_and_configuration_artifacts,
@@ -458,14 +461,19 @@ class ProductionEvaluationRunner:
             if case.parent_case_id is not None and outcome.snapshot_result.state in {
                 ReviewResultState.FINDINGS,
                 ReviewResultState.NO_FINDINGS,
-            } and _has_complete_lifecycle_coverage(arm, outcome):
+            }:
                 if parent_record is None or parent_record.state is not EvaluationRunState.COMPLETED:
                     raise EvaluationValidationError(
                         f"pair {case.case_id}/{arm.arm_id} requires a completed terminal parent record"
                     )
+                lifecycle_deriver = (
+                    derive_finding_lifecycle
+                    if _has_complete_lifecycle_coverage(arm, outcome)
+                    else carry_forward_active_findings
+                )
                 outcome = replace(
                     outcome,
-                    findings=derive_finding_lifecycle(
+                    findings=lifecycle_deriver(
                         outcome.findings,
                         parent_record.findings,
                         arm_id=arm.arm_id,
@@ -885,6 +893,8 @@ def _has_complete_lifecycle_coverage(
 
     if outcome.snapshot_result.coverage_issues:
         return False
+    if outcome.no_model_execution:
+        return True
     if not arm.stage_plan:
         return True
     details = outcome.run_details

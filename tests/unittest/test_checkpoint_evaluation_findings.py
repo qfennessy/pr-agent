@@ -14,6 +14,7 @@ from pr_agent.algo.checkpoint_evaluation_findings import (
     FRONTIER_FINDING_STAGE,
     GENERAL_REVIEW_FINDING_STAGE,
     VERIFIED_FINDING_STAGE,
+    carry_forward_active_findings,
     derive_finding_lifecycle,
     normalize_frontier_findings,
     normalize_general_review_findings,
@@ -645,6 +646,34 @@ def test_lifecycle_marks_only_missing_parent_active_findings_withdrawn():
             lifecycle_state=FindingLifecycleState.WITHDRAWN,
         ),
         new,
+    )
+
+
+def test_partial_lifecycle_carries_unresolved_findings_until_complete_checkpoint():
+    continuing = _observation(f"sha256:{'a' * 64}")
+    unresolved = _observation(f"sha256:{'b' * 64}", severity=FindingSeverity.MEDIUM)
+
+    partial_middle = carry_forward_active_findings(
+        [continuing],
+        [continuing, unresolved],
+        arm_id="arm-general",
+        parent_arm_id="arm-general",
+    )
+    complete_child = derive_finding_lifecycle(
+        [continuing],
+        partial_middle,
+        arm_id="arm-general",
+        parent_arm_id="arm-general",
+    )
+
+    assert partial_middle == (continuing, unresolved)
+    assert complete_child == (
+        continuing,
+        _observation(
+            unresolved.fingerprint,
+            severity=FindingSeverity.MEDIUM,
+            lifecycle_state=FindingLifecycleState.WITHDRAWN,
+        ),
     )
 
 
