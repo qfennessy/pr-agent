@@ -630,14 +630,14 @@ async def test_production_adapter_retains_malformed_completed_output(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_production_adapter_retains_verifier_retries_on_malformed_output(monkeypatch):
+async def test_production_adapter_retains_trusted_retries_when_verifier_artifact_disagrees(monkeypatch):
     snapshot = _snapshot()
     outcome = _outcome(snapshot, {
         "review": {"key_issues_to_review": []},
         "candidate_verification": {
             "status": "verifier_failed",
             "publication_safe": False,
-            "verifier_attempts": 3,
+            "verifier_attempts": 4,
             "decisions": [],
         },
     }, details=RunDetails(

@@ -1395,6 +1395,35 @@ def test_missing_runs_cannot_look_like_clean_zero_cost_evidence():
     assert arm.metrics["total_retries"].status is MeasurementStatus.UNAVAILABLE
 
 
+def test_telemetry_free_model_failure_makes_retry_evidence_partial():
+    known_case = _case("known", EvaluationCohort.CLEAN_CONTROL, ReviewEvent.FILE_SAVE, 0)
+    unknown_case = _case("unknown", EvaluationCohort.CLEAN_CONTROL, ReviewEvent.FILE_SAVE, 0)
+    general = _arm("general", EvaluationArmKind.GENERAL_REVIEW)
+    manifest = _manifest((known_case, unknown_case), (general,))
+    truth = TruthArtifact(
+        manifest_id=manifest.manifest_id,
+        truths=(
+            CheckpointTruth("known", True, _hash("truth-known")),
+            CheckpointTruth("unknown", True, _hash("truth-unknown")),
+        ),
+    )
+    known = _record(manifest, known_case, general.arm_id)
+    unknown = EvaluationRunRecord(
+        manifest_id=manifest.manifest_id,
+        case_id=unknown_case.case_id,
+        arm_id=general.arm_id,
+        snapshot_id=unknown_case.snapshot_id,
+        attempt=1,
+        state=EvaluationRunState.TIMEOUT,
+        terminal=False,
+        failure_reason_code="worker_timeout",
+    )
+
+    arm = score_matched_arms(manifest, truth, (known, unknown)).arms[0]
+
+    assert arm.metrics["total_retries"] == ScoreMetric(MeasurementStatus.PARTIAL, 0.0, 1)
+
+
 def test_stale_withdrawal_uses_lineage_ancestry_when_timing_is_missing():
     root = _case("root", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, None)
     fixed = _case(

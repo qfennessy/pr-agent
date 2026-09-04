@@ -1189,11 +1189,26 @@ def score_matched_arms(
             or bool(terminals_by_case[case.case_id].coverage_issues)
             for case in manifest.cases
         )
+        retry_records = [
+            record
+            for record in arm_records
+            if not (
+                arm.kind is not EvaluationArmKind.DETERMINISTIC
+                and record.state is not EvaluationRunState.COMPLETED
+                and record.model_id is None
+                and not record.stage_runs
+                and record.tokens.status is MeasurementStatus.UNAVAILABLE
+                and record.cost_usd.status is MeasurementStatus.UNAVAILABLE
+            )
+        ]
         retry_status = (
             MeasurementStatus.UNAVAILABLE
-            if not arm_records
+            if not retry_records
             else MeasurementStatus.PARTIAL
-            if len({record.case_id for record in arm_records}) < len(manifest.cases)
+            if (
+                len(retry_records) < len(arm_records)
+                or len({record.case_id for record in arm_records}) < len(manifest.cases)
+            )
             else MeasurementStatus.COMPLETE
         )
         metrics = {
@@ -1245,8 +1260,8 @@ def score_matched_arms(
             "total_cost_usd": total_cost,
             "total_retries": ScoreMetric(
                 retry_status,
-                float(sum(record.retry_count for record in arm_records)) if arm_records else None,
-                len(arm_records),
+                float(sum(record.retry_count for record in retry_records)) if retry_records else None,
+                len(retry_records),
             ),
             "cost_per_developer_hour": cost_per_hour,
             "cost_per_verified_finding": _measurement_ratio(

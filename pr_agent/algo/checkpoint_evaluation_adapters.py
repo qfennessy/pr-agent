@@ -172,12 +172,8 @@ def _coverage_issues(
     return tuple(issues)
 
 
-def _production_retry_count(
-    kind: EvaluationArmKind,
-    review: Mapping[str, object] | None,
-    details: RunDetails,
-) -> int:
-    """Aggregate observed fallback and same-route retries across production stages."""
+def _run_details_retry_count(details: RunDetails) -> int:
+    """Aggregate trusted fallback and same-route retries from run telemetry."""
 
     retry_count = max(0, details.route_attempts - 1) + details.model_retry_attempts
     retry_count += sum(
@@ -189,6 +185,16 @@ def _production_retry_count(
         if model_retries is None:
             raise EvaluationValidationError("production output has unavailable adjudication retry telemetry")
         retry_count += max(0, run.route_attempts - 1) + model_retries
+    return retry_count
+
+
+def _validate_verifier_attempts(
+    kind: EvaluationArmKind,
+    review: Mapping[str, object] | None,
+    details: RunDetails,
+) -> None:
+    """Cross-check redundant verifier output without making it retry authority."""
+
     if kind is EvaluationArmKind.VERIFIED_SPECIALISTS and review is not None:
         artifact = review.get("candidate_verification")
         if artifact is not None:
@@ -201,6 +207,17 @@ def _production_retry_count(
                 verifier_run = details.specialist_runs.get("candidate_verification")
                 if verifier_run is None or verifier_run.route_attempts != attempts:
                     raise EvaluationValidationError("verified production output has inconsistent verifier attempts")
+
+
+def _production_retry_count(
+    kind: EvaluationArmKind,
+    review: Mapping[str, object] | None,
+    details: RunDetails,
+) -> int:
+    """Validate output retry metadata and return the trusted run-details count."""
+
+    retry_count = _run_details_retry_count(details)
+    _validate_verifier_attempts(kind, review, details)
     return retry_count
 
 
@@ -324,7 +341,7 @@ def build_checkpoint_review_adapter(kind: EvaluationArmKind):
                 raise
             details = deserialize_run_details_for_evaluation(outcome.run_details)
             try:
-                retry_count = _production_retry_count(kind, outcome.review, details)
+                retry_count = _run_details_retry_count(details)
             except EvaluationValidationError:
                 retry_count = 0
             return failed_production_arm_result(
