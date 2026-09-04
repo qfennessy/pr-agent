@@ -30,8 +30,16 @@ isolated no-publish replay seam with the exact immutable snapshot/configuration 
 source-free per-stage telemetry across the subprocess protocol, and fail closed while joining trusted
 verifier identity to normalized severity. Evaluation-only root-cause metadata never changes the ordinary
 published finding shape, but the general-review arm remains blocked until production provides an explicit
-severity contract rather than an inferred default. Both bindings also remain unavailable until the model
-boundary can enforce a genuine pre-call dollar cap. The general replay contract remains limited to the
+severity contract rather than an inferred default. Both bindings also remain unavailable until an operator
+supplies a current, immutable provider/gateway maximum-charge authority for every frozen route and the bound
+runtime controls pass preflight. The model boundary can now consume that authority immediately before every
+underlying provider request, but the repository does not ship an authority or treat a LiteLLM price estimate
+as one. A quote must include a non-secret, immutable gateway route-binding identifier for its exact provider and
+revision. The source-free review bundle freezes a validated, credential-free HTTPS gateway endpoint and the worker
+rejects it unless its identity matches every authority quote. The model boundary sends the binding identifier only
+to that endpoint; generic LiteLLM provider routes do not enforce this contract. No enforcing gateway binding is
+installed, so general-review
+and checkpoint-stage execution remain unavailable. The general replay contract remains limited to the
 standard OpenAI route; unsupported routes continue to fail configuration capture.
 Issue #27 must still complete those contracts and the source/telemetry contracts needed to integrate
 the production orchestration delivered by issues #26, #12, #11, #9, and #33. A frozen
@@ -103,11 +111,16 @@ selected for that arm; production review code falls back to ambient configuratio
 checkpoint execution context. Verifier stage-plan hashes cover controls shared across the arm, while
 each review-configuration bundle separately content-addresses checkpoint-specific static-analysis
 evidence so evolving evidence does not invalidate later cases in the same paired run.
-Credentials, callback configuration, telemetry headers, and output sinks have no bundle fields.
+Credentials, callback configuration, telemetry headers, and output sinks have no bundle fields. A checkpoint
+bundle may carry one credential-free HTTPS gateway base URL: it is part of the content-derived configuration
+identity, never read from the worker environment, and must not contain a token or other secret.
 The isolated worker disables publication, callback and OpenTelemetry delivery, push outputs, and
 run-detail printing before importing the reviewer. It also passes only the standard OpenAI runtime
-credential and a minimal process environment; proxy, endpoint, Dynaconf, and other provider
-controls are not inherited. Checkpoint materialization writes the canonical bundle beside its
+credential and a minimal process environment; proxy, ambient endpoint, Dynaconf, and other provider
+controls are not inherited. If the bundle supplies the checkpoint gateway endpoint, the worker hash-matches it
+to every authority quote before reviewer construction and then replays that exact endpoint. A non-empty snapshot
+without this frozen endpoint fails preflight before reviewer construction. Checkpoint
+materialization writes the canonical bundle beside its
 source-bearing snapshot in the same atomic, owner-only local directory. Shared bundles are stored
 once, while the private snapshot index records each pair's deterministic relative paths, bundle
 identity, and exact artifact-byte hash. Loading rejects non-canonical bytes, unsafe links or
@@ -197,6 +210,55 @@ orchestration; planning alone is not authorization.
 Before a paid adapter starts, the artifact store exclusively persists its attempt number
 and hard-cap reservation. A crash, raised adapter exception, or rejected result leaves an
 unreconciled reservation that blocks resume instead of repeating a possibly charged call.
+
+### Provider/gateway maximum-charge authority
+
+`checkpoint-cost-authority-v1` is a separate source-free contract for one manifest, paid request,
+case, arm, snapshot, review configuration, and per-attempt cap. It names an immutable authority
+revision and hashes the external provider or enforcing-gateway guarantee. Each quote pins one exact
+stage, model, provider, revision, deployment identity, hashed HTTPS gateway endpoint, non-secret immutable
+gateway route-binding identifier, maximum output-token cap, and worst-case charge. The binding identifier is
+safe to persist and contains no credential, source, prompt, or endpoint URL. It also expires. Unknown fields,
+mutable revision aliases, ambiguous routes, incomplete route coverage,
+and any quote larger than the attempt cap fail validation locally.
+
+Every authority amount is bounded before it is used: at most 32 significant digits, a magnitude below
+10^16 USD, and no more than 18 fractional digits. Values outside that range are rejected when the
+authority is loaded, so a compact but enormous exponent cannot force an unbounded fixed-point rendering
+while an identity is derived. Cumulative reservation arithmetic then runs in a local decimal context wide
+enough to hold any sum of accepted values exactly, with inexact results trapped, so a rounded total can
+never compare below the hard cap.
+
+The raw gateway base URL is stored only in the private review-configuration bundle, where it is validated as
+bounded, HTTPS, and free of URL credentials, query parameters, and fragments. It is not stored in the authority,
+manifest, journal, report, or environment. Operators must treat the endpoint as non-secret configuration and
+must never embed credentials in its path.
+
+The isolated single-review worker installs one consume-only ledger process-wide and in its coroutine
+context, so both worker threads and concurrent specialist, verifier, and frontier tasks share it.
+Immediately before every LiteLLM `acompletion` call, including same-model
+retries, fallback routes, streaming calls, and the Bedrock credential fallback, the ledger atomically
+reserves the quote's full worst-case charge. It does not refund reservations based on estimated actual
+usage. A request is denied before the provider client when its route is unquoted, the output cap is
+missing or larger than quoted, provider SDK retries are not exactly zero, the authority is expired or
+mismatched, the explicit gateway endpoint does not match the quote, the route binding conflicts with an existing
+header, or the next reservation would exceed the cap. After reservation, the handler attaches the exact binding as
+`X-PR-Agent-Checkpoint-Route` on the actual `acompletion` request. The external gateway contract must guarantee
+that it rejects an unknown or mismatched identifier and routes a recognized identifier only to the quoted provider
+and immutable revision. This header is not a credential and must never be replaced with a secret token. Dynamic
+per-finding frontier telemetry attribution is normalized to
+the fixed `frontier_adjudication` stage only for quote lookup; full attribution remains in telemetry.
+Post-response cost and identity telemetry
+still must be complete and agree with the frozen arm; the authority does not turn missing telemetry into
+zero.
+
+This boundary depends on an external provider/gateway guarantee that the quoted maximum is actually
+enforced for the bound request regardless of its eventual input or output usage. Operator guesses and
+the ordinary LiteLLM pricing table are observational estimates, not
+spending authority. Consequently the default production binding inventory keeps
+`hard_cost_cap_enforcement_unavailable` until a real authority is supplied and its frozen route controls
+are proven. A direct or generic LiteLLM provider endpoint that ignores the route header does not qualify. This
+repository change alone does not authorize or execute a paid request.
 
 ## Resumable raw attempt artifacts
 
@@ -460,7 +522,8 @@ rendered artifacts off. It requires an outer isolation boundary and a fresh revi
 
 `checkpoint_review_subprocess` wraps construction and execution in a dedicated child process.
 Its versioned pipe protocol is disabled unless model execution is explicitly allowed, validates
-the complete request before importing model handlers, disables working-tree enrichment and every
+the complete request and source-free cost authority before importing model handlers, disables
+working-tree enrichment and every
 output sink, and returns only structured review data plus bounded run telemetry. Process-wide
 settings, callbacks, credentials, and environment mutations die with the child process.
 
@@ -475,6 +538,8 @@ aggregate, specialist, verifier, and frontier telemetry. Parent checkpoints exec
 and the runner derives withdrawals only from completed terminal parent records; children with unavailable
 parents are not reserved or executed. Clean empty-diff outcomes persist an unambiguous zero-call record
 with observed zero tokens and cost; missing telemetry after a model call remains unavailable. Paid
-calls still lack an enforceable pre-call dollar cap. General-review severity,
+calls remain unavailable because no authoritative provider/gateway maximum-charge contract is supplied
+by the repository, although the worker now enforces such a contract at every underlying call.
+An enforcing gateway route binding, general-review severity,
 deterministic/specialist finding contracts, and full-cascade frontier decision and aggregate-stage semantics
 also remain fail-closed.

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from pr_agent.algo.ai_request_context import AIModelRoute
+from pr_agent.algo.checkpoint_cost_authority import CheckpointCostAuthorityError
 from pr_agent.algo.frontier_adjudication import (
     FRONTIER_INPUT_SCHEMA_VERSION,
     FRONTIER_OUTPUT_SCHEMA_VERSION,
@@ -933,6 +934,25 @@ async def test_provider_failure_fails_unavailable():
     )
     assert result.state is FrontierState.PROVIDER_FAILURE
     assert result.failure_reason == "provider_failure"
+
+
+@pytest.mark.asyncio
+async def test_cost_authority_denial_escapes_frontier_failure_handling():
+    init_run_details()
+    stage_config = config()
+    denial = CheckpointCostAuthorityError("gateway route is not authorized")
+    handler = FakeHandler([denial])
+
+    with pytest.raises(CheckpointCostAuthorityError) as exc_info:
+        await run_frontier_adjudication(
+            request(stage_config),
+            stage_config,
+            handler,
+            current_identity=lambda: "head-1",
+        )
+
+    assert exc_info.value is denial
+    assert handler.calls == [stage_config.route.models[0]]
 
 
 @pytest.mark.asyncio

@@ -314,6 +314,28 @@ def _validate_endpoint(value: str, label: str) -> None:
         raise ValueError(f"{label} must be a credential-free HTTP endpoint")
 
 
+def _validate_checkpoint_gateway_api_base(value: object) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 2048:
+        raise ValueError("checkpoint gateway api_base must be a bounded non-empty string")
+    normalized = value.strip()
+    parsed = urlsplit(normalized)
+    try:
+        gateway_port = parsed.port
+    except ValueError as exc:
+        raise ValueError("checkpoint gateway api_base is malformed") from exc
+    del gateway_port
+    if (
+        parsed.scheme.casefold() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("checkpoint gateway api_base must be a credential-free HTTPS endpoint")
+    return normalized
+
+
 def _validate_setting(path: str, value: Any) -> Any:
     if path in _BOOLEAN_SETTINGS and isinstance(value, str):
         normalized = value.strip().casefold()
@@ -480,6 +502,7 @@ class ReviewConfigurationBundle:
     repo_context_max_lines: int
     prompt_date: str = ""
     stage_sources: Optional[CheckpointStageSources] = field(default=None, repr=False)
+    checkpoint_gateway_api_base: Optional[str] = field(default=None, repr=False)
     schema_version: str = REVIEW_CONFIGURATION_SCHEMA_VERSION
     configuration_hash: str = field(init=False)
 
@@ -501,6 +524,11 @@ class ReviewConfigurationBundle:
 
             if not isinstance(self.stage_sources, CheckpointStageSources):
                 raise TypeError("review configuration stage_sources must use CheckpointStageSources")
+        checkpoint_gateway_api_base = (
+            None
+            if self.checkpoint_gateway_api_base is None
+            else _validate_checkpoint_gateway_api_base(self.checkpoint_gateway_api_base)
+        )
 
         raw_settings = dict(self.settings)
         if set(raw_settings) - _ALLOWED_SETTING_PATHS:
@@ -546,6 +574,7 @@ class ReviewConfigurationBundle:
         object.__setattr__(self, "settings", _freeze_json(validated_settings))
         object.__setattr__(self, "missing_settings", missing)
         object.__setattr__(self, "repo_context_files", _freeze_json(repo_context))
+        object.__setattr__(self, "checkpoint_gateway_api_base", checkpoint_gateway_api_base)
         configuration_hash = _HASH_PATTERN_PREFIX + hashlib.sha256(
             _canonical_json_bytes(self._identity_payload())
         ).hexdigest()
@@ -567,6 +596,8 @@ class ReviewConfigurationBundle:
         }
         if self.stage_sources is not None:
             payload["stage_sources"] = self.stage_sources.to_dict()
+        if self.checkpoint_gateway_api_base is not None:
+            payload["checkpoint_gateway_api_base"] = self.checkpoint_gateway_api_base
         return payload
 
     def to_dict(self) -> dict[str, Any]:
@@ -586,9 +617,11 @@ class ReviewConfigurationBundle:
             "prompt_date",
             "configuration_hash",
         }
-        extended_fields = legacy_fields | {"stage_sources"}
-        if not isinstance(value, Mapping) or (
-            set(value) != legacy_fields and set(value) != extended_fields
+        optional_fields = {"stage_sources", "checkpoint_gateway_api_base"}
+        if (
+            not isinstance(value, Mapping)
+            or not legacy_fields <= set(value)
+            or set(value) - legacy_fields - optional_fields
         ):
             raise ValueError("invalid review configuration fields")
         if not isinstance(value.get("settings"), Mapping):
@@ -596,7 +629,7 @@ class ReviewConfigurationBundle:
         if not isinstance(value.get("missing_settings"), list):
             raise ValueError("invalid review configuration missing_settings")
         repo_context_files = _repo_context_from_payload(value.get("repo_context_files"))
-        has_stage_sources = set(value) == extended_fields
+        has_stage_sources = "stage_sources" in value
         raw_stage_sources = value.get("stage_sources")
         if has_stage_sources and not isinstance(raw_stage_sources, Mapping):
             raise ValueError("invalid review configuration stage_sources")
@@ -610,6 +643,7 @@ class ReviewConfigurationBundle:
             repo_context_max_lines=value.get("repo_context_max_lines"),
             prompt_date=value.get("prompt_date"),
             stage_sources=_load_checkpoint_stage_sources(raw_stage_sources) if has_stage_sources else None,
+            checkpoint_gateway_api_base=value.get("checkpoint_gateway_api_base"),
             schema_version=value.get("schema_version"),
         )
         if value.get("configuration_hash") != bundle.configuration_hash:
@@ -628,6 +662,7 @@ def materialize_review_configuration(
     repo_context_max_lines: Optional[int] = None,
     prompt_date: str = "",
     stage_sources: Optional[CheckpointStageSources] = None,
+    checkpoint_gateway_api_base: Optional[str] = None,
 ) -> ReviewConfigurationBundle:
     """Capture the allowlisted review inputs once without reading credential fields."""
 
@@ -660,6 +695,7 @@ def materialize_review_configuration(
         repo_context_max_lines=repo_context_max_lines,
         prompt_date=prompt_date,
         stage_sources=stage_sources,
+        checkpoint_gateway_api_base=checkpoint_gateway_api_base,
     )
 
 

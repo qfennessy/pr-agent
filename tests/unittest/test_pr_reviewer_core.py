@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pr_agent.algo.ai_request_context import AIModelRoute, get_ai_request_options
+from pr_agent.algo.checkpoint_cost_authority import CheckpointCostAuthorityError
 from pr_agent.algo.frontier_adjudication import (
     FRONTIER_OUTPUT_SCHEMA_VERSION,
     FrontierAdjudicationConfig,
@@ -5844,6 +5845,36 @@ async def test_specialist_wrapper_failure_materializes_every_planned_role():
     assert risk_stage.deployment_id == "deployment-risk_recommendation"
     assert risk_stage.fallback_used is False
     assert all(stage.state == SpecialistState.UNAVAILABLE.value for stage in stage_runs.values())
+
+
+@pytest.mark.asyncio
+async def test_specialist_wrapper_preserves_cost_authority_denial():
+    git_provider = MagicMock()
+    git_provider.get_pr_head_sha.return_value = "head"
+    git_provider.get_diff_files.return_value = []
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer._specialists_started = False
+    reviewer.vars = {"title": "Change behavior"}
+    reviewer.pr_description = "Description"
+    reviewer.ai_handler = MagicMock()
+    pipeline = SimpleNamespace(allowed_change_labels=())
+    denial = CheckpointCostAuthorityError("checkpoint cost authority rejected specialist call")
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.load_specialist_pipeline_config", return_value=pipeline),
+        patch("pr_agent.tools.pr_reviewer.get_specialist_snapshot_context", return_value=None),
+        patch("pr_agent.tools.pr_reviewer.build_specialist_input", return_value=MagicMock()),
+        patch(
+            "pr_agent.tools.pr_reviewer.run_shadow_specialists",
+            new_callable=AsyncMock,
+            side_effect=denial,
+        ) as run_shadow,
+    ):
+        with pytest.raises(CheckpointCostAuthorityError) as exc_info:
+            await reviewer._run_shadow_specialists_once()
+
+    assert exc_info.value is denial
+    run_shadow.assert_awaited_once()
 
 
 @pytest.mark.asyncio

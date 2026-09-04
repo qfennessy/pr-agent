@@ -551,6 +551,12 @@ async def retry_with_fallback_models(
                 finally:
                     get_settings().set("openai.deployment_id", original_deployment_id)
         except Exception as e:
+            from pr_agent.algo.checkpoint_cost_authority import CheckpointCostAuthorityError
+
+            if isinstance(e, CheckpointCostAuthorityError):
+                # A deterministic local spending denial must retain its type so
+                # the checkpoint worker can classify it without trying fallback routes.
+                raise
             elapsed = round(time.monotonic() - started_at, 1)
             attempt = {
                 "attempt": f"{i + 1}/{len(all_models)}",

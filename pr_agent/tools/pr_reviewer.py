@@ -1544,6 +1544,10 @@ class PRReviewer:
                 artifact=self.specialist_shadow_result.to_dict(),
             )
         except Exception as exc:
+            from pr_agent.algo.checkpoint_cost_authority import CheckpointCostAuthorityError
+
+            if isinstance(exc, CheckpointCostAuthorityError):
+                raise
             # Shadow infrastructure is observational. Configuration/provider failures
             # remain telemetry and can never block or alter the ordinary review.
             if pipeline is not None:
@@ -2803,6 +2807,10 @@ class PRReviewer:
                 "rejected_count": len(candidates) - len(published_findings),
             })
         except Exception as exc:
+            from pr_agent.algo.checkpoint_cost_authority import CheckpointCostAuthorityError
+
+            if isinstance(exc, CheckpointCostAuthorityError):
+                raise
             failure = exc.__cause__ if exc.__cause__ is not None else exc
             artifact.update({
                 "status": "verifier_failed",

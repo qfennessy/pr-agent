@@ -1392,6 +1392,10 @@ async def _execute_role(
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        from pr_agent.algo.checkpoint_cost_authority import CheckpointCostAuthorityError
+
+        if isinstance(exc, CheckpointCostAuthorityError):
+            raise
         state, failure_reason = _failure_state(exc)
         cause = exc.__cause__ or exc
         rejected_output = cause.output if isinstance(cause, SpecialistLowConfidenceError) else None

@@ -1,5 +1,6 @@
 import asyncio
 import builtins
+import hashlib
 import json
 import os
 import subprocess
@@ -12,6 +13,14 @@ from unittest.mock import AsyncMock
 import pytest
 
 from pr_agent.algo import checkpoint_review_subprocess as review_subprocess
+from pr_agent.algo.ai_request_context import AIModelRoute
+from pr_agent.algo.checkpoint_cost_authority import (
+    CheckpointCostAuthorityError,
+    FrozenCostAuthority,
+    ProviderMaximumCharge,
+    gateway_api_base_identity_hash,
+)
+from pr_agent.algo.pr_processing import retry_with_fallback_models
 from pr_agent.algo.review_configuration import (
     materialize_review_configuration,
     snapshot_review_configuration_hash,
@@ -23,11 +32,18 @@ from pr_agent.algo.run_details import RunDetails
 from pr_agent.algo.skills_loader import get_skills_context
 
 
-def _configuration(*, skills_context=None, repo_context_files=None, repo_context_max_lines=None):
+def _configuration(
+    *,
+    skills_context=None,
+    repo_context_files=None,
+    repo_context_max_lines=None,
+    checkpoint_gateway_api_base=None,
+):
     return materialize_review_configuration(
         skills_context,
         repo_context_files or {},
         repo_context_max_lines=repo_context_max_lines,
+        checkpoint_gateway_api_base=checkpoint_gateway_api_base,
     )
 
 
@@ -53,6 +69,43 @@ def _snapshot(*, review_configuration=None) -> ReviewSnapshot:
     )
 
 
+def _hash(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+
+def _authority(snapshot: ReviewSnapshot, configuration=None) -> FrozenCostAuthority:
+    configuration = configuration or _configuration()
+    return FrozenCostAuthority(
+        manifest_id=_hash("manifest"),
+        paid_request_id=_hash("paid-request"),
+        case_id="case-one",
+        arm_id="arm-general",
+        snapshot_id=snapshot.snapshot_id,
+        arm_configuration_hash=_hash("arm-configuration"),
+        review_configuration_hash=configuration.configuration_hash,
+        hard_cost_cap_usd=Decimal("0.02"),
+        authority_name="test-gateway",
+        authority_revision="test-rate-card-v1",
+        authority_reference_hash=_hash("test-authority"),
+        expires_at="2099-01-01T00:00:00Z",
+        quotes=(
+            ProviderMaximumCharge(
+                stage="general_review",
+                model_id="model",
+                provider_id="provider",
+                model_revision="model-revision-v1",
+                deployment_id_hash=None,
+                gateway_api_base_hash=gateway_api_base_identity_hash(
+                    "https://test-checkpoint-gateway.example/v1"
+                ),
+                gateway_route_binding_id=_hash("test-gateway-route"),
+                max_output_tokens=128,
+                maximum_charge_usd=Decimal("0.01"),
+            ),
+        ),
+    )
+
+
 def _request_bytes(
     snapshot: ReviewSnapshot,
     *,
@@ -66,6 +119,7 @@ def _request_bytes(
         "snapshot": snapshot.to_dict(),
         "review_configuration": configuration.to_dict(),
         "evaluation_stage_plan": [],
+        "cost_authority": _authority(snapshot, configuration).to_dict(),
     }).encode("utf-8")
 
 
@@ -170,6 +224,21 @@ async def test_parent_refuses_without_spawning(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_parent_refuses_paid_snapshot_without_cost_authority(monkeypatch):
+    snapshot = _snapshot()
+    spawn = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    outcome = await review_subprocess.run_checkpoint_review_subprocess(
+        snapshot,
+        allow_model_execution=True,
+    )
+
+    assert outcome.failure_reason_code == "cost_authority_unverified"
+    spawn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_parent_rejects_non_canonical_snapshot_without_spawning(monkeypatch):
     snapshot = replace(_snapshot(), changed_paths=("../example.py",))
     spawn = AsyncMock()
@@ -177,6 +246,7 @@ async def test_parent_rejects_non_canonical_snapshot_without_spawning(monkeypatc
 
     outcome = await review_subprocess.run_checkpoint_review_subprocess(
         snapshot,
+        cost_authority=_authority(snapshot),
         allow_model_execution=True,
     )
 
@@ -203,6 +273,7 @@ async def test_parent_uses_current_interpreter_without_a_shell(monkeypatch):
 
     outcome = await review_subprocess.run_checkpoint_review_subprocess(
         snapshot,
+        cost_authority=_authority(snapshot),
         allow_model_execution=True,
     )
 
@@ -248,6 +319,7 @@ async def test_parent_rejects_legacy_cli_snapshot_without_an_immutable_bundle(mo
 
     outcome = await review_subprocess.run_checkpoint_review_subprocess(
         snapshot,
+        cost_authority=_authority(snapshot),
         allow_model_execution=True,
     )
 
@@ -308,6 +380,7 @@ async def test_parent_drains_chunked_worker_output_before_waiting(monkeypatch):
 
     outcome = await review_subprocess.run_checkpoint_review_subprocess(
         snapshot,
+        cost_authority=_authority(snapshot),
         allow_model_execution=True,
     )
 
@@ -317,11 +390,13 @@ async def test_parent_drains_chunked_worker_output_before_waiting(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_parent_rejects_oversized_worker_output(monkeypatch):
+    snapshot = _snapshot()
     process = _FakeProcess(b"x" * (review_subprocess.MAX_REVIEW_SUBPROCESS_OUTPUT_BYTES + 1))
     monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
 
     outcome = await review_subprocess.run_checkpoint_review_subprocess(
-        _snapshot(),
+        snapshot,
+        cost_authority=_authority(snapshot),
         allow_model_execution=True,
     )
 
@@ -331,11 +406,13 @@ async def test_parent_rejects_oversized_worker_output(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_parent_maps_malformed_worker_output_to_bounded_failure(monkeypatch):
+    snapshot = _snapshot()
     process = _FakeProcess(b'{"secret_source":"contents"}')
     monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
 
     outcome = await review_subprocess.run_checkpoint_review_subprocess(
-        _snapshot(),
+        snapshot,
+        cost_authority=_authority(snapshot),
         allow_model_execution=True,
     )
 
@@ -345,11 +422,13 @@ async def test_parent_maps_malformed_worker_output_to_bounded_failure(monkeypatc
 
 @pytest.mark.asyncio
 async def test_parent_terminates_worker_on_timeout(monkeypatch):
+    snapshot = _snapshot()
     process = _TimeoutProcess(b"")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
 
     outcome = await review_subprocess.run_checkpoint_review_subprocess(
-        _snapshot(),
+        snapshot,
+        cost_authority=_authority(snapshot),
         allow_model_execution=True,
         timeout_seconds=0.001,
     )
@@ -371,11 +450,13 @@ async def test_stop_process_reaps_worker_that_exits_before_terminate():
 
 @pytest.mark.asyncio
 async def test_parent_maps_abnormal_worker_exit_to_bounded_failure(monkeypatch):
+    snapshot = _snapshot()
     process = _AbnormalExitProcess(b'provider exception included source text')
     monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
 
     outcome = await review_subprocess.run_checkpoint_review_subprocess(
-        _snapshot(),
+        snapshot,
+        cost_authority=_authority(snapshot),
         allow_model_execution=True,
     )
 
@@ -393,6 +474,22 @@ async def test_worker_refuses_permission_without_calling_executor():
     )
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.REFUSED
+    executor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_worker_refuses_paid_snapshot_without_cost_authority():
+    snapshot = _snapshot()
+    payload = json.loads(_request_bytes(snapshot))
+    payload["cost_authority"] = None
+    executor = AsyncMock()
+
+    outcome = await review_subprocess._handle_worker_request(
+        json.dumps(payload).encode("utf-8"),
+        executor=executor,
+    )
+
+    assert outcome.failure_reason_code == "cost_authority_unverified"
     executor.assert_not_awaited()
 
 
@@ -472,7 +569,7 @@ async def test_worker_rejects_answer_only_snapshot_data_before_execution():
 
 @pytest.mark.asyncio
 async def test_worker_does_not_leak_execution_exception_text():
-    async def fail(_snapshot, _review_configuration):
+    async def fail(_snapshot, _review_configuration, _cost_authority):
         raise RuntimeError("source line and credential")
 
     outcome = await review_subprocess._handle_worker_request(
@@ -484,6 +581,32 @@ async def test_worker_does_not_leak_execution_exception_text():
     assert outcome.failure_reason_code == "review_execution_failed"
     assert b"source line" not in encoded
     assert b"credential" not in encoded
+
+
+@pytest.mark.asyncio
+async def test_worker_preserves_cost_denial_without_trying_fallback_models():
+    attempted_models = []
+    route = AIModelRoute(
+        models=("model", "fallback-model"),
+        deployments=(None, None),
+        attribution="general_review",
+    )
+
+    async def executor(snapshot, _review_configuration, _cost_authority):
+        async def deny(model):
+            attempted_models.append(model)
+            raise CheckpointCostAuthorityError("gateway route is not authorized")
+
+        await retry_with_fallback_models(deny, model_route=route)
+        return _completed_outcome(snapshot)
+
+    outcome = await review_subprocess._handle_worker_request(
+        _request_bytes(_snapshot()),
+        executor=executor,
+    )
+
+    assert outcome.failure_reason_code == "cost_authority_rejected"
+    assert attempted_models == ["model"]
 
 
 @pytest.mark.asyncio
@@ -501,6 +624,63 @@ async def test_worker_executes_valid_request_and_binds_snapshot():
     executor.assert_awaited_once()
     assert executor.await_args.args[0].snapshot_id == snapshot.snapshot_id
     assert executor.await_args.args[1].configuration_hash == configuration.configuration_hash
+    assert executor.await_args.args[2].authority_id == _authority(snapshot, configuration).authority_id
+
+
+@pytest.mark.asyncio
+async def test_worker_transports_frozen_gateway_endpoint_without_environment(monkeypatch):
+    gateway_api_base = "https://test-checkpoint-gateway.example/v1"
+    configuration = _configuration(checkpoint_gateway_api_base=gateway_api_base)
+    snapshot = _snapshot(review_configuration=configuration)
+
+    async def executor(bound_snapshot, bound_configuration, _cost_authority):
+        assert bound_configuration.checkpoint_gateway_api_base == gateway_api_base
+        assert "OPENAI_API_BASE" not in review_subprocess._worker_environment()
+        return _completed_outcome(bound_snapshot)
+
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    outcome = await review_subprocess._handle_worker_request(
+        _request_bytes(snapshot, review_configuration=configuration),
+        executor=executor,
+    )
+
+    assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_execution_rejects_gateway_endpoint_not_bound_to_cost_authority():
+    configuration = _configuration(
+        checkpoint_gateway_api_base="https://different-checkpoint-gateway.example/v1"
+    )
+    snapshot = _snapshot(review_configuration=configuration)
+
+    outcome = await review_subprocess._execute_review(
+        snapshot,
+        configuration,
+        _authority(snapshot, configuration),
+    )
+
+    assert outcome.failure_reason_code == "cost_authority_unverified"
+
+
+@pytest.mark.asyncio
+async def test_execution_rejects_missing_frozen_gateway_endpoint_before_reviewer(monkeypatch):
+    configuration = _configuration()
+    snapshot = _snapshot(review_configuration=configuration)
+
+    class UnexpectedReviewer:
+        def __init__(self, _pr_url):
+            raise AssertionError("missing gateway endpoint must stop before reviewer construction")
+
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.PRReviewer", UnexpectedReviewer)
+
+    outcome = await review_subprocess._execute_review(
+        snapshot,
+        configuration,
+        _authority(snapshot, configuration),
+    )
+
+    assert outcome.failure_reason_code == "cost_authority_unverified"
 
 
 @pytest.mark.asyncio
@@ -509,6 +689,7 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
         skills_context="pinned skill content",
         repo_context_files={"CLAUDE.md": "pinned repository context"},
         repo_context_max_lines=7,
+        checkpoint_gateway_api_base="https://test-checkpoint-gateway.example/v1",
     )
     snapshot = _snapshot(review_configuration=configuration)
     configured = {"anthropic.key": "unrelated-secret", "openrouter.key": "unrelated-secret"}
@@ -546,6 +727,7 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
             assert configured["config.add_user_to_requests"] is False
             assert configured["config.output_run_cost"] is True
             assert configured["config.output_run_details"] is False
+            assert configured["openai.api_base"] == "https://test-checkpoint-gateway.example/v1"
             assert configured["litellm.enable_callbacks"] is False
             assert configured["litellm.extra_headers"] == {}
             assert configured["otel.is_enabled"] is False
@@ -581,7 +763,7 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
     monkeypatch.setattr("pr_agent.tools.pr_reviewer.PRReviewer", FakeReviewer)
     monkeypatch.setattr("pr_agent.algo.ai_handlers.litellm_helpers.drain_litellm_callbacks", drain)
 
-    outcome = await review_subprocess._execute_review(snapshot, configuration)
+    outcome = await review_subprocess._execute_review(snapshot, configuration, _authority(snapshot, configuration))
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
     assert outcome.run_details["total_tokens"] == 15
@@ -597,7 +779,9 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
 
 @pytest.mark.asyncio
 async def test_execution_passes_snapshot_intent_and_deterministic_evidence_to_reviewer(monkeypatch):
-    configuration = _configuration()
+    configuration = _configuration(
+        checkpoint_gateway_api_base="https://test-checkpoint-gateway.example/v1"
+    )
     snapshot = replace(
         _snapshot(review_configuration=configuration),
         task_intent="focus on concurrency",
@@ -636,7 +820,7 @@ async def test_execution_passes_snapshot_intent_and_deterministic_evidence_to_re
         AsyncMock(),
     )
 
-    outcome = await review_subprocess._execute_review(snapshot, configuration)
+    outcome = await review_subprocess._execute_review(snapshot, configuration, _authority(snapshot, configuration))
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
 
@@ -645,7 +829,7 @@ async def test_execution_passes_snapshot_intent_and_deterministic_evidence_to_re
 async def test_execution_refuses_unverified_review_configuration():
     configuration = _configuration()
     snapshot = replace(_snapshot(review_configuration=configuration), review_configuration_hash=None)
-    outcome = await review_subprocess._execute_review(snapshot, configuration)
+    outcome = await review_subprocess._execute_review(snapshot, configuration, _authority(snapshot, configuration))
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.FAILED
     assert outcome.failure_reason_code == "review_configuration_unverified"
@@ -656,7 +840,7 @@ async def test_execution_refuses_mismatched_review_configuration():
     configuration = _configuration()
     snapshot = replace(_snapshot(review_configuration=configuration), review_configuration_hash="sha256:" + "a" * 64)
 
-    outcome = await review_subprocess._execute_review(snapshot, configuration)
+    outcome = await review_subprocess._execute_review(snapshot, configuration, _authority(snapshot, configuration))
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.FAILED
     assert outcome.failure_reason_code == "review_configuration_mismatch"
@@ -703,7 +887,7 @@ async def test_empty_snapshot_completes_without_constructing_reviewer(monkeypatc
 
     monkeypatch.setattr("pr_agent.tools.pr_reviewer.PRReviewer", UnexpectedReviewer)
 
-    outcome = await review_subprocess._execute_review(snapshot, configuration)
+    outcome = await review_subprocess._execute_review(snapshot, configuration, None)
 
     assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
     assert outcome.review == {"review": {"key_issues_to_review": []}}

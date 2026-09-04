@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from decimal import Decimal
 
 from pr_agent.algo.checkpoint_evaluation import (
     EvaluationArmKind,
@@ -328,10 +329,39 @@ def build_checkpoint_review_adapter(kind: EvaluationArmKind):
         raise EvaluationValidationError(f"{kind.value} production finding semantics are unavailable")
 
     async def adapter(snapshot: ReviewSnapshot, context: ProductionArmContext) -> ProductionArmResult:
+        authority = context.cost_authority
+        if authority is not None:
+            try:
+                authority.require_context(
+                    manifest_id=context.manifest_id,
+                    case_id=context.case_id,
+                    arm_id=context.arm_id,
+                    snapshot_id=snapshot.snapshot_id,
+                    arm_configuration_hash=context.configuration_hash,
+                    review_configuration_hash=context.review_configuration.configuration_hash,
+                )
+                if (
+                    context.hard_cost_cap_usd is None
+                    or authority.hard_cost_cap_usd != Decimal(str(context.hard_cost_cap_usd))
+                ):
+                    raise EvaluationValidationError(
+                        "production cost authority cap does not match its adapter context"
+                    )
+            except EvaluationValidationError:
+                return adapt_checkpoint_review_outcome(
+                    snapshot,
+                    kind,
+                    CheckpointReviewSubprocessOutcome(
+                        state=CheckpointReviewSubprocessState.FAILED,
+                        snapshot_id=snapshot.snapshot_id,
+                        failure_reason_code="cost_authority_unverified",
+                    ),
+                )
         outcome = await run_checkpoint_review_subprocess(
             snapshot,
             review_configuration=context.review_configuration,
             evaluation_stage_plan=context.stage_plan,
+            cost_authority=context.cost_authority,
             allow_model_execution=True,
         )
         try:

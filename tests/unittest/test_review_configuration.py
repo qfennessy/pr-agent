@@ -141,6 +141,38 @@ def test_bundle_rejects_credential_bearing_endpoint_and_extra_body():
         replace(bundle, settings=body_settings)
 
 
+def test_bundle_round_trips_frozen_checkpoint_gateway_endpoint():
+    gateway_api_base = "https://checkpoint-gateway.example/v1"
+    bundle = materialize_review_configuration(
+        "",
+        {},
+        checkpoint_gateway_api_base=gateway_api_base,
+    )
+
+    restored = ReviewConfigurationBundle.from_dict(_payload(bundle))
+
+    assert restored.checkpoint_gateway_api_base == gateway_api_base
+    assert restored.configuration_hash == bundle.configuration_hash
+    assert gateway_api_base.encode() in review_configuration_canonical_bytes(bundle)
+
+
+@pytest.mark.parametrize(
+    "gateway_api_base",
+    (
+        "http://checkpoint-gateway.example/v1",
+        "https://user:password@checkpoint-gateway.example/v1",
+        "https://checkpoint-gateway.example/v1?token=secret",
+    ),
+)
+def test_bundle_rejects_unsafe_checkpoint_gateway_endpoint(gateway_api_base):
+    with pytest.raises(ValueError, match="credential-free HTTPS endpoint"):
+        materialize_review_configuration(
+            "",
+            {},
+            checkpoint_gateway_api_base=gateway_api_base,
+        )
+
+
 def test_materializer_rejects_ambient_extra_headers():
     protected = snapshot_settings(("litellm.extra_headers",))
     settings = get_settings()

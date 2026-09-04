@@ -1278,7 +1278,11 @@ async def run_frontier_adjudication(
         state = FrontierState.MALFORMED_OUTPUT
         failure_reason = "malformed_output"
         parsed = None
-    except Exception:
+    except Exception as exc:
+        from pr_agent.algo.checkpoint_cost_authority import CheckpointCostAuthorityError
+
+        if isinstance(exc, CheckpointCostAuthorityError):
+            raise
         state = FrontierState.PROVIDER_FAILURE
         failure_reason = "provider_failure"
         parsed = None
