@@ -17,7 +17,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
 
-from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshotResult
+from pr_agent.algo.review_snapshot import CoverageIssue, ReviewEvent, ReviewResultState, ReviewSnapshotResult
 from pr_agent.algo.run_details import RunDetails, SpecialistRunDetails
 
 EVALUATION_SCHEMA_VERSION = "checkpoint-evaluation-v2"
@@ -168,11 +168,12 @@ _EVALUATION_SCHEMA_DESCRIPTOR = {
         "observed_finding": (
             "fingerprint", "severity", "lifecycle_state", "deterministic_overlap", "stage",
         ),
+        "coverage_issue": ("reason", "path", "fingerprint"),
         "run_record": (
             "schema_version", "manifest_id", "case_id", "arm_id", "snapshot_id", "attempt", "state",
-            "terminal", "findings", "snapshot_result_state", "latency_seconds", "tokens", "cost_usd",
-            "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id", "provider_id",
-            "model_revision", "stage_runs", "failure_reason_code", "record_id",
+            "terminal", "findings", "snapshot_result_state", "coverage_issues", "latency_seconds", "tokens",
+            "cost_usd", "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id",
+            "provider_id", "model_revision", "stage_runs", "failure_reason_code", "record_id",
         ),
         "gate_rule": ("metric", "comparator", "threshold", "minimum_support"),
         "score_metric": ("status", "value", "support"),
@@ -261,6 +262,24 @@ def _reject_unknown_fields(name: str, value: Mapping[str, Any], allowed: set[str
     unknown = sorted(set(value) - allowed)
     if unknown:
         raise EvaluationValidationError(f"{name} contains unknown fields: {unknown}")
+
+
+def _coverage_issue_to_dict(issue: CoverageIssue) -> dict[str, Optional[str]]:
+    return {"reason": issue.reason, "path": issue.path, "fingerprint": issue.fingerprint}
+
+
+def _coverage_issue_from_dict(value: Mapping[str, Any]) -> CoverageIssue:
+    _reject_unknown_fields("coverage issue", value, {"reason", "path", "fingerprint"})
+    reason = value.get("reason")
+    path = value.get("path")
+    fingerprint = value.get("fingerprint")
+    if not isinstance(reason, str) or not reason.strip():
+        raise EvaluationValidationError("coverage issue reason must be a non-empty string")
+    if path is not None and (not isinstance(path, str) or not path.strip()):
+        raise EvaluationValidationError("coverage issue path must be a non-empty string or null")
+    if fingerprint is not None and (not isinstance(fingerprint, str) or not fingerprint.strip()):
+        raise EvaluationValidationError("coverage issue fingerprint must be a non-empty string or null")
+    return CoverageIssue(reason=reason, path=path, fingerprint=fingerprint)
 
 
 def _freeze_json(value: Any) -> Any:
@@ -1497,6 +1516,7 @@ class EvaluationRunRecord:
     terminal: bool
     findings: tuple[ObservedFinding, ...] = field(default_factory=tuple)
     snapshot_result_state: Optional[ReviewResultState] = None
+    coverage_issues: tuple[CoverageIssue, ...] = field(default_factory=tuple)
     latency_seconds: NumericMeasurement = field(
         default_factory=lambda: NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
     )
@@ -1561,6 +1581,9 @@ class EvaluationRunRecord:
         object.__setattr__(self, "findings", tuple(self.findings))
         if any(not isinstance(finding, ObservedFinding) for finding in self.findings):
             raise EvaluationValidationError("run findings must use ObservedFinding")
+        object.__setattr__(self, "coverage_issues", tuple(self.coverage_issues))
+        if any(not isinstance(issue, CoverageIssue) for issue in self.coverage_issues):
+            raise EvaluationValidationError("run coverage_issues must use CoverageIssue")
         if self.state is not EvaluationRunState.COMPLETED and self.findings:
             raise EvaluationValidationError("only completed run records may contain findings")
         if not isinstance(self.stage_latencies_seconds, Mapping) or any(
@@ -1614,6 +1637,7 @@ class EvaluationRunRecord:
             "terminal": self.terminal,
             "findings": [finding.to_dict() for finding in self.findings],
             "snapshot_result_state": self.snapshot_result_state.value if self.snapshot_result_state else None,
+            "coverage_issues": [_coverage_issue_to_dict(issue) for issue in self.coverage_issues],
             "latency_seconds": self.latency_seconds.to_dict(),
             "tokens": self.tokens.to_dict(),
             "cost_usd": self.cost_usd.to_dict(),
@@ -1644,9 +1668,9 @@ class EvaluationRunRecord:
             value,
             {
                 "schema_version", "manifest_id", "case_id", "arm_id", "snapshot_id", "attempt", "state",
-                "terminal", "findings", "snapshot_result_state", "latency_seconds", "tokens", "cost_usd",
-                "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id", "provider_id",
-                "model_revision", "stage_runs", "failure_reason_code", "record_id",
+                "terminal", "findings", "snapshot_result_state", "coverage_issues", "latency_seconds", "tokens",
+                "cost_usd", "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id",
+                "provider_id", "model_revision", "stage_runs", "failure_reason_code", "record_id",
             },
         )
         snapshot_result_state = value.get("snapshot_result_state")
@@ -1660,6 +1684,9 @@ class EvaluationRunRecord:
             terminal=value["terminal"],
             findings=tuple(ObservedFinding.from_dict(item) for item in value.get("findings", [])),
             snapshot_result_state=ReviewResultState(snapshot_result_state) if snapshot_result_state else None,
+            coverage_issues=tuple(
+                _coverage_issue_from_dict(item) for item in value.get("coverage_issues", [])
+            ),
             latency_seconds=NumericMeasurement.from_dict(value["latency_seconds"]),
             tokens=NumericMeasurement.from_dict(value["tokens"]),
             cost_usd=NumericMeasurement.from_dict(value["cost_usd"]),
@@ -1809,6 +1836,7 @@ class EvaluationRunRecord:
             terminal=terminal,
             findings=tuple(findings),
             snapshot_result_state=result.state,
+            coverage_issues=result.coverage_issues,
             latency_seconds=NumericMeasurement(MeasurementStatus.COMPLETE, result.latency_seconds),
             tokens=token_measurement,
             cost_usd=cost_measurement,

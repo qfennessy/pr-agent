@@ -34,7 +34,7 @@ from pr_agent.algo.checkpoint_evaluation_scoring import (
     evaluate_rollout_gate,
     score_matched_arms,
 )
-from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshotResult
+from pr_agent.algo.review_snapshot import CoverageIssue, ReviewEvent, ReviewResultState, ReviewSnapshotResult
 from pr_agent.algo.run_details import RunDetails
 from pr_agent.cli import run
 
@@ -367,6 +367,47 @@ def test_score_keeps_failures_and_missing_pairs_in_denominators():
     assert arm.metrics["verified_recall"].value == 0.5
     assert arm.metrics["failure_attempt_rate"].value == pytest.approx(1 / 3)
     assert arm.metrics["total_tokens"].status is MeasurementStatus.PARTIAL
+
+
+def test_score_retains_positive_findings_but_marks_persisted_partial_coverage():
+    case = _case("partial-positive", EvaluationCohort.HOLDOUT)
+    manifest = _manifest(case)
+    truth = TruthArtifact(
+        manifest_id=manifest.manifest_id,
+        truths=(_truth(case, clean=False),),
+    )
+    coverage_issue = CoverageIssue(reason="token_budget_omitted", path="omitted.py")
+    record = EvaluationRunRecord.from_snapshot_result(
+        manifest,
+        case,
+        manifest.arms[0],
+        ReviewSnapshotResult(
+            snapshot_id=case.snapshot_id,
+            state=ReviewResultState.FINDINGS,
+            current_snapshot_id=case.snapshot_id,
+            review=None,
+            coverage_issues=(coverage_issue,),
+            latency_seconds=0.25,
+        ),
+        None,
+        attempt=1,
+        terminal=True,
+        findings=(ObservedFinding("fingerprint-partial-positive", FindingSeverity.HIGH),),
+    )
+
+    restored = EvaluationRunRecord.from_dict(record.to_dict())
+    arm = score_matched_arms(manifest, truth, (restored,)).arms[0]
+
+    assert restored.coverage_issues == record.coverage_issues
+    assert arm.true_positive_count == 1
+    assert arm.metrics["verified_recall"].value == 1
+    assert arm.metrics["verified_recall"].status is MeasurementStatus.PARTIAL
+    assert arm.metrics["unavailable_coverage_rate"].value == 1
+    assert arm.metrics["failure_or_missing_case_rate"].value == 0
+    assert (
+        arm.cohort_metrics[EvaluationCohort.HOLDOUT.value]["verified_recall"].status
+        is MeasurementStatus.PARTIAL
+    )
 
 
 def test_score_accepts_pinned_stage_identities_and_rejects_forged_stage_telemetry():
