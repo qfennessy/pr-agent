@@ -143,7 +143,7 @@ def adapt_checkpoint_review_outcome(
         details = deserialize_run_details_for_evaluation(outcome.run_details)
         if kind is EvaluationArmKind.GENERAL_REVIEW:
             findings = normalize_general_review_findings(raw_findings)
-        elif kind is EvaluationArmKind.VERIFIED_SPECIALISTS:
+        else:
             findings = _verified_findings(outcome.review)
     result_state = ReviewResultState.FINDINGS if findings else ReviewResultState.NO_FINDINGS
     return ProductionArmResult(
