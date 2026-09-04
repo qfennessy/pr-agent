@@ -183,10 +183,10 @@ def adapt_checkpoint_review_outcome(
             findings = _verified_findings(outcome.review)
     coverage_issues = _coverage_issues(snapshot, kind, outcome.review, details)
     result_state = (
-        ReviewResultState.COVERAGE_UNAVAILABLE
-        if coverage_issues
-        else ReviewResultState.FINDINGS
+        ReviewResultState.FINDINGS
         if findings
+        else ReviewResultState.COVERAGE_UNAVAILABLE
+        if coverage_issues
         else ReviewResultState.NO_FINDINGS
     )
     return ProductionArmResult(
@@ -199,9 +199,13 @@ def adapt_checkpoint_review_outcome(
             latency_seconds=outcome.latency_seconds or 0.0,
         ),
         run_details=details,
-        findings=() if coverage_issues else findings,
-        terminal=not coverage_issues,
-        failure_reason_code="production_coverage_unavailable" if coverage_issues else None,
+        findings=findings,
+        terminal=result_state is not ReviewResultState.COVERAGE_UNAVAILABLE,
+        failure_reason_code=(
+            "production_coverage_unavailable"
+            if result_state is ReviewResultState.COVERAGE_UNAVAILABLE
+            else None
+        ),
         latency_measurement=latency,
         no_model_execution=outcome.run_details is None,
     )

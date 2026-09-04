@@ -165,6 +165,61 @@ def test_verified_adapter_converts_uncovered_clean_stage_to_coverage_unavailable
     assert result.failure_reason_code == "production_coverage_unavailable"
 
 
+def test_verified_adapter_preserves_findings_from_partial_stage_coverage():
+    snapshot = _snapshot()
+    stable_key = _hash("stable-key")
+    details = RunDetails(start_time=0.0, finish_time=0.25)
+    details.specialist_runs["candidate_verification"] = SpecialistRunDetails(
+        role="candidate_verification",
+        model_used="openai/gpt-test",
+        deployment_id="deployment-one",
+        fallback_used=False,
+        prompt_version="verification-prompt-v1",
+        input_schema_version="verification-input-v1",
+        schema_version="verification-output-v1",
+        state="partial",
+        failure_reason="verification_coverage_partial",
+    )
+    outcome = CheckpointReviewSubprocessOutcome(
+        state=CheckpointReviewSubprocessState.COMPLETED,
+        snapshot_id=snapshot.snapshot_id,
+        review={
+            "review": {"key_issues_to_review": [{
+                "relevant_file": "example.py",
+                "issue_header": "Bug",
+                "issue_content": "Verified failure",
+                "start_line": 1,
+                "end_line": 1,
+                "root_cause_id": _hash("root-cause"),
+                "trusted_stable_key": stable_key,
+                "normalized_severity": "high",
+            }]},
+            "candidate_verification": {
+                "status": "partial",
+                "publication_safe": True,
+                "decisions": [{
+                    "candidate_id": "candidate-1",
+                    "verdict": "verified",
+                    "trusted_stable_key": stable_key,
+                    "normalized_severity": "high",
+                }],
+            },
+        },
+        run_details=serialize_run_details_for_evaluation(details),
+        latency_seconds=0.25,
+    )
+
+    result = adapt_checkpoint_review_outcome(snapshot, EvaluationArmKind.VERIFIED_SPECIALISTS, outcome)
+
+    assert result.snapshot_result.state is ReviewResultState.FINDINGS
+    assert [finding.fingerprint for finding in result.findings] == [stable_key]
+    assert [(issue.reason, issue.path) for issue in result.snapshot_result.coverage_issues] == [
+        ("stage_coverage_unavailable", "candidate_verification"),
+    ]
+    assert result.terminal is True
+    assert result.failure_reason_code is None
+
+
 @pytest.mark.parametrize("mutation", ("missing", "conflicting", "duplicate"))
 def test_verified_adapter_rejects_untrusted_severity_joins(mutation):
     snapshot = _snapshot()
