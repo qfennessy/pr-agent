@@ -54,12 +54,14 @@ from pr_agent.algo.frontier_adjudication import (
 )
 from pr_agent.algo.git_patch_processing import iter_git_patch_lines, split_git_file_lines
 from pr_agent.algo.inline_comment_dedup import (
+    SUMMARY_FALLBACK_MARKER_VERSION,
     InlineCommentStore,
     can_verify_inline_comment_publication,
     get_inline_comment_store,
     key_issue_body_with_markers,
     key_issue_fingerprint,
     key_issue_location_fingerprint,
+    summary_fallback_markers,
 )
 from pr_agent.algo.pr_processing import (
     OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
@@ -92,6 +94,18 @@ from pr_agent.algo.review_specialists import (
     run_shadow_specialists,
     unavailable_specialist_batch,
     validate_specialist_output,
+)
+from pr_agent.algo.review_thread_reconciler import (
+    DesiredReviewThread,
+    ReviewThreadActionKind,
+    ReviewThreadActionState,
+    ReviewThreadAnchor,
+    ReviewThreadFailureKind,
+    SummaryFallbackEntry,
+    SummaryFallbackReason,
+    execute_review_thread_action_plan,
+    finding_identities_from_verified_findings,
+    plan_review_thread_actions,
 )
 from pr_agent.algo.run_details import (
     RunDetails,
@@ -227,6 +241,10 @@ class PRReviewer:
         self._force_no_publish = False
         self._structured_review_result = None
         self._review_execution_started = False
+        self.review_thread_reconciliation_artifact = None
+        self._review_thread_summary_fallbacks = ()
+        self._review_thread_lifecycle_notice = None
+        self._review_thread_lifecycle_blocks_summary = False
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
             self.git_provider.get_pr_description(split_changes_walkthrough=True))
@@ -1343,6 +1361,7 @@ class PRReviewer:
     def _clear_stale_persistent_bugs_only_review(self) -> None:
         """Remove a prior persistent defect summary after a clean bugs-only rerun."""
         if (not self._provider_mutations_allowed() or
+                getattr(self, "_review_thread_lifecycle_blocks_summary", False) or
                 self._candidate_verification_blocks_publication() or
                 self._review_profile() != "bugs_only" or
                 not get_settings().config.publish_output or
@@ -2841,6 +2860,9 @@ class PRReviewer:
             structured_data["candidate_verification"] = telemetry_safe_artifact(
                 self.candidate_verification_artifact
             )
+        review_thread_artifact = getattr(self, "review_thread_reconciliation_artifact", None)
+        if not source_free and isinstance(review_thread_artifact, Mapping):
+            structured_data["review_thread_lifecycle"] = copy.deepcopy(review_thread_artifact)
         frontier_artifact = getattr(self, "frontier_adjudication_artifact", None)
         if frontier_artifact is not None:
             structured_data["frontier_adjudication"] = copy.deepcopy(frontier_artifact)
@@ -2890,10 +2912,22 @@ class PRReviewer:
             data
         )
 
+        lifecycle_enabled = self._review_thread_lifecycle_enabled()
+        lifecycle_data = data
+        if (
+            lifecycle_enabled
+            and not candidate_verification_blocked
+            and self._provider_mutations_allowed()
+            and get_settings().config.publish_output
+        ):
+            lifecycle_data = self._apply_review_thread_lifecycle(data)
+
         self._publish_structured_review_data(data)
 
-        if candidate_verification_blocked:
+        if candidate_verification_blocked or getattr(self, "_review_thread_lifecycle_blocks_summary", False):
             return ""
+
+        data = lifecycle_data
 
         if self._provider_mutations_allowed():
             github_action_output(data, 'review')
@@ -2903,12 +2937,15 @@ class PRReviewer:
             key_issues_to_review = data['review'].pop('key_issues_to_review')
             data['review']['key_issues_to_review'] = key_issues_to_review
 
-        if (self._provider_mutations_allowed() and get_settings().config.publish_output and
+        if (not lifecycle_enabled and self._provider_mutations_allowed() and get_settings().config.publish_output and
                 get_settings().pr_reviewer.get('inline_key_issues', False)):
             data = self._publish_key_issues_as_inline_comments(data)
 
         if self._review_profile() == "bugs_only" and not (
-                (data.get("review") or {}).get("key_issues_to_review")):
+                (data.get("review") or {}).get("key_issues_to_review")) and not (
+                getattr(self, "_review_thread_summary_fallbacks", ())
+                or getattr(self, "_review_thread_lifecycle_notice", None)
+        ):
             return ""
 
         incremental_review_markdown_text = None
@@ -2923,6 +2960,7 @@ class PRReviewer:
                                                git_provider=self.git_provider,
                                                files=self.git_provider.get_diff_files(),
                                                review_profile=self._review_profile())
+        markdown_text = self._append_review_thread_lifecycle_summary(markdown_text)
 
         if (self._review_profile() != "bugs_only" and self.remaining_files_list and
                 get_settings().pr_reviewer.enable_review_coverage_footer):
@@ -2991,6 +3029,407 @@ class PRReviewer:
         return self._limit_findings(data, getattr(self, "_review_max_published_findings", None))
 
     @staticmethod
+    def _review_thread_lifecycle_enabled() -> bool:
+        value = get_settings().get("review_thread_lifecycle.enabled", False)
+        return parse_env_bool(value) is True
+
+    def _review_thread_absence_is_authoritative(self, published_finding_count: int) -> bool:
+        """Allow obsolete cleanup only after a coverage-complete full verification run."""
+        artifact = getattr(self, "candidate_verification_artifact", None)
+        incremental = getattr(self, "incremental", None)
+        route_decision = getattr(self, "review_route_decision", None)
+        publication_threshold = (
+            getattr(getattr(route_decision, "applied_budget", None), "publication_threshold", None)
+            if route_decision is not None and getattr(route_decision, "routing_enabled", False)
+            else None
+        )
+        finding_limit_dropped = artifact.get("finding_limit_dropped") if isinstance(artifact, Mapping) else None
+        if (
+            not isinstance(artifact, Mapping)
+            or artifact.get("publication_safe") is not True
+            or artifact.get("status") not in {"complete", "no_candidates"}
+            or bool(getattr(incremental, "is_incremental", False))
+            or bool(getattr(self, "_review_shadow_only", False))
+            or bool(getattr(self, "remaining_files_list", []))
+            or not isinstance(finding_limit_dropped, int)
+            or isinstance(finding_limit_dropped, bool)
+            or finding_limit_dropped != 0
+            or (
+                publication_threshold is not None
+                and str(publication_threshold).strip().casefold() not in {"none", "low"}
+            )
+        ):
+            return False
+        verified_count = artifact.get("verified_count")
+        return (
+            isinstance(verified_count, int)
+            and not isinstance(verified_count, bool)
+            and verified_count == published_finding_count
+        )
+
+    @staticmethod
+    def _review_thread_finding_body(issue: Mapping[str, Any]) -> str:
+        issue_content = _SUGGESTION_FENCE_RE.sub(
+            "```text", str(issue.get("issue_content") or "").strip()
+        )
+        issue_header = str(issue.get("issue_header") or "").strip()
+        if issue_header.lower() == "possible bug":
+            issue_header = "Possible Issue"
+        if not issue_content:
+            raise ValueError("verified finding requires issue_content")
+        return f"**{issue_header}**\n\n{issue_content}" if issue_header else issue_content
+
+    def _desired_review_threads(
+        self,
+        issues: list[Mapping[str, Any]],
+        *,
+        repository: str,
+        pull_request_number: int,
+    ) -> tuple[DesiredReviewThread, ...]:
+        identities = finding_identities_from_verified_findings(
+            issues,
+            repository=repository,
+            pull_request_number=pull_request_number,
+        )
+        diff_files = {}
+        for file in self.git_provider.get_diff_files() or []:
+            filename = str(getattr(file, "filename", "") or "").strip()
+            if not filename:
+                continue
+            diff_files[filename] = file
+            diff_files.setdefault(filename.lstrip("/"), file)
+
+        desired = []
+        for issue, identity in zip(issues, identities, strict=True):
+            body = self._review_thread_finding_body(issue)
+            comment = self._build_key_issue_comment(issue, diff_files, allow_old_side=True)
+            anchor = None
+            if comment is not None:
+                start_line = int(comment["relevant_lines_start"])
+                end_line = int(comment["relevant_lines_end"])
+                anchor = ReviewThreadAnchor(
+                    path=comment["relevant_file"],
+                    line=end_line,
+                    start_line=start_line if start_line != end_line else None,
+                    side="LEFT" if comment["relevant_side"] == "old" else "RIGHT",
+                )
+                body = comment["body"]
+            desired.append(DesiredReviewThread(identity=identity, anchor=anchor, body=body))
+        return tuple(desired)
+
+    def _set_review_thread_lifecycle_unavailable(
+        self,
+        status: str,
+        notice_reason: str,
+        *,
+        failure: Optional[str] = None,
+    ) -> None:
+        artifact = {
+            "enabled": True,
+            "status": status,
+            "head_match": None,
+            "authoritative_absence": False,
+            "mutations_attempted": 0,
+            "requires_fresh_inventory": False,
+            "summary_fallback_count": 0,
+            "reused_summary_fallback_count": 0,
+            "failure_kinds": {status: 1},
+            "results": {
+                "created": 0,
+                "updated": 0,
+                "unchanged": 0,
+                "resolved": 0,
+                "failed": 1,
+            },
+            "metrics": {
+                "actions": {kind.value: 0 for kind in ReviewThreadActionKind},
+                "action_states": {
+                    f"{kind.value}.{state.value}": 0
+                    for kind in ReviewThreadActionKind
+                    for state in ReviewThreadActionState
+                },
+                "states": {state.value: 0 for state in ReviewThreadActionState},
+                "summary_fallbacks": {reason.value: 0 for reason in SummaryFallbackReason},
+                "unavailable": {status: 1},
+            },
+        }
+        if failure:
+            artifact["failure"] = failure
+        self.review_thread_reconciliation_artifact = artifact
+        self._review_thread_lifecycle_blocks_summary = status in {"head_unavailable", "stale_head"}
+        self._review_thread_lifecycle_notice = (
+            "> ⚠️ **PR-Agent inline lifecycle:** "
+            f"{notice_reason}; verified findings remain in this review summary."
+        )
+        get_logger().warning(
+            "Review-thread lifecycle did not run",
+            artifact=copy.deepcopy(artifact),
+        )
+
+    def _apply_review_thread_lifecycle(self, data: dict) -> dict:
+        """Reconcile verified GitHub findings while preserving a visible summary on failure."""
+        self._review_thread_summary_fallbacks = ()
+        self._review_thread_lifecycle_notice = None
+        self._review_thread_lifecycle_blocks_summary = False
+        self.review_thread_reconciliation_artifact = {
+            "enabled": True,
+            "status": "initializing",
+            "mutations_attempted": 0,
+            "summary_fallback_count": 0,
+        }
+        issues = (data.get("review") or {}).get("key_issues_to_review")
+        if not isinstance(issues, list):
+            self._set_review_thread_lifecycle_unavailable(
+                "configuration_invalid", "verified finding output was unavailable"
+            )
+            return data
+        if not isinstance(getattr(self, "candidate_verification_artifact", None), Mapping):
+            self._set_review_thread_lifecycle_unavailable(
+                "configuration_invalid", "candidate verification did not provide a trusted result"
+            )
+            return data
+        if str(get_settings().get("config.git_provider", "") or "").strip().casefold() != "github":
+            self._set_review_thread_lifecycle_unavailable(
+                "unsupported_provider", "stable thread reconciliation is GitHub-only"
+            )
+            return data
+
+        repository = str(getattr(self.git_provider, "repo", "") or "").strip()
+        pull_request_number = getattr(self.git_provider, "pr_num", None)
+        if (
+            not repository
+            or isinstance(pull_request_number, bool)
+            or not isinstance(pull_request_number, int)
+            or pull_request_number < 1
+        ):
+            self._set_review_thread_lifecycle_unavailable(
+                "provider_identity_unavailable", "the pull-request identity could not be verified"
+            )
+            return data
+        try:
+            desired_threads = self._desired_review_threads(
+                issues,
+                repository=repository,
+                pull_request_number=pull_request_number,
+            )
+        except (TypeError, ValueError) as error:
+            self._set_review_thread_lifecycle_unavailable(
+                "finding_identity_invalid",
+                "verified finding identity was incomplete or ambiguous",
+                failure=type(error).__name__,
+            )
+            return data
+
+        try:
+            expected_head_sha = self.git_provider.get_pr_head_sha()
+            current_head_sha = self.git_provider.get_pr_head_sha(refresh=True)
+        except Exception as error:
+            self._set_review_thread_lifecycle_unavailable(
+                "head_unavailable",
+                "the reviewed pull-request head could not be confirmed",
+                failure=type(error).__name__,
+            )
+            return data
+        if not expected_head_sha or current_head_sha != expected_head_sha:
+            self._set_review_thread_lifecycle_unavailable(
+                "stale_head", "the pull-request head changed before reconciliation"
+            )
+            return data
+
+        try:
+            existing_threads = self.git_provider.get_review_thread_snapshots(require_viewer_bot=True)
+            existing_summary_bodies = ()
+            summary_is_replaced = bool(
+                get_settings().pr_reviewer.persistent_comment
+                and not self.incremental.is_incremental
+            )
+            if not summary_is_replaced:
+                existing_summary_bodies = self.git_provider.get_bot_owned_review_summary_bodies()
+            inventory_head_sha = self.git_provider.get_pr_head_sha(refresh=True)
+        except Exception as error:
+            self._set_review_thread_lifecycle_unavailable(
+                "inventory_unavailable",
+                "the complete review-thread inventory could not be read",
+                failure=type(error).__name__,
+            )
+            return data
+        if inventory_head_sha != expected_head_sha:
+            self._set_review_thread_lifecycle_unavailable(
+                "stale_head", "the pull-request head changed while threads were inventoried"
+            )
+            return data
+
+        obsolete_policy = str(
+            get_settings().get("review_thread_lifecycle.obsolete_thread_policy", "keep") or ""
+        ).strip().casefold()
+        if obsolete_policy not in {"keep", "resolve", "mark_fixed"}:
+            self._set_review_thread_lifecycle_unavailable(
+                "configuration_invalid", "the obsolete-thread policy is invalid"
+            )
+            return data
+        authoritative_absence = self._review_thread_absence_is_authoritative(len(issues))
+        try:
+            plan = plan_review_thread_actions(
+                desired_threads,
+                existing_threads,
+                expected_head_sha,
+                obsolete_policy=obsolete_policy,
+                authoritative_absence=authoritative_absence,
+            )
+            outcome = execute_review_thread_action_plan(
+                plan,
+                self.git_provider,
+                existing_summary_bodies=existing_summary_bodies,
+            )
+        except Exception as error:
+            self._set_review_thread_lifecycle_unavailable(
+                "reconciliation_failed",
+                "the reconciliation plan could not be completed",
+                failure=type(error).__name__,
+            )
+            return data
+
+        action_pairs = tuple(zip(plan.actions, outcome.action_outcomes, strict=True))
+        hard_failure_states = {
+            ReviewThreadActionState.STALE_HEAD,
+            ReviewThreadActionState.STALE_INVENTORY,
+            ReviewThreadActionState.FAILED,
+            ReviewThreadActionState.NOT_EXECUTED,
+            ReviewThreadActionState.APPLIED_REQUIRES_REFRESH,
+        }
+        hard_failures = [
+            result for _, result in action_pairs if result.state in hard_failure_states
+        ]
+        fallback_finding_ids = {entry.finding_id for entry in outcome.summary_fallbacks}
+        existing_fallback_finding_ids = set()
+        for body in existing_summary_bodies:
+            markers = summary_fallback_markers(body)
+            if markers and all(
+                version == SUMMARY_FALLBACK_MARKER_VERSION for version, _ in markers
+            ):
+                existing_fallback_finding_ids.update(finding_id for _, finding_id in markers)
+        fallback_eligible_finding_ids = {
+            action.finding_id
+            for action, result in action_pairs
+            if result.state == ReviewThreadActionState.FALLBACK_REQUIRED
+            or (
+                result.state == ReviewThreadActionState.FAILED
+                and result.failure_kind != ReviewThreadFailureKind.RATE_LIMITED
+                and not result.requires_fresh_inventory
+            )
+        }
+        reused_fallback_finding_ids = (
+            existing_fallback_finding_ids & fallback_eligible_finding_ids
+        )
+        threaded_finding_ids = {
+            action.finding_id
+            for action, result in action_pairs
+            if action.kind in {
+                ReviewThreadActionKind.CREATE,
+                ReviewThreadActionKind.UPDATE,
+                ReviewThreadActionKind.UNCHANGED,
+            }
+            and result.succeeded
+        }
+        finding_ids = [desired.identity.finding_id for desired in desired_threads]
+        handled_finding_ids = (
+            threaded_finding_ids | fallback_finding_ids | reused_fallback_finding_ids
+        )
+        remaining_issues = [
+            issue for issue, finding_id in zip(issues, finding_ids, strict=True)
+            if finding_id not in handled_finding_ids
+        ]
+        updated = copy.deepcopy(data)
+        if remaining_issues:
+            updated["review"]["key_issues_to_review"] = remaining_issues
+        else:
+            updated["review"].pop("key_issues_to_review", None)
+
+        self._review_thread_summary_fallbacks = outcome.summary_fallbacks
+        self._review_thread_lifecycle_blocks_summary = outcome.requires_fresh_inventory
+        protected_current_findings = {
+            action.finding_id
+            for action, result in action_pairs
+            if action.finding_id in finding_ids and result.state == ReviewThreadActionState.SKIPPED
+        }
+        if hard_failures:
+            status = "partial"
+            self._review_thread_lifecycle_notice = (
+                "> ⚠️ **PR-Agent inline lifecycle:** reconciliation was incomplete; "
+                "affected findings remain visible in a review summary."
+            )
+        elif outcome.summary_fallbacks or reused_fallback_finding_ids:
+            status = "complete_with_fallback"
+        elif protected_current_findings:
+            status = "protected_discussion"
+        else:
+            status = "complete"
+        failure_kinds = {}
+        for result in hard_failures:
+            key = result.failure_kind.value if result.failure_kind else result.state.value
+            failure_kinds[key] = failure_kinds.get(key, 0) + 1
+        self.review_thread_reconciliation_artifact = {
+            "enabled": True,
+            "status": status,
+            "head_match": outcome.current_head_sha == expected_head_sha,
+            "authoritative_absence": authoritative_absence,
+            "mutations_attempted": sum(
+                1 for _, result in action_pairs if result.mutation_attempted
+            ),
+            "requires_fresh_inventory": outcome.requires_fresh_inventory,
+            "summary_fallback_count": len(outcome.summary_fallbacks),
+            "reused_summary_fallback_count": len(reused_fallback_finding_ids),
+            "failure_kinds": failure_kinds,
+            "results": {
+                "created": sum(
+                    1 for action, result in action_pairs
+                    if action.kind == ReviewThreadActionKind.CREATE and result.succeeded
+                ),
+                "updated": sum(
+                    1 for action, result in action_pairs
+                    if action.kind == ReviewThreadActionKind.UPDATE and result.succeeded
+                ),
+                "unchanged": sum(
+                    1 for action, result in action_pairs
+                    if action.kind == ReviewThreadActionKind.UNCHANGED and result.succeeded
+                ),
+                "resolved": sum(
+                    1 for action, result in action_pairs
+                    if action.kind == ReviewThreadActionKind.RESOLVE and result.succeeded
+                ),
+                "failed": len(hard_failures),
+            },
+            "metrics": {
+                **outcome.metrics,
+                "unavailable": {},
+            },
+        }
+        get_logger().info(
+            "Review-thread lifecycle finished",
+            artifact=copy.deepcopy(self.review_thread_reconciliation_artifact),
+        )
+        return updated
+
+    def _append_review_thread_lifecycle_summary(self, markdown_text: str) -> str:
+        markdown_text = markdown_text or ""
+        sections = []
+        fallbacks: tuple[SummaryFallbackEntry, ...] = getattr(
+            self, "_review_thread_summary_fallbacks", ()
+        )
+        if fallbacks:
+            sections.append(
+                "### Inline review fallbacks\n\n"
+                + "\n\n".join(entry.rendered_body for entry in fallbacks)
+            )
+        notice = getattr(self, "_review_thread_lifecycle_notice", None)
+        if notice:
+            sections.append(notice)
+        if not sections:
+            return markdown_text
+        suffix = "\n\n".join(sections)
+        return f"{markdown_text.rstrip()}\n\n{suffix}" if markdown_text else suffix
+
+    @staticmethod
     def _limit_findings(data: dict, limit: int | None) -> dict:
         if limit is None:
             return data
@@ -3001,7 +3440,13 @@ class PRReviewer:
         limited["review"]["key_issues_to_review"] = issues[:limit]
         return limited
 
-    def _build_key_issue_comment(self, issue, diff_files: dict) -> Optional[dict]:
+    def _build_key_issue_comment(
+        self,
+        issue,
+        diff_files: dict,
+        *,
+        allow_old_side: bool = False,
+    ) -> Optional[dict]:
         if not isinstance(issue, dict):
             return None
         relevant_file = (issue.get("relevant_file") or "").strip()
@@ -3020,7 +3465,8 @@ class PRReviewer:
                                  artifact={"relevant_file": relevant_file, "start_line": start_line,
                                            "end_line": end_line})
             return None
-        if issue.get("side") == "old":
+        relevant_side = "old" if issue.get("side") == "old" else "new"
+        if relevant_side == "old" and not allow_old_side:
             get_logger().info(
                 "Review finding targets deleted code, keeping its old-side location in the summary",
                 artifact={"relevant_file": relevant_file, "start_line": start_line, "end_line": end_line},
@@ -3032,7 +3478,8 @@ class PRReviewer:
             get_logger().warning("Review finding points at a file that is not in the diff, "
                                  "keeping it in the summary", artifact={"relevant_file": relevant_file})
             return None
-        if not file.head_file or end_line > len(split_git_file_lines(file.head_file)):
+        target_file = file.base_file if relevant_side == "old" else file.head_file
+        if not target_file or end_line > len(split_git_file_lines(target_file)):
             get_logger().warning("Review finding points past the end of the file, keeping it in the summary",
                                  artifact={"relevant_file": relevant_file, "start_line": start_line,
                                            "end_line": end_line})
@@ -3040,11 +3487,14 @@ class PRReviewer:
 
         relevant_file = file.filename.strip()
         body = f"**{issue_header}**\n\n{issue_content}" if issue_header else issue_content
-        return {"body": body,
-                "relevant_file": relevant_file,
-                "relevant_lines_start": start_line,
-                "relevant_lines_end": end_line,
-                "fallback_to_pr_comment": False}
+        comment = {"body": body,
+                   "relevant_file": relevant_file,
+                   "relevant_lines_start": start_line,
+                   "relevant_lines_end": end_line,
+                   "fallback_to_pr_comment": False}
+        if allow_old_side:
+            comment["relevant_side"] = relevant_side
+        return comment
 
     def _can_verify_inline_key_issue_publication(self) -> bool:
         return can_verify_inline_comment_publication(self.git_provider)

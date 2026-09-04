@@ -6,7 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from pr_agent.algo.inline_comment_dedup import body_with_finding_identity_marker
+from pr_agent.algo.inline_comment_dedup import (
+    body_with_finding_identity_marker,
+    build_summary_fallback_marker,
+)
 from pr_agent.algo.review_thread_reconciler import (
     FIXED_THREAD_STATE_MARKER,
     VERIFIED_ROOT_CAUSE_ID_SCHEMA_VERSION,
@@ -166,6 +169,22 @@ def _inventory_page(
     )
 
 
+def _summary_page(comments, *, has_next=False, cursor=None, viewer_type="Bot"):
+    return _graphql(
+        {
+            "viewer": {"id": "BOT-1", "login": "pr-agent[bot]", "__typename": viewer_type},
+            "repository": {
+                "pullRequest": {
+                    "comments": {
+                        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                        "nodes": comments,
+                    }
+                }
+            },
+        }
+    )
+
+
 def _owned_thread_state(body=None, *, replies=(), resolved=False, viewer_can_resolve=True):
     identity = _identity()
     body = body or body_with_finding_identity_marker("finding", identity.finding_id)
@@ -299,6 +318,73 @@ def test_inventory_paginates_threads_and_comments():
         "threadId": "thread-1",
         "after": "comment-cursor",
     }
+
+
+def test_inventory_reads_more_than_one_hundred_threads():
+    identity = _identity()
+    body = body_with_finding_identity_marker("finding", identity.finding_id)
+    first_page = [
+        _thread(
+            f"thread-{index}",
+            [_comment(body, node_id=f"comment-{index}", database_id=1000 + index)],
+        )
+        for index in range(100)
+    ]
+    final_thread = _thread(
+        "thread-100",
+        [_comment(body, node_id="comment-100", database_id=1100)],
+    )
+    requester = _Requester(graphql=[
+        _inventory_page(first_page, has_next=True, cursor="thread-cursor"),
+        _inventory_page([final_thread]),
+    ])
+
+    snapshots = _provider(requester).get_review_thread_snapshots(require_viewer_bot=True)
+
+    assert len(snapshots) == 101
+    assert snapshots[-1].thread_id == "thread-100"
+    assert requester.calls[1][3]["variables"]["after"] == "thread-cursor"
+
+
+def test_summary_inventory_paginates_and_only_trusts_the_authenticated_bot():
+    marker = build_summary_fallback_marker(_identity().finding_id)
+    filler = [
+        {"body": f"ordinary comment {index}", "author": {
+            "id": "BOT-1", "login": "pr-agent[bot]", "__typename": "Bot",
+        }}
+        for index in range(99)
+    ]
+    copied_by_human = {
+        "body": f"copied marker\n\n{marker}",
+        "author": {"id": "USER-1", "login": "maintainer", "__typename": "User"},
+    }
+    owned_fallback = {
+        "body": f"real fallback\n\n{marker}",
+        "author": {"id": "BOT-1", "login": "pr-agent[bot]", "__typename": "Bot"},
+    }
+    requester = _Requester(graphql=[
+        _summary_page(
+            [*filler, copied_by_human],
+            has_next=True,
+            cursor="summary-cursor",
+            viewer_type="User",
+        ),
+        _summary_page([owned_fallback], viewer_type="User"),
+    ])
+
+    bodies = _provider(requester).get_bot_owned_review_summary_bodies()
+
+    assert bodies == (owned_fallback["body"],)
+    assert requester.calls[1][3]["variables"]["after"] == "summary-cursor"
+
+
+def test_lifecycle_inventory_requires_the_authenticated_viewer_to_be_a_bot():
+    requester = _Requester(graphql=[
+        _inventory_page([], viewer="maintainer", viewer_id="USER-1", viewer_type="User")
+    ])
+
+    with pytest.raises(RuntimeError, match="authenticated GitHub Bot identity"):
+        _provider(requester).get_review_thread_snapshots(require_viewer_bot=True)
 
 
 def test_inventory_fails_closed_when_review_thread_cursor_repeats():

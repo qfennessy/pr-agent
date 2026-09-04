@@ -30,6 +30,7 @@ from ..algo.file_filter import filter_ignored
 from ..algo.git_patch_processing import extract_hunk_headers, iter_git_patch_lines, strip_git_line_ending
 from ..algo.inline_comment_dedup import (
     FINDING_IDENTITY_MARKER_VERSION,
+    SUMMARY_FALLBACK_MARKER_VERSION,
     body_fingerprint,
     body_with_markers,
     code_fingerprint,
@@ -37,6 +38,7 @@ from ..algo.inline_comment_dedup import (
     get_inline_comment_store,
     has_marker,
     is_agent_inline_comment,
+    summary_fallback_markers,
 )
 from ..algo.language_handler import is_valid_file
 from ..algo.review_thread_reconciler import (
@@ -1109,7 +1111,11 @@ class GithubProvider(GitProvider):
             raise RuntimeError(f"GitHub omitted the next comment cursor for review thread {thread_id}")
         return comments, next_cursor or ""
 
-    def get_review_thread_snapshots(self) -> tuple[ReviewThreadSnapshot, ...]:
+    def get_review_thread_snapshots(
+        self,
+        *,
+        require_viewer_bot: bool = False,
+    ) -> tuple[ReviewThreadSnapshot, ...]:
         """Return an authoritative, paginated snapshot of GitHub review threads.
 
         API and pagination failures raise instead of returning an empty inventory;
@@ -1181,6 +1187,9 @@ class GithubProvider(GitProvider):
             if cursor in seen_thread_cursors:
                 raise RuntimeError("GitHub repeated a review-thread cursor")
             seen_thread_cursors.add(cursor)
+
+        if require_viewer_bot and not _github_actor_is_bot_identity(viewer_identity):
+            raise RuntimeError("review-thread lifecycle requires an authenticated GitHub Bot identity")
 
         snapshots = []
         for thread in raw_threads:
@@ -1300,6 +1309,78 @@ class GithubProvider(GitProvider):
             ))
         return tuple(snapshots)
 
+    def get_bot_owned_review_summary_bodies(self) -> tuple[str, ...]:
+        """Return fallback-bearing summary bodies owned by the authenticated GitHub Bot.
+
+        Append-only review modes need this inventory to suppress a fallback that
+        is already visible from an earlier run. Human-authored comments are never
+        trusted even when they copy a well-formed lifecycle marker.
+        """
+        owner, repo_name = self.repo.split("/", 1)
+        query = """
+        query($owner: String!, $name: String!, $number: Int!, $after: String) {
+          viewer { id login __typename }
+          repository(owner: $owner, name: $name) {
+            pullRequest(number: $number) {
+              comments(first: 100, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes { body author { id login __typename } }
+              }
+            }
+          }
+        }
+        """
+        cursor = None
+        seen_cursors = set()
+        viewer_identity = None
+        bodies = []
+        while True:
+            data = self._request_review_thread_graphql(
+                query,
+                {"owner": owner, "name": repo_name, "number": self.pr_num, "after": cursor},
+            )
+            viewer = data.get("viewer")
+            if not _github_actor_is_bot_identity(viewer):
+                raise RuntimeError("review-summary inventory requires an authenticated GitHub Bot identity")
+            if viewer_identity is None:
+                viewer_identity = viewer
+            elif viewer_identity != viewer:
+                raise RuntimeError("GitHub review-summary inventory viewer changed during pagination")
+            repository = data.get("repository")
+            pull_request = repository.get("pullRequest") if isinstance(repository, dict) else None
+            connection = pull_request.get("comments") if isinstance(pull_request, dict) else None
+            if not isinstance(connection, dict):
+                raise RuntimeError("GitHub review-summary inventory has no pull request connection")
+            nodes = connection.get("nodes")
+            page_info = connection.get("pageInfo")
+            if not isinstance(nodes, list) or not isinstance(page_info, dict):
+                raise RuntimeError("GitHub review-summary inventory is malformed")
+            for comment in nodes:
+                if not isinstance(comment, dict):
+                    raise RuntimeError("GitHub returned an invalid review-summary comment")
+                body = comment.get("body")
+                author = comment.get("author")
+                if not isinstance(body, str) or not isinstance(author, dict):
+                    continue
+                markers = summary_fallback_markers(body)
+                if (
+                    markers
+                    and all(version == SUMMARY_FALLBACK_MARKER_VERSION for version, _ in markers)
+                    and _github_actor_is_bot_identity(author)
+                    and author.get("id") == viewer_identity.get("id")
+                    and author.get("login") == viewer_identity.get("login")
+                ):
+                    bodies.append(body)
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                raise RuntimeError("GitHub omitted the next review-summary cursor")
+            if cursor in seen_cursors:
+                raise RuntimeError("GitHub repeated a review-summary cursor")
+            seen_cursors.add(cursor)
+        return tuple(bodies)
+
     def _live_review_head_sha(self) -> str:
         _, data = self.pr._requester.requestJsonAndCheck(
             "GET", f"{self.base_url}/repos/{self.repo}/pulls/{self.pr_num}"
@@ -1367,7 +1448,7 @@ class GithubProvider(GitProvider):
                 reason="planned_thread_precondition_is_not_safe",
             )
         try:
-            snapshots = self.get_review_thread_snapshots()
+            snapshots = self.get_review_thread_snapshots(require_viewer_bot=True)
             matches = [
                 thread
                 for thread in snapshots
@@ -1492,7 +1573,7 @@ class GithubProvider(GitProvider):
         try:
             same_finding = [
                 thread
-                for thread in self.get_review_thread_snapshots()
+                for thread in self.get_review_thread_snapshots(require_viewer_bot=True)
                 if thread.finding_id == finding_id
             ]
         except Exception as e:
@@ -1601,7 +1682,7 @@ class GithubProvider(GitProvider):
             try:
                 active = [
                     thread
-                    for thread in self.get_review_thread_snapshots()
+                    for thread in self.get_review_thread_snapshots(require_viewer_bot=True)
                     if not thread.is_resolved and thread.finding_id == finding_id and thread.anchor == anchor
                 ]
             except Exception as e:
