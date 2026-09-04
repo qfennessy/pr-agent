@@ -26,7 +26,7 @@ from pr_agent.algo.checkpoint_review_subprocess import (
     CheckpointReviewSubprocessState,
     run_checkpoint_review_subprocess,
 )
-from pr_agent.algo.review_snapshot import ReviewResultState, ReviewSnapshot, ReviewSnapshotResult
+from pr_agent.algo.review_snapshot import CoverageIssue, ReviewResultState, ReviewSnapshot, ReviewSnapshotResult
 from pr_agent.algo.run_details import RunDetails, deserialize_run_details_for_evaluation
 
 _SHA256_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -41,6 +41,7 @@ _MALFORMED_FAILURES = frozenset({
     "worker_protocol_failed",
     "worker_snapshot_mismatch",
 })
+_COMPLETE_STAGE_STATES = frozenset({"cached", "not_required", "success"})
 
 
 def _review_findings(review: Mapping[str, object]) -> list[Mapping[str, object]]:
@@ -97,6 +98,41 @@ def _verified_findings(review: Mapping[str, object]):
     return normalize_verified_findings(findings, severity_by_fingerprint=severity_by_key)
 
 
+def _coverage_issues(
+    snapshot: ReviewSnapshot,
+    kind: EvaluationArmKind,
+    review: Mapping[str, object],
+    details: RunDetails,
+) -> tuple[CoverageIssue, ...]:
+    """Retain production coverage gaps without exposing review source."""
+
+    metadata = review.get("metadata")
+    omitted_files = []
+    if metadata is not None:
+        if not isinstance(metadata, Mapping):
+            raise EvaluationValidationError("production review output has invalid metadata")
+        omitted_files = metadata.get("omitted_files", [])
+        if (
+            not isinstance(omitted_files, list)
+            or any(not isinstance(path, str) or not path for path in omitted_files)
+        ):
+            raise EvaluationValidationError("production review output has invalid omitted-file coverage")
+    unexpected_paths = set(omitted_files) - set(snapshot.changed_paths)
+    if unexpected_paths:
+        raise EvaluationValidationError("production review output names an unexpected omitted file")
+    issues = [
+        CoverageIssue(reason="diff_compression_omitted", path=path)
+        for path in sorted(set(omitted_files))
+    ]
+    if kind is EvaluationArmKind.VERIFIED_SPECIALISTS:
+        issues.extend(
+            CoverageIssue(reason="stage_coverage_unavailable", path=stage)
+            for stage, stage_details in sorted(details.specialist_runs.items())
+            if stage_details.state not in _COMPLETE_STAGE_STATES
+        )
+    return tuple(issues)
+
+
 def adapt_checkpoint_review_outcome(
     snapshot: ReviewSnapshot,
     kind: EvaluationArmKind,
@@ -145,18 +181,27 @@ def adapt_checkpoint_review_outcome(
             findings = normalize_general_review_findings(raw_findings)
         else:
             findings = _verified_findings(outcome.review)
-    result_state = ReviewResultState.FINDINGS if findings else ReviewResultState.NO_FINDINGS
+    coverage_issues = _coverage_issues(snapshot, kind, outcome.review, details)
+    result_state = (
+        ReviewResultState.COVERAGE_UNAVAILABLE
+        if coverage_issues
+        else ReviewResultState.FINDINGS
+        if findings
+        else ReviewResultState.NO_FINDINGS
+    )
     return ProductionArmResult(
         snapshot_result=ReviewSnapshotResult(
             snapshot_id=snapshot.snapshot_id,
             state=result_state,
             current_snapshot_id=snapshot.snapshot_id,
             review=None,
-            coverage_issues=(),
+            coverage_issues=coverage_issues,
             latency_seconds=outcome.latency_seconds or 0.0,
         ),
         run_details=details,
-        findings=findings,
+        findings=() if coverage_issues else findings,
+        terminal=not coverage_issues,
+        failure_reason_code="production_coverage_unavailable" if coverage_issues else None,
         latency_measurement=latency,
         no_model_execution=outcome.run_details is None,
     )

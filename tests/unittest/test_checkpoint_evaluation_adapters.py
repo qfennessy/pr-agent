@@ -13,8 +13,8 @@ from pr_agent.algo.checkpoint_review_subprocess import (
     CheckpointReviewSubprocessState,
 )
 from pr_agent.algo.review_configuration import materialize_review_configuration
-from pr_agent.algo.review_snapshot import ReviewEvent, ReviewSnapshot
-from pr_agent.algo.run_details import RunDetails, serialize_run_details_for_evaluation
+from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshot
+from pr_agent.algo.run_details import RunDetails, SpecialistRunDetails, serialize_run_details_for_evaluation
 
 
 def _hash(value: str) -> str:
@@ -105,6 +105,64 @@ def test_verified_adapter_joins_trusted_identity_to_verifier_severity():
     assert result.findings[0].fingerprint == stable_key
     assert result.findings[0].severity is FindingSeverity.CRITICAL
     assert result.findings[0].stage == "candidate_verification"
+
+
+def test_adapter_retains_omitted_file_as_unavailable_coverage():
+    snapshot = _snapshot()
+    outcome = _outcome(snapshot, {
+        "review": {"key_issues_to_review": []},
+        "metadata": {"omitted_files": ["example.py", "example.py"]},
+    })
+
+    result = adapt_checkpoint_review_outcome(snapshot, EvaluationArmKind.GENERAL_REVIEW, outcome)
+
+    assert result.snapshot_result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert [(issue.reason, issue.path) for issue in result.snapshot_result.coverage_issues] == [
+        ("diff_compression_omitted", "example.py"),
+    ]
+    assert result.findings == ()
+    assert result.terminal is False
+    assert result.failure_reason_code == "production_coverage_unavailable"
+
+
+def test_verified_adapter_converts_uncovered_clean_stage_to_coverage_unavailable():
+    snapshot = _snapshot()
+    details = RunDetails(start_time=0.0, finish_time=0.25)
+    details.specialist_runs["change_classification"] = SpecialistRunDetails(
+        role="change_classification",
+        model_used="openai/gpt-test",
+        deployment_id="deployment-one",
+        fallback_used=False,
+        prompt_version="classification-prompt-v1",
+        input_schema_version="classification-input-v1",
+        schema_version="classification-output-v1",
+        state="unavailable",
+        failure_reason="specialist_unavailable",
+    )
+    outcome = CheckpointReviewSubprocessOutcome(
+        state=CheckpointReviewSubprocessState.COMPLETED,
+        snapshot_id=snapshot.snapshot_id,
+        review={
+            "review": {"key_issues_to_review": []},
+            "candidate_verification": {
+                "status": "no_candidates",
+                "publication_safe": True,
+                "decisions": [],
+            },
+        },
+        run_details=serialize_run_details_for_evaluation(details),
+        latency_seconds=0.25,
+    )
+
+    result = adapt_checkpoint_review_outcome(snapshot, EvaluationArmKind.VERIFIED_SPECIALISTS, outcome)
+
+    assert result.snapshot_result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert [(issue.reason, issue.path) for issue in result.snapshot_result.coverage_issues] == [
+        ("stage_coverage_unavailable", "change_classification"),
+    ]
+    assert result.findings == ()
+    assert result.terminal is False
+    assert result.failure_reason_code == "production_coverage_unavailable"
 
 
 @pytest.mark.parametrize("mutation", ("missing", "conflicting", "duplicate"))

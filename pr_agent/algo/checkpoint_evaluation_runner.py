@@ -883,6 +883,8 @@ def _has_complete_lifecycle_coverage(
 ) -> bool:
     """Require complete planned stages before inferring that a parent finding disappeared."""
 
+    if outcome.snapshot_result.coverage_issues:
+        return False
     if not arm.stage_plan:
         return True
     details = outcome.run_details
