@@ -140,6 +140,7 @@ specialists_enabled = checkpoint_specialists_enabled
 MAX_REVIEW_COVERAGE_FILES = 50
 _SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
 _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_MACHINE_FAILURE_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _VALID_REVIEW_PROFILES = {"full", "bugs_only"}
 _ROUTING_INVENTORY_UNSET = object()
 _BUG_FINDING_HEADERS = {
@@ -384,6 +385,11 @@ class PRReviewer:
             if not self.git_provider.get_files():
                 if not route_prepared:
                     self._prepare_route_after_empty_review_inventory()
+                if getattr(self, "_force_no_publish", False):
+                    self._publish_structured_review_data(
+                        {"review": {"key_issues_to_review": []}},
+                        source_free=True,
+                    )
                 if self._local_artifact_mutations_allowed() and getattr(self, "_review_shadow_only", False):
                     get_settings().data = {"artifact": ""}
                 get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
@@ -2758,7 +2764,10 @@ class PRReviewer:
         }.get(status, ("unavailable", status or "verification_unavailable"))
         explicit_failure = str(artifact.get("failure") or "").strip()
         if failure_reason is not None and explicit_failure:
-            failure_reason = explicit_failure[:128]
+            normalized_failure = re.sub(r"(?<!^)(?=[A-Z])", "_", explicit_failure).lower()
+            normalized_failure = re.sub(r"[^a-z0-9_]+", "_", normalized_failure).strip("_")[:128]
+            if _MACHINE_FAILURE_REASON_RE.fullmatch(normalized_failure):
+                failure_reason = normalized_failure
         details = get_run_details()
         existing = (
             details.specialist_runs.get("candidate_verification")

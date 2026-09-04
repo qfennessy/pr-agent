@@ -6097,6 +6097,28 @@ def test_candidate_verification_finalizes_evaluation_stage(status, expected_stat
     assert stage.fallback_used is False
 
 
+def test_candidate_verification_normalizes_exception_class_failure_reason():
+    init_run_details()
+    config = SimpleNamespace(
+        prompt_version="candidate-prompt-v1",
+        input_schema_version="candidate-input-v1",
+        output_schema_version="candidate-output-v1",
+        route=SimpleNamespace(
+            models=("verifier-model",),
+            deployments=("verifier-deployment",),
+        ),
+    )
+
+    PRReviewer._record_candidate_verification_stage(
+        config,
+        {"status": "verifier_failed", "failure": "TimeoutError"},
+    )
+
+    stage = get_run_details().specialist_runs["candidate_verification"]
+    assert stage.state == "provider_failure"
+    assert stage.failure_reason == "timeout_error"
+
+
 @pytest.mark.parametrize("issue", [
     _bugs_only_issue(finding_type="style"),
     _bugs_only_issue(start_line=1, end_line=1),
@@ -6829,6 +6851,22 @@ async def test_structured_no_publish_run_restores_force_gate_after_error():
 
     assert reviewer._force_no_publish is False
     assert reviewer._structured_review_result is None
+
+
+@pytest.mark.asyncio
+async def test_structured_no_publish_run_returns_clean_result_for_authoritative_empty_inventory():
+    reviewer = _make_prediction_reviewer()
+    reviewer.vars = {}
+    reviewer.git_provider.get_files.return_value = []
+    reviewer._prepare_route_after_empty_review_inventory = MagicMock()
+    reviewer._local_artifact_mutations_allowed = MagicMock(return_value=False)
+
+    with isolate_review_execution():
+        result = await reviewer._run_structured_no_publish_once()
+
+    assert result.review["review"]["key_issues_to_review"] == []
+    assert result.run_details.num_ai_calls == 0
+    reviewer._prepare_route_after_empty_review_inventory.assert_called_once_with()
 
 
 @pytest.mark.asyncio
