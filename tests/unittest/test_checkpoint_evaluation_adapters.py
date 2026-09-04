@@ -78,6 +78,7 @@ def test_general_review_adapter_uses_production_root_cause_and_severity():
         model_used="openai/gpt-test",
         fallback_used=True,
         route_attempts=2,
+        model_retry_attempts=2,
         num_ai_calls=1,
         start_time=0.0,
         finish_time=0.25,
@@ -88,7 +89,7 @@ def test_general_review_adapter_uses_production_root_cause_and_severity():
     assert len(result.findings) == 1
     assert result.findings[0].severity is FindingSeverity.HIGH
     assert result.findings[0].stage == "general_review"
-    assert result.retry_count == 1
+    assert result.retry_count == 3
 
 
 def test_verified_adapter_joins_trusted_identity_to_verifier_severity():
@@ -120,6 +121,7 @@ def test_verified_adapter_joins_trusted_identity_to_verifier_severity():
     }, details=RunDetails(
         model_used="openai/gpt-test",
         route_attempts=2,
+        model_retry_attempts=1,
         num_ai_calls=1,
         specialist_runs={
             "candidate_verification": SpecialistRunDetails(
@@ -127,6 +129,7 @@ def test_verified_adapter_joins_trusted_identity_to_verifier_severity():
                 model_used="openai/verifier-test",
                 fallback_used=True,
                 route_attempts=3,
+                model_retry_attempts=2,
                 num_ai_calls=1,
             ),
         },
@@ -139,7 +142,7 @@ def test_verified_adapter_joins_trusted_identity_to_verifier_severity():
     assert result.findings[0].fingerprint == stable_key
     assert result.findings[0].severity is FindingSeverity.CRITICAL
     assert result.findings[0].stage == "candidate_verification"
-    assert result.retry_count == 3
+    assert result.retry_count == 6
 
 
 def test_verified_adapter_rejects_invalid_verifier_attempt_count():

@@ -1091,6 +1091,7 @@ class PRReviewer:
                 "deployment": enabled_role_configs[role].deployment,
                 "fallback_used": False,
                 "route_attempts": 0,
+                "model_retry_attempts": 0,
                 "prompt_version": prompt.prompt_version,
                 "input_schema_version": prompt.input_schema_version,
                 "schema_version": prompt.schema_version,

@@ -177,11 +177,18 @@ def _production_retry_count(
     review: Mapping[str, object] | None,
     details: RunDetails,
 ) -> int:
-    """Aggregate observed provider-neutral route retries across production stages."""
+    """Aggregate observed fallback and same-route retries across production stages."""
 
-    retry_count = max(0, details.route_attempts - 1)
-    retry_count += sum(max(0, run.route_attempts - 1) for run in details.specialist_runs.values())
-    retry_count += sum(max(0, run.route_attempts - 1) for run in details.adjudication_runs.values())
+    retry_count = max(0, details.route_attempts - 1) + details.model_retry_attempts
+    retry_count += sum(
+        max(0, run.route_attempts - 1) + run.model_retry_attempts
+        for run in details.specialist_runs.values()
+    )
+    for run in details.adjudication_runs.values():
+        model_retries = run.model_retry_attempts
+        if model_retries is None:
+            raise EvaluationValidationError("production output has unavailable adjudication retry telemetry")
+        retry_count += max(0, run.route_attempts - 1) + model_retries
     if kind is EvaluationArmKind.VERIFIED_SPECIALISTS and review is not None:
         artifact = review.get("candidate_verification")
         if artifact is not None:
@@ -245,6 +252,7 @@ def adapt_checkpoint_review_outcome(
     no_model_execution = (
         details.num_ai_calls == 0
         and details.route_attempts == 0
+        and details.model_retry_attempts == 0
         and not details.has_token_usage
         and details.known_cost_call_count == 0
         and details.total_cost_usd == 0

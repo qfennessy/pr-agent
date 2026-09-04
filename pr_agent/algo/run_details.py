@@ -37,6 +37,7 @@ class SpecialistRunDetails:
     deployment_id: Optional[str] = None
     fallback_used: bool = False
     route_attempts: int = 0
+    model_retry_attempts: int = 0
     prompt_version: Optional[str] = None
     input_schema_version: Optional[str] = None
     schema_version: Optional[str] = None
@@ -71,6 +72,7 @@ class SpecialistRunDetails:
             "deployment": self.deployment_id,
             "fallback_used": self.fallback_used,
             "route_attempts": self.route_attempts,
+            "model_retry_attempts": self.model_retry_attempts,
             "prompt_version": self.prompt_version,
             "input_schema_version": self.input_schema_version,
             "schema_version": self.schema_version,
@@ -247,6 +249,8 @@ class RunDetails:
     fallback_used: bool = False
     # Provider-neutral model/deployment route entries attempted by the main review.
     route_attempts: int = 0
+    # Observable retries within an already selected model/deployment route.
+    model_retry_attempts: int = 0
     # Input/output tokens summed over every AI call of the run. Named after litellm's
     # normalized usage object, which is what the collector reads. Both stay 0 when no usage
     # reaches the collector, e.g. streaming responses or the langchain handler.
@@ -310,14 +314,14 @@ _EVALUATION_RUN_DETAILS_FIELDS = frozenset({
     "schema_version", "model_used", "review_profile", "fallback_used", "prompt_tokens",
     "completion_tokens", "total_tokens", "num_ai_calls", "total_cost_usd",
     "known_cost_call_count", "model_costs_usd", "specialist_runs", "adjudication_runs",
-    "duration_seconds", "route_attempts",
+    "duration_seconds", "route_attempts", "model_retry_attempts",
 })
 _EVALUATION_SPECIALIST_FIELDS = frozenset({
     "role", "model_used", "deployment_id", "fallback_used", "prompt_version",
     "input_schema_version", "schema_version", "state", "latency_seconds", "prompt_tokens",
     "completion_tokens", "total_tokens", "num_ai_calls", "total_cost_usd",
     "known_cost_call_count", "model_costs_usd", "confidence", "failure_reason", "cached",
-    "input_token_reservation", "output_token_reservation", "route_attempts",
+    "input_token_reservation", "output_token_reservation", "route_attempts", "model_retry_attempts",
 })
 _EVALUATION_ADJUDICATION_FIELDS = frozenset({
     "finding_id", "model_used", "provider", "model_revision", "deployment_id", "fallback_used",
@@ -393,6 +397,7 @@ def serialize_run_details_for_evaluation(details: RunDetails) -> dict[str, Any]:
             "deployment_id": run.deployment_id,
             "fallback_used": run.fallback_used,
             "route_attempts": run.route_attempts,
+            "model_retry_attempts": run.model_retry_attempts,
             "prompt_version": run.prompt_version,
             "input_schema_version": run.input_schema_version,
             "schema_version": run.schema_version,
@@ -431,6 +436,7 @@ def serialize_run_details_for_evaluation(details: RunDetails) -> dict[str, Any]:
         "review_profile": details.review_profile,
         "fallback_used": details.fallback_used,
         "route_attempts": details.route_attempts,
+        "model_retry_attempts": details.model_retry_attempts,
         "prompt_tokens": details.prompt_tokens,
         "completion_tokens": details.completion_tokens,
         "total_tokens": details.total_tokens,
@@ -468,6 +474,7 @@ def deserialize_run_details_for_evaluation(
         for field_name in (
             "prompt_tokens", "completion_tokens", "total_tokens", "num_ai_calls", "known_cost_call_count",
             "route_attempts",
+            "model_retry_attempts",
         )
     }
     if integer_fields["known_cost_call_count"] > integer_fields["num_ai_calls"]:
@@ -495,6 +502,9 @@ def deserialize_run_details_for_evaluation(
             deployment_id=_evaluation_string(raw_run.get("deployment_id"), "specialist deployment_id"),
             fallback_used=raw_run.get("fallback_used"),
             route_attempts=_evaluation_int(raw_run.get("route_attempts"), "specialist route_attempts"),
+            model_retry_attempts=_evaluation_int(
+                raw_run.get("model_retry_attempts"), "specialist model retry attempts"
+            ),
             prompt_version=_evaluation_string(raw_run.get("prompt_version"), "specialist prompt_version"),
             input_schema_version=_evaluation_string(
                 raw_run.get("input_schema_version"), "specialist input_schema_version"
@@ -603,6 +613,7 @@ def deserialize_run_details_for_evaluation(
         review_profile=review_profile,
         fallback_used=value["fallback_used"],
         route_attempts=integer_fields["route_attempts"],
+        model_retry_attempts=integer_fields["model_retry_attempts"],
         prompt_tokens=integer_fields["prompt_tokens"],
         completion_tokens=integer_fields["completion_tokens"],
         total_tokens=integer_fields["total_tokens"],
@@ -765,16 +776,25 @@ def record_model_request_attempt(attribution: Optional[str] = None) -> None:
 
     ``retry_with_fallback_models`` records the first attempt for every selected
     model/deployment route. Handler retry hooks call this function only before
-    subsequent invocations, so ``model_attempts - route_attempts`` is the exact
-    retry-attempt count.
+    subsequent invocations. Main and specialist runs retain that count directly;
+    adjudication runs retain total model attempts for their richer audit contract.
     """
 
     request_options = get_ai_request_options()
     attribution = attribution or (
         request_options.attribution if request_options is not None else None
     )
+    details = get_run_details()
+    if details is None:
+        return
+    if not attribution:
+        details.model_retry_attempts += 1
+        return
     adjudication = _get_adjudication_details(attribution)
     if adjudication is None:
+        specialist = _get_specialist_details(attribution)
+        if specialist is not None:
+            specialist.model_retry_attempts += 1
         return
     if adjudication.model_attempts is None:
         adjudication.model_attempts = 0
