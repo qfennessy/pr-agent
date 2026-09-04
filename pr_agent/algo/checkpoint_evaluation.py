@@ -125,6 +125,7 @@ class FindingSeverity(str, Enum):
 
 class FindingLifecycleState(str, Enum):
     ACTIVE = "active"
+    CARRIED_FORWARD = "carried_forward"
     WITHDRAWN = "withdrawn"
 
 

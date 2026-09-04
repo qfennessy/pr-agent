@@ -598,7 +598,10 @@ async def test_runner_executes_parent_first_and_derives_withdrawal_only_for_comp
         for record in result.records
         if record.case_id == "a-child" and record.arm_id == "arm-verified_specialists"
     )
-    assert set(partial_child.findings) == {finding, missing_finding}
+    assert set(partial_child.findings) == {
+        finding,
+        replace(missing_finding, lifecycle_state=FindingLifecycleState.CARRIED_FORWARD),
+    }
     assert next(
         stage for stage in partial_child.stage_runs if stage.stage == "candidate_verification"
     ).coverage_status is MeasurementStatus.PARTIAL

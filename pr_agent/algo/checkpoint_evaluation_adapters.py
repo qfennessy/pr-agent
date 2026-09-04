@@ -208,12 +208,23 @@ def adapt_checkpoint_review_outcome(
         raise EvaluationValidationError("completed production review output is incomplete")
     raw_findings = _review_findings(outcome.review)
     if outcome.run_details is None:
-        if raw_findings or snapshot.diff.strip():
-            raise EvaluationValidationError("only empty-diff production results may omit run telemetry")
         details = RunDetails(start_time=0.0, finish_time=0.0)
-        findings = ()
     else:
         details = deserialize_run_details_for_evaluation(outcome.run_details)
+    no_model_execution = (
+        details.num_ai_calls == 0
+        and not details.has_token_usage
+        and details.known_cost_call_count == 0
+        and details.total_cost_usd == 0
+        and not details.model_costs_usd
+        and not details.specialist_runs
+        and not details.adjudication_runs
+    )
+    if no_model_execution:
+        if raw_findings or snapshot.diff.strip():
+            raise EvaluationValidationError("only empty-diff production results may have zero model execution")
+        findings = ()
+    else:
         if kind is EvaluationArmKind.GENERAL_REVIEW:
             findings = normalize_general_review_findings(raw_findings)
         else:
@@ -244,7 +255,7 @@ def adapt_checkpoint_review_outcome(
             else None
         ),
         latency_measurement=latency,
-        no_model_execution=outcome.run_details is None,
+        no_model_execution=no_model_execution,
     )
 
 

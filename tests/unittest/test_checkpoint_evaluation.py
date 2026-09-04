@@ -17,6 +17,7 @@ from pr_agent.algo.checkpoint_evaluation import (
     EvaluationStagePlan,
     EvaluationStageRun,
     EvaluationValidationError,
+    FindingLifecycleState,
     FindingSeverity,
     FindingTruth,
     MeasurementStatus,
@@ -408,6 +409,41 @@ def test_score_retains_positive_findings_but_marks_persisted_partial_coverage():
         arm.cohort_metrics[EvaluationCohort.HOLDOUT.value]["verified_recall"].status
         is MeasurementStatus.PARTIAL
     )
+
+
+def test_score_excludes_carried_lineage_findings_from_checkpoint_observations():
+    defect = _case("carried-defect", EvaluationCohort.HOLDOUT)
+    control = _case("carried-control", EvaluationCohort.CLEAN_CONTROL)
+    manifest = _manifest(defect, control)
+    truth = TruthArtifact(
+        manifest_id=manifest.manifest_id,
+        truths=(_truth(defect, clean=False), _truth(control, clean=True)),
+    )
+    defect_record = _record(
+        manifest,
+        defect,
+        findings=(ObservedFinding(
+            "fingerprint-carried-defect",
+            FindingSeverity.HIGH,
+            lifecycle_state=FindingLifecycleState.CARRIED_FORWARD,
+        ),),
+    )
+    control_record = _record(
+        manifest,
+        control,
+        findings=(ObservedFinding(
+            "inherited-false-positive",
+            FindingSeverity.MEDIUM,
+            lifecycle_state=FindingLifecycleState.CARRIED_FORWARD,
+        ),),
+    )
+
+    arm = score_matched_arms(manifest, truth, (defect_record, control_record)).arms[0]
+
+    assert arm.true_positive_count == 0
+    assert arm.false_positive_count == 0
+    assert arm.false_negative_count == 1
+    assert arm.false_interruption_count == 0
 
 
 def test_score_accepts_pinned_stage_identities_and_rejects_forged_stage_telemetry():

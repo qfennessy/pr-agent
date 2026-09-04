@@ -107,6 +107,24 @@ def test_verified_adapter_joins_trusted_identity_to_verifier_severity():
     assert result.findings[0].stage == "candidate_verification"
 
 
+@pytest.mark.parametrize("kind", (EvaluationArmKind.GENERAL_REVIEW, EvaluationArmKind.VERIFIED_SPECIALISTS))
+def test_adapter_treats_serialized_zero_call_empty_result_as_no_model_execution(kind):
+    snapshot = _snapshot(diff="")
+    outcome = CheckpointReviewSubprocessOutcome(
+        state=CheckpointReviewSubprocessState.COMPLETED,
+        snapshot_id=snapshot.snapshot_id,
+        review={"review": {"key_issues_to_review": []}},
+        run_details=serialize_run_details_for_evaluation(RunDetails(start_time=0.0, finish_time=0.0)),
+        latency_seconds=0.0,
+    )
+
+    result = adapt_checkpoint_review_outcome(snapshot, kind, outcome)
+
+    assert result.snapshot_result.state is ReviewResultState.NO_FINDINGS
+    assert result.no_model_execution is True
+    assert result.findings == ()
+
+
 def test_adapter_retains_omitted_file_as_unavailable_coverage():
     snapshot = _snapshot()
     outcome = _outcome(snapshot, {

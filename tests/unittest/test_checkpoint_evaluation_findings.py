@@ -666,7 +666,12 @@ def test_partial_lifecycle_carries_unresolved_findings_until_complete_checkpoint
         parent_arm_id="arm-general",
     )
 
-    assert partial_middle == (continuing, unresolved)
+    carried = _observation(
+        unresolved.fingerprint,
+        severity=FindingSeverity.MEDIUM,
+        lifecycle_state=FindingLifecycleState.CARRIED_FORWARD,
+    )
+    assert partial_middle == (continuing, carried)
     assert complete_child == (
         continuing,
         _observation(
@@ -675,6 +680,21 @@ def test_partial_lifecycle_carries_unresolved_findings_until_complete_checkpoint
             lifecycle_state=FindingLifecycleState.WITHDRAWN,
         ),
     )
+
+
+def test_partial_lifecycle_keeps_carried_findings_distinct_from_current_observations():
+    observed = _observation(f"sha256:{'a' * 64}")
+    inherited = _observation(f"sha256:{'b' * 64}", severity=FindingSeverity.MEDIUM)
+
+    partial = carry_forward_active_findings(
+        [observed],
+        [inherited],
+        arm_id="arm-general",
+        parent_arm_id="arm-general",
+    )
+
+    assert [finding for finding in partial if finding.lifecycle_state is FindingLifecycleState.ACTIVE] == [observed]
+    assert partial[1].lifecycle_state is FindingLifecycleState.CARRIED_FORWARD
 
 
 def test_lifecycle_does_not_repeat_historical_withdrawals():
