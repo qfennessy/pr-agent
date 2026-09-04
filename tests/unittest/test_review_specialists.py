@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from pr_agent.algo.ai_request_context import get_ai_request_options
+from pr_agent.algo.checkpoint_cost_authority import CheckpointCostAuthorityError
 from pr_agent.algo.review_specialists import (
     SpecialistConfigurationError,
     SpecialistOutputError,
@@ -845,6 +846,30 @@ async def test_provider_failure_preserves_attempted_route_without_claiming_usage
     assert record["reservation"]["output_tokens"] == 600
     assert record["usage"]["ai_calls"] == 0
     assert record["cost"]["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_cost_authority_denial_escapes_specialist_failure_handling():
+    specialist_input = _input()
+    role = SpecialistRole.RISK_RECOMMENDATION
+    roles = tuple(
+        replace(_role_config(candidate), enabled=candidate is role)
+        for candidate in SpecialistRole
+    )
+    denial = CheckpointCostAuthorityError("gateway route is not authorized")
+    handler = _Handler(_outputs(specialist_input), failures={role.value: denial})
+    init_run_details()
+
+    with pytest.raises(CheckpointCostAuthorityError) as exc_info:
+        await run_shadow_specialists(
+            specialist_input,
+            _pipeline(roles=roles),
+            handler,
+            current_identity=lambda: specialist_input.head_sha,
+        )
+
+    assert exc_info.value is denial
+    assert [call["role"] for call in handler.calls] == [role.value]
 
 
 @pytest.mark.asyncio

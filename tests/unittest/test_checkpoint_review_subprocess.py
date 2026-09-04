@@ -32,11 +32,18 @@ from pr_agent.algo.run_details import RunDetails
 from pr_agent.algo.skills_loader import get_skills_context
 
 
-def _configuration(*, skills_context=None, repo_context_files=None, repo_context_max_lines=None):
+def _configuration(
+    *,
+    skills_context=None,
+    repo_context_files=None,
+    repo_context_max_lines=None,
+    checkpoint_gateway_api_base=None,
+):
     return materialize_review_configuration(
         skills_context,
         repo_context_files or {},
         repo_context_max_lines=repo_context_max_lines,
+        checkpoint_gateway_api_base=checkpoint_gateway_api_base,
     )
 
 
@@ -621,11 +628,68 @@ async def test_worker_executes_valid_request_and_binds_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_worker_transports_frozen_gateway_endpoint_without_environment(monkeypatch):
+    gateway_api_base = "https://test-checkpoint-gateway.example/v1"
+    configuration = _configuration(checkpoint_gateway_api_base=gateway_api_base)
+    snapshot = _snapshot(review_configuration=configuration)
+
+    async def executor(bound_snapshot, bound_configuration, _cost_authority):
+        assert bound_configuration.checkpoint_gateway_api_base == gateway_api_base
+        assert "OPENAI_API_BASE" not in review_subprocess._worker_environment()
+        return _completed_outcome(bound_snapshot)
+
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    outcome = await review_subprocess._handle_worker_request(
+        _request_bytes(snapshot, review_configuration=configuration),
+        executor=executor,
+    )
+
+    assert outcome.state is review_subprocess.CheckpointReviewSubprocessState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_execution_rejects_gateway_endpoint_not_bound_to_cost_authority():
+    configuration = _configuration(
+        checkpoint_gateway_api_base="https://different-checkpoint-gateway.example/v1"
+    )
+    snapshot = _snapshot(review_configuration=configuration)
+
+    outcome = await review_subprocess._execute_review(
+        snapshot,
+        configuration,
+        _authority(snapshot, configuration),
+    )
+
+    assert outcome.failure_reason_code == "cost_authority_unverified"
+
+
+@pytest.mark.asyncio
+async def test_execution_rejects_missing_frozen_gateway_endpoint_before_reviewer(monkeypatch):
+    configuration = _configuration()
+    snapshot = _snapshot(review_configuration=configuration)
+
+    class UnexpectedReviewer:
+        def __init__(self, _pr_url):
+            raise AssertionError("missing gateway endpoint must stop before reviewer construction")
+
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.PRReviewer", UnexpectedReviewer)
+
+    outcome = await review_subprocess._execute_review(
+        snapshot,
+        configuration,
+        _authority(snapshot, configuration),
+    )
+
+    assert outcome.failure_reason_code == "cost_authority_unverified"
+
+
+@pytest.mark.asyncio
 async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_sinks(monkeypatch):
     configuration = _configuration(
         skills_context="pinned skill content",
         repo_context_files={"CLAUDE.md": "pinned repository context"},
         repo_context_max_lines=7,
+        checkpoint_gateway_api_base="https://test-checkpoint-gateway.example/v1",
     )
     snapshot = _snapshot(review_configuration=configuration)
     configured = {"anthropic.key": "unrelated-secret", "openrouter.key": "unrelated-secret"}
@@ -663,6 +727,7 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
             assert configured["config.add_user_to_requests"] is False
             assert configured["config.output_run_cost"] is True
             assert configured["config.output_run_details"] is False
+            assert configured["openai.api_base"] == "https://test-checkpoint-gateway.example/v1"
             assert configured["litellm.enable_callbacks"] is False
             assert configured["litellm.extra_headers"] == {}
             assert configured["otel.is_enabled"] is False
@@ -714,7 +779,9 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
 
 @pytest.mark.asyncio
 async def test_execution_passes_snapshot_intent_and_deterministic_evidence_to_reviewer(monkeypatch):
-    configuration = _configuration()
+    configuration = _configuration(
+        checkpoint_gateway_api_base="https://test-checkpoint-gateway.example/v1"
+    )
     snapshot = replace(
         _snapshot(review_configuration=configuration),
         task_intent="focus on concurrency",

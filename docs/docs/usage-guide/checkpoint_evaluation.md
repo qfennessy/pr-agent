@@ -35,8 +35,10 @@ supplies a current, immutable provider/gateway maximum-charge authority for ever
 runtime controls pass preflight. The model boundary can now consume that authority immediately before every
 underlying provider request, but the repository does not ship an authority or treat a LiteLLM price estimate
 as one. A quote must include a non-secret, immutable gateway route-binding identifier for its exact provider and
-revision. The model boundary sends that identifier only to the explicitly hashed HTTPS gateway endpoint; generic
-LiteLLM provider routes do not enforce this contract. No enforcing gateway binding is installed, so general-review
+revision. The source-free review bundle freezes a validated, credential-free HTTPS gateway endpoint and the worker
+rejects it unless its identity matches every authority quote. The model boundary sends the binding identifier only
+to that endpoint; generic LiteLLM provider routes do not enforce this contract. No enforcing gateway binding is
+installed, so general-review
 and checkpoint-stage execution remain unavailable. The general replay contract remains limited to the
 standard OpenAI route; unsupported routes continue to fail configuration capture.
 Issue #27 must still complete those contracts and the source/telemetry contracts needed to integrate
@@ -109,11 +111,16 @@ selected for that arm; production review code falls back to ambient configuratio
 checkpoint execution context. Verifier stage-plan hashes cover controls shared across the arm, while
 each review-configuration bundle separately content-addresses checkpoint-specific static-analysis
 evidence so evolving evidence does not invalidate later cases in the same paired run.
-Credentials, callback configuration, telemetry headers, and output sinks have no bundle fields.
+Credentials, callback configuration, telemetry headers, and output sinks have no bundle fields. A checkpoint
+bundle may carry one credential-free HTTPS gateway base URL: it is part of the content-derived configuration
+identity, never read from the worker environment, and must not contain a token or other secret.
 The isolated worker disables publication, callback and OpenTelemetry delivery, push outputs, and
 run-detail printing before importing the reviewer. It also passes only the standard OpenAI runtime
-credential and a minimal process environment; proxy, endpoint, Dynaconf, and other provider
-controls are not inherited. Checkpoint materialization writes the canonical bundle beside its
+credential and a minimal process environment; proxy, ambient endpoint, Dynaconf, and other provider
+controls are not inherited. If the bundle supplies the checkpoint gateway endpoint, the worker hash-matches it
+to every authority quote before reviewer construction and then replays that exact endpoint. A non-empty snapshot
+without this frozen endpoint fails preflight before reviewer construction. Checkpoint
+materialization writes the canonical bundle beside its
 source-bearing snapshot in the same atomic, owner-only local directory. Shared bundles are stored
 once, while the private snapshot index records each pair's deterministic relative paths, bundle
 identity, and exact artifact-byte hash. Loading rejects non-canonical bytes, unsafe links or
@@ -214,6 +221,11 @@ gateway route-binding identifier, maximum output-token cap, and worst-case charg
 safe to persist and contains no credential, source, prompt, or endpoint URL. It also expires. Unknown fields,
 mutable revision aliases, ambiguous routes, incomplete route coverage,
 and any quote larger than the attempt cap fail validation locally.
+
+The raw gateway base URL is stored only in the private review-configuration bundle, where it is validated as
+bounded, HTTPS, and free of URL credentials, query parameters, and fragments. It is not stored in the authority,
+manifest, journal, report, or environment. Operators must treat the endpoint as non-secret configuration and
+must never embed credentials in its path.
 
 The isolated single-review worker installs one consume-only ledger process-wide and in its coroutine
 context, so both worker threads and concurrent specialist, verifier, and frontier tasks share it.

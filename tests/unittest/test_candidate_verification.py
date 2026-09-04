@@ -30,6 +30,7 @@ from pr_agent.algo.candidate_verification import (
     telemetry_safe_artifact,
     validated_specialist_prioritization,
 )
+from pr_agent.algo.checkpoint_cost_authority import CheckpointCostAuthorityError
 from pr_agent.algo.checkpoint_evaluation import EvaluationStageModelIdentity, deployment_identity_hash
 from pr_agent.algo.checkpoint_stage_sources import CheckpointStageSources, use_checkpoint_stage_sources
 from pr_agent.algo.review_specialists import (
@@ -6149,6 +6150,27 @@ async def test_orchestration_exposes_verifier_failure_and_does_not_publish_candi
     assert reviewer.candidate_verification_artifact["model_calls"] == 1
     assert reviewer.candidate_verification_artifact["publication_safe"] is False
     assert reviewer.verified_review_data["review"]["key_issues_to_review"] == []
+
+
+@pytest.mark.asyncio
+async def test_cost_authority_denial_escapes_candidate_verification_failure_handling():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    denial = CheckpointCostAuthorityError("gateway route is not authorized")
+    reviewer.ai_handler.chat_completion = AsyncMock(side_effect=denial)
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+        pytest.raises(CheckpointCostAuthorityError) as exc_info,
+    ):
+        await reviewer._run_candidate_verification()
+
+    assert exc_info.value is denial
+    reviewer.ai_handler.chat_completion.assert_awaited_once()
 
 
 @pytest.mark.asyncio

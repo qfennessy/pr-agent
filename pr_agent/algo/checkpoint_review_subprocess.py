@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
 from pr_agent.algo.checkpoint_cost_authority import (
     CheckpointCostAuthorityError,
     FrozenCostAuthority,
+    gateway_api_base_identity_hash,
     use_checkpoint_cost_authority,
 )
 from pr_agent.algo.checkpoint_evaluation import EvaluationStagePlan
@@ -564,6 +565,19 @@ async def _execute_review(
             )
         ):
             raise CheckpointCostAuthorityError("cost authority belongs to a different snapshot")
+        checkpoint_gateway_api_base = review_configuration.checkpoint_gateway_api_base
+        if checkpoint_gateway_api_base is None:
+            raise CheckpointCostAuthorityError(
+                "checkpoint execution requires a frozen enforcing gateway api_base"
+            )
+        gateway_api_base_hash = gateway_api_base_identity_hash(checkpoint_gateway_api_base)
+        if any(
+            not hmac.compare_digest(quote.gateway_api_base_hash, gateway_api_base_hash)
+            for quote in cost_authority.quotes
+        ):
+            raise CheckpointCostAuthorityError(
+                "checkpoint gateway api_base does not match every cost quote"
+            )
     except CheckpointCostAuthorityError:
         return _failure_outcome(
             CheckpointReviewSubprocessState.FAILED,
@@ -587,6 +601,9 @@ async def _execute_review(
                 # A missing provider section is already credential-free.
                 pass
         with replay_review_configuration(review_configuration):
+            # The endpoint is frozen in the source-free protocol and matched to
+            # the authority above; never inherit it from the worker environment.
+            settings.set("openai.api_base", checkpoint_gateway_api_base, merge=False)
             settings.set("config.git_provider", "plain-diff")
             settings.set("config.cli_mode", False)
             settings.set("config.use_repo_settings_file", False)
