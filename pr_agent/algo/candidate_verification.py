@@ -882,7 +882,9 @@ def telemetry_safe_artifact(artifact: dict) -> dict:
         "proposed_candidate_count", "accepted_model_candidate_count",
         "sensitive_candidate_count", "candidate_rejection_count",
         "verifier_verified_count", "finding_limit_dropped", "rejected_count", "failure",
-        "verifier_latency_seconds", "publication_safe",
+        "verifier_latency_seconds", "publication_safe", "first_pass_finish_reason",
+        "first_pass_generation_complete", "reviewed_patches_complete",
+        "reviewed_file_inventory_complete",
     }
     mapping_keys = {
         "specialist_prioritization", "sensitive_audit_coverage", "prompt_budget",

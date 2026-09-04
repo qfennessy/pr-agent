@@ -51,26 +51,25 @@ is enabled, bugs-only reviews use their own check name and a clean rerun updates
 output still contains `review.key_issues_to_review`, using an empty list for that case. Set `inline_key_issues = true`
 to keep supported inline publication behavior.
 
-#### Stable review-thread lifecycle foundation
+#### Stable review-thread lifecycle
 
-PR-Agent contains a disabled foundation for keeping one verified finding in one GitHub review thread across pushes.
-It defines versioned finding identities, paginated thread inventory, explicit create/update/resolve operations, and a
-fail-closed action plan tied to one pull-request head commit. Existing persistent inline comments still use the
-simpler duplicate-suppression behavior described in the [improve tool](./improve.md#persistent-inline-comments).
+PR-Agent contains an opt-in GitHub lifecycle for keeping one independently verified finding in one review thread across
+pushes. It defines versioned finding identities, paginated thread inventory, explicit create/update/resolve operations,
+and a fail-closed action plan tied to one pull-request head commit. It remains disabled by default until issue #27's
+benchmark, target-repository pilot, and live-shadow gates are complete. Existing persistent inline comments continue to
+use the simpler duplicate-suppression behavior described in the [improve tool](./improve.md#persistent-inline-comments).
 
-The lifecycle foundation is not connected to `/review` publication yet. Its integration boundary consumes the
-`root_cause_id`, `trusted_stable_key`, and `relevant_file` emitted by the issue #9 `apply_verification_decisions` path,
-scopes them to the current repository and pull request, and never derives a substitute identity from finding prose or
-line numbers. The root-cause contract is `verified-root-cause-v2`; verifier-supplied identity fields are ignored before
-the finding reaches this boundary. Because v2 uses occurrence ordinals to distinguish repeated normalized code shapes,
-the batch adapter consumes a non-reversible trusted shape discriminator, a patch-derived total occurrence count, and the
-prepared same-anchor candidate count. It only accepts shapes that occur exactly once anywhere in the patch and anchors
-that had exactly one prepared candidate, even when the verifier retained just one of several candidates, and rejects
-same-anchor or equal-shape ambiguity. The adapter also requires the provider patch to be explicitly complete, so a
-truncated diff cannot hide another matching shape. Older batches without all trusted values fail closed. This leaves any
-persisted thread mapping untouched instead of swapping content when candidates reorder or one repeated shape is deleted.
-The reserved setting remains off and has no runtime effect until the publication integration is implemented and rollout
-evidence exists:
+The `/review` integration consumes the `root_cause_id`, `trusted_stable_key`, and `relevant_file` emitted by the issue #9
+`apply_verification_decisions` path, scopes them to the current repository and pull request, and never derives a
+substitute identity from finding prose or line numbers. The root-cause contract is `verified-root-cause-v2`;
+verifier-supplied identity fields are ignored before the finding reaches this boundary. Because v2 uses occurrence
+ordinals to distinguish repeated normalized code shapes, the batch adapter consumes a non-reversible trusted shape
+discriminator, a patch-derived total occurrence count, and the prepared same-anchor candidate count. It only accepts
+shapes that occur exactly once anywhere in the patch and anchors that had exactly one prepared candidate, even when the
+verifier retained just one of several candidates, and rejects same-anchor or equal-shape ambiguity. The adapter also
+requires the provider patch to be explicitly complete, so a truncated diff cannot hide another matching shape. Older
+batches without all trusted values fail closed. This leaves any persisted thread mapping untouched instead of swapping
+content when candidates reorder or one repeated shape is deleted. The setting remains off until rollout evidence exists:
 
 ```toml
 [review_thread_lifecycle]
@@ -78,10 +77,16 @@ enabled = false
 obsolete_thread_policy = "keep"
 ```
 
-`obsolete_thread_policy = "mark_fixed"` is the visible close-out policy reserved for the later gated integration: it
-adds a fixed-or-obsolete notice before resolving the thread. Both `mark_fixed` and the lower-level `resolve` policy
+`obsolete_thread_policy = "mark_fixed"` is the visible close-out policy: it adds a fixed-or-obsolete notice before
+resolving the thread. Both `mark_fixed` and the lower-level `resolve` policy
 also require an explicit authoritative-absence signal from a coverage-complete run. Without that signal the planner
 keeps the thread, and it always preserves resolved threads, human-owned threads, and every thread with replies.
+
+Lifecycle publication requires candidate verification, `config.publish_output = true`, and an authenticated GitHub Bot
+identity. A personal user token is rejected before any lifecycle mutation because a later Bot run could not safely claim
+or maintain a user-owned thread. The reviewed head is checked before and after the paginated inventory and again around
+every mutation. Incremental, shadow, partial, omitted-file, severity-thresholded, and finding-truncated runs never treat a
+missing finding as proof that an older thread was fixed.
 
 Move recovery creates one replacement before resolving any superseded threads. If a previous run created the
 replacement but could not finish cleanup, the next inventory keeps the single thread at the current anchor and only
@@ -108,9 +113,13 @@ creation and cleanup. Multi-copy `mark_fixed` plans project each preceding updat
 expected by the next update, and consume that projection only after the preceding cleanup succeeds. A bot-resolved
 historical thread is also preserved when it gains a reply or first appears after recurrence was planned.
 
-The foundation also models invalid or rejected inline locations as de-duplicated summary fallbacks. It returns those
-fallback entries to its caller rather than publishing them itself. Runtime publication remains disconnected until
-the gated integration is implemented and the evaluation/rollout gate from #27 provides its evidence.
+Invalid or GitHub-rejected inline locations remain visible as one identity-marked fallback in the current review summary.
+Append-only and incremental reviews paginate existing summary comments and suppress a repeated fallback only when its
+marker belongs to the exact authenticated Bot; persistent full reviews re-render the fallback because they replace the
+previous summary. Permission and provider failures are likewise explicit, and structured output includes created,
+updated, unchanged, resolved, failed, and per-action-state counts even when lifecycle preflight is unavailable. A stale
+or ambiguous create requires a fresh inventory and prevents the same run from replacing the summary, avoiding an
+unverified duplicate after an uncertain provider response.
 
 If you want to edit [configurations](#configuration-options), add the relevant ones to the command:
 

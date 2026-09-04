@@ -654,6 +654,10 @@ class GitProvider(ABC):
     def supports_review_comment_identity(self) -> bool:
         return False
 
+    def supports_review_thread_lifecycle(self) -> bool:
+        """Return whether this active provider can safely inventory and mutate review threads."""
+        return False
+
     def get_ci_failure_context(self) -> dict:
         """Return bounded failed-check metadata when the provider can supply it."""
         return {"status": "unavailable", "failures": []}
@@ -669,6 +673,10 @@ class GitProvider(ABC):
         except Exception as e:
             get_logger().exception(f"Failed to clear persistent {name}, error: {e}")
         return False
+
+    def clear_persistent_review_comment(self, identity_marker: str, name: str = "review") -> bool:
+        """Remove a persistent review comment without mutating provider-specific output channels."""
+        return GitProvider.clear_persistent_review(self, identity_marker, name)
 
     def unresolve_comment_thread(self, comment):  # noqa: B027 - intentional no-op
         pass

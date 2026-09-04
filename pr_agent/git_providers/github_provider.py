@@ -27,9 +27,15 @@ from retry.api import retry_call
 from starlette_context import context
 
 from ..algo.file_filter import filter_ignored
-from ..algo.git_patch_processing import extract_hunk_headers, iter_git_patch_lines, strip_git_line_ending
+from ..algo.git_patch_processing import (
+    RE_HUNK_HEADER,
+    extract_hunk_headers,
+    iter_git_patch_lines,
+    strip_git_line_ending,
+)
 from ..algo.inline_comment_dedup import (
     FINDING_IDENTITY_MARKER_VERSION,
+    SUMMARY_FALLBACK_MARKER_VERSION,
     body_fingerprint,
     body_with_markers,
     code_fingerprint,
@@ -37,6 +43,7 @@ from ..algo.inline_comment_dedup import (
     get_inline_comment_store,
     has_marker,
     is_agent_inline_comment,
+    summary_fallback_markers,
 )
 from ..algo.language_handler import is_valid_file
 from ..algo.review_thread_reconciler import (
@@ -74,6 +81,60 @@ from .git_provider import (
 _REVIEW_THREAD_MUTATION_LOCKS_GUARD = threading.Lock()
 _REVIEW_THREAD_MUTATION_LOCKS = WeakValueDictionary()
 _REVIEW_THREAD_MUTATION_PROCESS_LOCK_PREFIX = os.path.join(tempfile.gettempdir(), "pr-agent-review-thread")
+
+
+def _github_patch_is_complete(patch: object, additions: object, deletions: object) -> bool:
+    """Prove that one original GitHub patch contains every declared changed record."""
+    if (
+        not isinstance(patch, str)
+        or not patch.strip()
+        or isinstance(additions, bool)
+        or not isinstance(additions, int)
+        or additions < 0
+        or isinstance(deletions, bool)
+        or not isinstance(deletions, int)
+        or deletions < 0
+    ):
+        return False
+
+    saw_hunk = False
+    expected_old = expected_new = observed_old = observed_new = 0
+    observed_additions = observed_deletions = 0
+    for record in iter_git_patch_lines(patch):
+        line = strip_git_line_ending(record)
+        match = RE_HUNK_HEADER.match(line)
+        if match:
+            if saw_hunk and (observed_old != expected_old or observed_new != expected_new):
+                return False
+            _, expected_old, expected_new, _, _ = extract_hunk_headers(match)
+            observed_old = observed_new = 0
+            saw_hunk = True
+            continue
+        if not saw_hunk:
+            continue
+        if line.startswith("\\ No newline at end of file"):
+            continue
+        if line.startswith("+"):
+            observed_new += 1
+            observed_additions += 1
+        elif line.startswith("-"):
+            observed_old += 1
+            observed_deletions += 1
+        elif line.startswith(" "):
+            observed_old += 1
+            observed_new += 1
+        else:
+            return False
+        if observed_old > expected_old or observed_new > expected_new:
+            return False
+
+    return (
+        saw_hunk
+        and observed_old == expected_old
+        and observed_new == expected_new
+        and observed_additions == additions
+        and observed_deletions == deletions
+    )
 
 
 class _ReviewThreadMutationLockError(RuntimeError):
@@ -214,6 +275,10 @@ MAX_CI_CHECK_RUNS = 100
 
 
 class GithubProvider(GitProvider):
+    # None until a filtering pass records the result, so callers that need a
+    # complete inventory of changed files fail closed rather than assume none.
+    excluded_diff_file_paths: Optional[tuple[str, ...]] = None
+
     def __init__(self, pr_url: Optional[str] = None):
         self.repo_obj = None
         try:
@@ -230,6 +295,7 @@ class GithubProvider(GitProvider):
         self.issue_main = None
         self.github_user_id = None
         self.diff_files = None
+        self.excluded_diff_file_paths = None
         self.git_files = None
         self.incremental = IncrementalPR(False)
         self._routing_incremental_files = None
@@ -592,6 +658,12 @@ class GithubProvider(GitProvider):
             # filter files using [ignore] patterns
             files_original = self.get_files()
             files = filter_ignored(files_original)
+            # Ignored paths never reach the model, so record them for callers that
+            # must know whether the reviewed inventory was complete.
+            kept_names = {file.filename for file in files}
+            ignored_files_names = [
+                file.filename for file in files_original if file.filename not in kept_names
+            ]
             if files_original != files:
                 try:
                     names_original = [file.filename for file in files_original]
@@ -628,7 +700,8 @@ class GithubProvider(GitProvider):
                     invalid_files_names.append(file.filename)
                     continue
 
-                patch = file.patch
+                github_patch = file.patch
+                patch = github_patch
                 is_renamed = file.status == "renamed" and getattr(file, "previous_filename", None)
                 old_filename = file.previous_filename if is_renamed else None
                 if is_close_to_rate_limit:
@@ -676,23 +749,34 @@ class GithubProvider(GitProvider):
                     edit_type = EDIT_TYPE.UNKNOWN
 
                 # count number of lines added and removed
+                github_additions = getattr(file, 'additions', None)
+                github_deletions = getattr(file, 'deletions', None)
                 if hasattr(file, 'additions') and hasattr(file, 'deletions'):
-                    num_plus_lines = file.additions
-                    num_minus_lines = file.deletions
+                    num_plus_lines = github_additions
+                    num_minus_lines = github_deletions
                 else:
                     patch_lines = list(iter_git_patch_lines(patch))
                     num_plus_lines = len([line for line in patch_lines if line.startswith('+')])
                     num_minus_lines = len([line for line in patch_lines if line.startswith('-')])
+                patch_is_complete = (
+                    not self.incremental.is_incremental
+                    and _github_patch_is_complete(github_patch, github_additions, github_deletions)
+                )
 
                 file_patch_canonical_structure = FilePatchInfo(original_file_content_str, new_file_content_str, patch,
                                                                file.filename, edit_type=edit_type,
                                                                old_filename=old_filename,
                                                                num_plus_lines=num_plus_lines,
-                                                               num_minus_lines=num_minus_lines,)
+                                                               num_minus_lines=num_minus_lines,
+                                                               patch_is_complete=patch_is_complete,)
                 diff_files.append(file_patch_canonical_structure)
             if invalid_files_names:
                 get_logger().info(f"Filtered out files with invalid extensions: {invalid_files_names}")
 
+            # Changed paths that never reached the model: dropped by [ignore]
+            # patterns, or by the extension/validity check above. Neither appears in
+            # diff_files, so neither appears in remaining_files_list either.
+            self.excluded_diff_file_paths = tuple(sorted(set(ignored_files_names) | set(invalid_files_names)))
             self.diff_files = diff_files
             try:
                 context["diff_files"] = diff_files
@@ -744,6 +828,9 @@ class GithubProvider(GitProvider):
         )
 
     def supports_review_comment_identity(self) -> bool:
+        return True
+
+    def supports_review_thread_lifecycle(self) -> bool:
         return True
 
     def get_ci_failure_context(self) -> dict:
@@ -1109,7 +1196,11 @@ class GithubProvider(GitProvider):
             raise RuntimeError(f"GitHub omitted the next comment cursor for review thread {thread_id}")
         return comments, next_cursor or ""
 
-    def get_review_thread_snapshots(self) -> tuple[ReviewThreadSnapshot, ...]:
+    def get_review_thread_snapshots(
+        self,
+        *,
+        require_viewer_bot: bool = False,
+    ) -> tuple[ReviewThreadSnapshot, ...]:
         """Return an authoritative, paginated snapshot of GitHub review threads.
 
         API and pagination failures raise instead of returning an empty inventory;
@@ -1181,6 +1272,9 @@ class GithubProvider(GitProvider):
             if cursor in seen_thread_cursors:
                 raise RuntimeError("GitHub repeated a review-thread cursor")
             seen_thread_cursors.add(cursor)
+
+        if require_viewer_bot and not _github_actor_is_bot_identity(viewer_identity):
+            raise RuntimeError("review-thread lifecycle requires an authenticated GitHub Bot identity")
 
         snapshots = []
         for thread in raw_threads:
@@ -1300,6 +1394,78 @@ class GithubProvider(GitProvider):
             ))
         return tuple(snapshots)
 
+    def get_bot_owned_review_summary_bodies(self) -> tuple[str, ...]:
+        """Return fallback-bearing summary bodies owned by the authenticated GitHub Bot.
+
+        Append-only review modes need this inventory to suppress a fallback that
+        is already visible from an earlier run. Human-authored comments are never
+        trusted even when they copy a well-formed lifecycle marker.
+        """
+        owner, repo_name = self.repo.split("/", 1)
+        query = """
+        query($owner: String!, $name: String!, $number: Int!, $after: String) {
+          viewer { id login __typename }
+          repository(owner: $owner, name: $name) {
+            pullRequest(number: $number) {
+              comments(first: 100, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes { body author { id login __typename } }
+              }
+            }
+          }
+        }
+        """
+        cursor = None
+        seen_cursors = set()
+        viewer_identity = None
+        bodies = []
+        while True:
+            data = self._request_review_thread_graphql(
+                query,
+                {"owner": owner, "name": repo_name, "number": self.pr_num, "after": cursor},
+            )
+            viewer = data.get("viewer")
+            if not _github_actor_is_bot_identity(viewer):
+                raise RuntimeError("review-summary inventory requires an authenticated GitHub Bot identity")
+            if viewer_identity is None:
+                viewer_identity = viewer
+            elif viewer_identity != viewer:
+                raise RuntimeError("GitHub review-summary inventory viewer changed during pagination")
+            repository = data.get("repository")
+            pull_request = repository.get("pullRequest") if isinstance(repository, dict) else None
+            connection = pull_request.get("comments") if isinstance(pull_request, dict) else None
+            if not isinstance(connection, dict):
+                raise RuntimeError("GitHub review-summary inventory has no pull request connection")
+            nodes = connection.get("nodes")
+            page_info = connection.get("pageInfo")
+            if not isinstance(nodes, list) or not isinstance(page_info, dict):
+                raise RuntimeError("GitHub review-summary inventory is malformed")
+            for comment in nodes:
+                if not isinstance(comment, dict):
+                    raise RuntimeError("GitHub returned an invalid review-summary comment")
+                body = comment.get("body")
+                author = comment.get("author")
+                if not isinstance(body, str) or not isinstance(author, dict):
+                    continue
+                markers = summary_fallback_markers(body)
+                if (
+                    markers
+                    and all(version == SUMMARY_FALLBACK_MARKER_VERSION for version, _ in markers)
+                    and _github_actor_is_bot_identity(author)
+                    and author.get("id") == viewer_identity.get("id")
+                    and author.get("login") == viewer_identity.get("login")
+                ):
+                    bodies.append(body)
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                raise RuntimeError("GitHub omitted the next review-summary cursor")
+            if cursor in seen_cursors:
+                raise RuntimeError("GitHub repeated a review-summary cursor")
+            seen_cursors.add(cursor)
+        return tuple(bodies)
+
     def _live_review_head_sha(self) -> str:
         _, data = self.pr._requester.requestJsonAndCheck(
             "GET", f"{self.base_url}/repos/{self.repo}/pulls/{self.pr_num}"
@@ -1367,7 +1533,7 @@ class GithubProvider(GitProvider):
                 reason="planned_thread_precondition_is_not_safe",
             )
         try:
-            snapshots = self.get_review_thread_snapshots()
+            snapshots = self.get_review_thread_snapshots(require_viewer_bot=True)
             matches = [
                 thread
                 for thread in snapshots
@@ -1492,7 +1658,7 @@ class GithubProvider(GitProvider):
         try:
             same_finding = [
                 thread
-                for thread in self.get_review_thread_snapshots()
+                for thread in self.get_review_thread_snapshots(require_viewer_bot=True)
                 if thread.finding_id == finding_id
             ]
         except Exception as e:
@@ -1601,7 +1767,7 @@ class GithubProvider(GitProvider):
             try:
                 active = [
                     thread
-                    for thread in self.get_review_thread_snapshots()
+                    for thread in self.get_review_thread_snapshots(require_viewer_bot=True)
                     if not thread.is_resolved and thread.finding_id == finding_id and thread.anchor == anchor
                 ]
             except Exception as e:

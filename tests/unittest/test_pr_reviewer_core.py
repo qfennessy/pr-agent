@@ -84,6 +84,27 @@ def _make_prediction_reviewer(git_provider=None):
     return reviewer
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+async def test_get_prediction_records_normalized_first_pass_finish_reason(finish_reason):
+    reviewer = _make_reviewer()
+    reviewer.vars = {}
+    reviewer.patches_diff = "diff"
+    reviewer.ai_handler = SimpleNamespace(
+        chat_completion=AsyncMock(return_value=(VALID_PREDICTION, finish_reason.upper()))
+    )
+    settings = SimpleNamespace(
+        config=SimpleNamespace(temperature=0),
+        pr_review_prompt=SimpleNamespace(system="system", user="{{ diff }}"),
+    )
+
+    with patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings):
+        response = await reviewer._get_prediction("model")
+
+    assert response == VALID_PREDICTION
+    assert reviewer._review_prediction_finish_reason == finish_reason
+
+
 def _routing_configuration(
     *, consume=False, requested_depth="auto", sensitive_categories=(), shadow_only=False
 ):

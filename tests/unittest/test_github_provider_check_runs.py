@@ -407,3 +407,22 @@ def test_clear_persistent_bugs_only_review_updates_check_and_removes_fallback_co
     assert result is True
     assert provider.removed_comment is comment
     assert any(call[0] == "PATCH" for call in requester.calls)
+
+
+def test_clear_persistent_review_comment_leaves_an_existing_check_untouched():
+    requester = _FakeRequester()
+    provider = _make_provider(requester=requester)
+    comment = SimpleNamespace(
+        body="## Team Review 🔍\n\n<!-- pr-agent:review:bugs-only -->\n\ndefect"
+    )
+    provider.pr.get_issue_comments = lambda: [comment]
+    provider.remove_comment = lambda value: setattr(provider, "removed_comment", value)
+
+    result = provider.clear_persistent_review_comment(
+        "<!-- pr-agent:review:bugs-only -->",
+        "bugs-only review",
+    )
+
+    assert result is True
+    assert provider.removed_comment is comment
+    assert requester.calls == []

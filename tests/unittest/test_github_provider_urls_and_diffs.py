@@ -482,6 +482,67 @@ class TestGetDiffFilesEditTypes:
         assert len(diffs) == 1
         assert diffs[0].patch == "LARGE_DIFF"
         assert diffs[0].edit_type == EDIT_TYPE.MODIFIED
+        assert diffs[0].patch_is_complete is False
+
+    @pytest.mark.parametrize(
+        ("status", "patch", "additions", "deletions"),
+        [
+            ("modified", "@@ -1 +1 @@\n-old\n+new", 1, 1),
+            (
+                "modified",
+                "@@ -1,2 +1,2 @@\n-old\n+new\n same\n@@ -10 +10,2 @@\n-old2\n+new2\n+extra",
+                3,
+                2,
+            ),
+            ("added", "@@ -0,0 +1,2 @@\n+one\n+two", 2, 0),
+            ("removed", "@@ -1,2 +0,0 @@\n-one\n-two", 0, 2),
+        ],
+    )
+    def test_original_complete_patch_is_marked_trustworthy(
+        self, patched_helpers, status, patch, additions, deletions
+    ):
+        f = _make_file("complete.py", status, patch=patch, additions=additions, deletions=deletions)
+        p = _make_provider_for_diff([f])
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+
+        diffs = p.get_diff_files()
+
+        assert diffs[0].patch_is_complete is True
+
+    @pytest.mark.parametrize(
+        ("patch", "additions", "deletions"),
+        [
+            ("@@ -1 +1 @@\n-old\n+new", 2, 1),
+            ("@@ -1,3 +1,3 @@\n-old\n+new\n context", 1, 1),
+            ("@@ malformed @@\n-old\n+new", 1, 1),
+        ],
+    )
+    def test_truncated_or_malformed_patch_is_not_marked_trustworthy(
+        self, patched_helpers, patch, additions, deletions
+    ):
+        f = _make_file("incomplete.py", "modified", patch=patch, additions=additions, deletions=deletions)
+        p = _make_provider_for_diff([f])
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+
+        diffs = p.get_diff_files()
+
+        assert diffs[0].patch_is_complete is False
+
+    def test_incremental_github_patch_is_not_marked_trustworthy(self, patched_helpers):
+        f = _make_file(
+            "incremental.py",
+            "modified",
+            patch="@@ -1 +1 @@\n-old\n+new",
+            additions=1,
+            deletions=1,
+        )
+        p = _make_provider_for_diff([f])
+        p.incremental.is_incremental = True
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+
+        diffs = p.get_diff_files()
+
+        assert diffs[0].patch_is_complete is False
 
     def test_existing_patch_preserved(self, patched_helpers):
         f = _make_file("ok.py", "modified", patch="@@ -1 +1 @@\n-a\n+b")
@@ -573,3 +634,65 @@ class TestGetDiffFilesRename:
         original_content_call = spy.call_args_list[-1]
         assert original_content_call.args[1] == "prev-sha"
         assert original_content_call.kwargs.get("path") == "old_dir/module.py"
+
+
+class TestExcludedDiffFilePaths:
+    """[ignore] patterns drop changed files entirely, so callers must be able to see that."""
+
+    def test_unknown_until_a_filtering_pass_runs(self):
+        p = _make_provider_for_diff([])
+        assert p.excluded_diff_file_paths is None
+
+    def test_empty_tuple_when_nothing_is_filtered(self, patched_helpers):
+        p = _make_provider_for_diff([_make_file("kept.py", "modified")])
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+
+        p.get_diff_files()
+
+        assert p.excluded_diff_file_paths == ()
+
+    def test_records_the_paths_that_ignore_patterns_removed(self):
+        kept = _make_file("kept.py", "modified")
+        dropped = _make_file("vendor/generated.py", "modified")
+        other = _make_file("docs/notes.md", "modified")
+        p = _make_provider_for_diff([kept, dropped, other])
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+        mod = "pr_agent.git_providers.github_provider"
+        with patch(f"{mod}.filter_ignored", side_effect=lambda fs: [kept]), patch(
+            f"{mod}.is_valid_file", return_value=True
+        ), patch(f"{mod}.load_large_diff", return_value="LARGE_DIFF"):
+            diffs = p.get_diff_files()
+
+        assert [d.filename for d in diffs] == ["kept.py"]
+        assert p.excluded_diff_file_paths == ("docs/notes.md", "vendor/generated.py")
+
+    def test_records_paths_rejected_by_the_validity_check(self):
+        kept = _make_file("kept.py", "modified")
+        bad_extension = _make_file("package-lock.json", "modified")
+        p = _make_provider_for_diff([kept, bad_extension])
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+        mod = "pr_agent.git_providers.github_provider"
+        with patch(f"{mod}.filter_ignored", side_effect=lambda fs: fs), patch(
+            f"{mod}.is_valid_file", side_effect=lambda name: name != "package-lock.json"
+        ), patch(f"{mod}.load_large_diff", return_value="LARGE_DIFF"):
+            diffs = p.get_diff_files()
+
+        assert [d.filename for d in diffs] == ["kept.py"]
+        assert p.excluded_diff_file_paths == ("package-lock.json",)
+
+    def test_combines_ignored_and_invalid_paths_without_duplicates(self):
+        kept = _make_file("kept.py", "modified")
+        ignored = _make_file("vendor/generated.py", "modified")
+        invalid = _make_file("package-lock.json", "modified")
+        p = _make_provider_for_diff([kept, ignored, invalid])
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+        mod = "pr_agent.git_providers.github_provider"
+        with patch(
+            f"{mod}.filter_ignored", side_effect=lambda fs: [f for f in fs if f is not ignored]
+        ), patch(
+            f"{mod}.is_valid_file", side_effect=lambda name: name != "package-lock.json"
+        ), patch(f"{mod}.load_large_diff", return_value="LARGE_DIFF"):
+            diffs = p.get_diff_files()
+
+        assert [d.filename for d in diffs] == ["kept.py"]
+        assert p.excluded_diff_file_paths == ("package-lock.json", "vendor/generated.py")
