@@ -846,7 +846,11 @@ def _time_and_lineage_metrics(
     withdrawn_count = len(withdrawals)
     for key, withdrawal_case_id in withdrawals.items():
         withdrawal_terminal = terminals_by_case.get(withdrawal_case_id)
-        if withdrawal_terminal is None or withdrawal_terminal.state is not EvaluationRunState.COMPLETED:
+        if (
+            withdrawal_terminal is None
+            or withdrawal_terminal.state is not EvaluationRunState.COMPLETED
+            or bool(withdrawal_terminal.coverage_issues)
+        ):
             withdrawal_evidence_incomplete = True
         for case in ordered_cases:
             if roots[case.case_id] != key[0]:
@@ -855,7 +859,11 @@ def _time_and_lineage_metrics(
             if not after_withdrawal:
                 continue
             terminal = terminals_by_case.get(case.case_id)
-            if terminal is None or terminal.state is not EvaluationRunState.COMPLETED:
+            if (
+                terminal is None
+                or terminal.state is not EvaluationRunState.COMPLETED
+                or bool(terminal.coverage_issues)
+            ):
                 withdrawal_evidence_incomplete = True
             if terminal and terminal.state is EvaluationRunState.COMPLETED and any(
                 finding.fingerprint == key[1] and finding.lifecycle_state is FindingLifecycleState.ACTIVE
@@ -937,7 +945,9 @@ def _paired_comparisons(
             "case_recall": recall,
             "false_interruption_rate": (
                 float(bool(observations))
-                if completed and truth_by_case[case.case_id].is_clean
+                if completed
+                and not terminal.coverage_issues
+                and truth_by_case[case.case_id].is_clean
                 else None
             ),
         }
