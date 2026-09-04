@@ -41,7 +41,11 @@ from pr_agent.algo.checkpoint_evaluation_execution import (
     PaidExecutionRequest,
     evaluate_paid_execution,
 )
-from pr_agent.algo.checkpoint_evaluation_snapshot import load_review_snapshot_artifact
+from pr_agent.algo.checkpoint_evaluation_snapshot import (
+    LoadedReviewSnapshotAndConfiguration,
+    load_review_snapshot_and_configuration_artifacts,
+)
+from pr_agent.algo.review_configuration import ReviewConfigurationBundle
 from pr_agent.algo.review_snapshot import CoverageIssue, ReviewResultState, ReviewSnapshot, ReviewSnapshotResult
 from pr_agent.algo.run_details import RunDetails
 
@@ -74,12 +78,15 @@ class ProductionArmContext:
     configuration_hash: str
     prompt_hash: str
     model_visible_metadata: Mapping[str, object]
+    review_configuration: ReviewConfigurationBundle = field(repr=False)
     hard_cost_cap_usd: Optional[float] = None
     publish_output: bool = False
 
     def __post_init__(self) -> None:
         if self.publish_output:
             raise EvaluationValidationError("checkpoint production bindings cannot publish output")
+        if not isinstance(self.review_configuration, ReviewConfigurationBundle):
+            raise EvaluationValidationError("production adapter context requires a review configuration bundle")
         if self.hard_cost_cap_usd is not None and (
             not isinstance(self.hard_cost_cap_usd, (int, float))
             or isinstance(self.hard_cost_cap_usd, bool)
@@ -240,11 +247,17 @@ class ProductionArmBinding:
 class ProductionEvaluationPreflight:
     manifest_id: str
     snapshots_by_case_id: Mapping[str, ReviewSnapshot]
+    review_configurations_by_case_id: Mapping[str, ReviewConfigurationBundle] = field(repr=False)
     arms_by_kind: Mapping[EvaluationArmKind, EvaluationArm]
     bindings_by_kind: Mapping[EvaluationArmKind, ProductionArmBinding]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "snapshots_by_case_id", MappingProxyType(dict(self.snapshots_by_case_id)))
+        object.__setattr__(
+            self,
+            "review_configurations_by_case_id",
+            MappingProxyType(dict(self.review_configurations_by_case_id)),
+        )
         object.__setattr__(self, "arms_by_kind", MappingProxyType(dict(self.arms_by_kind)))
         object.__setattr__(self, "bindings_by_kind", MappingProxyType(dict(self.bindings_by_kind)))
 
@@ -263,6 +276,7 @@ class ProductionEvaluationRunner:
         manifest: EvaluationManifest,
         *,
         snapshot_paths: Mapping[str, str | Path],
+        review_configuration_artifact_hashes: Optional[Mapping[str, str]] = None,
         bindings: Sequence[ProductionArmBinding],
         artifact_store: EvaluationArtifactStore,
         paid_request: PaidExecutionRequest,
@@ -273,6 +287,9 @@ class ProductionEvaluationRunner:
     ) -> None:
         self.manifest = manifest
         self.snapshot_paths = MappingProxyType(dict(snapshot_paths))
+        self.review_configuration_artifact_hashes = MappingProxyType(
+            dict(review_configuration_artifact_hashes or {})
+        )
         self.bindings = tuple(bindings)
         self.artifact_store = artifact_store
         self.paid_request = paid_request
@@ -293,11 +310,18 @@ class ProductionEvaluationRunner:
             allow_paid_execution=self.allow_paid_execution,
             publish_output=self.publish_output,
         )
-        snapshots = _load_all_snapshots(self.manifest, self.snapshot_paths)
+        loaded_pairs = _load_all_snapshot_configuration_pairs(
+            self.manifest,
+            self.snapshot_paths,
+            self.review_configuration_artifact_hashes,
+        )
         self.artifact_store.bind_paid_request(self.manifest, self.paid_request)
         return ProductionEvaluationPreflight(
             manifest_id=self.manifest.manifest_id,
-            snapshots_by_case_id=snapshots,
+            snapshots_by_case_id={case_id: pair.snapshot for case_id, pair in loaded_pairs.items()},
+            review_configurations_by_case_id={
+                case_id: pair.review_configuration for case_id, pair in loaded_pairs.items()
+            },
             arms_by_kind=arms_by_kind,
             bindings_by_kind=bindings_by_kind,
         )
@@ -316,6 +340,7 @@ class ProductionEvaluationRunner:
             arm = arms_by_id[item.arm_id]
             binding = bindings_by_arm_id[item.arm_id]
             snapshot = preflight.snapshots_by_case_id[item.case_id]
+            review_configuration = preflight.review_configurations_by_case_id[item.case_id]
             adapter = binding.adapter
             if adapter is None:  # guarded by preflight; keep the paid boundary explicit
                 raise ProductionDependencyUnavailable(f"{binding.kind.value} production adapter is unavailable")
@@ -338,6 +363,7 @@ class ProductionEvaluationRunner:
                 configuration_hash=arm.configuration_hash,
                 prompt_hash=arm.prompt_hash,
                 model_visible_metadata=case.model_visible_metadata,
+                review_configuration=review_configuration,
                 hard_cost_cap_usd=(
                     paid_budget.hard_cost_cap_per_attempt_usd
                     if paid_budget is not None
@@ -533,10 +559,11 @@ def _require_remaining_paid_capacity(
         )
 
 
-def _load_all_snapshots(
+def _load_all_snapshot_configuration_pairs(
     manifest: EvaluationManifest,
     snapshot_paths: Mapping[str, str | Path],
-) -> Mapping[str, ReviewSnapshot]:
+    review_configuration_artifact_hashes: Mapping[str, str],
+) -> Mapping[str, LoadedReviewSnapshotAndConfiguration]:
     expected_case_ids = {case.case_id for case in manifest.cases}
     supplied_case_ids = set(snapshot_paths)
     if supplied_case_ids != expected_case_ids:
@@ -545,13 +572,25 @@ def _load_all_snapshots(
         raise EvaluationValidationError(
             f"snapshot paths must match manifest cases exactly; missing={missing}, extra={extra}"
         )
-    snapshots: dict[str, ReviewSnapshot] = {}
+    supplied_configuration_case_ids = set(review_configuration_artifact_hashes)
+    if supplied_configuration_case_ids != expected_case_ids:
+        missing = sorted(expected_case_ids - supplied_configuration_case_ids)
+        extra = sorted(supplied_configuration_case_ids - expected_case_ids)
+        raise EvaluationValidationError(
+            "review configuration artifact hashes must match manifest cases exactly; "
+            f"missing={missing}, extra={extra}"
+        )
+    loaded_pairs: dict[str, LoadedReviewSnapshotAndConfiguration] = {}
     for case in sorted(manifest.cases, key=lambda item: item.case_id):
-        snapshots[case.case_id] = load_review_snapshot_artifact(snapshot_paths[case.case_id], case)
+        loaded_pairs[case.case_id] = load_review_snapshot_and_configuration_artifacts(
+            snapshot_paths[case.case_id],
+            case,
+            review_configuration_artifact_hash=review_configuration_artifact_hashes[case.case_id],
+        )
     for case in manifest.cases:
-        snapshot = snapshots[case.case_id]
+        snapshot = loaded_pairs[case.case_id].snapshot
         expected_parent_snapshot_id = (
-            snapshots[case.parent_case_id].snapshot_id
+            loaded_pairs[case.parent_case_id].snapshot.snapshot_id
             if case.parent_case_id is not None
             else None
         )
@@ -560,7 +599,7 @@ def _load_all_snapshots(
                 f"snapshot lineage for case {case.case_id} does not match its manifest parent"
             )
         _validate_loaded_snapshot_metadata(case, snapshot)
-    return MappingProxyType(snapshots)
+    return MappingProxyType(loaded_pairs)
 
 
 def _validate_loaded_snapshot_metadata(case: CheckpointCase, snapshot: ReviewSnapshot) -> None:

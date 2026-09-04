@@ -113,8 +113,8 @@ def test_production_binding_inventory_is_exact_and_fail_closed():
         item for item in inventory.bindings if item.kind is EvaluationArmKind.FULL_CASCADE
     )
     assert set(full_cascade.blocker_codes) == {
-        "immutable_review_configuration_replay_unavailable",
-        "finding_fingerprint_contract_unavailable",
+        "general_review_adapter_unavailable",
+        "finding_normalization_adapter_unavailable",
         "verified_candidate_source_contract_unavailable",
         "frontier_stage_telemetry_contract_unavailable",
         "frontier_decision_semantics_unavailable",
@@ -124,8 +124,8 @@ def test_production_binding_inventory_is_exact_and_fail_closed():
         item for item in inventory.bindings if item.kind is EvaluationArmKind.GENERAL_REVIEW
     )
     assert set(general_review.blocker_codes) == {
-        "immutable_review_configuration_replay_unavailable",
-        "finding_fingerprint_contract_unavailable",
+        "general_review_adapter_unavailable",
+        "finding_normalization_adapter_unavailable",
         "hard_cost_cap_enforcement_unavailable",
     }
 

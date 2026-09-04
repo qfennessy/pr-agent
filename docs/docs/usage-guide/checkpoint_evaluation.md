@@ -24,11 +24,13 @@ claims to the immutable manifest. Every entry remains unavailable until all its 
 blocker contracts are implemented. An unavailable arm has no adapter, cannot claim hard-cost-cap
 enforcement, and stops production preflight before the artifact store or any model client is touched.
 
-The general-review arm now has a versioned configuration-bundle contract and an isolated
-no-publish replay seam. It remains unavailable until snapshot capture securely persists and reloads
-the original bundle, and until the finding-fingerprint contract and hard cost-cap enforcement are
-implemented. This first replay contract is deliberately limited to the standard OpenAI route and
-rejects candidate verification, specialist routing, custom endpoints, and frontier adjudication.
+The general-review arm now has a versioned configuration-bundle contract, atomic private
+snapshot/bundle persistence, and an isolated no-publish replay seam. Production preflight requires
+the exact artifact hashes and passes the validated immutable bundle to each adapter. The arm remains
+unavailable until an adapter connects that context to the replay seam, emits normalized findings,
+and enforces a genuine hard cost cap. This first replay contract is deliberately limited to the
+standard OpenAI route and rejects candidate verification, specialist routing, custom endpoints, and
+frontier adjudication.
 Issue #27 must still complete those contracts and the source/telemetry contracts needed to integrate
 the production orchestration delivered by issues #26, #12, #11, #9, and #33. A frozen
 target-repository replay and one week of live shadow evidence are also required before any rollout
@@ -449,9 +451,12 @@ the complete request before importing model handlers, disables working-tree enri
 output sink, and returns only structured review data plus bounded run telemetry. Process-wide
 settings, callbacks, credentials, and environment mutations die with the child process.
 
-This is still not a runnable production evaluation arm. The immutable configuration can now be
-persisted and reloaded with its snapshot, but no production binding yet threads that validated pair
-into the subprocess. General-review findings also do not expose the normalized fingerprint/severity
-contract required by `ProductionArmResult`, and paid calls do not yet have an enforceable pre-call
-dollar cap. Full-cascade replay additionally needs the specialist and verification source contracts.
-Those blockers remain fail-closed.
+This is still not a runnable production evaluation arm. Preflight now loads each immutable
+snapshot/configuration pair before artifact-store access and supplies the exact bundle in the frozen
+adapter context. Provider-neutral normalizers derive versioned general-review fingerprints, preserve
+trusted verified-finding keys, and compute active/withdrawn lifecycle transitions from parent
+checkpoints rather than model fields. They fail closed when production output omits durable root-cause
+identity or trusted severity instead of inferring either value from mutable prose or location. No
+production binding yet retains and joins that source metadata to subprocess output, and paid calls do
+not yet have an enforceable pre-call dollar cap. Full-cascade replay additionally needs the specialist
+and verification source contracts. Those blockers remain fail-closed.
