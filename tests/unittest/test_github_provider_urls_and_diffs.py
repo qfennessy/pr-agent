@@ -665,3 +665,34 @@ class TestExcludedDiffFilePaths:
 
         assert [d.filename for d in diffs] == ["kept.py"]
         assert p.excluded_diff_file_paths == ("docs/notes.md", "vendor/generated.py")
+
+    def test_records_paths_rejected_by_the_validity_check(self):
+        kept = _make_file("kept.py", "modified")
+        bad_extension = _make_file("package-lock.json", "modified")
+        p = _make_provider_for_diff([kept, bad_extension])
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+        mod = "pr_agent.git_providers.github_provider"
+        with patch(f"{mod}.filter_ignored", side_effect=lambda fs: fs), patch(
+            f"{mod}.is_valid_file", side_effect=lambda name: name != "package-lock.json"
+        ), patch(f"{mod}.load_large_diff", return_value="LARGE_DIFF"):
+            diffs = p.get_diff_files()
+
+        assert [d.filename for d in diffs] == ["kept.py"]
+        assert p.excluded_diff_file_paths == ("package-lock.json",)
+
+    def test_combines_ignored_and_invalid_paths_without_duplicates(self):
+        kept = _make_file("kept.py", "modified")
+        ignored = _make_file("vendor/generated.py", "modified")
+        invalid = _make_file("package-lock.json", "modified")
+        p = _make_provider_for_diff([kept, ignored, invalid])
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+        mod = "pr_agent.git_providers.github_provider"
+        with patch(
+            f"{mod}.filter_ignored", side_effect=lambda fs: [f for f in fs if f is not ignored]
+        ), patch(
+            f"{mod}.is_valid_file", side_effect=lambda name: name != "package-lock.json"
+        ), patch(f"{mod}.load_large_diff", return_value="LARGE_DIFF"):
+            diffs = p.get_diff_files()
+
+        assert [d.filename for d in diffs] == ["kept.py"]
+        assert p.excluded_diff_file_paths == ("package-lock.json", "vendor/generated.py")

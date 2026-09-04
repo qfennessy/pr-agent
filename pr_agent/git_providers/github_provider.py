@@ -661,9 +661,9 @@ class GithubProvider(GitProvider):
             # Ignored paths never reach the model, so record them for callers that
             # must know whether the reviewed inventory was complete.
             kept_names = {file.filename for file in files}
-            self.excluded_diff_file_paths = tuple(sorted(
+            ignored_files_names = [
                 file.filename for file in files_original if file.filename not in kept_names
-            ))
+            ]
             if files_original != files:
                 try:
                     names_original = [file.filename for file in files_original]
@@ -773,6 +773,10 @@ class GithubProvider(GitProvider):
             if invalid_files_names:
                 get_logger().info(f"Filtered out files with invalid extensions: {invalid_files_names}")
 
+            # Changed paths that never reached the model: dropped by [ignore]
+            # patterns, or by the extension/validity check above. Neither appears in
+            # diff_files, so neither appears in remaining_files_list either.
+            self.excluded_diff_file_paths = tuple(sorted(set(ignored_files_names) | set(invalid_files_names)))
             self.diff_files = diff_files
             try:
                 context["diff_files"] = diff_files
