@@ -15,7 +15,7 @@ from pr_agent.algo.review_thread_reconciler import (
     ReviewThreadSnapshot,
     finding_identities_from_verified_findings,
 )
-from pr_agent.algo.types import FilePatchInfo
+from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.tools.pr_reviewer import PRReviewer
 
 
@@ -270,6 +270,26 @@ def test_deleted_code_finding_creates_a_left_side_thread():
     create = _mutation_calls(provider)[0]
     assert create[1]["side"] == "LEFT"
     assert create[1]["line"] == 2
+    assert "key_issues_to_review" not in result["review"]
+
+
+def test_renamed_file_old_side_finding_uses_old_path_for_lookup_and_new_path_for_thread():
+    provider = _Provider()
+    provider.get_diff_files = MagicMock(return_value=[FilePatchInfo(
+        "old\nvalue\nthird\nfourth\n",
+        "new\nvalue\nthird\nfourth\n",
+        "@@ -1 +1 @@",
+        "src/new-app.py",
+        edit_type=EDIT_TYPE.RENAMED,
+        old_filename="src/old-app.py",
+    )])
+    reviewer = _reviewer(provider)
+
+    result = _apply(reviewer, [_finding(relevant_file="src/old-app.py", side="old")])
+
+    create = _mutation_calls(provider)[0]
+    assert create[1]["path"] == "src/new-app.py"
+    assert create[1]["side"] == "LEFT"
     assert "key_issues_to_review" not in result["review"]
 
 

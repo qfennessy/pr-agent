@@ -3133,6 +3133,10 @@ class PRReviewer:
                 continue
             diff_files[filename] = file
             diff_files.setdefault(filename.lstrip("/"), file)
+            old_filename = str(getattr(file, "old_filename", "") or "").strip()
+            if old_filename:
+                diff_files.setdefault(old_filename, file)
+                diff_files.setdefault(old_filename.lstrip("/"), file)
 
         desired = []
         for issue, identity in zip(issues, identities, strict=True):
