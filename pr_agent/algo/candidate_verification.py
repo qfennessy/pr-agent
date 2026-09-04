@@ -3187,7 +3187,13 @@ def bounded_verification_evidence(evidence: list[dict], content_fraction: float)
     fraction = min(1.0, max(0.0, float(content_fraction)))
     bounded = []
     for item in evidence:
-        bounded_item = dict(item)
+        # Static evidence remains deeply immutable while bound to the run
+        # configuration. Materialize a detached JSON-shaped copy only at the
+        # prompt boundary so nested mapping proxies and tuples cannot reach
+        # json.dumps or alias later ambient mutations.
+        bounded_item = _thaw_static_evidence_value(item)
+        if not isinstance(bounded_item, dict):
+            continue
         if "content" in bounded_item:
             content = str(bounded_item["content"] or "")
             allowed_characters = int(len(content) * fraction)
