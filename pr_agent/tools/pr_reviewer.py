@@ -2939,9 +2939,13 @@ class PRReviewer:
         )
 
         lifecycle_enabled = self._review_thread_lifecycle_enabled()
+        lifecycle_owns_inline_publication = (
+            lifecycle_enabled
+            and str(get_settings().get("config.git_provider", "") or "").strip().casefold() == "github"
+        )
         lifecycle_data = data
         if (
-            lifecycle_enabled
+            lifecycle_owns_inline_publication
             and not candidate_verification_blocked
             and self._provider_mutations_allowed()
             and get_settings().config.publish_output
@@ -2963,7 +2967,8 @@ class PRReviewer:
             key_issues_to_review = data['review'].pop('key_issues_to_review')
             data['review']['key_issues_to_review'] = key_issues_to_review
 
-        if (not lifecycle_enabled and self._provider_mutations_allowed() and get_settings().config.publish_output and
+        if (not lifecycle_owns_inline_publication and self._provider_mutations_allowed() and
+                get_settings().config.publish_output and
                 get_settings().pr_reviewer.get('inline_key_issues', False)):
             data = self._publish_key_issues_as_inline_comments(data)
 

@@ -604,3 +604,29 @@ def test_disabled_setting_preserves_legacy_inline_path():
 
     reviewer._apply_review_thread_lifecycle.assert_not_called()
     reviewer._publish_key_issues_as_inline_comments.assert_called_once()
+
+
+def test_non_github_provider_preserves_legacy_inline_path_when_lifecycle_setting_is_enabled():
+    reviewer = _reviewer(_Provider())
+    reviewer.verified_review_data = {"review": {"key_issues_to_review": [_finding()]}}
+    reviewer.prediction = "review: {}"
+    reviewer._candidate_verification_blocks_publication = MagicMock(return_value=False)
+    reviewer._apply_review_thread_lifecycle = MagicMock()
+    reviewer._publish_structured_review_data = MagicMock()
+    reviewer._publish_key_issues_as_inline_comments = MagicMock(return_value={"review": {}})
+    reviewer._provider_mutations_allowed = MagicMock(return_value=True)
+    reviewer.set_review_labels = MagicMock()
+    reviewer.git_provider.is_supported = MagicMock(return_value=False)
+
+    with (
+        patch(
+            "pr_agent.tools.pr_reviewer.get_settings",
+            return_value=_Settings(enabled=True, provider="gitlab"),
+        ),
+        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", return_value="review"),
+    ):
+        reviewer._prepare_pr_review()
+
+    reviewer._apply_review_thread_lifecycle.assert_not_called()
+    reviewer._publish_key_issues_as_inline_comments.assert_called_once()
