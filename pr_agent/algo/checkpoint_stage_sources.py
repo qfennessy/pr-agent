@@ -589,6 +589,44 @@ def get_checkpoint_stage_sources() -> Optional[CheckpointStageSources]:
     return _ACTIVE_STAGE_SOURCES.get()
 
 
+def checkpoint_enforced_model_identity(
+    stage: str,
+    model_id: str,
+    deployment_id: Optional[str],
+) -> Optional[EvaluationStageModelIdentity]:
+    """Resolve the provider/revision pinned by the injected production source."""
+
+    sources = get_checkpoint_stage_sources()
+    if sources is None:
+        return None
+    if stage in sources.specialist_model_identities:
+        identities = sources.specialist_model_identities[stage]
+    elif stage == "candidate_verification":
+        identities = (
+            sources.candidate_verification_model_identities
+            or sources.full_cascade_candidate_verification_model_identities
+        )
+    elif stage == "frontier_adjudication" and sources.frontier_adjudication is not None:
+        identities = tuple(
+            EvaluationStageModelIdentity(
+                model_id=identity.model,
+                provider_id=identity.provider,
+                model_revision=identity.revision,
+                deployment_id_hash=deployment_identity_hash(identity.deployment),
+            )
+            for identity in sources.frontier_adjudication.model_identities
+        )
+    else:
+        return None
+    deployment_hash = deployment_identity_hash(deployment_id)
+    matches = tuple(
+        identity
+        for identity in identities
+        if identity.model_id == model_id and identity.deployment_id_hash == deployment_hash
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
 def infer_checkpoint_arm_kind(
     stage_plan: Sequence[EvaluationStagePlan],
 ) -> Optional[EvaluationArmKind]:

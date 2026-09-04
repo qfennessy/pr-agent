@@ -32,6 +32,7 @@ from pr_agent.algo.checkpoint_evaluation_execution import PaidExecutionRequest
 CHECKPOINT_COST_AUTHORITY_SCHEMA_VERSION = "checkpoint-cost-authority-v1"
 CHECKPOINT_COST_ENFORCEMENT_KIND = "provider_gateway_maximum_charge"
 GENERAL_REVIEW_COST_STAGE = "general_review"
+FRONTIER_ADJUDICATION_COST_STAGE = "frontier_adjudication"
 _HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _STAGE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _MUTABLE_REVISIONS = frozenset({"default", "latest", "main", "stable"})
@@ -39,6 +40,14 @@ _MUTABLE_REVISIONS = frozenset({"default", "latest", "main", "stable"})
 
 class CheckpointCostAuthorityError(EvaluationValidationError):
     """Raised before a provider request when its hard spending proof is absent."""
+
+
+def checkpoint_cost_stage(attribution: Optional[str]) -> str:
+    """Map telemetry attribution to the fixed stage named by a cost quote."""
+
+    if attribution and attribution.startswith(f"{FRONTIER_ADJUDICATION_COST_STAGE}:"):
+        return FRONTIER_ADJUDICATION_COST_STAGE
+    return attribution or GENERAL_REVIEW_COST_STAGE
 
 
 def _require_hash(name: str, value: object) -> str:
@@ -133,8 +142,8 @@ class ProviderMaximumCharge:
             self.deployment_id_hash,
         )
 
-    def runtime_key(self) -> tuple[str, str, Optional[str]]:
-        return self.stage, self.model_id, self.deployment_id_hash
+    def runtime_key(self) -> tuple[str, str, str, str, Optional[str]]:
+        return self.route_key()
 
     def _identity_payload(self) -> dict[str, Any]:
         return {
@@ -473,6 +482,8 @@ class CostAuthorityLedger:
         *,
         stage: str,
         model_id: str,
+        provider_id: str,
+        model_revision: str,
         deployment_id: Optional[str],
         max_output_tokens: object,
         provider_max_retries: object,
@@ -490,8 +501,13 @@ class CostAuthorityLedger:
             or max_output_tokens < 1
         ):
             raise CheckpointCostAuthorityError("checkpoint provider request requires a bounded output cap")
-        key = (_require_stage(stage), _require_identifier("provider request model_id", model_id),
-               deployment_identity_hash(deployment_id))
+        key = (
+            _require_stage(stage),
+            _require_identifier("provider request model_id", model_id),
+            _require_identifier("provider request provider_id", provider_id),
+            _require_identifier("provider request model_revision", model_revision),
+            deployment_identity_hash(deployment_id),
+        )
         quote = self._quotes.get(key)
         if quote is None:
             raise CheckpointCostAuthorityError("checkpoint provider request has no authoritative maximum-charge quote")
@@ -565,9 +581,19 @@ def reserve_checkpoint_provider_attempt(
     ledger = get_checkpoint_cost_authority_ledger()
     if ledger is None:
         return None
+    stage = checkpoint_cost_stage(attribution)
+    from pr_agent.algo.checkpoint_stage_sources import checkpoint_enforced_model_identity
+
+    enforced_identity = checkpoint_enforced_model_identity(stage, model_id, deployment_id)
+    if enforced_identity is None:
+        raise CheckpointCostAuthorityError(
+            "checkpoint provider request has no pre-call enforced provider/revision identity"
+        )
     return ledger.reserve(
-        stage=attribution or GENERAL_REVIEW_COST_STAGE,
+        stage=stage,
         model_id=model_id,
+        provider_id=enforced_identity.provider_id,
+        model_revision=enforced_identity.model_revision,
         deployment_id=deployment_id,
         max_output_tokens=max_output_tokens,
         provider_max_retries=provider_max_retries,

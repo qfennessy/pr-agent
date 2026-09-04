@@ -34,7 +34,10 @@ severity contract rather than an inferred default. Both bindings also remain una
 supplies a current, immutable provider/gateway maximum-charge authority for every frozen route and the bound
 runtime controls pass preflight. The model boundary can now consume that authority immediately before every
 underlying provider request, but the repository does not ship an authority or treat a LiteLLM price estimate
-as one. The general replay contract remains limited to the
+as one. A quote cannot attest to its own route: checkpoint stage calls resolve provider and immutable revision
+from the separately injected production stage source before lookup. General-review execution has no equivalent
+independent pre-call identity source yet and therefore remains unavailable. The general replay contract remains
+limited to the
 standard OpenAI route; unsupported routes continue to fail configuration capture.
 Issue #27 must still complete those contracts and the source/telemetry contracts needed to integrate
 the production orchestration delivered by issues #26, #12, #11, #9, and #33. A frozen
@@ -217,7 +220,10 @@ retries, fallback routes, streaming calls, and the Bedrock credential fallback, 
 reserves the quote's full worst-case charge. It does not refund reservations based on estimated actual
 usage. A request is denied before the provider client when its route is unquoted, the output cap is
 missing or larger than quoted, provider SDK retries are not exactly zero, the authority is expired or
-mismatched, or the next reservation would exceed the cap. Post-response cost and identity telemetry
+mismatched, an independently injected stage source cannot pin its provider and immutable revision, or the
+next reservation would exceed the cap. Dynamic per-finding frontier telemetry attribution is normalized to
+the fixed `frontier_adjudication` stage only for quote lookup; full attribution remains in telemetry.
+Post-response cost and identity telemetry
 still must be complete and agree with the frozen arm; the authority does not turn missing telemetry into
 zero.
 
@@ -508,6 +514,6 @@ parents are not reserved or executed. Clean empty-diff outcomes persist an unamb
 with observed zero tokens and cost; missing telemetry after a model call remains unavailable. Paid
 calls remain unavailable because no authoritative provider/gateway maximum-charge contract is supplied
 by the repository, although the worker now enforces such a contract at every underlying call.
-General-review severity,
+An independent general-review provider/revision source, general-review severity,
 deterministic/specialist finding contracts, and full-cascade frontier decision and aggregate-stage semantics
 also remain fail-closed.

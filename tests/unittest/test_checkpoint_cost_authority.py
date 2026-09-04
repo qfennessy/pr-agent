@@ -15,6 +15,7 @@ from pr_agent.algo.checkpoint_cost_authority import (
     CostAuthorityLedger,
     FrozenCostAuthority,
     ProviderMaximumCharge,
+    checkpoint_cost_stage,
     reserve_checkpoint_provider_attempt,
     use_checkpoint_cost_authority,
     validate_cost_authorities,
@@ -27,6 +28,7 @@ from pr_agent.algo.checkpoint_evaluation import (
     EvaluationCohort,
     EvaluationManifest,
     EvaluationModelIdentity,
+    EvaluationStageModelIdentity,
 )
 from pr_agent.algo.checkpoint_evaluation_execution import PaidExecutionRequest, PaidPlanItemBudget
 from pr_agent.algo.review_snapshot import ReviewEvent
@@ -104,6 +106,28 @@ def _contracts():
     return manifest, request, case, arm, authority
 
 
+def _install_enforced_general_identity(monkeypatch):
+    revisions = {
+        "openai/model-primary": "model-primary-2026-09-01",
+        "openai/model-fallback": "model-fallback-2026-09-01",
+    }
+
+    def resolve(stage, model_id, deployment_id):
+        assert stage == "general_review"
+        assert deployment_id is None
+        return EvaluationStageModelIdentity(
+            model_id=model_id,
+            provider_id="openai",
+            model_revision=revisions[model_id],
+            deployment_id_hash=None,
+        )
+
+    monkeypatch.setattr(
+        "pr_agent.algo.checkpoint_stage_sources.checkpoint_enforced_model_identity",
+        resolve,
+    )
+
+
 def test_cost_authority_round_trip_is_exact_and_source_free():
     _manifest, _request, _case, _arm, authority = _contracts()
 
@@ -138,6 +162,8 @@ def test_cost_authority_must_cover_the_exact_frozen_routes():
         ({"max_output_tokens": None}, "bounded output"),
         ({"max_output_tokens": 129}, "quoted output"),
         ({"model_id": "openai/unpriced-model"}, "no authoritative"),
+        ({"provider_id": "unpriced-provider"}, "no authoritative"),
+        ({"model_revision": "unpriced-revision"}, "no authoritative"),
     ),
 )
 def test_ledger_rejects_unbounded_or_unpriced_provider_requests(kwargs, message):
@@ -145,6 +171,8 @@ def test_ledger_rejects_unbounded_or_unpriced_provider_requests(kwargs, message)
     arguments = {
         "stage": "general_review",
         "model_id": "openai/model-primary",
+        "provider_id": "openai",
+        "model_revision": "model-primary-2026-09-01",
         "deployment_id": None,
         "max_output_tokens": 128,
         "provider_max_retries": 0,
@@ -166,6 +194,8 @@ def test_ledger_atomically_consumes_worst_case_charge_across_concurrency():
             return ledger.reserve(
                 stage="general_review",
                 model_id=quote.model_id,
+                provider_id=quote.provider_id,
+                model_revision=quote.model_revision,
                 deployment_id=None,
                 max_output_tokens=128,
                 provider_max_retries=0,
@@ -183,8 +213,9 @@ def test_ledger_atomically_consumes_worst_case_charge_across_concurrency():
     assert len({item.reservation_id for item in accepted}) == 5
 
 
-def test_context_reservation_defaults_to_general_review_stage():
+def test_context_reservation_defaults_to_general_review_stage(monkeypatch):
     _manifest, _request, _case, _arm, authority = _contracts()
+    _install_enforced_general_identity(monkeypatch)
 
     with use_checkpoint_cost_authority(authority) as ledger:
         reservation = reserve_checkpoint_provider_attempt(
@@ -200,8 +231,9 @@ def test_context_reservation_defaults_to_general_review_stage():
     assert ledger.reserved_usd == Decimal("0.01")
 
 
-def test_context_ledger_is_process_wide_for_worker_threads():
+def test_context_ledger_is_process_wide_for_worker_threads(monkeypatch):
     _manifest, _request, _case, _arm, authority = _contracts()
+    _install_enforced_general_identity(monkeypatch)
 
     def reserve_once():
         return reserve_checkpoint_provider_attempt(
@@ -223,6 +255,7 @@ def test_context_ledger_is_process_wide_for_worker_threads():
 @pytest.mark.asyncio
 async def test_litellm_provider_boundary_reserves_before_each_actual_call(monkeypatch):
     _manifest, _request, _case, _arm, authority = _contracts()
+    _install_enforced_general_identity(monkeypatch)
     authority = replace(authority, hard_cost_cap_usd=Decimal("0.01"))
     completion = AsyncMock(return_value={
         "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
@@ -255,8 +288,9 @@ async def test_litellm_provider_boundary_reserves_before_each_actual_call(monkey
 
 
 @pytest.mark.asyncio
-async def test_context_ledger_is_shared_by_concurrent_child_tasks():
+async def test_context_ledger_is_shared_by_concurrent_child_tasks(monkeypatch):
     _manifest, _request, _case, _arm, authority = _contracts()
+    _install_enforced_general_identity(monkeypatch)
 
     async def reserve_once():
         await asyncio.sleep(0)
@@ -273,3 +307,21 @@ async def test_context_ledger_is_shared_by_concurrent_child_tasks():
 
     assert all(item is not None for item in reservations)
     assert ledger.reserved_usd == Decimal("0.03")
+
+
+def test_dynamic_frontier_attribution_uses_the_fixed_quoted_stage():
+    assert checkpoint_cost_stage("frontier_adjudication:finding-123") == "frontier_adjudication"
+
+
+def test_context_reservation_rejects_missing_pre_call_route_identity():
+    _manifest, _request, _case, _arm, authority = _contracts()
+
+    with use_checkpoint_cost_authority(authority):
+        with pytest.raises(CheckpointCostAuthorityError, match="provider/revision identity"):
+            reserve_checkpoint_provider_attempt(
+                model_id="openai/model-primary",
+                deployment_id=None,
+                max_output_tokens=64,
+                provider_max_retries=0,
+                attribution="general_review",
+            )
