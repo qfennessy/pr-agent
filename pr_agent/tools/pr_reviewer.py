@@ -2741,6 +2741,16 @@ class PRReviewer:
         explicit_failure = str(artifact.get("failure") or "").strip()
         if failure_reason is not None and explicit_failure:
             failure_reason = explicit_failure[:128]
+        details = get_run_details()
+        existing = (
+            details.specialist_runs.get("candidate_verification")
+            if details is not None
+            else None
+        )
+        has_observed_model = existing is not None and existing.model_used is not None
+        # No-call exits still need the frozen route identity to materialize the
+        # planned stage. ai_call_count remains zero, so this does not claim that
+        # the configured primary actually executed.
         record_specialist_result(
             "candidate_verification",
             prompt_version=verification_config.prompt_version,
@@ -2749,6 +2759,9 @@ class PRReviewer:
             state=state,
             latency_seconds=float(artifact.get("verifier_latency_seconds") or 0.0),
             failure_reason=failure_reason,
+            model=None if has_observed_model else verification_config.route.models[0],
+            deployment_id=None if has_observed_model else verification_config.route.deployments[0],
+            fallback_used=None if has_observed_model else False,
         )
 
     def _publish_structured_review_data(

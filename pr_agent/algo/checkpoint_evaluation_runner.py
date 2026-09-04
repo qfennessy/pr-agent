@@ -790,7 +790,12 @@ def _record_from_production_result(
         raise EvaluationValidationError("deterministic production bindings cannot emit model stage telemetry")
     if telemetry_shape is ModelTelemetryShape.SINGLE_SELECTED and has_stage_runs:
         raise EvaluationValidationError("single-model production bindings cannot emit per-stage model telemetry")
-    if telemetry_shape is ModelTelemetryShape.PER_STAGE and not has_stage_runs and not no_model_execution:
+    if (
+        telemetry_shape is ModelTelemetryShape.PER_STAGE
+        and not has_stage_runs
+        and not no_model_execution
+        and outcome.failure_state is None
+    ):
         raise EvaluationValidationError("per-stage production bindings require model stage telemetry")
     replacements = {}
     if outcome.latency_measurement is not None:
@@ -808,6 +813,8 @@ def _record_from_production_result(
                 model_identity = (None, None, None)
             elif no_model_execution:
                 model_identity = arm.resolve_model_identity(record.model_id)
+            elif outcome.failure_state is not None:
+                model_identity = (None, None, None)
             else:
                 raise EvaluationValidationError("model-backed results require an observed model identity")
         elif not arm.accepts_run_identity(*model_identity):

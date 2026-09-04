@@ -1853,7 +1853,18 @@ def validate_run_model_telemetry(
         raise EvaluationValidationError("run model telemetry validation requires an arm and run record")
     aggregate_identity = (record.model_id, record.provider_id, record.model_revision)
     if aggregate_identity == (None, None, None):
-        if arm.kind is not EvaluationArmKind.DETERMINISTIC and not record.stage_runs:
+        telemetry_free_failure = (
+            record.state is not EvaluationRunState.COMPLETED
+            and not record.stage_runs
+            and record.tokens.status is MeasurementStatus.UNAVAILABLE
+            and record.cost_usd.status is MeasurementStatus.UNAVAILABLE
+            and not record.stage_latencies_seconds
+        )
+        if (
+            arm.kind is not EvaluationArmKind.DETERMINISTIC
+            and not record.stage_runs
+            and not telemetry_free_failure
+        ):
             raise EvaluationValidationError(
                 f"{context} omits both aggregate and per-stage model identities"
             )
@@ -1865,6 +1876,13 @@ def validate_run_model_telemetry(
     unexpected = sorted(set(actual_by_stage) - set(expected_by_stage))
     if missing or unexpected:
         if _is_no_model_execution_record(record) and missing and not unexpected:
+            return
+        if (
+            record.state is not EvaluationRunState.COMPLETED
+            and missing
+            and not unexpected
+            and not actual_by_stage
+        ):
             return
         raise EvaluationValidationError(
             f"{context} stages do not match its frozen plan; missing={missing}, unexpected={unexpected}"

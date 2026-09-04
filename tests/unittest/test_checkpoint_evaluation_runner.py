@@ -1911,7 +1911,7 @@ async def test_missing_token_and_cost_telemetry_never_becomes_zero(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_failed_model_arm_requires_explicit_identity_and_preserves_unavailable_latency(tmp_path):
+async def test_failed_model_arm_preserves_absent_identity_and_unavailable_latency(tmp_path):
     snapshot, path, artifact_hash = _write_snapshot(tmp_path)
     manifest = _manifest(snapshot, artifact_hash)
     request, decision = _paid_authorization(manifest)
@@ -1931,15 +1931,25 @@ async def test_failed_model_arm_requires_explicit_identity_and_preserves_unavail
 
         return adapter
 
-    with pytest.raises(EvaluationValidationError, match="observed model identity"):
+    inferred_store = EvaluationArtifactStore(tmp_path / "inferred-failure-model")
+    with pytest.raises(EvaluationValidationError, match="complete cost telemetry"):
         await _runner(
             manifest,
             path,
             _bindings(manifest, missing_identity_factory),
-            EvaluationArtifactStore(tmp_path / "missing-failure-model"),
+            inferred_store,
             request,
             decision,
         ).run()
+    inferred = next(
+        record for record in inferred_store.load_records(manifest)
+        if record.arm_id == "arm-general_review"
+    )
+    assert inferred.state is EvaluationRunState.PROVIDER_FAILURE
+    assert inferred.failure_reason_code == "provider_unavailable"
+    assert inferred.latency_seconds.status is MeasurementStatus.UNAVAILABLE
+    assert inferred.latency_seconds.value is None
+    assert (inferred.model_id, inferred.provider_id, inferred.model_revision) == (None, None, None)
 
     def explicit_identity_factory(arm):
         async def adapter(loaded_snapshot, _context):
@@ -1967,6 +1977,42 @@ async def test_failed_model_arm_requires_explicit_identity_and_preserves_unavail
     assert failed.latency_seconds.status is MeasurementStatus.UNAVAILABLE
     assert failed.latency_seconds.value is None
     assert (failed.model_id, failed.provider_id, failed.model_revision) == general_arm.model_identities()[0]
+
+
+@pytest.mark.asyncio
+async def test_failed_staged_arm_persists_without_fabricated_stage_runs(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+
+    def factory(arm):
+        async def adapter(loaded_snapshot, _context):
+            if arm.kind is EvaluationArmKind.VERIFIED_SPECIALISTS:
+                return failed_production_arm_result(
+                    loaded_snapshot,
+                    state=EvaluationRunState.TIMEOUT,
+                    reason_code="worker_timeout",
+                    latency_seconds=NumericMeasurement(MeasurementStatus.COMPLETE, 1.0),
+                    retry_count=0,
+                )
+            return _success(arm, loaded_snapshot)
+
+        return adapter
+
+    result = await _runner(
+        manifest,
+        path,
+        _bindings(manifest, factory),
+        EvaluationArtifactStore(tmp_path / "failed-staged-model"),
+        request,
+        decision,
+    ).run()
+
+    failed = next(record for record in result.records if record.arm_id == "arm-verified_specialists")
+    assert failed.state is EvaluationRunState.TIMEOUT
+    assert failed.failure_reason_code == "worker_timeout"
+    assert failed.stage_runs == ()
+    assert (failed.model_id, failed.provider_id, failed.model_revision) == (None, None, None)
 
 
 def test_failure_latency_and_reason_are_bounded_and_completed_ids_remain_compatible(tmp_path):

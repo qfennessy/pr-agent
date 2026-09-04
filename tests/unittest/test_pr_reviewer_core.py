@@ -5954,6 +5954,10 @@ def test_candidate_verification_finalizes_evaluation_stage(status, expected_stat
         prompt_version="candidate-prompt-v1",
         input_schema_version="candidate-input-v1",
         output_schema_version="candidate-output-v1",
+        route=SimpleNamespace(
+            models=("verifier-model",),
+            deployments=("verifier-deployment",),
+        ),
     )
 
     PRReviewer._record_candidate_verification_stage(config, {"status": status})
@@ -5964,6 +5968,9 @@ def test_candidate_verification_finalizes_evaluation_stage(status, expected_stat
     assert stage.prompt_version == "candidate-prompt-v1"
     assert stage.input_schema_version == "candidate-input-v1"
     assert stage.schema_version == "candidate-output-v1"
+    assert stage.model_used == "verifier-model"
+    assert stage.deployment_id == "verifier-deployment"
+    assert stage.fallback_used is False
 
 
 @pytest.mark.parametrize("issue", [
