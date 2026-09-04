@@ -172,6 +172,27 @@ def _coverage_issues(
     return tuple(issues)
 
 
+def _verifier_retry_count(
+    kind: EvaluationArmKind,
+    review: Mapping[str, object] | None,
+) -> int:
+    """Convert observed verifier attempts into retry telemetry."""
+
+    if kind is not EvaluationArmKind.VERIFIED_SPECIALISTS or review is None:
+        return 0
+    artifact = review.get("candidate_verification")
+    if artifact is None:
+        return 0
+    if not isinstance(artifact, Mapping):
+        raise EvaluationValidationError("verified production output has invalid verifier telemetry")
+    attempts = artifact.get("verifier_attempts")
+    if attempts is None:
+        return 0
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
+        raise EvaluationValidationError("verified production output has invalid verifier attempt count")
+    return max(0, attempts - 1)
+
+
 def adapt_checkpoint_review_outcome(
     snapshot: ReviewSnapshot,
     kind: EvaluationArmKind,
@@ -211,6 +232,7 @@ def adapt_checkpoint_review_outcome(
         raise EvaluationValidationError("production review output names a different snapshot")
     if outcome.review is None:
         raise EvaluationValidationError("completed production review output is incomplete")
+    retry_count = _verifier_retry_count(kind, outcome.review)
     raw_findings = _review_findings(outcome.review)
     if outcome.run_details is None:
         details = RunDetails(start_time=0.0, finish_time=0.0)
@@ -258,6 +280,7 @@ def adapt_checkpoint_review_outcome(
         run_details=details,
         findings=findings,
         terminal=result_state is not ReviewResultState.COVERAGE_UNAVAILABLE,
+        retry_count=retry_count,
         failure_reason_code=(
             "production_coverage_unavailable"
             if result_state is ReviewResultState.COVERAGE_UNAVAILABLE
@@ -281,7 +304,9 @@ def build_checkpoint_review_adapter(kind: EvaluationArmKind):
             evaluation_stage_plan=context.stage_plan,
             allow_model_execution=True,
         )
+        retry_count = 0
         try:
+            retry_count = _verifier_retry_count(kind, outcome.review)
             return adapt_checkpoint_review_outcome(snapshot, kind, outcome)
         except EvaluationValidationError:
             if outcome.run_details is None:
@@ -297,7 +322,7 @@ def build_checkpoint_review_adapter(kind: EvaluationArmKind):
                     else MeasurementStatus.UNAVAILABLE,
                     outcome.latency_seconds,
                 ),
-                retry_count=0,
+                retry_count=retry_count,
                 run_details=details,
             )
 

@@ -96,6 +96,7 @@ def test_verified_adapter_joins_trusted_identity_to_verifier_severity():
         "candidate_verification": {
             "status": "complete",
             "publication_safe": True,
+            "verifier_attempts": 3,
             "decisions": [{
                 "candidate_id": "candidate-1",
                 "verdict": "verified",
@@ -110,6 +111,23 @@ def test_verified_adapter_joins_trusted_identity_to_verifier_severity():
     assert result.findings[0].fingerprint == stable_key
     assert result.findings[0].severity is FindingSeverity.CRITICAL
     assert result.findings[0].stage == "candidate_verification"
+    assert result.retry_count == 2
+
+
+def test_verified_adapter_rejects_invalid_verifier_attempt_count():
+    snapshot = _snapshot()
+    outcome = _outcome(snapshot, {
+        "review": {"key_issues_to_review": []},
+        "candidate_verification": {
+            "status": "no_candidates",
+            "publication_safe": True,
+            "verifier_attempts": "2",
+            "decisions": [],
+        },
+    })
+
+    with pytest.raises(EvaluationValidationError, match="invalid verifier attempt count"):
+        adapt_checkpoint_review_outcome(snapshot, EvaluationArmKind.VERIFIED_SPECIALISTS, outcome)
 
 
 @pytest.mark.parametrize("kind", (EvaluationArmKind.GENERAL_REVIEW, EvaluationArmKind.VERIFIED_SPECIALISTS))
@@ -572,3 +590,43 @@ async def test_production_adapter_retains_malformed_completed_output(monkeypatch
     assert result.failure_state is EvaluationRunState.MALFORMED
     assert result.failure_reason_code == "production_output_invalid"
     assert result.run_details.model_used == "openai/gpt-test"
+
+
+@pytest.mark.asyncio
+async def test_production_adapter_retains_verifier_retries_on_malformed_output(monkeypatch):
+    snapshot = _snapshot()
+    outcome = _outcome(snapshot, {
+        "review": {"key_issues_to_review": []},
+        "candidate_verification": {
+            "status": "verifier_failed",
+            "publication_safe": False,
+            "verifier_attempts": 3,
+            "decisions": [],
+        },
+    })
+
+    async def run_subprocess(*_args, **_kwargs):
+        return outcome
+
+    monkeypatch.setattr(
+        "pr_agent.algo.checkpoint_evaluation_adapters.run_checkpoint_review_subprocess",
+        run_subprocess,
+    )
+    adapter = build_checkpoint_review_adapter(EvaluationArmKind.VERIFIED_SPECIALISTS)
+    context = ProductionArmContext(
+        manifest_id=_hash("manifest"),
+        case_id="case-one",
+        arm_id="verified",
+        event="pre_commit",
+        snapshot_artifact_hash=_hash("artifact"),
+        configuration_hash=_hash("configuration"),
+        prompt_hash=_hash("prompt"),
+        model_visible_metadata={},
+        review_configuration=materialize_review_configuration(repo_context_files={}),
+    )
+
+    result = await adapter(snapshot, context)
+
+    assert result.failure_state is EvaluationRunState.MALFORMED
+    assert result.failure_reason_code == "production_output_invalid"
+    assert result.retry_count == 2
