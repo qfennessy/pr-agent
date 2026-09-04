@@ -409,6 +409,26 @@ def test_runtime_incompatible_configuration_is_rejected_before_persisting(tmp_pa
     _assert_no_bundle_or_staging(output)
 
 
+def test_shared_configuration_runtime_is_validated_once(tmp_path, monkeypatch):
+    calls = 0
+    real_require_compatible_runtime = ReviewConfigurationBundle.require_compatible_runtime
+
+    def count_runtime_validation(review_configuration):
+        nonlocal calls
+        calls += 1
+        real_require_compatible_runtime(review_configuration)
+
+    monkeypatch.setattr(
+        ReviewConfigurationBundle,
+        "require_compatible_runtime",
+        count_runtime_validation,
+    )
+
+    _materialize(tmp_path)
+
+    assert calls == 1
+
+
 def test_private_write_rejects_symlink_hard_link_and_permissive_output_root(tmp_path):
     spec, snapshots = _fixture()
     output = tmp_path / "output"

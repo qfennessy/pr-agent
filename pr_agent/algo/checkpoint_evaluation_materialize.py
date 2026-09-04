@@ -885,6 +885,7 @@ def materialize_checkpoint_controls(
     snapshot_payloads: list[tuple[str, bytes]] = []
     configuration_payloads: dict[str, bytes] = {}
     configuration_artifact_hashes: dict[str, str] = {}
+    runtime_validated_configuration_hashes: set[str] = set()
     snapshot_ids: set[str] = set()
     artifact_hashes: set[str] = set()
     all_identity_hashes: set[str] = {entry.adjudication_hash for entry in entries}
@@ -896,12 +897,14 @@ def materialize_checkpoint_controls(
             raise EvaluationValidationError(
                 f"checkpoint {entry.case_id} review configuration is not a ReviewConfigurationBundle"
             )
-        try:
-            review_configuration.require_compatible_runtime()
-        except ValueError as exc:
-            raise EvaluationValidationError(
-                f"checkpoint {entry.case_id} review configuration runtime mismatch"
-            ) from exc
+        if review_configuration.configuration_hash not in runtime_validated_configuration_hashes:
+            try:
+                review_configuration.require_compatible_runtime()
+            except ValueError as exc:
+                raise EvaluationValidationError(
+                    f"checkpoint {entry.case_id} review configuration runtime mismatch"
+                ) from exc
+            runtime_validated_configuration_hashes.add(review_configuration.configuration_hash)
         if (
             not isinstance(snapshot.review_configuration_hash, str)
             or not hmac.compare_digest(
