@@ -88,8 +88,8 @@ _BLOCKERS: Mapping[EvaluationArmKind, tuple[str, ...]] = MappingProxyType({
         "deterministic_finding_contract_unavailable",
     ),
     EvaluationArmKind.GENERAL_REVIEW: (
-        "immutable_review_configuration_replay_unavailable",
-        "finding_fingerprint_contract_unavailable",
+        "general_review_adapter_unavailable",
+        "finding_normalization_adapter_unavailable",
         "hard_cost_cap_enforcement_unavailable",
     ),
     EvaluationArmKind.SPECIALISTS: (
@@ -101,8 +101,8 @@ _BLOCKERS: Mapping[EvaluationArmKind, tuple[str, ...]] = MappingProxyType({
         "hard_cost_cap_enforcement_unavailable",
     ),
     EvaluationArmKind.FULL_CASCADE: (
-        "immutable_review_configuration_replay_unavailable",
-        "finding_fingerprint_contract_unavailable",
+        "general_review_adapter_unavailable",
+        "finding_normalization_adapter_unavailable",
         "verified_candidate_source_contract_unavailable",
         "frontier_stage_telemetry_contract_unavailable",
         "frontier_decision_semantics_unavailable",

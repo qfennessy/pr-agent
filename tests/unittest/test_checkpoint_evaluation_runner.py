@@ -2,6 +2,7 @@ import hashlib
 import json
 from dataclasses import replace
 from decimal import Decimal
+from functools import lru_cache
 
 import pytest
 
@@ -17,8 +18,11 @@ from pr_agent.algo.checkpoint_evaluation import (
     EvaluationStagePlan,
     EvaluationStageRun,
     EvaluationValidationError,
+    FindingLifecycleState,
+    FindingSeverity,
     MeasurementStatus,
     NumericMeasurement,
+    ObservedFinding,
     deployment_identity_hash,
 )
 from pr_agent.algo.checkpoint_evaluation_execution import (
@@ -35,12 +39,31 @@ from pr_agent.algo.checkpoint_evaluation_runner import (
     ProductionEvaluationRunner,
     failed_production_arm_result,
 )
+from pr_agent.algo.review_configuration import (
+    materialize_review_configuration,
+    review_configuration_artifact_name,
+    review_configuration_canonical_bytes,
+)
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshot, ReviewSnapshotResult
 from pr_agent.algo.run_details import RunDetails, SpecialistRunDetails
 
 
 def _hash(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+
+def _artifact_hash(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def _review_configuration():
+    return materialize_review_configuration(
+        skills_context="frozen specialist instructions",
+        repo_context_files={"AGENTS.md": "frozen repository instructions"},
+        repo_context_max_lines=100,
+        prompt_date="2026-09-03",
+    )
 
 
 def _write_snapshot(
@@ -50,6 +73,7 @@ def _write_snapshot(
     parent_snapshot_id=None,
     changed_path="src/example.py",
 ) -> tuple[ReviewSnapshot, object, str]:
+    review_configuration = _review_configuration()
     snapshot = ReviewSnapshot(
         event=ReviewEvent.FILE_SAVE,
         repository_root=str(tmp_path / "source-repository"),
@@ -58,13 +82,27 @@ def _write_snapshot(
         diff="diff --git a/src/example.py b/src/example.py\n+value = 1\n",
         policy_version="policy-v1",
         created_at="2026-08-30T12:00:00Z",
+        review_configuration_hash=review_configuration.configuration_hash,
         parent_snapshot_id=parent_snapshot_id,
     )
     payload = (json.dumps(snapshot.to_dict(), allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
     path = tmp_path / f"{name}.json"
+    tmp_path.chmod(0o700)
     path.write_bytes(payload)
-    artifact_hash = "sha256:" + hashlib.sha256(payload).hexdigest()
+    path.chmod(0o600)
+    configuration_path = tmp_path / review_configuration_artifact_name(review_configuration.configuration_hash)
+    configuration_path.write_bytes(review_configuration_canonical_bytes(review_configuration))
+    configuration_path.chmod(0o600)
+    artifact_hash = _artifact_hash(payload)
     return snapshot, path, artifact_hash
+
+
+def _configuration_artifact_hash(snapshot_path) -> str:
+    snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    configuration_path = snapshot_path.with_name(
+        review_configuration_artifact_name(snapshot_payload["review_configuration_hash"])
+    )
+    return _artifact_hash(configuration_path.read_bytes())
 
 
 def _arm(kind: EvaluationArmKind) -> EvaluationArm:
@@ -175,6 +213,35 @@ def _success(arm: EvaluationArm, snapshot: ReviewSnapshot, *, details=True) -> P
     )
 
 
+def test_no_findings_result_retains_withdrawn_lifecycle_observations(tmp_path):
+    snapshot, _path, _artifact_hash = _write_snapshot(tmp_path)
+    arm = _arm(EvaluationArmKind.GENERAL_REVIEW)
+    withdrawn = ObservedFinding(
+        fingerprint=_hash("resolved-finding"),
+        severity=FindingSeverity.HIGH,
+        lifecycle_state=FindingLifecycleState.WITHDRAWN,
+        stage="general_review",
+    )
+
+    result = replace(_success(arm, snapshot), findings=(withdrawn,))
+
+    assert result.findings == (withdrawn,)
+
+
+def test_no_findings_result_rejects_active_lifecycle_observations(tmp_path):
+    snapshot, _path, _artifact_hash = _write_snapshot(tmp_path)
+    arm = _arm(EvaluationArmKind.GENERAL_REVIEW)
+    active = ObservedFinding(
+        fingerprint=_hash("active-finding"),
+        severity=FindingSeverity.HIGH,
+        lifecycle_state=FindingLifecycleState.ACTIVE,
+        stage="general_review",
+    )
+
+    with pytest.raises(EvaluationValidationError, match="only withdrawn"):
+        replace(_success(arm, snapshot), findings=(active,))
+
+
 def _specialist_run(arm: EvaluationArm, *, role="change_classification", **overrides):
     version_role = role.replace("_", "-")
     values = {
@@ -232,10 +299,24 @@ def _bindings(manifest: EvaluationManifest, adapter_factory=None) -> list[Produc
     return bindings
 
 
-def _runner(manifest, snapshot_path, bindings, store, request, decision):
+def _runner(
+    manifest,
+    snapshot_path,
+    bindings,
+    store,
+    request,
+    decision,
+    *,
+    review_configuration_artifact_hashes=None,
+):
     return ProductionEvaluationRunner(
         manifest,
         snapshot_paths={"case-one": snapshot_path},
+        review_configuration_artifact_hashes=(
+            {"case-one": _configuration_artifact_hash(snapshot_path)}
+            if review_configuration_artifact_hashes is None
+            else review_configuration_artifact_hashes
+        ),
         bindings=bindings,
         artifact_store=store,
         paid_request=request,
@@ -252,6 +333,10 @@ class _NoCallStore:
 
     def resume_plan(self, _manifest):
         self.calls.append("resume_plan")
+        raise AssertionError("artifact store must not be touched")
+
+    def bind_paid_request(self, _manifest, _request):
+        self.calls.append("bind_paid_request")
         raise AssertionError("artifact store must not be touched")
 
     def append_record(self, _manifest, _record):
@@ -314,15 +399,34 @@ async def test_every_arm_receives_the_same_loaded_snapshot_object(tmp_path):
         return adapter
 
     store = EvaluationArtifactStore(tmp_path / "artifacts")
-    result = await _runner(manifest, path, _bindings(manifest, factory), store, request, decision).run()
+    runner = _runner(manifest, path, _bindings(manifest, factory), store, request, decision)
+    preflight = runner.preflight()
+    rendered_preflight = repr(preflight)
+    assert "frozen specialist instructions" not in rendered_preflight
+    assert "frozen repository instructions" not in rendered_preflight
+    assert "review_configurations_by_case_id=" not in rendered_preflight
+
+    result = await runner.run()
 
     assert len(result.records) == len(EvaluationArmKind)
     assert len(received) == len(EvaluationArmKind)
     assert all(item[0] is received[0][0] for item in received)
     assert received[0][0] is not snapshot
+    assert all(
+        context.review_configuration is received[0][1].review_configuration
+        for _, context in received
+    )
+    assert (
+        received[0][1].review_configuration.configuration_hash
+        == received[0][0].review_configuration_hash
+    )
     assert all(context.publish_output is False for _, context in received)
     assert received[0][1].hard_cost_cap_usd is None
     assert all(context.hard_cost_cap_usd == 0.02 for _, context in received[1:])
+    rendered_context = repr(received[0][1])
+    assert "pinned skills" not in rendered_context
+    assert "pinned repository rules" not in rendered_context
+    assert "review_configuration=" not in rendered_context
     assert all(record.terminal for record in store.load_records(manifest))
 
 
@@ -344,6 +448,91 @@ async def test_snapshot_artifact_hash_mismatch_stops_before_adapter_or_store_cal
     with pytest.raises(EvaluationValidationError, match="artifact bytes do not match"):
         await _runner(manifest, path, _bindings(manifest, factory), store, request, decision).run()
     assert adapter_calls == []
+    assert store.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "configuration_hashes",
+    ({}, {"case-one": _hash("configuration"), "extra": _hash("extra")}),
+)
+async def test_configuration_artifact_hash_keys_must_match_cases_before_side_effects(
+    tmp_path,
+    configuration_hashes,
+):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+    adapter_calls = []
+
+    def factory(arm):
+        async def adapter(loaded_snapshot, _context):
+            adapter_calls.append(arm.kind)
+            return _success(arm, loaded_snapshot)
+
+        return adapter
+
+    store = _NoCallStore()
+    with pytest.raises(EvaluationValidationError, match="hashes must match manifest cases exactly"):
+        await _runner(
+            manifest,
+            path,
+            _bindings(manifest, factory),
+            store,
+            request,
+            decision,
+            review_configuration_artifact_hashes=configuration_hashes,
+        ).run()
+    assert adapter_calls == []
+    assert store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_configuration_artifact_tamper_stops_before_adapter_or_store_calls(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+    configuration_path = path.with_name(review_configuration_artifact_name(snapshot.review_configuration_hash))
+    original_hash = _artifact_hash(configuration_path.read_bytes())
+    configuration_path.write_bytes(configuration_path.read_bytes() + b" ")
+    configuration_path.chmod(0o600)
+    store = _NoCallStore()
+
+    with pytest.raises(EvaluationValidationError, match="bytes do not match expected artifact hash"):
+        await _runner(
+            manifest,
+            path,
+            _bindings(manifest),
+            store,
+            request,
+            decision,
+            review_configuration_artifact_hashes={"case-one": original_hash},
+        ).run()
+    assert store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_configuration_bundle_mismatch_stops_before_adapter_or_store_calls(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+    mismatched_configuration = replace(_review_configuration(), prompt_date="2026-09-04")
+    mismatched_payload = review_configuration_canonical_bytes(mismatched_configuration)
+    configuration_path = path.with_name(review_configuration_artifact_name(snapshot.review_configuration_hash))
+    configuration_path.write_bytes(mismatched_payload)
+    configuration_path.chmod(0o600)
+    store = _NoCallStore()
+
+    with pytest.raises(EvaluationValidationError, match="does not match ReviewSnapshot"):
+        await _runner(
+            manifest,
+            path,
+            _bindings(manifest),
+            store,
+            request,
+            decision,
+            review_configuration_artifact_hashes={"case-one": _artifact_hash(mismatched_payload)},
+        ).run()
     assert store.calls == []
 
 
@@ -383,6 +572,10 @@ def test_snapshot_parent_lineage_must_match_the_manifest_parent(tmp_path):
     runner = ProductionEvaluationRunner(
         manifest,
         snapshot_paths={"parent": parent_path, "child": child_path},
+        review_configuration_artifact_hashes={
+            "parent": _configuration_artifact_hash(parent_path),
+            "child": _configuration_artifact_hash(child_path),
+        },
         bindings=_bindings(manifest),
         artifact_store=EvaluationArtifactStore(tmp_path / "lineage-artifacts"),
         paid_request=request,
