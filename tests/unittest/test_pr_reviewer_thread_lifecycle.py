@@ -147,11 +147,13 @@ class _Provider:
         refresh_heads=("head-1", "head-1"),
         outcomes=(),
         summary_bodies=(),
+        supports_lifecycle=True,
     ):
         self.inventory = tuple(inventory)
         self.refresh_heads = list(refresh_heads)
         self.outcomes = list(outcomes)
         self.summary_bodies = tuple(summary_bodies)
+        self.supports_lifecycle = supports_lifecycle
         self.calls = []
         self.structured = None
 
@@ -162,6 +164,9 @@ class _Provider:
             "@@ -1 +1 @@",
             "src/app.py",
         )]
+
+    def supports_review_thread_lifecycle(self):
+        return self.supports_lifecycle
 
     def get_pr_head_sha(self, refresh=False):
         if not refresh:
@@ -433,7 +438,7 @@ def test_head_change_before_inventory_mutates_nothing_and_retains_the_finding():
 
 
 def test_non_github_provider_keeps_the_verified_finding_in_the_summary():
-    provider = _Provider()
+    provider = _Provider(supports_lifecycle=False)
     reviewer = _reviewer(provider)
 
     result = _apply(reviewer, [_finding()], settings=_Settings(provider="gitlab"))
@@ -709,8 +714,8 @@ def test_disabled_setting_preserves_legacy_inline_path():
     reviewer._publish_key_issues_as_inline_comments.assert_called_once()
 
 
-def test_non_github_provider_preserves_legacy_inline_path_when_lifecycle_setting_is_enabled():
-    reviewer = _reviewer(_Provider())
+def test_active_non_github_provider_preserves_legacy_inline_path_despite_github_setting():
+    reviewer = _reviewer(_Provider(supports_lifecycle=False))
     reviewer.verified_review_data = {"review": {"key_issues_to_review": [_finding()]}}
     reviewer.prediction = "review: {}"
     reviewer._candidate_verification_blocks_publication = MagicMock(return_value=False)
@@ -724,7 +729,7 @@ def test_non_github_provider_preserves_legacy_inline_path_when_lifecycle_setting
     with (
         patch(
             "pr_agent.tools.pr_reviewer.get_settings",
-            return_value=_Settings(enabled=True, provider="gitlab"),
+            return_value=_Settings(enabled=True, provider="github"),
         ),
         patch("pr_agent.tools.pr_reviewer.github_action_output"),
         patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", return_value="review"),

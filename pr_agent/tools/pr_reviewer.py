@@ -2945,7 +2945,7 @@ class PRReviewer:
         lifecycle_enabled = self._review_thread_lifecycle_enabled()
         lifecycle_owns_inline_publication = (
             lifecycle_enabled
-            and str(get_settings().get("config.git_provider", "") or "").strip().casefold() == "github"
+            and self._review_thread_lifecycle_provider_supported()
         )
         lifecycle_data = data
         if (
@@ -3067,6 +3067,10 @@ class PRReviewer:
     def _review_thread_lifecycle_enabled() -> bool:
         value = get_settings().get("review_thread_lifecycle.enabled", False)
         return parse_env_bool(value) is True
+
+    def _review_thread_lifecycle_provider_supported(self) -> bool:
+        capability = getattr(self.git_provider, "supports_review_thread_lifecycle", None)
+        return callable(capability) and capability() is True
 
     def _review_thread_absence_is_authoritative(self, published_finding_count: int) -> bool:
         """Allow obsolete cleanup only after a coverage-complete full verification run."""
@@ -3247,7 +3251,7 @@ class PRReviewer:
                 "configuration_invalid", "candidate verification did not provide a trusted result"
             )
             return data
-        if str(get_settings().get("config.git_provider", "") or "").strip().casefold() != "github":
+        if not self._review_thread_lifecycle_provider_supported():
             self._set_review_thread_lifecycle_unavailable(
                 "unsupported_provider", "stable thread reconciliation is GitHub-only"
             )

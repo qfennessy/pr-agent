@@ -654,6 +654,10 @@ class GitProvider(ABC):
     def supports_review_comment_identity(self) -> bool:
         return False
 
+    def supports_review_thread_lifecycle(self) -> bool:
+        """Return whether this active provider can safely inventory and mutate review threads."""
+        return False
+
     def get_ci_failure_context(self) -> dict:
         """Return bounded failed-check metadata when the provider can supply it."""
         return {"status": "unavailable", "failures": []}

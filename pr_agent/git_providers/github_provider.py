@@ -815,6 +815,9 @@ class GithubProvider(GitProvider):
     def supports_review_comment_identity(self) -> bool:
         return True
 
+    def supports_review_thread_lifecycle(self) -> bool:
+        return True
+
     def get_ci_failure_context(self) -> dict:
         """Return bounded failed check-run details for the current PR head."""
         if not getattr(self, "last_commit_id", None) or not getattr(self, "pr", None):
