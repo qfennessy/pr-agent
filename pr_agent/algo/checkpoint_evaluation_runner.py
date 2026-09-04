@@ -187,10 +187,16 @@ class ProductionArmResult:
         if self.no_model_execution:
             details = self.run_details
             if (
-                self.snapshot_result.state is not ReviewResultState.NO_FINDINGS
+                self.snapshot_result.state not in {
+                    ReviewResultState.NO_FINDINGS,
+                    ReviewResultState.COVERAGE_UNAVAILABLE,
+                }
                 or has_active_findings
                 or self.failure_state is not None
                 or self.model_identity is not None
+                or self.terminal is not (
+                    self.snapshot_result.state is ReviewResultState.NO_FINDINGS
+                )
                 or details is None
                 or details.num_ai_calls != 0
                 or details.has_token_usage

@@ -57,7 +57,13 @@ from pr_agent.algo.review_configuration import (
     review_configuration_artifact_name,
     review_configuration_canonical_bytes,
 )
-from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshot, ReviewSnapshotResult
+from pr_agent.algo.review_snapshot import (
+    CoverageIssue,
+    ReviewEvent,
+    ReviewResultState,
+    ReviewSnapshot,
+    ReviewSnapshotResult,
+)
 from pr_agent.algo.review_specialists import (
     SpecialistPipelineConfig,
     SpecialistPrompt,
@@ -392,6 +398,73 @@ def test_zero_call_empty_snapshot_has_complete_lifecycle_coverage():
 
     assert outcome.no_model_execution is True
     assert _has_complete_lifecycle_coverage(arm, outcome) is True
+
+
+@pytest.mark.asyncio
+async def test_zero_call_empty_snapshot_with_coverage_is_persistable_without_model_calls(tmp_path):
+    configuration = _review_configuration()
+    snapshot = ReviewSnapshot(
+        event=ReviewEvent.PRE_COMMIT,
+        repository_root=str(tmp_path / "source-repository"),
+        base_revision="a" * 40,
+        changed_paths=(),
+        diff="",
+        policy_version="policy-v1",
+        created_at="2026-09-04T12:00:00Z",
+        review_configuration_hash=configuration.configuration_hash,
+        coverage_issues=(CoverageIssue(reason="no_reviewable_diff"),),
+    )
+    payload = (json.dumps(snapshot.to_dict(), sort_keys=True, separators=(",", ":")) + "\n").encode()
+    snapshot_path = tmp_path / "empty-covered.json"
+    snapshot_path.write_bytes(payload)
+    snapshot_path.chmod(0o600)
+    configuration_path = tmp_path / review_configuration_artifact_name(configuration.configuration_hash)
+    configuration_path.write_bytes(review_configuration_canonical_bytes(configuration))
+    configuration_path.chmod(0o600)
+    manifest = _manifest(snapshot, _artifact_hash(payload))
+    arm = next(item for item in manifest.arms if item.kind is EvaluationArmKind.VERIFIED_SPECIALISTS)
+    request, decision = _paid_authorization(manifest)
+
+    def factory(bound_arm):
+        async def adapter(loaded_snapshot, _context):
+            if bound_arm.kind is not EvaluationArmKind.VERIFIED_SPECIALISTS:
+                return _success(bound_arm, loaded_snapshot)
+            return adapt_checkpoint_review_outcome(
+                loaded_snapshot,
+                bound_arm.kind,
+                CheckpointReviewSubprocessOutcome(
+                    state=CheckpointReviewSubprocessState.COMPLETED,
+                    snapshot_id=loaded_snapshot.snapshot_id,
+                    review={"review": {"key_issues_to_review": []}},
+                    latency_seconds=0.0,
+                ),
+            )
+
+        return adapter
+
+    runner = ProductionEvaluationRunner(
+        manifest,
+        snapshot_paths={"case-one": snapshot_path},
+        review_configuration_artifact_hashes={
+            "case-one": _artifact_hash(configuration_path.read_bytes()),
+        },
+        bindings=_bindings(manifest, factory),
+        artifact_store=EvaluationArtifactStore(tmp_path / "covered-empty-artifacts"),
+        paid_request=request,
+        paid_decision=decision,
+        evaluation_enabled=True,
+        allow_paid_execution=True,
+        publish_output=False,
+    )
+
+    result = await runner.run()
+
+    record = next(item for item in result.records if item.arm_id == arm.arm_id)
+    assert record.state is EvaluationRunState.COVERAGE_UNAVAILABLE
+    assert record.terminal is False
+    assert record.tokens == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+    assert record.cost_usd == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+    assert record.stage_runs == ()
 
 
 @pytest.mark.asyncio

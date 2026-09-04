@@ -1750,12 +1750,15 @@ class EvaluationRunRecord:
             cost_measurement = _sum_measurements(cost_components)
         if no_model_execution:
             if (
-                result.state is not ReviewResultState.NO_FINDINGS
+                result.state not in {
+                    ReviewResultState.NO_FINDINGS,
+                    ReviewResultState.COVERAGE_UNAVAILABLE,
+                }
                 or any(
                     finding.lifecycle_state is FindingLifecycleState.ACTIVE
                     for finding in findings
                 )
-                or not terminal
+                or terminal is not (result.state is ReviewResultState.NO_FINDINGS)
                 or retry_count
                 or result.cached
                 or escalated is not None
@@ -1768,9 +1771,8 @@ class EvaluationRunRecord:
                 or details.model_costs_usd
                 or details.specialist_runs
                 or details.adjudication_runs
-                or failure_reason_code is not None
             ):
-                raise EvaluationValidationError("no-model run records must be zero-call successful executions")
+                raise EvaluationValidationError("no-model run records must be zero-call empty executions")
             token_measurement = NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
             cost_measurement = NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
         selected_model_id = (
@@ -1824,9 +1826,14 @@ class EvaluationRunRecord:
 
 def _is_no_model_execution_record(record: EvaluationRunRecord) -> bool:
     return (
-        record.state is EvaluationRunState.COMPLETED
-        and record.terminal
-        and record.snapshot_result_state is ReviewResultState.NO_FINDINGS
+        record.state in {EvaluationRunState.COMPLETED, EvaluationRunState.COVERAGE_UNAVAILABLE}
+        and record.snapshot_result_state in {
+            ReviewResultState.NO_FINDINGS,
+            ReviewResultState.COVERAGE_UNAVAILABLE,
+        }
+        and record.terminal is (
+            record.snapshot_result_state is ReviewResultState.NO_FINDINGS
+        )
         and not any(
             finding.lifecycle_state is FindingLifecycleState.ACTIVE
             for finding in record.findings
@@ -1838,7 +1845,9 @@ def _is_no_model_execution_record(record: EvaluationRunRecord) -> bool:
         and record.escalated is None
         and not record.stage_runs
         and not record.stage_latencies_seconds
-        and record.failure_reason_code is None
+        and (record.failure_reason_code is None) is (
+            record.snapshot_result_state is ReviewResultState.NO_FINDINGS
+        )
     )
 
 
