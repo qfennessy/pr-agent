@@ -13,7 +13,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from pr_agent.algo import checkpoint_review_subprocess as review_subprocess
-from pr_agent.algo.checkpoint_cost_authority import FrozenCostAuthority, ProviderMaximumCharge
+from pr_agent.algo.checkpoint_cost_authority import (
+    FrozenCostAuthority,
+    ProviderMaximumCharge,
+    gateway_api_base_identity_hash,
+)
 from pr_agent.algo.review_configuration import (
     materialize_review_configuration,
     snapshot_review_configuration_hash,
@@ -81,6 +85,10 @@ def _authority(snapshot: ReviewSnapshot, configuration=None) -> FrozenCostAuthor
                 provider_id="provider",
                 model_revision="model-revision-v1",
                 deployment_id_hash=None,
+                gateway_api_base_hash=gateway_api_base_identity_hash(
+                    "https://test-checkpoint-gateway.example/v1"
+                ),
+                gateway_route_binding_id=_hash("test-gateway-route"),
                 max_output_tokens=128,
                 maximum_charge_usd=Decimal("0.01"),
             ),

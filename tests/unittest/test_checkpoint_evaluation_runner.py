@@ -11,7 +11,11 @@ from pr_agent.algo.candidate_verification import (
     candidate_verification_provider_controls_hash,
     parse_candidate_verification_config,
 )
-from pr_agent.algo.checkpoint_cost_authority import FrozenCostAuthority, ProviderMaximumCharge
+from pr_agent.algo.checkpoint_cost_authority import (
+    FrozenCostAuthority,
+    ProviderMaximumCharge,
+    gateway_api_base_identity_hash,
+)
 from pr_agent.algo.checkpoint_evaluation import (
     CheckpointCase,
     EvaluationArm,
@@ -853,6 +857,12 @@ def _cost_authorities(manifest, request, snapshot_paths):
                             provider_id=provider_id,
                             model_revision=model_revision,
                             deployment_id_hash=deployment_id_hash,
+                            gateway_api_base_hash=gateway_api_base_identity_hash(
+                                "https://test-checkpoint-gateway.example/v1"
+                            ),
+                            gateway_route_binding_id=_hash(
+                                f"test-gateway-route:{provider_id}:{model_revision}:{deployment_id_hash}"
+                            ),
                             max_output_tokens=4096,
                             maximum_charge_usd=Decimal("0.001"),
                         )

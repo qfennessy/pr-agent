@@ -11,11 +11,13 @@ from pr_agent.algo.ai_handlers import litellm_ai_handler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.ai_request_context import AIRequestOptions, use_ai_request_options
 from pr_agent.algo.checkpoint_cost_authority import (
+    CHECKPOINT_GATEWAY_ROUTE_HEADER,
     CheckpointCostAuthorityError,
     CostAuthorityLedger,
     FrozenCostAuthority,
     ProviderMaximumCharge,
     checkpoint_cost_stage,
+    gateway_api_base_identity_hash,
     reserve_checkpoint_provider_attempt,
     use_checkpoint_cost_authority,
     validate_cost_authorities,
@@ -28,7 +30,6 @@ from pr_agent.algo.checkpoint_evaluation import (
     EvaluationCohort,
     EvaluationManifest,
     EvaluationModelIdentity,
-    EvaluationStageModelIdentity,
 )
 from pr_agent.algo.checkpoint_evaluation_execution import PaidExecutionRequest, PaidPlanItemBudget
 from pr_agent.algo.review_snapshot import ReviewEvent
@@ -36,6 +37,9 @@ from pr_agent.algo.review_snapshot import ReviewEvent
 
 def _hash(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+
+_GATEWAY_API_BASE = "https://checkpoint-gateway.example/v1"
 
 
 def _contracts():
@@ -83,6 +87,8 @@ def _contracts():
             provider_id=provider_id,
             model_revision=model_revision,
             deployment_id_hash=None,
+            gateway_api_base_hash=gateway_api_base_identity_hash(_GATEWAY_API_BASE),
+            gateway_route_binding_id=_hash(f"gateway-route:{provider_id}:{model_revision}"),
             max_output_tokens=128,
             maximum_charge_usd=Decimal("0.01"),
         )
@@ -106,28 +112,6 @@ def _contracts():
     return manifest, request, case, arm, authority
 
 
-def _install_enforced_general_identity(monkeypatch):
-    revisions = {
-        "openai/model-primary": "model-primary-2026-09-01",
-        "openai/model-fallback": "model-fallback-2026-09-01",
-    }
-
-    def resolve(stage, model_id, deployment_id):
-        assert stage == "general_review"
-        assert deployment_id is None
-        return EvaluationStageModelIdentity(
-            model_id=model_id,
-            provider_id="openai",
-            model_revision=revisions[model_id],
-            deployment_id_hash=None,
-        )
-
-    monkeypatch.setattr(
-        "pr_agent.algo.checkpoint_stage_sources.checkpoint_enforced_model_identity",
-        resolve,
-    )
-
-
 def test_cost_authority_round_trip_is_exact_and_source_free():
     _manifest, _request, _case, _arm, authority = _contracts()
 
@@ -137,6 +121,8 @@ def test_cost_authority_round_trip_is_exact_and_source_free():
     assert restored.authority_id.startswith("sha256:")
     assert "prompt" not in restored.to_dict()
     assert "diff" not in restored.to_dict()
+    assert _GATEWAY_API_BASE not in str(restored.to_dict())
+    assert all(quote.gateway_route_binding_id.startswith("sha256:") for quote in restored.quotes)
     tampered = authority.to_dict()
     tampered["hard_cost_cap_usd"] = "0.04"
     with pytest.raises(CheckpointCostAuthorityError, match="identity"):
@@ -162,8 +148,7 @@ def test_cost_authority_must_cover_the_exact_frozen_routes():
         ({"max_output_tokens": None}, "bounded output"),
         ({"max_output_tokens": 129}, "quoted output"),
         ({"model_id": "openai/unpriced-model"}, "no authoritative"),
-        ({"provider_id": "unpriced-provider"}, "no authoritative"),
-        ({"model_revision": "unpriced-revision"}, "no authoritative"),
+        ({"gateway_api_base": "https://different-gateway.example/v1"}, "no authoritative"),
     ),
 )
 def test_ledger_rejects_unbounded_or_unpriced_provider_requests(kwargs, message):
@@ -171,9 +156,8 @@ def test_ledger_rejects_unbounded_or_unpriced_provider_requests(kwargs, message)
     arguments = {
         "stage": "general_review",
         "model_id": "openai/model-primary",
-        "provider_id": "openai",
-        "model_revision": "model-primary-2026-09-01",
         "deployment_id": None,
+        "gateway_api_base": _GATEWAY_API_BASE,
         "max_output_tokens": 128,
         "provider_max_retries": 0,
     }
@@ -194,9 +178,8 @@ def test_ledger_atomically_consumes_worst_case_charge_across_concurrency():
             return ledger.reserve(
                 stage="general_review",
                 model_id=quote.model_id,
-                provider_id=quote.provider_id,
-                model_revision=quote.model_revision,
                 deployment_id=None,
+                gateway_api_base=_GATEWAY_API_BASE,
                 max_output_tokens=128,
                 provider_max_retries=0,
             )
@@ -213,14 +196,14 @@ def test_ledger_atomically_consumes_worst_case_charge_across_concurrency():
     assert len({item.reservation_id for item in accepted}) == 5
 
 
-def test_context_reservation_defaults_to_general_review_stage(monkeypatch):
+def test_context_reservation_defaults_to_general_review_stage():
     _manifest, _request, _case, _arm, authority = _contracts()
-    _install_enforced_general_identity(monkeypatch)
 
     with use_checkpoint_cost_authority(authority) as ledger:
         reservation = reserve_checkpoint_provider_attempt(
             model_id="openai/model-primary",
             deployment_id=None,
+            gateway_api_base=_GATEWAY_API_BASE,
             max_output_tokens=64,
             provider_max_retries=0,
             attribution=None,
@@ -231,14 +214,14 @@ def test_context_reservation_defaults_to_general_review_stage(monkeypatch):
     assert ledger.reserved_usd == Decimal("0.01")
 
 
-def test_context_ledger_is_process_wide_for_worker_threads(monkeypatch):
+def test_context_ledger_is_process_wide_for_worker_threads():
     _manifest, _request, _case, _arm, authority = _contracts()
-    _install_enforced_general_identity(monkeypatch)
 
     def reserve_once():
         return reserve_checkpoint_provider_attempt(
             model_id="openai/model-primary",
             deployment_id=None,
+            gateway_api_base=_GATEWAY_API_BASE,
             max_output_tokens=64,
             provider_max_retries=0,
             attribution="general_review",
@@ -255,7 +238,6 @@ def test_context_ledger_is_process_wide_for_worker_threads(monkeypatch):
 @pytest.mark.asyncio
 async def test_litellm_provider_boundary_reserves_before_each_actual_call(monkeypatch):
     _manifest, _request, _case, _arm, authority = _contracts()
-    _install_enforced_general_identity(monkeypatch)
     authority = replace(authority, hard_cost_cap_usd=Decimal("0.01"))
     completion = AsyncMock(return_value={
         "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
@@ -275,6 +257,7 @@ async def test_litellm_provider_boundary_reserves_before_each_actual_call(monkey
         "model": "openai/model-primary",
         "deployment_id": None,
         "messages": [],
+        "api_base": _GATEWAY_API_BASE,
         "max_tokens": 64,
         "max_retries": 0,
     }
@@ -285,18 +268,66 @@ async def test_litellm_provider_boundary_reserves_before_each_actual_call(monkey
 
     assert response[:2] == ("ok", "stop")
     completion.assert_awaited_once()
+    sent_headers = completion.await_args.kwargs["extra_headers"]
+    assert sent_headers[CHECKPOINT_GATEWAY_ROUTE_HEADER] == authority.quotes[0].gateway_route_binding_id
 
 
 @pytest.mark.asyncio
-async def test_context_ledger_is_shared_by_concurrent_child_tasks(monkeypatch):
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    (
+        ({"api_base": None}, "explicit enforcing gateway"),
+        ({"api_base": "https://different-gateway.example/v1"}, "no authoritative"),
+        (
+            {
+                "extra_headers": {
+                    CHECKPOINT_GATEWAY_ROUTE_HEADER.lower(): _hash("conflicting-gateway-route")
+                }
+            },
+            "route binding conflicts",
+        ),
+    ),
+)
+async def test_litellm_gateway_binding_denials_stop_before_provider_call(monkeypatch, overrides, message):
     _manifest, _request, _case, _arm, authority = _contracts()
-    _install_enforced_general_identity(monkeypatch)
+    completion = AsyncMock()
+    monkeypatch.setattr(litellm_ai_handler, "acompletion", completion)
+    handler = object.__new__(LiteLLMAIHandler)
+    handler.streaming_required_models = []
+    handler.force_streaming_provider = ""
+    handler.force_streaming_api_base_substrings = []
+    options = AIRequestOptions(
+        provider_retries=0,
+        max_output_tokens=64,
+        attribution="general_review",
+    )
+    kwargs = {
+        "model": "openai/model-primary",
+        "deployment_id": None,
+        "messages": [],
+        "api_base": _GATEWAY_API_BASE,
+        "max_tokens": 64,
+        "max_retries": 0,
+        **overrides,
+    }
+
+    with use_checkpoint_cost_authority(authority), use_ai_request_options(options):
+        with pytest.raises(CheckpointCostAuthorityError, match=message):
+            await handler._get_completion(display_model="openai/model-primary", **kwargs)
+
+    completion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_context_ledger_is_shared_by_concurrent_child_tasks():
+    _manifest, _request, _case, _arm, authority = _contracts()
 
     async def reserve_once():
         await asyncio.sleep(0)
         return reserve_checkpoint_provider_attempt(
             model_id="openai/model-primary",
             deployment_id=None,
+            gateway_api_base=_GATEWAY_API_BASE,
             max_output_tokens=64,
             provider_max_retries=0,
             attribution="general_review",
@@ -313,14 +344,15 @@ def test_dynamic_frontier_attribution_uses_the_fixed_quoted_stage():
     assert checkpoint_cost_stage("frontier_adjudication:finding-123") == "frontier_adjudication"
 
 
-def test_context_reservation_rejects_missing_pre_call_route_identity():
+def test_context_reservation_rejects_missing_enforcing_gateway_binding():
     _manifest, _request, _case, _arm, authority = _contracts()
 
     with use_checkpoint_cost_authority(authority):
-        with pytest.raises(CheckpointCostAuthorityError, match="provider/revision identity"):
+        with pytest.raises(CheckpointCostAuthorityError, match="explicit enforcing gateway"):
             reserve_checkpoint_provider_attempt(
                 model_id="openai/model-primary",
                 deployment_id=None,
+                gateway_api_base=None,
                 max_output_tokens=64,
                 provider_max_retries=0,
                 attribution="general_review",

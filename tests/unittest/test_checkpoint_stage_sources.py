@@ -12,7 +12,11 @@ from pr_agent.algo.candidate_verification import (
     candidate_verification_provider_controls_hash,
     parse_candidate_verification_config,
 )
-from pr_agent.algo.checkpoint_cost_authority import FrozenCostAuthority, ProviderMaximumCharge
+from pr_agent.algo.checkpoint_cost_authority import (
+    FrozenCostAuthority,
+    ProviderMaximumCharge,
+    gateway_api_base_identity_hash,
+)
 from pr_agent.algo.checkpoint_evaluation import (
     EvaluationArmKind,
     EvaluationStageModelIdentity,
@@ -24,7 +28,6 @@ from pr_agent.algo.checkpoint_stage_sources import (
     CheckpointStageSources,
     checkpoint_candidate_verification_config,
     checkpoint_candidate_verification_enabled,
-    checkpoint_enforced_model_identity,
     checkpoint_frontier_adjudication_config,
     checkpoint_frontier_adjudication_enabled,
     checkpoint_specialist_pipeline,
@@ -73,6 +76,10 @@ def _cost_authority(snapshot: ReviewSnapshot, configuration: ReviewConfiguration
                 provider_id="provider",
                 model_revision="model-revision-v1",
                 deployment_id_hash=None,
+                gateway_api_base_hash=gateway_api_base_identity_hash(
+                    "https://test-checkpoint-gateway.example/v1"
+                ),
+                gateway_route_binding_id=_hash_json("test-gateway-route"),
                 max_output_tokens=128,
                 maximum_charge_usd=Decimal("0.01"),
             ),
@@ -427,30 +434,6 @@ def test_candidate_and_frontier_sources_are_injected_without_ambient_reparse():
         ) is sources.full_cascade_candidate_verification
         assert checkpoint_frontier_adjudication_enabled() is True
         assert checkpoint_frontier_adjudication_config({}, {}) is sources.frontier_adjudication
-
-
-def test_injected_sources_resolve_exact_pre_call_provider_and_revision_identity():
-    sources = _sources()
-    selected = sources.for_stage_plan(_stage_plan(sources))
-    frontier = selected.frontier_adjudication
-    assert frontier is not None
-
-    with use_checkpoint_stage_sources(selected):
-        identity = checkpoint_enforced_model_identity(
-            "frontier_adjudication",
-            frontier.route.models[0],
-            frontier.route.deployments[0],
-        )
-        mismatched = checkpoint_enforced_model_identity(
-            "frontier_adjudication",
-            frontier.route.models[0],
-            "different-deployment",
-        )
-
-    assert identity is not None
-    assert identity.provider_id == frontier.model_identities[0].provider
-    assert identity.model_revision == frontier.model_identities[0].revision
-    assert mismatched is None
 
 
 @pytest.mark.asyncio

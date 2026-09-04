@@ -1,7 +1,7 @@
 """Frozen pre-call spending authority for checkpoint evaluation workers.
 
 The local ledger does not estimate prices. It consumes a maximum-charge guarantee
-issued by the provider or an enforcing gateway before every underlying provider
+issued through an enforcing gateway before every underlying provider
 request. A missing guarantee, an unbounded output, or SDK-internal retrying denies
 the request before the model client is called.
 """
@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Iterator, Mapping, Optional, Sequence
+from urllib.parse import urlsplit
 
 from pr_agent.algo.checkpoint_evaluation import (
     CheckpointCase,
@@ -30,7 +31,9 @@ from pr_agent.algo.checkpoint_evaluation import (
 from pr_agent.algo.checkpoint_evaluation_execution import PaidExecutionRequest
 
 CHECKPOINT_COST_AUTHORITY_SCHEMA_VERSION = "checkpoint-cost-authority-v1"
-CHECKPOINT_COST_ENFORCEMENT_KIND = "provider_gateway_maximum_charge"
+CHECKPOINT_COST_ENFORCEMENT_KIND = "enforcing_gateway_maximum_charge"
+CHECKPOINT_GATEWAY_ROUTE_BINDING_KIND = "enforcing_gateway_route_v1"
+CHECKPOINT_GATEWAY_ROUTE_HEADER = "X-PR-Agent-Checkpoint-Route"
 GENERAL_REVIEW_COST_STAGE = "general_review"
 FRONTIER_ADJUDICATION_COST_STAGE = "frontier_adjudication"
 _HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -99,6 +102,36 @@ def _parse_expiry(value: object) -> datetime:
     return parsed
 
 
+def gateway_api_base_identity_hash(value: object) -> str:
+    """Hash the explicit HTTPS gateway endpoint without persisting its URL."""
+
+    if not isinstance(value, str) or not value.strip() or len(value) > 2048:
+        raise CheckpointCostAuthorityError(
+            "checkpoint provider request requires an explicit enforcing gateway api_base"
+        )
+    try:
+        parsed = urlsplit(value.strip())
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise CheckpointCostAuthorityError("checkpoint enforcing gateway api_base is malformed") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise CheckpointCostAuthorityError(
+            "checkpoint enforcing gateway api_base must be a credential-free HTTPS endpoint"
+        )
+    host = parsed.hostname.casefold()
+    rendered_host = f"[{host}]" if ":" in host else host
+    port = f":{parsed_port}" if parsed_port is not None else ""
+    path = parsed.path.rstrip("/")
+    return content_hash({"gateway_api_base": f"https://{rendered_host}{port}{path}"})
+
+
 @dataclass(frozen=True)
 class ProviderMaximumCharge:
     """One externally guaranteed maximum charge for an exact provider request."""
@@ -108,8 +141,11 @@ class ProviderMaximumCharge:
     provider_id: str
     model_revision: str
     deployment_id_hash: Optional[str]
+    gateway_api_base_hash: str
+    gateway_route_binding_id: str
     max_output_tokens: int
     maximum_charge_usd: Decimal
+    gateway_route_binding_kind: str = CHECKPOINT_GATEWAY_ROUTE_BINDING_KIND
     quote_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -120,6 +156,10 @@ class ProviderMaximumCharge:
             raise CheckpointCostAuthorityError("cost quote model revision must be immutable")
         if self.deployment_id_hash is not None:
             _require_hash("cost quote deployment identity", self.deployment_id_hash)
+        _require_hash("cost quote gateway api_base identity", self.gateway_api_base_hash)
+        _require_hash("cost quote gateway route binding", self.gateway_route_binding_id)
+        if self.gateway_route_binding_kind != CHECKPOINT_GATEWAY_ROUTE_BINDING_KIND:
+            raise CheckpointCostAuthorityError("unsupported gateway route binding kind")
         if (
             not isinstance(self.max_output_tokens, int)
             or isinstance(self.max_output_tokens, bool)
@@ -142,8 +182,15 @@ class ProviderMaximumCharge:
             self.deployment_id_hash,
         )
 
-    def runtime_key(self) -> tuple[str, str, str, str, Optional[str]]:
-        return self.route_key()
+    def runtime_key(self) -> tuple[str, str, Optional[str], str]:
+        """Use outbound-visible fields; the matched gateway binding enforces the quoted backend."""
+
+        return (
+            self.stage,
+            self.model_id,
+            self.deployment_id_hash,
+            self.gateway_api_base_hash,
+        )
 
     def _identity_payload(self) -> dict[str, Any]:
         return {
@@ -152,6 +199,9 @@ class ProviderMaximumCharge:
             "provider_id": self.provider_id,
             "model_revision": self.model_revision,
             "deployment_id_hash": self.deployment_id_hash,
+            "gateway_api_base_hash": self.gateway_api_base_hash,
+            "gateway_route_binding_kind": self.gateway_route_binding_kind,
+            "gateway_route_binding_id": self.gateway_route_binding_id,
             "max_output_tokens": self.max_output_tokens,
             "maximum_charge_usd": _decimal_text(self.maximum_charge_usd),
         }
@@ -167,6 +217,9 @@ class ProviderMaximumCharge:
             "provider_id",
             "model_revision",
             "deployment_id_hash",
+            "gateway_api_base_hash",
+            "gateway_route_binding_kind",
+            "gateway_route_binding_id",
             "max_output_tokens",
             "maximum_charge_usd",
             "quote_id",
@@ -179,6 +232,9 @@ class ProviderMaximumCharge:
             provider_id=value["provider_id"],
             model_revision=value["model_revision"],
             deployment_id_hash=value["deployment_id_hash"],
+            gateway_api_base_hash=value["gateway_api_base_hash"],
+            gateway_route_binding_kind=value["gateway_route_binding_kind"],
+            gateway_route_binding_id=value["gateway_route_binding_id"],
             max_output_tokens=value["max_output_tokens"],
             maximum_charge_usd=value["maximum_charge_usd"],
         )
@@ -438,6 +494,10 @@ class ProviderAttemptReservation:
     quote_id: str
     stage: str
     model_id: str
+    provider_id: str
+    model_revision: str
+    gateway_api_base_hash: str
+    gateway_route_binding_id: str
     maximum_charge_usd: Decimal
     cumulative_reserved_usd: Decimal
     reservation_id: str = field(init=False)
@@ -449,6 +509,10 @@ class ProviderAttemptReservation:
             "quote_id": self.quote_id,
             "stage": self.stage,
             "model_id": self.model_id,
+            "provider_id": self.provider_id,
+            "model_revision": self.model_revision,
+            "gateway_api_base_hash": self.gateway_api_base_hash,
+            "gateway_route_binding_id": self.gateway_route_binding_id,
             "maximum_charge_usd": _decimal_text(self.maximum_charge_usd),
             "cumulative_reserved_usd": _decimal_text(self.cumulative_reserved_usd),
         }))
@@ -482,9 +546,8 @@ class CostAuthorityLedger:
         *,
         stage: str,
         model_id: str,
-        provider_id: str,
-        model_revision: str,
         deployment_id: Optional[str],
+        gateway_api_base: object,
         max_output_tokens: object,
         provider_max_retries: object,
     ) -> ProviderAttemptReservation:
@@ -504,9 +567,8 @@ class CostAuthorityLedger:
         key = (
             _require_stage(stage),
             _require_identifier("provider request model_id", model_id),
-            _require_identifier("provider request provider_id", provider_id),
-            _require_identifier("provider request model_revision", model_revision),
             deployment_identity_hash(deployment_id),
+            gateway_api_base_identity_hash(gateway_api_base),
         )
         quote = self._quotes.get(key)
         if quote is None:
@@ -523,6 +585,10 @@ class CostAuthorityLedger:
                 quote_id=quote.quote_id,
                 stage=stage,
                 model_id=model_id,
+                provider_id=quote.provider_id,
+                model_revision=quote.model_revision,
+                gateway_api_base_hash=quote.gateway_api_base_hash,
+                gateway_route_binding_id=quote.gateway_route_binding_id,
                 maximum_charge_usd=quote.maximum_charge_usd,
                 cumulative_reserved_usd=cumulative,
             )
@@ -572,6 +638,7 @@ def reserve_checkpoint_provider_attempt(
     *,
     model_id: str,
     deployment_id: Optional[str],
+    gateway_api_base: object,
     max_output_tokens: object,
     provider_max_retries: object,
     attribution: Optional[str],
@@ -582,22 +649,41 @@ def reserve_checkpoint_provider_attempt(
     if ledger is None:
         return None
     stage = checkpoint_cost_stage(attribution)
-    from pr_agent.algo.checkpoint_stage_sources import checkpoint_enforced_model_identity
-
-    enforced_identity = checkpoint_enforced_model_identity(stage, model_id, deployment_id)
-    if enforced_identity is None:
-        raise CheckpointCostAuthorityError(
-            "checkpoint provider request has no pre-call enforced provider/revision identity"
-        )
     return ledger.reserve(
         stage=stage,
         model_id=model_id,
-        provider_id=enforced_identity.provider_id,
-        model_revision=enforced_identity.model_revision,
         deployment_id=deployment_id,
+        gateway_api_base=gateway_api_base,
         max_output_tokens=max_output_tokens,
         provider_max_retries=provider_max_retries,
     )
+
+
+def apply_checkpoint_gateway_route_binding(
+    kwargs: dict[str, Any],
+    reservation: Optional[ProviderAttemptReservation],
+) -> None:
+    """Attach the non-secret route binding that an explicit gateway must enforce."""
+
+    if reservation is None:
+        return
+    existing = kwargs.get("extra_headers")
+    if existing is None:
+        headers: dict[str, Any] = {}
+    elif isinstance(existing, Mapping):
+        headers = dict(existing)
+    else:
+        raise CheckpointCostAuthorityError("checkpoint gateway extra_headers must be a mapping")
+    matches = tuple(
+        value
+        for name, value in headers.items()
+        if isinstance(name, str) and name.casefold() == CHECKPOINT_GATEWAY_ROUTE_HEADER.casefold()
+    )
+    if len(matches) > 1 or (matches and matches[0] != reservation.gateway_route_binding_id):
+        raise CheckpointCostAuthorityError("checkpoint gateway route binding conflicts with the cost authority")
+    if not matches:
+        headers[CHECKPOINT_GATEWAY_ROUTE_HEADER] = reservation.gateway_route_binding_id
+    kwargs["extra_headers"] = headers
 
 
 def validate_cost_authorities(

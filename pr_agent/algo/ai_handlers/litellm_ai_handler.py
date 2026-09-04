@@ -1470,16 +1470,21 @@ class LiteLLMAIHandler(BaseAiHandler):
         Wrapper that automatically handles streaming for required models.
         """
         model = kwargs["model"]
-        from pr_agent.algo.checkpoint_cost_authority import reserve_checkpoint_provider_attempt
+        from pr_agent.algo.checkpoint_cost_authority import (
+            apply_checkpoint_gateway_route_binding,
+            reserve_checkpoint_provider_attempt,
+        )
 
         request_options = get_ai_request_options()
-        reserve_checkpoint_provider_attempt(
+        reservation = reserve_checkpoint_provider_attempt(
             model_id=display_model or model,
             deployment_id=kwargs.get("deployment_id"),
+            gateway_api_base=kwargs.get("api_base"),
             max_output_tokens=kwargs.get("max_tokens"),
             provider_max_retries=kwargs.get("max_retries"),
             attribution=request_options.attribution if request_options is not None else None,
         )
+        apply_checkpoint_gateway_route_binding(kwargs, reservation)
         custom_llm_provider = str(kwargs.get("custom_llm_provider") or "").strip().lower()
         # Double the prefix so LiteLLM strips its provider prefix but preserves
         # OpenRouter's native router ID; leave other explicit providers unchanged.

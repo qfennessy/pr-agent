@@ -34,10 +34,10 @@ severity contract rather than an inferred default. Both bindings also remain una
 supplies a current, immutable provider/gateway maximum-charge authority for every frozen route and the bound
 runtime controls pass preflight. The model boundary can now consume that authority immediately before every
 underlying provider request, but the repository does not ship an authority or treat a LiteLLM price estimate
-as one. A quote cannot attest to its own route: checkpoint stage calls resolve provider and immutable revision
-from the separately injected production stage source before lookup. General-review execution has no equivalent
-independent pre-call identity source yet and therefore remains unavailable. The general replay contract remains
-limited to the
+as one. A quote must include a non-secret, immutable gateway route-binding identifier for its exact provider and
+revision. The model boundary sends that identifier only to the explicitly hashed HTTPS gateway endpoint; generic
+LiteLLM provider routes do not enforce this contract. No enforcing gateway binding is installed, so general-review
+and checkpoint-stage execution remain unavailable. The general replay contract remains limited to the
 standard OpenAI route; unsupported routes continue to fail configuration capture.
 Issue #27 must still complete those contracts and the source/telemetry contracts needed to integrate
 the production orchestration delivered by issues #26, #12, #11, #9, and #33. A frozen
@@ -209,8 +209,10 @@ unreconciled reservation that blocks resume instead of repeating a possibly char
 `checkpoint-cost-authority-v1` is a separate source-free contract for one manifest, paid request,
 case, arm, snapshot, review configuration, and per-attempt cap. It names an immutable authority
 revision and hashes the external provider or enforcing-gateway guarantee. Each quote pins one exact
-stage, model, provider, revision, deployment identity, maximum output-token cap, and worst-case charge.
-It also expires. Unknown fields, mutable revision aliases, ambiguous routes, incomplete route coverage,
+stage, model, provider, revision, deployment identity, hashed HTTPS gateway endpoint, non-secret immutable
+gateway route-binding identifier, maximum output-token cap, and worst-case charge. The binding identifier is
+safe to persist and contains no credential, source, prompt, or endpoint URL. It also expires. Unknown fields,
+mutable revision aliases, ambiguous routes, incomplete route coverage,
 and any quote larger than the attempt cap fail validation locally.
 
 The isolated single-review worker installs one consume-only ledger process-wide and in its coroutine
@@ -220,8 +222,12 @@ retries, fallback routes, streaming calls, and the Bedrock credential fallback, 
 reserves the quote's full worst-case charge. It does not refund reservations based on estimated actual
 usage. A request is denied before the provider client when its route is unquoted, the output cap is
 missing or larger than quoted, provider SDK retries are not exactly zero, the authority is expired or
-mismatched, an independently injected stage source cannot pin its provider and immutable revision, or the
-next reservation would exceed the cap. Dynamic per-finding frontier telemetry attribution is normalized to
+mismatched, the explicit gateway endpoint does not match the quote, the route binding conflicts with an existing
+header, or the next reservation would exceed the cap. After reservation, the handler attaches the exact binding as
+`X-PR-Agent-Checkpoint-Route` on the actual `acompletion` request. The external gateway contract must guarantee
+that it rejects an unknown or mismatched identifier and routes a recognized identifier only to the quoted provider
+and immutable revision. This header is not a credential and must never be replaced with a secret token. Dynamic
+per-finding frontier telemetry attribution is normalized to
 the fixed `frontier_adjudication` stage only for quote lookup; full attribution remains in telemetry.
 Post-response cost and identity telemetry
 still must be complete and agree with the frozen arm; the authority does not turn missing telemetry into
@@ -232,7 +238,8 @@ enforced for the bound request regardless of its eventual input or output usage.
 the ordinary LiteLLM pricing table are observational estimates, not
 spending authority. Consequently the default production binding inventory keeps
 `hard_cost_cap_enforcement_unavailable` until a real authority is supplied and its frozen route controls
-are proven. This repository change alone does not authorize or execute a paid request.
+are proven. A direct or generic LiteLLM provider endpoint that ignores the route header does not qualify. This
+repository change alone does not authorize or execute a paid request.
 
 ## Resumable raw attempt artifacts
 
@@ -514,6 +521,6 @@ parents are not reserved or executed. Clean empty-diff outcomes persist an unamb
 with observed zero tokens and cost; missing telemetry after a model call remains unavailable. Paid
 calls remain unavailable because no authoritative provider/gateway maximum-charge contract is supplied
 by the repository, although the worker now enforces such a contract at every underlying call.
-An independent general-review provider/revision source, general-review severity,
+An enforcing gateway route binding, general-review severity,
 deterministic/specialist finding contracts, and full-cascade frontier decision and aggregate-stage semantics
 also remain fail-closed.
