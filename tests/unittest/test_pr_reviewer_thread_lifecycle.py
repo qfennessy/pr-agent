@@ -454,9 +454,19 @@ def test_inventory_failure_is_visible_and_retains_all_findings():
     assert reviewer.review_thread_reconciliation_artifact["status"] == "inventory_unavailable"
     assert reviewer.review_thread_reconciliation_artifact["results"]["failed"] == 1
     assert set(reviewer.review_thread_reconciliation_artifact["metrics"]["action_states"]) == {
-        f"{kind.value}.{state.value}"
-        for kind in ReviewThreadActionKind
-        for state in ReviewThreadActionState
+        f"{kind}.{state}"
+        for kind in ("create", "update", "resolve", "unchanged", "skip", "summary_fallback")
+        for state in (
+            "applied",
+            "already_applied",
+            "stale_head",
+            "stale_inventory",
+            "failed",
+            "not_executed",
+            "skipped",
+            "fallback_required",
+            "applied_requires_refresh",
+        )
     }
     assert "could not be read" in reviewer._review_thread_lifecycle_notice
 

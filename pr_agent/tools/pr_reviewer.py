@@ -157,6 +157,32 @@ _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _MACHINE_FAILURE_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _VALID_REVIEW_PROFILES = {"full", "bugs_only"}
 _ROUTING_INVENTORY_UNSET = object()
+_REVIEW_THREAD_ACTION_KINDS = (
+    ReviewThreadActionKind.CREATE,
+    ReviewThreadActionKind.UPDATE,
+    ReviewThreadActionKind.RESOLVE,
+    ReviewThreadActionKind.UNCHANGED,
+    ReviewThreadActionKind.SKIP,
+    ReviewThreadActionKind.SUMMARY_FALLBACK,
+)
+_REVIEW_THREAD_ACTION_STATES = (
+    ReviewThreadActionState.APPLIED,
+    ReviewThreadActionState.ALREADY_APPLIED,
+    ReviewThreadActionState.STALE_HEAD,
+    ReviewThreadActionState.STALE_INVENTORY,
+    ReviewThreadActionState.FAILED,
+    ReviewThreadActionState.NOT_EXECUTED,
+    ReviewThreadActionState.SKIPPED,
+    ReviewThreadActionState.FALLBACK_REQUIRED,
+    ReviewThreadActionState.APPLIED_REQUIRES_REFRESH,
+)
+_REVIEW_THREAD_FALLBACK_REASONS = (
+    SummaryFallbackReason.INVALID_INLINE_LOCATION,
+    SummaryFallbackReason.INLINE_REJECTED,
+    SummaryFallbackReason.PERMISSION_DENIED,
+    SummaryFallbackReason.RATE_LIMITED,
+    SummaryFallbackReason.PROVIDER_FAILURE,
+)
 _BUG_FINDING_HEADERS = {
     "bug": "Bug",
     "security": "Security vulnerability",
@@ -3142,14 +3168,23 @@ class PRReviewer:
                 "failed": 1,
             },
             "metrics": {
-                "actions": {kind.value: 0 for kind in ReviewThreadActionKind},
+                "actions": {
+                    kind.value: 0
+                    for kind in _REVIEW_THREAD_ACTION_KINDS
+                },
                 "action_states": {
                     f"{kind.value}.{state.value}": 0
-                    for kind in ReviewThreadActionKind
-                    for state in ReviewThreadActionState
+                    for kind in _REVIEW_THREAD_ACTION_KINDS
+                    for state in _REVIEW_THREAD_ACTION_STATES
                 },
-                "states": {state.value: 0 for state in ReviewThreadActionState},
-                "summary_fallbacks": {reason.value: 0 for reason in SummaryFallbackReason},
+                "states": {
+                    state.value: 0
+                    for state in _REVIEW_THREAD_ACTION_STATES
+                },
+                "summary_fallbacks": {
+                    reason.value: 0
+                    for reason in _REVIEW_THREAD_FALLBACK_REASONS
+                },
                 "unavailable": {status: 1},
             },
         }
