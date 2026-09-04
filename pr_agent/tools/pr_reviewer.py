@@ -1414,6 +1414,7 @@ class PRReviewer:
         """Run the configured shadow batch once without changing review inputs or output."""
 
         self._specialists_started = True
+        pipeline = None
         try:
             pipeline = load_specialist_pipeline_config()
             self._specialist_pipeline = pipeline
@@ -1471,6 +1472,11 @@ class PRReviewer:
         except Exception as exc:
             # Shadow infrastructure is observational. Configuration/provider failures
             # remain telemetry and can never block or alter the ordinary review.
+            if pipeline is not None:
+                self.specialist_shadow_result = unavailable_specialist_batch(
+                    pipeline,
+                    failure_reason="specialist_batch_failed",
+                )
             get_logger().warning(
                 "Specialist shadow batch failed; continuing the ordinary review",
                 artifact={"error_class": type(exc).__name__},

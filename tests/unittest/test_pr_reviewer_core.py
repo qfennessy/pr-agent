@@ -39,6 +39,7 @@ from pr_agent.algo.run_details import (
     record_ai_call,
     record_model_used,
     record_provider_request_attempt,
+    record_specialist_result,
 )
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity, convert_to_markdown_v2, show_run_details
@@ -5712,6 +5713,83 @@ async def test_enabled_provider_without_stable_identity_records_unavailable_batc
         failure_reason="stable_head_identity_unavailable",
     )
     run_shadow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_specialist_wrapper_failure_materializes_every_planned_role():
+    git_provider = MagicMock()
+    git_provider.get_pr_head_sha.return_value = "head"
+    git_provider.get_diff_files.return_value = []
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer._specialists_started = False
+    reviewer.vars = {"title": "Change behavior"}
+    reviewer.pr_description = "Description"
+    reviewer.ai_handler = MagicMock()
+    prompts = {
+        SpecialistRole.CHANGE_CLASSIFICATION: SimpleNamespace(
+            prompt_version="change-v1",
+            input_schema_version="specialist-input-v1",
+            schema_version="specialist-output-v1",
+        ),
+        SpecialistRole.RISK_RECOMMENDATION: SimpleNamespace(
+            prompt_version="risk-v1",
+            input_schema_version="specialist-input-v1",
+            schema_version="specialist-output-v1",
+        ),
+    }
+    role_configs = tuple(
+        SimpleNamespace(
+            role=role,
+            enabled=True,
+            model=f"model-{role.value}",
+            deployment=f"deployment-{role.value}",
+        )
+        for role in prompts
+    )
+    pipeline = SimpleNamespace(
+        configuration_hash="configuration-hash",
+        roles=role_configs,
+        prompt=lambda role: prompts[role],
+        allowed_change_labels=(),
+    )
+    init_run_details()
+    record_specialist_result(
+        SpecialistRole.CHANGE_CLASSIFICATION.value,
+        prompt_version="change-v1",
+        input_schema_version="specialist-input-v1",
+        schema_version="specialist-output-v1",
+        state=SpecialistState.SUCCESS.value,
+        latency_seconds=1.0,
+        model="observed-change-model",
+        deployment_id="observed-change-deployment",
+        fallback_used=True,
+    )
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.load_specialist_pipeline_config", return_value=pipeline),
+        patch("pr_agent.tools.pr_reviewer.get_specialist_snapshot_context", return_value=None),
+        patch(
+            "pr_agent.tools.pr_reviewer.build_specialist_input",
+            side_effect=RuntimeError("input construction failed"),
+        ),
+    ):
+        await reviewer._run_shadow_specialists_once()
+
+    assert {record.role for record in reviewer.specialist_shadow_result.records} == set(prompts)
+    assert all(
+        record.state is SpecialistState.UNAVAILABLE
+        and record.failure_reason == "specialist_batch_failed"
+        for record in reviewer.specialist_shadow_result.records
+    )
+    stage_runs = get_run_details().specialist_runs
+    assert set(stage_runs) == {role.value for role in prompts}
+    assert stage_runs[SpecialistRole.CHANGE_CLASSIFICATION.value].model_used == "observed-change-model"
+    assert stage_runs[SpecialistRole.CHANGE_CLASSIFICATION.value].fallback_used is True
+    risk_stage = stage_runs[SpecialistRole.RISK_RECOMMENDATION.value]
+    assert risk_stage.model_used == "model-risk_recommendation"
+    assert risk_stage.deployment_id == "deployment-risk_recommendation"
+    assert risk_stage.fallback_used is False
+    assert all(stage.state == SpecialistState.UNAVAILABLE.value for stage in stage_runs.values())
 
 
 @pytest.mark.asyncio
