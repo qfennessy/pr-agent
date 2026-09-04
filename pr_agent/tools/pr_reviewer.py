@@ -3079,6 +3079,10 @@ class PRReviewer:
             else None
         )
         finding_limit_dropped = artifact.get("finding_limit_dropped") if isinstance(artifact, Mapping) else None
+        proposed_candidate_count = (
+            artifact.get("proposed_candidate_count") if isinstance(artifact, Mapping) else None
+        )
+        generation_cap = self._maximum_generated_findings()
         if (
             not isinstance(artifact, Mapping)
             or artifact.get("publication_safe") is not True
@@ -3089,6 +3093,13 @@ class PRReviewer:
             or not isinstance(finding_limit_dropped, int)
             or isinstance(finding_limit_dropped, bool)
             or finding_limit_dropped != 0
+            or not isinstance(generation_cap, int)
+            or isinstance(generation_cap, bool)
+            or generation_cap < 1
+            or not isinstance(proposed_candidate_count, int)
+            or isinstance(proposed_candidate_count, bool)
+            or proposed_candidate_count < 0
+            or proposed_candidate_count >= generation_cap
             or (
                 publication_threshold is not None
                 and str(publication_threshold).strip().casefold() not in {"none", "low"}

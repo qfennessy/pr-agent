@@ -482,6 +482,67 @@ class TestGetDiffFilesEditTypes:
         assert len(diffs) == 1
         assert diffs[0].patch == "LARGE_DIFF"
         assert diffs[0].edit_type == EDIT_TYPE.MODIFIED
+        assert diffs[0].patch_is_complete is False
+
+    @pytest.mark.parametrize(
+        ("status", "patch", "additions", "deletions"),
+        [
+            ("modified", "@@ -1 +1 @@\n-old\n+new", 1, 1),
+            (
+                "modified",
+                "@@ -1,2 +1,2 @@\n-old\n+new\n same\n@@ -10 +10,2 @@\n-old2\n+new2\n+extra",
+                3,
+                2,
+            ),
+            ("added", "@@ -0,0 +1,2 @@\n+one\n+two", 2, 0),
+            ("removed", "@@ -1,2 +0,0 @@\n-one\n-two", 0, 2),
+        ],
+    )
+    def test_original_complete_patch_is_marked_trustworthy(
+        self, patched_helpers, status, patch, additions, deletions
+    ):
+        f = _make_file("complete.py", status, patch=patch, additions=additions, deletions=deletions)
+        p = _make_provider_for_diff([f])
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+
+        diffs = p.get_diff_files()
+
+        assert diffs[0].patch_is_complete is True
+
+    @pytest.mark.parametrize(
+        ("patch", "additions", "deletions"),
+        [
+            ("@@ -1 +1 @@\n-old\n+new", 2, 1),
+            ("@@ -1,3 +1,3 @@\n-old\n+new\n context", 1, 1),
+            ("@@ malformed @@\n-old\n+new", 1, 1),
+        ],
+    )
+    def test_truncated_or_malformed_patch_is_not_marked_trustworthy(
+        self, patched_helpers, patch, additions, deletions
+    ):
+        f = _make_file("incomplete.py", "modified", patch=patch, additions=additions, deletions=deletions)
+        p = _make_provider_for_diff([f])
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+
+        diffs = p.get_diff_files()
+
+        assert diffs[0].patch_is_complete is False
+
+    def test_incremental_github_patch_is_not_marked_trustworthy(self, patched_helpers):
+        f = _make_file(
+            "incremental.py",
+            "modified",
+            patch="@@ -1 +1 @@\n-old\n+new",
+            additions=1,
+            deletions=1,
+        )
+        p = _make_provider_for_diff([f])
+        p.incremental.is_incremental = True
+        p._get_pr_file_content = lambda file, sha, path=None: "content"
+
+        diffs = p.get_diff_files()
+
+        assert diffs[0].patch_is_complete is False
 
     def test_existing_patch_preserved(self, patched_helpers):
         f = _make_file("ok.py", "modified", patch="@@ -1 +1 @@\n-a\n+b")

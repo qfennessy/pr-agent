@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from pr_agent.algo.inline_comment_dedup import (
     body_with_finding_identity_marker,
     build_summary_fallback_marker,
@@ -31,6 +33,7 @@ class _Settings:
         obsolete_policy="keep",
         provider="github",
         persistent_comment=True,
+        num_max_findings=3,
     ):
         self.config = _Section(
             git_provider=provider,
@@ -43,6 +46,7 @@ class _Settings:
             enable_review_coverage_footer=False,
             enable_help_text=False,
             persistent_comment=persistent_comment,
+            num_max_findings=num_max_findings,
         )
         self.review_thread_lifecycle = _Section(
             enabled=enabled,
@@ -227,6 +231,7 @@ def _reviewer(provider, *, artifact=None, incremental=False, remaining_files=())
     reviewer.candidate_verification_artifact = artifact or {
         "status": "complete",
         "publication_safe": True,
+        "proposed_candidate_count": 1,
         "verified_count": 1,
         "finding_limit_dropped": 0,
     }
@@ -517,6 +522,7 @@ def test_complete_full_clean_run_may_resolve_an_obsolete_bot_owned_thread():
     reviewer = _reviewer(provider, artifact={
         "status": "no_candidates",
         "publication_safe": True,
+        "proposed_candidate_count": 0,
         "verified_count": 0,
         "finding_limit_dropped": 0,
     })
@@ -532,6 +538,7 @@ def test_incremental_clean_run_cannot_resolve_an_obsolete_thread():
     reviewer = _reviewer(provider, incremental=True, artifact={
         "status": "no_candidates",
         "publication_safe": True,
+        "proposed_candidate_count": 0,
         "verified_count": 0,
         "finding_limit_dropped": 0,
     })
@@ -546,6 +553,7 @@ def test_omitted_or_budgeted_findings_make_absence_non_authoritative():
     artifact = {
         "status": "complete",
         "publication_safe": True,
+        "proposed_candidate_count": 1,
         "verified_count": 1,
         "finding_limit_dropped": 0,
     }
@@ -554,6 +562,81 @@ def test_omitted_or_budgeted_findings_make_absence_non_authoritative():
 
     reviewer.remaining_files_list = []
     assert reviewer._review_thread_absence_is_authoritative(0) is False
+
+
+@pytest.mark.parametrize(
+    ("proposed_count", "generation_cap", "published_count", "expected"),
+    [
+        (2, 3, 2, True),
+        (3, 3, 3, False),
+        (4, 3, 4, False),
+        (None, 3, 0, False),
+        (True, 3, 0, False),
+        (-1, 3, 0, False),
+        (0, 0, 0, False),
+        (0, True, 0, False),
+    ],
+)
+def test_generation_cap_saturation_and_malformed_counts_make_absence_non_authoritative(
+    proposed_count, generation_cap, published_count, expected
+):
+    reviewer = _reviewer(_Provider(), artifact={
+        "status": "complete",
+        "publication_safe": True,
+        "proposed_candidate_count": proposed_count,
+        "verified_count": published_count,
+        "finding_limit_dropped": 0,
+    })
+
+    with patch(
+        "pr_agent.tools.pr_reviewer.get_settings",
+        return_value=_Settings(num_max_findings=generation_cap),
+    ):
+        assert reviewer._review_thread_absence_is_authoritative(published_count) is expected
+
+
+def test_applied_route_generation_cap_controls_authoritative_absence():
+    reviewer = _reviewer(_Provider(), artifact={
+        "status": "complete",
+        "publication_safe": True,
+        "proposed_candidate_count": 2,
+        "verified_count": 2,
+        "finding_limit_dropped": 0,
+    })
+    reviewer._review_max_findings = 2
+
+    with patch(
+        "pr_agent.tools.pr_reviewer.get_settings",
+        return_value=_Settings(num_max_findings=3),
+    ):
+        assert reviewer._review_thread_absence_is_authoritative(2) is False
+
+
+def test_saturated_run_reconciles_current_finding_without_resolving_absent_thread():
+    provider = _Provider((_snapshot(),))
+    current_finding = _finding(
+        start_line=3,
+        end_line=3,
+        root_cause_id=f"sha256:{'d' * 64}",
+        trusted_stable_key=f"sha256:{'e' * 64}",
+        _trusted_anchor_shape_id=f"sha256:{'f' * 64}",
+    )
+    reviewer = _reviewer(provider, artifact={
+        "status": "complete",
+        "publication_safe": True,
+        "proposed_candidate_count": 1,
+        "verified_count": 1,
+        "finding_limit_dropped": 0,
+    })
+
+    _apply(
+        reviewer,
+        [current_finding],
+        settings=_Settings(obsolete_policy="resolve", num_max_findings=1),
+    )
+
+    assert [call[0] for call in _mutation_calls(provider)] == ["create"]
+    assert reviewer.review_thread_reconciliation_artifact["authoritative_absence"] is False
 
 
 def test_structured_output_contains_bounded_reconciliation_metrics():

@@ -27,7 +27,12 @@ from retry.api import retry_call
 from starlette_context import context
 
 from ..algo.file_filter import filter_ignored
-from ..algo.git_patch_processing import extract_hunk_headers, iter_git_patch_lines, strip_git_line_ending
+from ..algo.git_patch_processing import (
+    RE_HUNK_HEADER,
+    extract_hunk_headers,
+    iter_git_patch_lines,
+    strip_git_line_ending,
+)
 from ..algo.inline_comment_dedup import (
     FINDING_IDENTITY_MARKER_VERSION,
     SUMMARY_FALLBACK_MARKER_VERSION,
@@ -76,6 +81,60 @@ from .git_provider import (
 _REVIEW_THREAD_MUTATION_LOCKS_GUARD = threading.Lock()
 _REVIEW_THREAD_MUTATION_LOCKS = WeakValueDictionary()
 _REVIEW_THREAD_MUTATION_PROCESS_LOCK_PREFIX = os.path.join(tempfile.gettempdir(), "pr-agent-review-thread")
+
+
+def _github_patch_is_complete(patch: object, additions: object, deletions: object) -> bool:
+    """Prove that one original GitHub patch contains every declared changed record."""
+    if (
+        not isinstance(patch, str)
+        or not patch.strip()
+        or isinstance(additions, bool)
+        or not isinstance(additions, int)
+        or additions < 0
+        or isinstance(deletions, bool)
+        or not isinstance(deletions, int)
+        or deletions < 0
+    ):
+        return False
+
+    saw_hunk = False
+    expected_old = expected_new = observed_old = observed_new = 0
+    observed_additions = observed_deletions = 0
+    for record in iter_git_patch_lines(patch):
+        line = strip_git_line_ending(record)
+        match = RE_HUNK_HEADER.match(line)
+        if match:
+            if saw_hunk and (observed_old != expected_old or observed_new != expected_new):
+                return False
+            _, expected_old, expected_new, _, _ = extract_hunk_headers(match)
+            observed_old = observed_new = 0
+            saw_hunk = True
+            continue
+        if not saw_hunk:
+            continue
+        if line.startswith("\\ No newline at end of file"):
+            continue
+        if line.startswith("+"):
+            observed_new += 1
+            observed_additions += 1
+        elif line.startswith("-"):
+            observed_old += 1
+            observed_deletions += 1
+        elif line.startswith(" "):
+            observed_old += 1
+            observed_new += 1
+        else:
+            return False
+        if observed_old > expected_old or observed_new > expected_new:
+            return False
+
+    return (
+        saw_hunk
+        and observed_old == expected_old
+        and observed_new == expected_new
+        and observed_additions == additions
+        and observed_deletions == deletions
+    )
 
 
 class _ReviewThreadMutationLockError(RuntimeError):
@@ -630,7 +689,8 @@ class GithubProvider(GitProvider):
                     invalid_files_names.append(file.filename)
                     continue
 
-                patch = file.patch
+                github_patch = file.patch
+                patch = github_patch
                 is_renamed = file.status == "renamed" and getattr(file, "previous_filename", None)
                 old_filename = file.previous_filename if is_renamed else None
                 if is_close_to_rate_limit:
@@ -678,19 +738,26 @@ class GithubProvider(GitProvider):
                     edit_type = EDIT_TYPE.UNKNOWN
 
                 # count number of lines added and removed
+                github_additions = getattr(file, 'additions', None)
+                github_deletions = getattr(file, 'deletions', None)
                 if hasattr(file, 'additions') and hasattr(file, 'deletions'):
-                    num_plus_lines = file.additions
-                    num_minus_lines = file.deletions
+                    num_plus_lines = github_additions
+                    num_minus_lines = github_deletions
                 else:
                     patch_lines = list(iter_git_patch_lines(patch))
                     num_plus_lines = len([line for line in patch_lines if line.startswith('+')])
                     num_minus_lines = len([line for line in patch_lines if line.startswith('-')])
+                patch_is_complete = (
+                    not self.incremental.is_incremental
+                    and _github_patch_is_complete(github_patch, github_additions, github_deletions)
+                )
 
                 file_patch_canonical_structure = FilePatchInfo(original_file_content_str, new_file_content_str, patch,
                                                                file.filename, edit_type=edit_type,
                                                                old_filename=old_filename,
                                                                num_plus_lines=num_plus_lines,
-                                                               num_minus_lines=num_minus_lines,)
+                                                               num_minus_lines=num_minus_lines,
+                                                               patch_is_complete=patch_is_complete,)
                 diff_files.append(file_patch_canonical_structure)
             if invalid_files_names:
                 get_logger().info(f"Filtered out files with invalid extensions: {invalid_files_names}")
