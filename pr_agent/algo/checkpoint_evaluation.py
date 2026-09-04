@@ -1772,7 +1772,9 @@ class EvaluationRunRecord:
                 or details.specialist_runs
                 or details.adjudication_runs
             ):
-                raise EvaluationValidationError("no-model run records must be zero-call empty executions")
+                raise EvaluationValidationError(
+                    "no-model run records must be zero-call successful or coverage-unavailable executions"
+                )
             token_measurement = NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
             cost_measurement = NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
         selected_model_id = (
