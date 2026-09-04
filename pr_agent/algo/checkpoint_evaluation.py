@@ -17,7 +17,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
 
-from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshotResult
+from pr_agent.algo.review_snapshot import CoverageIssue, ReviewEvent, ReviewResultState, ReviewSnapshotResult
 from pr_agent.algo.run_details import RunDetails, SpecialistRunDetails
 
 EVALUATION_SCHEMA_VERSION = "checkpoint-evaluation-v2"
@@ -34,13 +34,16 @@ _SPECIALIST_STAGE_STATES = frozenset({
     "input_budget_exhausted",
     "low_confidence",
     "malformed_output",
+    "not_required",
+    "partial",
     "provider_failure",
     "stale",
     "success",
     "timeout",
     "unavailable",
 })
-_COMPLETE_SPECIALIST_STAGE_STATES = frozenset({"cached", "success"})
+_COMPLETE_SPECIALIST_STAGE_STATES = frozenset({"cached", "not_required", "success"})
+_PARTIAL_SPECIALIST_STAGE_STATES = frozenset({"partial"})
 _ANSWER_ONLY_KEYS = frozenset({
     "adjudication",
     "adjudication_hash",
@@ -122,6 +125,7 @@ class FindingSeverity(str, Enum):
 
 class FindingLifecycleState(str, Enum):
     ACTIVE = "active"
+    CARRIED_FORWARD = "carried_forward"
     WITHDRAWN = "withdrawn"
 
 
@@ -165,11 +169,12 @@ _EVALUATION_SCHEMA_DESCRIPTOR = {
         "observed_finding": (
             "fingerprint", "severity", "lifecycle_state", "deterministic_overlap", "stage",
         ),
+        "coverage_issue": ("reason", "path", "fingerprint"),
         "run_record": (
             "schema_version", "manifest_id", "case_id", "arm_id", "snapshot_id", "attempt", "state",
-            "terminal", "findings", "snapshot_result_state", "latency_seconds", "tokens", "cost_usd",
-            "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id", "provider_id",
-            "model_revision", "stage_runs", "failure_reason_code", "record_id",
+            "terminal", "findings", "snapshot_result_state", "coverage_issues", "latency_seconds", "tokens",
+            "cost_usd", "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id",
+            "provider_id", "model_revision", "stage_runs", "failure_reason_code", "record_id",
         ),
         "gate_rule": ("metric", "comparator", "threshold", "minimum_support"),
         "score_metric": ("status", "value", "support"),
@@ -258,6 +263,24 @@ def _reject_unknown_fields(name: str, value: Mapping[str, Any], allowed: set[str
     unknown = sorted(set(value) - allowed)
     if unknown:
         raise EvaluationValidationError(f"{name} contains unknown fields: {unknown}")
+
+
+def _coverage_issue_to_dict(issue: CoverageIssue) -> dict[str, Optional[str]]:
+    return {"reason": issue.reason, "path": issue.path, "fingerprint": issue.fingerprint}
+
+
+def _coverage_issue_from_dict(value: Mapping[str, Any]) -> CoverageIssue:
+    _reject_unknown_fields("coverage issue", value, {"reason", "path", "fingerprint"})
+    reason = value.get("reason")
+    path = value.get("path")
+    fingerprint = value.get("fingerprint")
+    if not isinstance(reason, str) or not reason.strip():
+        raise EvaluationValidationError("coverage issue reason must be a non-empty string")
+    if path is not None and (not isinstance(path, str) or not path.strip()):
+        raise EvaluationValidationError("coverage issue path must be a non-empty string or null")
+    if fingerprint is not None and (not isinstance(fingerprint, str) or not fingerprint.strip()):
+        raise EvaluationValidationError("coverage issue fingerprint must be a non-empty string or null")
+    return CoverageIssue(reason=reason, path=path, fingerprint=fingerprint)
 
 
 def _freeze_json(value: Any) -> Any:
@@ -1162,7 +1185,11 @@ class EvaluationStageRun:
         expected_coverage = (
             MeasurementStatus.COMPLETE
             if self.state in _COMPLETE_SPECIALIST_STAGE_STATES
-            else MeasurementStatus.UNAVAILABLE
+            else (
+                MeasurementStatus.PARTIAL
+                if self.state in _PARTIAL_SPECIALIST_STAGE_STATES
+                else MeasurementStatus.UNAVAILABLE
+            )
         )
         if self.coverage_status is not expected_coverage:
             raise EvaluationValidationError("stage run coverage_status contradicts its state")
@@ -1324,7 +1351,11 @@ class EvaluationStageRun:
         coverage_status = (
             MeasurementStatus.COMPLETE
             if state in _COMPLETE_SPECIALIST_STAGE_STATES
-            else MeasurementStatus.UNAVAILABLE
+            else (
+                MeasurementStatus.PARTIAL
+                if state in _PARTIAL_SPECIALIST_STAGE_STATES
+                else MeasurementStatus.UNAVAILABLE
+            )
         )
         for name in ("prompt_version", "input_schema_version", "schema_version"):
             value = getattr(details, name)
@@ -1486,6 +1517,7 @@ class EvaluationRunRecord:
     terminal: bool
     findings: tuple[ObservedFinding, ...] = field(default_factory=tuple)
     snapshot_result_state: Optional[ReviewResultState] = None
+    coverage_issues: tuple[CoverageIssue, ...] = field(default_factory=tuple)
     latency_seconds: NumericMeasurement = field(
         default_factory=lambda: NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
     )
@@ -1550,6 +1582,9 @@ class EvaluationRunRecord:
         object.__setattr__(self, "findings", tuple(self.findings))
         if any(not isinstance(finding, ObservedFinding) for finding in self.findings):
             raise EvaluationValidationError("run findings must use ObservedFinding")
+        object.__setattr__(self, "coverage_issues", tuple(self.coverage_issues))
+        if any(not isinstance(issue, CoverageIssue) for issue in self.coverage_issues):
+            raise EvaluationValidationError("run coverage_issues must use CoverageIssue")
         if self.state is not EvaluationRunState.COMPLETED and self.findings:
             raise EvaluationValidationError("only completed run records may contain findings")
         if not isinstance(self.stage_latencies_seconds, Mapping) or any(
@@ -1603,6 +1638,7 @@ class EvaluationRunRecord:
             "terminal": self.terminal,
             "findings": [finding.to_dict() for finding in self.findings],
             "snapshot_result_state": self.snapshot_result_state.value if self.snapshot_result_state else None,
+            "coverage_issues": [_coverage_issue_to_dict(issue) for issue in self.coverage_issues],
             "latency_seconds": self.latency_seconds.to_dict(),
             "tokens": self.tokens.to_dict(),
             "cost_usd": self.cost_usd.to_dict(),
@@ -1633,9 +1669,9 @@ class EvaluationRunRecord:
             value,
             {
                 "schema_version", "manifest_id", "case_id", "arm_id", "snapshot_id", "attempt", "state",
-                "terminal", "findings", "snapshot_result_state", "latency_seconds", "tokens", "cost_usd",
-                "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id", "provider_id",
-                "model_revision", "stage_runs", "failure_reason_code", "record_id",
+                "terminal", "findings", "snapshot_result_state", "coverage_issues", "latency_seconds", "tokens",
+                "cost_usd", "retry_count", "cached", "escalated", "stage_latencies_seconds", "model_id",
+                "provider_id", "model_revision", "stage_runs", "failure_reason_code", "record_id",
             },
         )
         snapshot_result_state = value.get("snapshot_result_state")
@@ -1649,6 +1685,9 @@ class EvaluationRunRecord:
             terminal=value["terminal"],
             findings=tuple(ObservedFinding.from_dict(item) for item in value.get("findings", [])),
             snapshot_result_state=ReviewResultState(snapshot_result_state) if snapshot_result_state else None,
+            coverage_issues=tuple(
+                _coverage_issue_from_dict(item) for item in value.get("coverage_issues", [])
+            ),
             latency_seconds=NumericMeasurement.from_dict(value["latency_seconds"]),
             tokens=NumericMeasurement.from_dict(value["tokens"]),
             cost_usd=NumericMeasurement.from_dict(value["cost_usd"]),
@@ -1687,6 +1726,7 @@ class EvaluationRunRecord:
         escalated: Optional[bool] = None,
         stage_latencies_seconds: Optional[Mapping[str, NumericMeasurement]] = None,
         failure_reason_code: Optional[str] = None,
+        no_model_execution: bool = False,
     ) -> "EvaluationRunRecord":
         """Bind shipped snapshot/run telemetry to one evaluation attempt."""
         if case not in manifest.cases:
@@ -1736,6 +1776,35 @@ class EvaluationRunRecord:
             cost_components.extend(stage.cost_usd for stage in stage_runs)
             token_measurement = _sum_measurements(token_components)
             cost_measurement = _sum_measurements(cost_components)
+        if no_model_execution:
+            if (
+                result.state not in {
+                    ReviewResultState.NO_FINDINGS,
+                    ReviewResultState.COVERAGE_UNAVAILABLE,
+                }
+                or any(
+                    finding.lifecycle_state is FindingLifecycleState.ACTIVE
+                    for finding in findings
+                )
+                or terminal is not (result.state is ReviewResultState.NO_FINDINGS)
+                or retry_count
+                or result.cached
+                or escalated is not None
+                or stage_latencies_seconds
+                or details is None
+                or details.num_ai_calls
+                or details.has_token_usage
+                or details.known_cost_call_count
+                or details.total_cost_usd
+                or details.model_costs_usd
+                or details.specialist_runs
+                or details.adjudication_runs
+            ):
+                raise EvaluationValidationError(
+                    "no-model run records must be zero-call successful or coverage-unavailable executions"
+                )
+            token_measurement = NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+            cost_measurement = NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
         selected_model_id = (
             None
             if arm.kind is EvaluationArmKind.DETERMINISTIC
@@ -1768,6 +1837,7 @@ class EvaluationRunRecord:
             terminal=terminal,
             findings=tuple(findings),
             snapshot_result_state=result.state,
+            coverage_issues=result.coverage_issues,
             latency_seconds=NumericMeasurement(MeasurementStatus.COMPLETE, result.latency_seconds),
             tokens=token_measurement,
             cost_usd=cost_measurement,
@@ -1785,6 +1855,33 @@ class EvaluationRunRecord:
         return record
 
 
+def _is_no_model_execution_record(record: EvaluationRunRecord) -> bool:
+    return (
+        record.state in {EvaluationRunState.COMPLETED, EvaluationRunState.COVERAGE_UNAVAILABLE}
+        and record.snapshot_result_state in {
+            ReviewResultState.NO_FINDINGS,
+            ReviewResultState.COVERAGE_UNAVAILABLE,
+        }
+        and record.terminal is (
+            record.snapshot_result_state is ReviewResultState.NO_FINDINGS
+        )
+        and not any(
+            finding.lifecycle_state is FindingLifecycleState.ACTIVE
+            for finding in record.findings
+        )
+        and record.tokens == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+        and record.cost_usd == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+        and not record.retry_count
+        and not record.cached
+        and record.escalated is None
+        and not record.stage_runs
+        and not record.stage_latencies_seconds
+        and (record.failure_reason_code is None) is (
+            record.snapshot_result_state is ReviewResultState.NO_FINDINGS
+        )
+    )
+
+
 def validate_run_model_telemetry(
     arm: EvaluationArm,
     record: EvaluationRunRecord,
@@ -1796,7 +1893,18 @@ def validate_run_model_telemetry(
         raise EvaluationValidationError("run model telemetry validation requires an arm and run record")
     aggregate_identity = (record.model_id, record.provider_id, record.model_revision)
     if aggregate_identity == (None, None, None):
-        if arm.kind is not EvaluationArmKind.DETERMINISTIC and not record.stage_runs:
+        telemetry_free_failure = (
+            record.state is not EvaluationRunState.COMPLETED
+            and not record.stage_runs
+            and record.tokens.status is MeasurementStatus.UNAVAILABLE
+            and record.cost_usd.status is MeasurementStatus.UNAVAILABLE
+            and not record.stage_latencies_seconds
+        )
+        if (
+            arm.kind is not EvaluationArmKind.DETERMINISTIC
+            and not record.stage_runs
+            and not telemetry_free_failure
+        ):
             raise EvaluationValidationError(
                 f"{context} omits both aggregate and per-stage model identities"
             )
@@ -1807,6 +1915,15 @@ def validate_run_model_telemetry(
     missing = sorted(set(expected_by_stage) - set(actual_by_stage))
     unexpected = sorted(set(actual_by_stage) - set(expected_by_stage))
     if missing or unexpected:
+        if _is_no_model_execution_record(record) and missing and not unexpected:
+            return
+        if (
+            record.state is not EvaluationRunState.COMPLETED
+            and missing
+            and not unexpected
+            and not actual_by_stage
+        ):
+            return
         raise EvaluationValidationError(
             f"{context} stages do not match its frozen plan; missing={missing}, unexpected={unexpected}"
         )

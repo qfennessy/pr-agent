@@ -977,6 +977,7 @@ def test_apply_verification_decisions_publishes_only_evidence_backed_findings():
     assert "**Trigger:** The lookup returns None." in findings[0]["issue_content"]
     assert decisions[0]["verdict"] == "verified"
     assert decisions[0]["normalized_severity"] == "high"
+    assert findings[0]["normalized_severity"] == "high"
     assert decisions[0]["trusted_stable_key"] == findings[0]["trusted_stable_key"]
     assert "issue_content" not in telemetry_safe_artifact({"decisions": decisions})["decisions"][0]
 

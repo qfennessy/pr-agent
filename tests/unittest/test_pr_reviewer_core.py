@@ -39,6 +39,7 @@ from pr_agent.algo.run_details import (
     record_ai_call,
     record_model_used,
     record_provider_request_attempt,
+    record_specialist_result,
 )
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.algo.utils import PRReviewHeader, PRReviewIdentity, convert_to_markdown_v2, show_run_details
@@ -52,7 +53,7 @@ from pr_agent.git_providers.gitea_provider import GiteaProvider
 from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.git_providers.gitlab_provider import GitLabProvider
 from pr_agent.git_providers.plain_diff_provider import PlainDiffGitProvider
-from pr_agent.tools.pr_reviewer import PRReviewer
+from pr_agent.tools.pr_reviewer import PRReviewer, StructuredReviewExecution
 from tests.unittest._settings_helpers import restore_settings, snapshot_settings
 
 # _prepare_prediction now rejects output it cannot parse, so the model's answer can fall
@@ -1295,7 +1296,7 @@ def test_partial_candidate_verification_remains_safe_when_route_retains_a_findin
     reviewer.verified_review_data = {
         "review": {
             "key_issues_to_review": [
-                {"issue_header": "one"},
+                {"issue_header": "one", "normalized_severity": "high"},
                 {"issue_header": "two"},
             ]
         }
@@ -1311,7 +1312,8 @@ def test_partial_candidate_verification_remains_safe_when_route_retains_a_findin
         lambda *args, **kwargs: "verified review",
     )
 
-    review = reviewer._prepare_pr_review()
+    with patch("pr_agent.tools.pr_reviewer.github_action_output") as action_output:
+        review = reviewer._prepare_pr_review()
 
     assert review == "verified review"
     assert reviewer._candidate_verification_blocks_publication() is False
@@ -1320,6 +1322,38 @@ def test_partial_candidate_verification_remains_safe_when_route_retains_a_findin
         finding["issue_header"]
         for finding in structured["review"]["key_issues_to_review"]
     ] == ["one"]
+    assert "normalized_severity" not in structured["review"]["key_issues_to_review"][0]
+    action_data = action_output.call_args.args[0]
+    assert "normalized_severity" not in action_data["review"]["key_issues_to_review"][0]
+
+
+def test_forced_no_publish_review_retains_evaluation_severity(monkeypatch):
+    reviewer = _make_prediction_reviewer(MagicMock())
+    reviewer.review_profile = "full"
+    reviewer._force_no_publish = True
+    reviewer.verified_review_data = {
+        "review": {
+            "key_issues_to_review": [{
+                "issue_header": "verified",
+                "normalized_severity": "high",
+            }],
+        },
+    }
+    reviewer.candidate_verification_artifact = {
+        "status": "complete",
+        "publication_safe": True,
+        "verified_count": 1,
+    }
+    reviewer.set_review_labels = MagicMock()
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+        lambda *args, **kwargs: "verified review",
+    )
+
+    reviewer._prepare_pr_review()
+
+    finding = reviewer._structured_review_result["review"]["key_issues_to_review"][0]
+    assert finding["normalized_severity"] == "high"
 
 
 def test_complete_candidate_verification_can_publish_clean_after_route_budgeting(
@@ -2685,7 +2719,9 @@ async def test_candidate_verification_early_exit_distinguishes_frontier_disabled
     frontier_enabled,
 ):
     reviewer = _make_reviewer()
+    reviewer.ai_handler = SimpleNamespace(azure=False, claude_extended_thinking_models=[])
     reviewer._parse_review_prediction = MagicMock(return_value=None)
+    init_run_details()
     settings = get_settings()
     snapshot = snapshot_settings(("pr_reviewer.enable_frontier_adjudication",))
     try:
@@ -2695,6 +2731,11 @@ async def test_candidate_verification_early_exit_distinguishes_frontier_disabled
         restore_settings(snapshot)
 
     assert reviewer.candidate_verification_artifact["status"] == "candidate_parse_failed"
+    stage = get_run_details().specialist_runs["candidate_verification"]
+    assert stage.state == "unavailable"
+    assert stage.failure_reason == "candidate_parse_failed"
+    assert stage.model_used is not None
+    assert stage.num_ai_calls == 0
     expected = (
         {
             "enabled": True,
@@ -4438,9 +4479,15 @@ def _unavailable_specialist_fixture():
         input_schema_version="specialist-input-v1",
         schema_version="specialist-output-v1",
     )
+    role_config = SimpleNamespace(
+        role=role,
+        enabled=True,
+        model="model-risk_recommendation",
+        deployment="deployment-risk_recommendation",
+    )
     pipeline = SimpleNamespace(
         configuration_hash="configuration-hash",
-        roles=(SimpleNamespace(role=role, enabled=True),),
+        roles=(role_config,),
         prompt=lambda requested_role: prompt if requested_role is role else None,
     )
     batch = unavailable_specialist_batch(pipeline, failure_reason=reason)
@@ -5702,6 +5749,83 @@ async def test_enabled_provider_without_stable_identity_records_unavailable_batc
 
 
 @pytest.mark.asyncio
+async def test_specialist_wrapper_failure_materializes_every_planned_role():
+    git_provider = MagicMock()
+    git_provider.get_pr_head_sha.return_value = "head"
+    git_provider.get_diff_files.return_value = []
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer._specialists_started = False
+    reviewer.vars = {"title": "Change behavior"}
+    reviewer.pr_description = "Description"
+    reviewer.ai_handler = MagicMock()
+    prompts = {
+        SpecialistRole.CHANGE_CLASSIFICATION: SimpleNamespace(
+            prompt_version="change-v1",
+            input_schema_version="specialist-input-v1",
+            schema_version="specialist-output-v1",
+        ),
+        SpecialistRole.RISK_RECOMMENDATION: SimpleNamespace(
+            prompt_version="risk-v1",
+            input_schema_version="specialist-input-v1",
+            schema_version="specialist-output-v1",
+        ),
+    }
+    role_configs = tuple(
+        SimpleNamespace(
+            role=role,
+            enabled=True,
+            model=f"model-{role.value}",
+            deployment=f"deployment-{role.value}",
+        )
+        for role in prompts
+    )
+    pipeline = SimpleNamespace(
+        configuration_hash="configuration-hash",
+        roles=role_configs,
+        prompt=lambda role: prompts[role],
+        allowed_change_labels=(),
+    )
+    init_run_details()
+    record_specialist_result(
+        SpecialistRole.CHANGE_CLASSIFICATION.value,
+        prompt_version="change-v1",
+        input_schema_version="specialist-input-v1",
+        schema_version="specialist-output-v1",
+        state=SpecialistState.SUCCESS.value,
+        latency_seconds=1.0,
+        model="observed-change-model",
+        deployment_id="observed-change-deployment",
+        fallback_used=True,
+    )
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.load_specialist_pipeline_config", return_value=pipeline),
+        patch("pr_agent.tools.pr_reviewer.get_specialist_snapshot_context", return_value=None),
+        patch(
+            "pr_agent.tools.pr_reviewer.build_specialist_input",
+            side_effect=RuntimeError("input construction failed"),
+        ),
+    ):
+        await reviewer._run_shadow_specialists_once()
+
+    assert {record.role for record in reviewer.specialist_shadow_result.records} == set(prompts)
+    assert all(
+        record.state is SpecialistState.UNAVAILABLE
+        and record.failure_reason == "specialist_batch_failed"
+        for record in reviewer.specialist_shadow_result.records
+    )
+    stage_runs = get_run_details().specialist_runs
+    assert set(stage_runs) == {role.value for role in prompts}
+    assert stage_runs[SpecialistRole.CHANGE_CLASSIFICATION.value].model_used == "observed-change-model"
+    assert stage_runs[SpecialistRole.CHANGE_CLASSIFICATION.value].fallback_used is True
+    risk_stage = stage_runs[SpecialistRole.RISK_RECOMMENDATION.value]
+    assert risk_stage.model_used == "model-risk_recommendation"
+    assert risk_stage.deployment_id == "deployment-risk_recommendation"
+    assert risk_stage.fallback_used is False
+    assert all(stage.state == SpecialistState.UNAVAILABLE.value for stage in stage_runs.values())
+
+
+@pytest.mark.asyncio
 async def test_prepare_prediction_keeps_incremental_review_compatible_with_tuple_result():
     reviewer = _make_prediction_reviewer()
     reviewer.incremental = SimpleNamespace(is_incremental=True)
@@ -5922,6 +6046,77 @@ def test_bugs_only_keeps_a_complete_defect_and_exposes_only_the_public_finding_s
         "start_line": 2,
         "end_line": 2,
     }]}}
+
+
+def test_bugs_only_forced_no_publish_retains_evaluation_identity_without_repr_leakage():
+    issue = _bugs_only_issue(issue_header="[P1] Tenant cache isolation")
+    reviewer, data = _bugs_only_reviewer(issue)
+    reviewer._force_no_publish = True
+
+    result = reviewer._normalize_bugs_only_review(data)
+
+    finding = result["review"]["key_issues_to_review"][0]
+    assert finding["root_cause"] == "The cache key omits the tenant identifier."
+    assert "normalized_severity" not in finding
+    execution = StructuredReviewExecution(review=result, run_details=None)
+    assert "cache key omits" not in repr(execution)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_state", "expected_failure"),
+    [
+        ("complete", "success", None),
+        ("no_candidates", "not_required", None),
+        ("partial", "partial", "verification_coverage_partial"),
+        ("verifier_response_invalid", "malformed_output", "verifier_response_invalid"),
+        ("verifier_failed", "provider_failure", "verifier_failed"),
+    ],
+)
+def test_candidate_verification_finalizes_evaluation_stage(status, expected_state, expected_failure):
+    init_run_details()
+    config = SimpleNamespace(
+        prompt_version="candidate-prompt-v1",
+        input_schema_version="candidate-input-v1",
+        output_schema_version="candidate-output-v1",
+        route=SimpleNamespace(
+            models=("verifier-model",),
+            deployments=("verifier-deployment",),
+        ),
+    )
+
+    PRReviewer._record_candidate_verification_stage(config, {"status": status})
+
+    stage = get_run_details().specialist_runs["candidate_verification"]
+    assert stage.state == expected_state
+    assert stage.failure_reason == expected_failure
+    assert stage.prompt_version == "candidate-prompt-v1"
+    assert stage.input_schema_version == "candidate-input-v1"
+    assert stage.schema_version == "candidate-output-v1"
+    assert stage.model_used == "verifier-model"
+    assert stage.deployment_id == "verifier-deployment"
+    assert stage.fallback_used is False
+
+
+def test_candidate_verification_normalizes_exception_class_failure_reason():
+    init_run_details()
+    config = SimpleNamespace(
+        prompt_version="candidate-prompt-v1",
+        input_schema_version="candidate-input-v1",
+        output_schema_version="candidate-output-v1",
+        route=SimpleNamespace(
+            models=("verifier-model",),
+            deployments=("verifier-deployment",),
+        ),
+    )
+
+    PRReviewer._record_candidate_verification_stage(
+        config,
+        {"status": "verifier_failed", "failure": "TimeoutError"},
+    )
+
+    stage = get_run_details().specialist_runs["candidate_verification"]
+    assert stage.state == "provider_failure"
+    assert stage.failure_reason == "timeout_error"
 
 
 @pytest.mark.parametrize("issue", [
@@ -6656,6 +6851,51 @@ async def test_structured_no_publish_run_restores_force_gate_after_error():
 
     assert reviewer._force_no_publish is False
     assert reviewer._structured_review_result is None
+
+
+@pytest.mark.asyncio
+async def test_structured_no_publish_run_returns_clean_result_for_authoritative_empty_inventory():
+    reviewer = _make_prediction_reviewer()
+    reviewer.vars = {}
+    reviewer.git_provider.get_files.return_value = []
+    reviewer._prepare_route_after_empty_review_inventory = MagicMock()
+    reviewer._local_artifact_mutations_allowed = MagicMock(return_value=False)
+
+    with isolate_review_execution():
+        result = await reviewer._run_structured_no_publish_once()
+
+    assert result.review["review"]["key_issues_to_review"] == []
+    assert result.run_details.num_ai_calls == 0
+    reviewer._prepare_route_after_empty_review_inventory.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_structured_no_publish_run_retains_coverage_when_processed_diff_is_empty(monkeypatch):
+    from pr_agent.tools import pr_reviewer as pr_reviewer_module
+
+    git_provider = MagicMock()
+    git_provider.get_files.return_value = ["omitted.py", "deleted.py"]
+    git_provider.is_supported.return_value = True
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.review_profile = "full"
+    reviewer.vars = {}
+    reviewer._prepare_review_route = MagicMock()
+
+    async def fake_retry(prepare_fn, model_type=None, model_route=None):
+        reviewer.prediction = None
+        reviewer.remaining_files_list = ["omitted.py"]
+        reviewer.deleted_files_list = ["deleted.py"]
+
+    monkeypatch.setattr(pr_reviewer_module, "retry_with_fallback_models", fake_retry)
+    monkeypatch.setattr(pr_reviewer_module, "extract_and_cache_pr_tickets", AsyncMock())
+
+    with isolate_review_execution():
+        result = await reviewer._run_structured_no_publish_once()
+
+    assert result.review["review"]["key_issues_to_review"] == []
+    assert result.review["metadata"]["omitted_files"] == ["omitted.py"]
+    assert result.review["metadata"]["deleted_files"] == ["deleted.py"]
+    assert result.run_details.num_ai_calls == 0
 
 
 @pytest.mark.asyncio

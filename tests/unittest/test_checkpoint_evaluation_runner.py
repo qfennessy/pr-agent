@@ -30,6 +30,7 @@ from pr_agent.algo.checkpoint_evaluation import (
     ObservedFinding,
     deployment_identity_hash,
 )
+from pr_agent.algo.checkpoint_evaluation_adapters import adapt_checkpoint_review_outcome
 from pr_agent.algo.checkpoint_evaluation_execution import (
     EvaluationArtifactStore,
     PaidExecutionRequest,
@@ -42,7 +43,12 @@ from pr_agent.algo.checkpoint_evaluation_runner import (
     ProductionArmResult,
     ProductionDependencyUnavailable,
     ProductionEvaluationRunner,
+    _has_complete_lifecycle_coverage,
     failed_production_arm_result,
+)
+from pr_agent.algo.checkpoint_review_subprocess import (
+    CheckpointReviewSubprocessOutcome,
+    CheckpointReviewSubprocessState,
 )
 from pr_agent.algo.checkpoint_stage_sources import CheckpointStageSources
 from pr_agent.algo.frontier_adjudication import FrontierAdjudicationConfig, FrontierModelIdentity
@@ -51,7 +57,13 @@ from pr_agent.algo.review_configuration import (
     review_configuration_artifact_name,
     review_configuration_canonical_bytes,
 )
-from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshot, ReviewSnapshotResult
+from pr_agent.algo.review_snapshot import (
+    CoverageIssue,
+    ReviewEvent,
+    ReviewResultState,
+    ReviewSnapshot,
+    ReviewSnapshotResult,
+)
 from pr_agent.algo.review_specialists import (
     SpecialistPipelineConfig,
     SpecialistPrompt,
@@ -286,15 +298,17 @@ def _write_snapshot(
     *,
     parent_snapshot_id=None,
     changed_path="src/example.py",
+    diff=None,
     review_configuration=None,
 ) -> tuple[ReviewSnapshot, object, str]:
     review_configuration = review_configuration or _review_configuration()
+    diff = diff if diff is not None else "diff --git a/src/example.py b/src/example.py\n+value = 1\n"
     snapshot = ReviewSnapshot(
         event=ReviewEvent.FILE_SAVE,
         repository_root=str(tmp_path / "source-repository"),
         base_revision="base-revision",
-        changed_paths=(changed_path,),
-        diff="diff --git a/src/example.py b/src/example.py\n+value = 1\n",
+        changed_paths=(changed_path,) if changed_path else (),
+        diff=diff,
         policy_version="policy-v1",
         created_at="2026-08-30T12:00:00Z",
         review_configuration_hash=review_configuration.configuration_hash,
@@ -356,6 +370,400 @@ def _manifest(snapshot: ReviewSnapshot, artifact_hash: str, *, arms=None) -> Eva
         cases=(case,),
         arms=tuple(arms or (_arm(kind) for kind in EvaluationArmKind)),
     )
+
+
+def test_zero_call_empty_snapshot_has_complete_lifecycle_coverage():
+    arm = _arm(EvaluationArmKind.VERIFIED_SPECIALISTS)
+    configuration = materialize_review_configuration(repo_context_files={})
+    snapshot = ReviewSnapshot(
+        event=ReviewEvent.PRE_COMMIT,
+        repository_root="/private/checkpoint/repository",
+        base_revision="a" * 40,
+        changed_paths=(),
+        diff="",
+        policy_version="policy-v1",
+        created_at="2026-09-04T12:00:00Z",
+        review_configuration_hash=configuration.configuration_hash,
+    )
+    outcome = adapt_checkpoint_review_outcome(
+        snapshot,
+        arm.kind,
+        CheckpointReviewSubprocessOutcome(
+            state=CheckpointReviewSubprocessState.COMPLETED,
+            snapshot_id=snapshot.snapshot_id,
+            review={"review": {"key_issues_to_review": []}},
+            latency_seconds=0.0,
+        ),
+    )
+
+    assert outcome.no_model_execution is True
+    assert _has_complete_lifecycle_coverage(arm, outcome) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pruned_diff", (False, True))
+async def test_zero_call_covered_snapshot_is_persistable_without_model_calls(tmp_path, pruned_diff):
+    configuration = _review_configuration()
+    snapshot = ReviewSnapshot(
+        event=ReviewEvent.PRE_COMMIT,
+        repository_root=str(tmp_path / "source-repository"),
+        base_revision="a" * 40,
+        changed_paths=("example.py",) if pruned_diff else (),
+        diff=("diff --git a/example.py b/example.py\n+changed = True\n" if pruned_diff else ""),
+        policy_version="policy-v1",
+        created_at="2026-09-04T12:00:00Z",
+        review_configuration_hash=configuration.configuration_hash,
+        coverage_issues=(
+            () if pruned_diff else (CoverageIssue(reason="no_reviewable_diff"),)
+        ),
+    )
+    payload = (json.dumps(snapshot.to_dict(), sort_keys=True, separators=(",", ":")) + "\n").encode()
+    snapshot_path = tmp_path / "empty-covered.json"
+    snapshot_path.write_bytes(payload)
+    snapshot_path.chmod(0o600)
+    configuration_path = tmp_path / review_configuration_artifact_name(configuration.configuration_hash)
+    configuration_path.write_bytes(review_configuration_canonical_bytes(configuration))
+    configuration_path.chmod(0o600)
+    manifest = _manifest(snapshot, _artifact_hash(payload))
+    arm = next(item for item in manifest.arms if item.kind is EvaluationArmKind.VERIFIED_SPECIALISTS)
+    request, decision = _paid_authorization(manifest)
+
+    def factory(bound_arm):
+        async def adapter(loaded_snapshot, _context):
+            if bound_arm.kind is not EvaluationArmKind.VERIFIED_SPECIALISTS:
+                return _success(bound_arm, loaded_snapshot)
+            return adapt_checkpoint_review_outcome(
+                loaded_snapshot,
+                bound_arm.kind,
+                CheckpointReviewSubprocessOutcome(
+                    state=CheckpointReviewSubprocessState.COMPLETED,
+                    snapshot_id=loaded_snapshot.snapshot_id,
+                    review={
+                        "review": {"key_issues_to_review": []},
+                        "metadata": {
+                            "omitted_files": ["example.py"] if pruned_diff else [],
+                        },
+                    },
+                    latency_seconds=0.0,
+                ),
+            )
+
+        return adapter
+
+    runner = ProductionEvaluationRunner(
+        manifest,
+        snapshot_paths={"case-one": snapshot_path},
+        review_configuration_artifact_hashes={
+            "case-one": _artifact_hash(configuration_path.read_bytes()),
+        },
+        bindings=_bindings(manifest, factory),
+        artifact_store=EvaluationArtifactStore(tmp_path / "covered-empty-artifacts"),
+        paid_request=request,
+        paid_decision=decision,
+        evaluation_enabled=True,
+        allow_paid_execution=True,
+        publish_output=False,
+    )
+
+    result = await runner.run()
+
+    record = next(item for item in result.records if item.arm_id == arm.arm_id)
+    assert record.state is EvaluationRunState.COVERAGE_UNAVAILABLE
+    assert record.terminal is False
+    assert record.tokens == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+    assert record.cost_usd == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+    assert record.stage_runs == ()
+
+
+@pytest.mark.asyncio
+async def test_runner_executes_parent_first_and_derives_withdrawal_only_for_complete_coverage(tmp_path):
+    parent_snapshot, parent_path, parent_hash = _write_snapshot(tmp_path, "parent")
+    child_snapshot, child_path, child_hash = _write_snapshot(
+        tmp_path,
+        "child",
+        parent_snapshot_id=parent_snapshot.snapshot_id,
+        changed_path=None,
+        diff="",
+    )
+    arms = tuple(_arm(kind) for kind in EvaluationArmKind)
+    manifest = EvaluationManifest(
+        name="production-lineage",
+        corpus_hash=_hash("corpus"),
+        policy_hash=_hash("policy"),
+        configuration_hash=_hash("manifest-configuration"),
+        cases=(
+            CheckpointCase(
+                case_id="z-parent",
+                snapshot_id=parent_snapshot.snapshot_id,
+                snapshot_artifact_hash=parent_hash,
+                event=parent_snapshot.event,
+                cohort=EvaluationCohort.HOLDOUT,
+            ),
+            CheckpointCase(
+                case_id="a-child",
+                snapshot_id=child_snapshot.snapshot_id,
+                snapshot_artifact_hash=child_hash,
+                event=child_snapshot.event,
+                cohort=EvaluationCohort.HOLDOUT,
+                parent_case_id="z-parent",
+            ),
+        ),
+        arms=arms,
+    )
+    request, decision = _paid_authorization(manifest)
+    finding = ObservedFinding(
+        fingerprint=_hash("lineage-finding"),
+        severity=FindingSeverity.HIGH,
+        stage="general_review",
+    )
+    missing_finding = replace(finding, fingerprint=_hash("partial-lineage-finding"))
+    calls = []
+
+    def factory(arm):
+        async def adapter(snapshot, _context):
+            calls.append(snapshot.snapshot_id)
+            result = _success(arm, snapshot)
+            if (
+                arm.kind is EvaluationArmKind.GENERAL_REVIEW
+                and snapshot.snapshot_id == parent_snapshot.snapshot_id
+            ):
+                return replace(
+                    result,
+                    snapshot_result=replace(result.snapshot_result, state=ReviewResultState.FINDINGS),
+                    findings=(finding,),
+                )
+            if (
+                arm.kind is EvaluationArmKind.VERIFIED_SPECIALISTS
+                and snapshot.snapshot_id == parent_snapshot.snapshot_id
+            ):
+                return replace(
+                    result,
+                    snapshot_result=replace(result.snapshot_result, state=ReviewResultState.FINDINGS),
+                    findings=(finding, missing_finding),
+                )
+            if (
+                arm.kind is EvaluationArmKind.GENERAL_REVIEW
+                and snapshot.snapshot_id == child_snapshot.snapshot_id
+            ):
+                return adapt_checkpoint_review_outcome(
+                    snapshot,
+                    EvaluationArmKind.GENERAL_REVIEW,
+                    CheckpointReviewSubprocessOutcome(
+                        state=CheckpointReviewSubprocessState.COMPLETED,
+                        snapshot_id=snapshot.snapshot_id,
+                        review={"review": {"key_issues_to_review": []}},
+                        latency_seconds=0.0,
+                    ),
+                )
+            if (
+                arm.kind is EvaluationArmKind.VERIFIED_SPECIALISTS
+                and snapshot.snapshot_id == child_snapshot.snapshot_id
+            ):
+                result.run_details.specialist_runs["candidate_verification"] = _specialist_run(
+                    arm,
+                    role="candidate_verification",
+                    state="partial",
+                    failure_reason="verification_coverage_partial",
+                )
+                return replace(
+                    result,
+                    snapshot_result=replace(result.snapshot_result, state=ReviewResultState.FINDINGS),
+                    findings=(finding,),
+                )
+            return result
+
+        return adapter
+
+    runner = ProductionEvaluationRunner(
+        manifest,
+        snapshot_paths={"z-parent": parent_path, "a-child": child_path},
+        review_configuration_artifact_hashes={
+            "z-parent": _configuration_artifact_hash(parent_path),
+            "a-child": _configuration_artifact_hash(child_path),
+        },
+        bindings=_bindings(manifest, factory),
+        artifact_store=EvaluationArtifactStore(tmp_path / "lineage-artifacts"),
+        paid_request=request,
+        paid_decision=decision,
+        evaluation_enabled=True,
+        allow_paid_execution=True,
+        publish_output=False,
+    )
+
+    result = await runner.run()
+
+    assert calls[:len(arms)] == [parent_snapshot.snapshot_id] * len(arms)
+    child = next(
+        record
+        for record in result.records
+        if record.case_id == "a-child" and record.arm_id == "arm-general_review"
+    )
+    assert child.findings == (replace(finding, lifecycle_state=FindingLifecycleState.WITHDRAWN),)
+    assert child.tokens == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+    assert child.cost_usd == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+    partial_child = next(
+        record
+        for record in result.records
+        if record.case_id == "a-child" and record.arm_id == "arm-verified_specialists"
+    )
+    assert set(partial_child.findings) == {
+        finding,
+        replace(missing_finding, lifecycle_state=FindingLifecycleState.CARRIED_FORWARD),
+    }
+    assert next(
+        stage for stage in partial_child.stage_runs if stage.stage == "candidate_verification"
+    ).coverage_status is MeasurementStatus.PARTIAL
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_reserve_or_execute_child_when_parent_failed(tmp_path):
+    parent_snapshot, parent_path, parent_hash = _write_snapshot(tmp_path, "failed-parent")
+    child_snapshot, child_path, child_hash = _write_snapshot(
+        tmp_path,
+        "blocked-child",
+        parent_snapshot_id=parent_snapshot.snapshot_id,
+        changed_path="src/blocked_child.py",
+    )
+    arms = tuple(_arm(kind) for kind in EvaluationArmKind)
+    manifest = EvaluationManifest(
+        name="failed-parent-lineage",
+        corpus_hash=_hash("corpus"),
+        policy_hash=_hash("policy"),
+        configuration_hash=_hash("manifest-configuration"),
+        cases=(
+            CheckpointCase(
+                case_id="parent",
+                snapshot_id=parent_snapshot.snapshot_id,
+                snapshot_artifact_hash=parent_hash,
+                event=parent_snapshot.event,
+                cohort=EvaluationCohort.HOLDOUT,
+            ),
+            CheckpointCase(
+                case_id="child",
+                snapshot_id=child_snapshot.snapshot_id,
+                snapshot_artifact_hash=child_hash,
+                event=child_snapshot.event,
+                cohort=EvaluationCohort.HOLDOUT,
+                parent_case_id="parent",
+            ),
+        ),
+        arms=arms,
+    )
+    request, decision = _paid_authorization(manifest)
+    calls = []
+
+    def factory(bound_arm):
+        async def adapter(snapshot, _context):
+            calls.append((snapshot.snapshot_id, bound_arm.kind))
+            if (
+                snapshot.snapshot_id == parent_snapshot.snapshot_id
+                and bound_arm.kind is EvaluationArmKind.GENERAL_REVIEW
+            ):
+                return failed_production_arm_result(
+                    snapshot,
+                    state=EvaluationRunState.PROVIDER_FAILURE,
+                    reason_code="provider_failure",
+                    latency_seconds=NumericMeasurement(MeasurementStatus.COMPLETE, 0.1),
+                    retry_count=0,
+                    run_details=RunDetails(
+                        model_used=bound_arm.model_id,
+                        num_ai_calls=1,
+                        total_cost_usd=Decimal("0.001"),
+                        known_cost_call_count=1,
+                        model_costs_usd={bound_arm.model_id: Decimal("0.001")},
+                        start_time=0.0,
+                        finish_time=0.1,
+                    ),
+                )
+            return _success(bound_arm, snapshot)
+
+        return adapter
+
+    artifact_store = EvaluationArtifactStore(tmp_path / "failed-parent-artifacts")
+    runner = ProductionEvaluationRunner(
+        manifest,
+        snapshot_paths={"parent": parent_path, "child": child_path},
+        review_configuration_artifact_hashes={
+            "parent": _configuration_artifact_hash(parent_path),
+            "child": _configuration_artifact_hash(child_path),
+        },
+        bindings=_bindings(manifest, factory),
+        artifact_store=artifact_store,
+        paid_request=request,
+        paid_decision=decision,
+        evaluation_enabled=True,
+        allow_paid_execution=True,
+        publish_output=False,
+    )
+
+    result = await runner.run()
+    records = result.records
+
+    assert (child_snapshot.snapshot_id, EvaluationArmKind.GENERAL_REVIEW) not in calls
+    assert any(
+        record.case_id == "parent"
+        and record.arm_id == "arm-general_review"
+        and record.state is EvaluationRunState.PROVIDER_FAILURE
+        for record in records
+    )
+    assert not any(
+        record.case_id == "child" and record.arm_id == "arm-general_review"
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_records_empty_snapshot_without_model_or_stage_calls(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(
+        tmp_path,
+        "empty-snapshot",
+        changed_path=None,
+        diff="",
+    )
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+
+    def factory(arm):
+        async def adapter(current_snapshot, _context):
+            if arm.kind is EvaluationArmKind.DETERMINISTIC:
+                return _success(arm, current_snapshot, details=False)
+            return adapt_checkpoint_review_outcome(
+                current_snapshot,
+                EvaluationArmKind.GENERAL_REVIEW,
+                CheckpointReviewSubprocessOutcome(
+                    state=CheckpointReviewSubprocessState.COMPLETED,
+                    snapshot_id=current_snapshot.snapshot_id,
+                    review={"review": {"key_issues_to_review": []}},
+                    latency_seconds=0.0,
+                ),
+            )
+
+        return adapter
+
+    runner = ProductionEvaluationRunner(
+        manifest,
+        snapshot_paths={"case-one": path},
+        review_configuration_artifact_hashes={"case-one": _configuration_artifact_hash(path)},
+        bindings=_bindings(manifest, factory),
+        artifact_store=EvaluationArtifactStore(tmp_path / "empty-snapshot-artifacts"),
+        paid_request=request,
+        paid_decision=decision,
+        evaluation_enabled=True,
+        allow_paid_execution=True,
+        publish_output=False,
+    )
+
+    result = await runner.run()
+
+    assert len(result.records) == len(EvaluationArmKind)
+    paid_records = tuple(
+        record for record in result.records if record.arm_id != "arm-deterministic"
+    )
+    assert all(record.state is EvaluationRunState.COMPLETED for record in paid_records)
+    assert all(record.tokens == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0) for record in paid_records)
+    assert all(record.cost_usd == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0) for record in paid_records)
+    assert all(record.model_id is not None and not record.stage_runs for record in paid_records)
+    assert all(EvaluationRunRecord.from_dict(record.to_dict()) == record for record in paid_records)
 
 
 def _paid_authorization(manifest: EvaluationManifest):
@@ -439,6 +847,21 @@ def test_no_findings_result_rejects_active_lifecycle_observations(tmp_path):
 
     with pytest.raises(EvaluationValidationError, match="only withdrawn"):
         replace(_success(arm, snapshot), findings=(active,))
+
+
+def test_unknown_cost_failure_cannot_claim_zero_model_execution(tmp_path):
+    snapshot, _path, _artifact_hash = _write_snapshot(tmp_path)
+
+    with pytest.raises(EvaluationValidationError, match="pre-execution failure"):
+        failed_production_arm_result(
+            snapshot,
+            state=EvaluationRunState.PROVIDER_FAILURE,
+            reason_code="provider_unavailable",
+            latency_seconds=NumericMeasurement(MeasurementStatus.UNAVAILABLE, None),
+            retry_count=0,
+            run_details=RunDetails(start_time=0.0, finish_time=0.0),
+            no_model_execution=True,
+        )
 
 
 def _specialist_run(arm: EvaluationArm, *, role="change_classification", **overrides):
@@ -1482,6 +1905,47 @@ async def test_nonterminal_failure_is_retained_and_only_that_pair_resumes(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_pre_execution_paid_failure_retains_zero_cost_and_remains_retryable(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+    store = EvaluationArtifactStore(tmp_path / "pre-execution-resume")
+    calls = []
+
+    def factory(arm):
+        async def adapter(loaded_snapshot, _context):
+            calls.append(arm.kind)
+            if arm.kind is EvaluationArmKind.GENERAL_REVIEW and calls.count(arm.kind) == 1:
+                return adapt_checkpoint_review_outcome(
+                    loaded_snapshot,
+                    arm.kind,
+                    CheckpointReviewSubprocessOutcome(
+                        state=CheckpointReviewSubprocessState.FAILED,
+                        snapshot_id=loaded_snapshot.snapshot_id,
+                        failure_reason_code="worker_start_failed",
+                    ),
+                )
+            return _success(arm, loaded_snapshot)
+
+        return adapter
+
+    bindings = _bindings(manifest, factory)
+    first = await _runner(manifest, path, bindings, store, request, decision).run()
+    failure = next(record for record in first.records if record.arm_id == "arm-general_review")
+
+    assert failure.state is EvaluationRunState.PROVIDER_FAILURE
+    assert failure.cost_usd == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+    assert failure.tokens == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+
+    second = await _runner(manifest, path, bindings, store, request, decision).run()
+
+    assert len(second.records) == 1
+    assert second.records[0].arm_id == "arm-general_review"
+    assert second.records[0].attempt == 2
+    assert second.records[0].state is EvaluationRunState.COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_paid_failure_becomes_terminal_at_its_immutable_attempt_limit(tmp_path):
     snapshot, path, artifact_hash = _write_snapshot(tmp_path)
     manifest = _manifest(snapshot, artifact_hash)
@@ -1650,7 +2114,7 @@ async def test_missing_token_and_cost_telemetry_never_becomes_zero(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_failed_model_arm_requires_explicit_identity_and_preserves_unavailable_latency(tmp_path):
+async def test_failed_model_arm_preserves_absent_identity_and_unavailable_latency(tmp_path):
     snapshot, path, artifact_hash = _write_snapshot(tmp_path)
     manifest = _manifest(snapshot, artifact_hash)
     request, decision = _paid_authorization(manifest)
@@ -1670,15 +2134,25 @@ async def test_failed_model_arm_requires_explicit_identity_and_preserves_unavail
 
         return adapter
 
-    with pytest.raises(EvaluationValidationError, match="observed model identity"):
+    inferred_store = EvaluationArtifactStore(tmp_path / "inferred-failure-model")
+    with pytest.raises(EvaluationValidationError, match="complete cost telemetry"):
         await _runner(
             manifest,
             path,
             _bindings(manifest, missing_identity_factory),
-            EvaluationArtifactStore(tmp_path / "missing-failure-model"),
+            inferred_store,
             request,
             decision,
         ).run()
+    inferred = next(
+        record for record in inferred_store.load_records(manifest)
+        if record.arm_id == "arm-general_review"
+    )
+    assert inferred.state is EvaluationRunState.PROVIDER_FAILURE
+    assert inferred.failure_reason_code == "provider_unavailable"
+    assert inferred.latency_seconds.status is MeasurementStatus.UNAVAILABLE
+    assert inferred.latency_seconds.value is None
+    assert (inferred.model_id, inferred.provider_id, inferred.model_revision) == (None, None, None)
 
     def explicit_identity_factory(arm):
         async def adapter(loaded_snapshot, _context):
@@ -1706,6 +2180,42 @@ async def test_failed_model_arm_requires_explicit_identity_and_preserves_unavail
     assert failed.latency_seconds.status is MeasurementStatus.UNAVAILABLE
     assert failed.latency_seconds.value is None
     assert (failed.model_id, failed.provider_id, failed.model_revision) == general_arm.model_identities()[0]
+
+
+@pytest.mark.asyncio
+async def test_failed_staged_arm_persists_without_fabricated_stage_runs(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+
+    def factory(arm):
+        async def adapter(loaded_snapshot, _context):
+            if arm.kind is EvaluationArmKind.VERIFIED_SPECIALISTS:
+                return failed_production_arm_result(
+                    loaded_snapshot,
+                    state=EvaluationRunState.TIMEOUT,
+                    reason_code="worker_timeout",
+                    latency_seconds=NumericMeasurement(MeasurementStatus.COMPLETE, 1.0),
+                    retry_count=0,
+                )
+            return _success(arm, loaded_snapshot)
+
+        return adapter
+
+    result = await _runner(
+        manifest,
+        path,
+        _bindings(manifest, factory),
+        EvaluationArtifactStore(tmp_path / "failed-staged-model"),
+        request,
+        decision,
+    ).run()
+
+    failed = next(record for record in result.records if record.arm_id == "arm-verified_specialists")
+    assert failed.state is EvaluationRunState.TIMEOUT
+    assert failed.failure_reason_code == "worker_timeout"
+    assert failed.stage_runs == ()
+    assert (failed.model_id, failed.provider_id, failed.model_revision) == (None, None, None)
 
 
 def test_failure_latency_and_reason_are_bounded_and_completed_ids_remain_compatible(tmp_path):

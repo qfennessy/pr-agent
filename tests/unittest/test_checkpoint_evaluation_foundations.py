@@ -64,7 +64,7 @@ from pr_agent.algo.checkpoint_shadow_journal import (
     _append_private_line,
     load_shadow_journal,
 )
-from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshotResult
+from pr_agent.algo.review_snapshot import CoverageIssue, ReviewEvent, ReviewResultState, ReviewSnapshotResult
 from pr_agent.algo.run_details import RunDetails
 from pr_agent.cli import run
 
@@ -264,6 +264,130 @@ def test_small_paired_sample_uses_student_t_instead_of_the_normal_approximation(
     assert normal_lower > 0
     assert lower < 0
     assert upper > mean
+
+
+def test_paired_recall_gate_excludes_partial_coverage_cases():
+    case = _case("defect", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
+    arms = (
+        _arm("baseline", EvaluationArmKind.GENERAL_REVIEW),
+        _arm("candidate", EvaluationArmKind.FULL_CASCADE),
+    )
+    manifest = _manifest((case,), arms)
+    finding = FindingTruth(
+        finding_id="finding",
+        fingerprint="bug",
+        severity=FindingSeverity.HIGH,
+        earliest_opportunity=ReviewEvent.FILE_SAVE,
+        earliest_case_id=case.case_id,
+        required_context=("changed_hunk",),
+    )
+    truth = TruthArtifact(
+        manifest_id=manifest.manifest_id,
+        truths=(CheckpointTruth(case.case_id, False, _hash("truth"), (finding,)),),
+    )
+    observed = ObservedFinding("bug", FindingSeverity.HIGH)
+    baseline = _record(manifest, case, "baseline", findings=(observed,))
+    partial_candidate = replace(
+        _record(manifest, case, "candidate", findings=(observed,)),
+        coverage_issues=(CoverageIssue(reason="token_budget_omitted", path="other.py"),),
+    )
+
+    scorecard = score_matched_arms(manifest, truth, (baseline, partial_candidate))
+
+    assert not any(
+        comparison.arm_id == "candidate" and comparison.metric == "case_recall"
+        for comparison in scorecard.paired_comparisons
+    )
+    gate = evaluate_rollout_gate(
+        "live-shadow",
+        scorecard,
+        "candidate",
+        (GateRule("paired.case_recall.lower_95", GateComparator.AT_LEAST, 0.0),),
+    )
+    assert gate.status is GateStatus.NOT_EVALUABLE
+    assert gate.rule_results[0].observed is None
+
+
+def test_paired_interruption_gate_excludes_partial_clean_cases():
+    case = _case("clean", EvaluationCohort.CLEAN_CONTROL, ReviewEvent.FILE_SAVE, 0)
+    arms = (
+        _arm("baseline", EvaluationArmKind.GENERAL_REVIEW),
+        _arm("candidate", EvaluationArmKind.FULL_CASCADE),
+    )
+    manifest = _manifest((case,), arms)
+    truth = TruthArtifact(
+        manifest_id=manifest.manifest_id,
+        truths=(CheckpointTruth(case.case_id, True, _hash("truth")),),
+    )
+    baseline = _record(manifest, case, "baseline")
+    partial_candidate = replace(
+        _record(manifest, case, "candidate"),
+        coverage_issues=(CoverageIssue(reason="token_budget_omitted", path="other.py"),),
+    )
+
+    scorecard = score_matched_arms(manifest, truth, (baseline, partial_candidate))
+
+    assert not any(
+        comparison.arm_id == "candidate" and comparison.metric == "false_interruption_rate"
+        for comparison in scorecard.paired_comparisons
+    )
+    gate = evaluate_rollout_gate(
+        "live-shadow",
+        scorecard,
+        "candidate",
+        (GateRule("paired.false_interruption_rate.upper_95", GateComparator.AT_MOST, 0.0),),
+    )
+    assert gate.status is GateStatus.NOT_EVALUABLE
+    assert gate.rule_results[0].observed is None
+
+
+def test_partial_withdrawal_checkpoint_downgrades_stale_finding_evidence():
+    root = _case("root", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
+    fixed = _case("fixed", EvaluationCohort.HOLDOUT, ReviewEvent.PRE_COMMIT, 60, parent="root")
+    manifest = _manifest(
+        (root, fixed),
+        (_arm("candidate", EvaluationArmKind.GENERAL_REVIEW),),
+    )
+    finding = FindingTruth(
+        finding_id="finding",
+        fingerprint="bug",
+        severity=FindingSeverity.HIGH,
+        earliest_opportunity=ReviewEvent.FILE_SAVE,
+        earliest_case_id=root.case_id,
+        required_context=("changed_hunk",),
+        withdrawn_at_case_id=fixed.case_id,
+    )
+    truth = TruthArtifact(
+        manifest_id=manifest.manifest_id,
+        truths=(
+            CheckpointTruth(root.case_id, False, _hash("root-truth"), (finding,)),
+            CheckpointTruth(fixed.case_id, True, _hash("fixed-truth")),
+        ),
+    )
+    root_record = _record(
+        manifest,
+        root,
+        "candidate",
+        findings=(ObservedFinding("bug", FindingSeverity.HIGH),),
+    )
+    partial_fixed_record = replace(
+        _record(
+            manifest,
+            fixed,
+            "candidate",
+            findings=(
+                ObservedFinding("bug", FindingSeverity.HIGH, FindingLifecycleState.CARRIED_FORWARD),
+            ),
+        ),
+        coverage_issues=(CoverageIssue(reason="token_budget_omitted", path="other.py"),),
+    )
+
+    scorecard = score_matched_arms(manifest, truth, (root_record, partial_fixed_record))
+    metric = scorecard.arms[0].metrics["stale_findings_withdrawn_rate"]
+
+    assert metric.status is MeasurementStatus.PARTIAL
+    assert metric.value == 1.0
+    assert scorecard.arms[0].stale_finding_count == 0
 
 
 @pytest.mark.parametrize(
@@ -1269,6 +1393,35 @@ def test_missing_runs_cannot_look_like_clean_zero_cost_evidence():
     assert arm.metrics["failure_or_missing_case_rate"].value == 1
     assert arm.metrics["false_interruptions_per_clean_checkpoint"].status is MeasurementStatus.PARTIAL
     assert arm.metrics["total_retries"].status is MeasurementStatus.UNAVAILABLE
+
+
+def test_telemetry_free_model_failure_makes_retry_evidence_partial():
+    known_case = _case("known", EvaluationCohort.CLEAN_CONTROL, ReviewEvent.FILE_SAVE, 0)
+    unknown_case = _case("unknown", EvaluationCohort.CLEAN_CONTROL, ReviewEvent.FILE_SAVE, 0)
+    general = _arm("general", EvaluationArmKind.GENERAL_REVIEW)
+    manifest = _manifest((known_case, unknown_case), (general,))
+    truth = TruthArtifact(
+        manifest_id=manifest.manifest_id,
+        truths=(
+            CheckpointTruth("known", True, _hash("truth-known")),
+            CheckpointTruth("unknown", True, _hash("truth-unknown")),
+        ),
+    )
+    known = _record(manifest, known_case, general.arm_id)
+    unknown = EvaluationRunRecord(
+        manifest_id=manifest.manifest_id,
+        case_id=unknown_case.case_id,
+        arm_id=general.arm_id,
+        snapshot_id=unknown_case.snapshot_id,
+        attempt=1,
+        state=EvaluationRunState.TIMEOUT,
+        terminal=False,
+        failure_reason_code="worker_timeout",
+    )
+
+    arm = score_matched_arms(manifest, truth, (known, unknown)).arms[0]
+
+    assert arm.metrics["total_retries"] == ScoreMetric(MeasurementStatus.PARTIAL, 0.0, 1)
 
 
 def test_stale_withdrawal_uses_lineage_ancestry_when_timing_is_missing():

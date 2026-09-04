@@ -1633,6 +1633,21 @@ def _record_role_results(
 ) -> None:
     for result in results:
         prompt = pipeline.prompt(result.role)
+        details = get_run_details()
+        existing = (
+            details.specialist_runs.get(result.role.value)
+            if details is not None
+            else None
+        )
+        has_observed_model = existing is not None and existing.model_used is not None
+        model = result.model
+        deployment = result.deployment
+        fallback_used = result.fallback_used if model is not None else None
+        if model is None and not has_observed_model:
+            config = next(config for config in pipeline.roles if config.role is result.role)
+            model = config.model
+            deployment = config.deployment
+            fallback_used = False
         record_specialist_result(
             result.role.value,
             prompt_version=prompt.prompt_version,
@@ -1646,9 +1661,9 @@ def _record_role_results(
             input_token_reservation=result.input_tokens,
             output_token_reservation=result.output_tokens,
             output=result.output,
-            model=result.model,
-            deployment_id=result.deployment,
-            fallback_used=result.fallback_used if result.cached else None,
+            model=model,
+            deployment_id=deployment,
+            fallback_used=fallback_used,
         )
 
 

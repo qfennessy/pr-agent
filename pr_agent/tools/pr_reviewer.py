@@ -4,7 +4,7 @@ import datetime
 import json
 import re
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, List, Mapping, Optional, Tuple
 
@@ -101,6 +101,7 @@ from pr_agent.algo.run_details import (
     isolate_run_details,
     record_review_profile,
     record_review_route,
+    record_specialist_result,
 )
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.token_handler import TokenEncoder, TokenHandler
@@ -139,6 +140,7 @@ specialists_enabled = checkpoint_specialists_enabled
 MAX_REVIEW_COVERAGE_FILES = 50
 _SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
 _HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_MACHINE_FAILURE_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _VALID_REVIEW_PROFILES = {"full", "bugs_only"}
 _ROUTING_INVENTORY_UNSET = object()
 _BUG_FINDING_HEADERS = {
@@ -156,8 +158,8 @@ _GENERIC_CI_EVIDENCE_TERMS = {
 class StructuredReviewExecution:
     """Provider-neutral output from one forced no-publish review run."""
 
-    review: Optional[Mapping[str, Any]]
-    run_details: Optional[RunDetails]
+    review: Optional[Mapping[str, Any]] = field(repr=False)
+    run_details: Optional[RunDetails] = field(repr=False)
 
 
 class PRReviewer:
@@ -383,6 +385,11 @@ class PRReviewer:
             if not self.git_provider.get_files():
                 if not route_prepared:
                     self._prepare_route_after_empty_review_inventory()
+                if getattr(self, "_force_no_publish", False):
+                    self._publish_structured_review_data(
+                        {"review": {"key_issues_to_review": []}},
+                        source_free=True,
+                    )
                 if self._local_artifact_mutations_allowed() and getattr(self, "_review_shadow_only", False):
                     get_settings().data = {"artifact": ""}
                 get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
@@ -453,6 +460,10 @@ class PRReviewer:
                     model_route=model_route,
                 )
             if not self.prediction:
+                if getattr(self, "_force_no_publish", False):
+                    self._publish_structured_review_data({
+                        "review": {"key_issues_to_review": []},
+                    })
                 return None
             candidate_verification_enabled = self._candidate_verification_enabled()
             if candidate_verification_enabled:
@@ -1027,17 +1038,24 @@ class PRReviewer:
         if not isinstance(role_configs, tuple):
             return False
         enabled_roles = []
+        enabled_role_configs = {}
         for config in role_configs:
             role = getattr(config, "role", None)
             enabled = getattr(config, "enabled", None)
+            model = getattr(config, "model", None)
+            deployment = getattr(config, "deployment", None)
             if (
                 not isinstance(role, SpecialistRole)
                 or not isinstance(enabled, bool)
                 or role in enabled_roles
+                or not isinstance(model, str)
+                or not model.strip()
+                or (deployment is not None and not isinstance(deployment, str))
             ):
                 return False
             if enabled:
                 enabled_roles.append(role)
+                enabled_role_configs[role] = config
         if len(result.records) != len(enabled_roles):
             return False
 
@@ -1069,9 +1087,11 @@ class PRReviewer:
                 return False
             expected_role_record = {
                 "role": role.value,
-                "model": None,
-                "deployment": None,
+                "model": enabled_role_configs[role].model,
+                "deployment": enabled_role_configs[role].deployment,
                 "fallback_used": False,
+                "route_attempts": 0,
+                "model_retry_attempts": 0,
                 "prompt_version": prompt.prompt_version,
                 "input_schema_version": prompt.input_schema_version,
                 "schema_version": prompt.schema_version,
@@ -1406,6 +1426,7 @@ class PRReviewer:
         """Run the configured shadow batch once without changing review inputs or output."""
 
         self._specialists_started = True
+        pipeline = None
         try:
             pipeline = load_specialist_pipeline_config()
             self._specialist_pipeline = pipeline
@@ -1463,6 +1484,17 @@ class PRReviewer:
         except Exception as exc:
             # Shadow infrastructure is observational. Configuration/provider failures
             # remain telemetry and can never block or alter the ordinary review.
+            if pipeline is not None:
+                try:
+                    self.specialist_shadow_result = unavailable_specialist_batch(
+                        pipeline,
+                        failure_reason="specialist_batch_failed",
+                    )
+                except Exception as telemetry_exc:
+                    get_logger().debug(
+                        "Could not materialize failed specialist telemetry",
+                        artifact={"error_class": type(telemetry_exc).__name__},
+                    )
             get_logger().warning(
                 "Specialist shadow batch failed; continuing the ordinary review",
                 artifact={"error_class": type(exc).__name__},
@@ -1648,13 +1680,18 @@ class PRReviewer:
             if root_cause_key in seen_root_causes:
                 continue
             seen_root_causes.add(root_cause_key)
-            normalized_issues.append({
+            normalized_issue = {
                 "relevant_file": relevant_file,
                 "issue_header": _BUG_FINDING_HEADERS[finding_type],
                 "issue_content": f"{issue_content}\n\n**Trigger:** {trigger}\n\n**Impact:** {impact}",
                 "start_line": start_line,
                 "end_line": end_line,
-            })
+            }
+            if getattr(self, "_force_no_publish", False):
+                normalized_issue.update({
+                    "root_cause": root_cause,
+                })
+            normalized_issues.append(normalized_issue)
             if len(normalized_issues) >= self._maximum_generated_findings():
                 break
         return {"review": {"key_issues_to_review": normalized_issues}}
@@ -2183,42 +2220,10 @@ class PRReviewer:
             "specialist_prioritization": {"status": "initializing"},
         }
         verifier_started = None
+        verification_config = None
         details_before = None
         self.candidate_verification_artifact = artifact
         try:
-            review_data = self._parse_review_prediction()
-            if not isinstance(review_data, dict) or not isinstance(review_data.get("review"), dict):
-                artifact.update({"status": "candidate_parse_failed", "verified_count": 0})
-                return
-            raw_candidate_input = review_data["review"].get("key_issues_to_review")
-            raw_candidate_list_valid = isinstance(raw_candidate_input, list)
-            proposed_candidate_count = (
-                len(raw_candidate_input) if raw_candidate_list_valid else 0
-            )
-            artifact.update({
-                "proposal_source": "first_pass_review",
-                "proposal_shape": "list" if raw_candidate_list_valid else "invalid",
-                "proposed_candidate_count": proposed_candidate_count,
-            })
-            self.verified_review_data = copy.deepcopy(review_data)
-            self.verified_review_data["review"]["key_issues_to_review"] = []
-
-            if not raw_candidate_list_valid:
-                artifact.update({
-                    "status": "candidate_input_invalid",
-                    "candidate_count": 0,
-                    "accepted_model_candidate_count": 0,
-                    "candidate_rejection_count": 0,
-                    "verified_count": 0,
-                    "publication_safe": False,
-                })
-                return
-
-            capability = getattr(self.git_provider, "supports_repo_file_fetching", None)
-            if not callable(capability) or not capability():
-                artifact.update({"status": "unsupported_provider", "verified_count": 0})
-                return
-
             runtime_settings = get_settings()
             route_candidate_cap = getattr(self, "_review_max_verification_candidates", None)
 
@@ -2272,6 +2277,38 @@ class PRReviewer:
                     "failure": "invalid_model_route",
                     "verified_count": 0,
                 })
+                return
+            review_data = self._parse_review_prediction()
+            if not isinstance(review_data, dict) or not isinstance(review_data.get("review"), dict):
+                artifact.update({"status": "candidate_parse_failed", "verified_count": 0})
+                return
+            raw_candidate_input = review_data["review"].get("key_issues_to_review")
+            raw_candidate_list_valid = isinstance(raw_candidate_input, list)
+            proposed_candidate_count = (
+                len(raw_candidate_input) if raw_candidate_list_valid else 0
+            )
+            artifact.update({
+                "proposal_source": "first_pass_review",
+                "proposal_shape": "list" if raw_candidate_list_valid else "invalid",
+                "proposed_candidate_count": proposed_candidate_count,
+            })
+            self.verified_review_data = copy.deepcopy(review_data)
+            self.verified_review_data["review"]["key_issues_to_review"] = []
+
+            if not raw_candidate_list_valid:
+                artifact.update({
+                    "status": "candidate_input_invalid",
+                    "candidate_count": 0,
+                    "accepted_model_candidate_count": 0,
+                    "candidate_rejection_count": 0,
+                    "verified_count": 0,
+                    "publication_safe": False,
+                })
+                return
+
+            capability = getattr(self.git_provider, "supports_repo_file_fetching", None)
+            if not callable(capability) or not capability():
+                artifact.update({"status": "unsupported_provider", "verified_count": 0})
                 return
             consume_specialist_prioritization = verification_config.consume_specialist_prioritization
             artifact.update({
@@ -2713,7 +2750,52 @@ class PRReviewer:
                         "usd": str(details.total_cost_usd - details_before["total_cost_usd"])
                         if known_cost_delta > 0 else None,
                     }
+            if verification_config is not None:
+                self._record_candidate_verification_stage(verification_config, artifact)
             get_logger().info("Candidate verification finished", artifact=telemetry_safe_artifact(artifact))
+
+    @staticmethod
+    def _record_candidate_verification_stage(verification_config, artifact: Mapping[str, Any]) -> None:
+        """Finalize source-free verifier telemetry for checkpoint evaluation."""
+
+        status = str(artifact.get("status") or "unavailable").strip().lower()
+        state, failure_reason = {
+            "complete": ("success", None),
+            "no_candidates": ("not_required", None),
+            "partial": ("partial", "verification_coverage_partial"),
+            "candidate_validation_incomplete": ("partial", "candidate_validation_incomplete"),
+            "prompt_budget_exhausted": ("input_budget_exhausted", "prompt_budget_exhausted"),
+            "verifier_response_invalid": ("malformed_output", "verifier_response_invalid"),
+            "verifier_failed": ("provider_failure", "verifier_failed"),
+        }.get(status, ("unavailable", status or "verification_unavailable"))
+        explicit_failure = str(artifact.get("failure") or "").strip()
+        if failure_reason is not None and explicit_failure:
+            normalized_failure = re.sub(r"(?<!^)(?=[A-Z])", "_", explicit_failure).lower()
+            normalized_failure = re.sub(r"[^a-z0-9_]+", "_", normalized_failure).strip("_")[:128]
+            if _MACHINE_FAILURE_REASON_RE.fullmatch(normalized_failure):
+                failure_reason = normalized_failure
+        details = get_run_details()
+        existing = (
+            details.specialist_runs.get("candidate_verification")
+            if details is not None
+            else None
+        )
+        has_observed_model = existing is not None and existing.model_used is not None
+        # No-call exits still need the frozen route identity to materialize the
+        # planned stage. ai_call_count remains zero, so this does not claim that
+        # the configured primary actually executed.
+        record_specialist_result(
+            "candidate_verification",
+            prompt_version=verification_config.prompt_version,
+            input_schema_version=verification_config.input_schema_version,
+            schema_version=verification_config.output_schema_version,
+            state=state,
+            latency_seconds=float(artifact.get("verifier_latency_seconds") or 0.0),
+            failure_reason=failure_reason,
+            model=None if has_observed_model else verification_config.route.models[0],
+            deployment_id=None if has_observed_model else verification_config.route.deployments[0],
+            fallback_used=None if has_observed_model else False,
+        )
 
     def _publish_structured_review_data(
         self,
@@ -2796,6 +2878,12 @@ class PRReviewer:
             get_logger().exception("Failed to parse review data", artifact={"data": data})
             return ""
         data = self._normalize_bugs_only_review(data)
+        if not getattr(self, "_force_no_publish", False):
+            issues = (data.get("review") or {}).get("key_issues_to_review")
+            if isinstance(issues, list):
+                for issue in issues:
+                    if isinstance(issue, dict):
+                        issue.pop("normalized_severity", None)
         data = self._apply_finding_budget(data)
         data = self._apply_publication_budget(data)
         candidate_verification_blocked = self._candidate_verification_blocks_publication(

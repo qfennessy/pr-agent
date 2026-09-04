@@ -599,6 +599,7 @@ def _basic_case_metrics(
     unavailable_coverage = 0
     failed_or_missing = 0
     clean_evidence_missing = 0
+    partial_coverage = 0
     for case in cases:
         truth = truth_by_case[case.case_id]
         terminal = terminals_by_case.get(case.case_id)
@@ -625,12 +626,21 @@ def _basic_case_metrics(
         weighted_truth += sum(_SEVERITY_WEIGHT[finding.severity] for finding in truth.findings)
         failed_or_missing += terminal is None or terminal.state is not EvaluationRunState.COMPLETED
         unavailable_coverage += (
-            terminal is not None and terminal.state is EvaluationRunState.COVERAGE_UNAVAILABLE
+            terminal is not None
+            and (
+                terminal.state is EvaluationRunState.COVERAGE_UNAVAILABLE
+                or bool(terminal.coverage_issues)
+            )
         )
+        partial_coverage += terminal is not None and bool(terminal.coverage_issues)
         if truth.is_clean:
             clean_count += 1
             false_interruptions += bool(observed)
-            clean_evidence_missing += terminal is None or terminal.state is not EvaluationRunState.COMPLETED
+            clean_evidence_missing += (
+                terminal is None
+                or terminal.state is not EvaluationRunState.COMPLETED
+                or bool(terminal.coverage_issues)
+            )
     false_interruption_metric = _ratio(false_interruptions, clean_count, clean_count)
     if clean_evidence_missing and false_interruption_metric.status is MeasurementStatus.COMPLETE:
         false_interruption_metric = ScoreMetric(
@@ -638,7 +648,7 @@ def _basic_case_metrics(
             false_interruption_metric.value,
             false_interruption_metric.support,
         )
-    return {
+    metrics = {
         "case_support": ScoreMetric(MeasurementStatus.COMPLETE, float(len(cases)), len(cases)),
         "structured_output_rate": _ratio(completed, len(cases), len(cases)),
         "verified_precision": _ratio(
@@ -658,6 +668,12 @@ def _basic_case_metrics(
             unavailable_coverage, len(cases), len(cases)
         ),
     }
+    if partial_coverage:
+        for name in ("verified_recall", "severity_weighted_recall"):
+            metric = metrics[name]
+            if metric.status is MeasurementStatus.COMPLETE:
+                metrics[name] = ScoreMetric(MeasurementStatus.PARTIAL, metric.value, metric.support)
+    return metrics
 
 
 def _time_and_lineage_metrics(
@@ -830,7 +846,11 @@ def _time_and_lineage_metrics(
     withdrawn_count = len(withdrawals)
     for key, withdrawal_case_id in withdrawals.items():
         withdrawal_terminal = terminals_by_case.get(withdrawal_case_id)
-        if withdrawal_terminal is None or withdrawal_terminal.state is not EvaluationRunState.COMPLETED:
+        if (
+            withdrawal_terminal is None
+            or withdrawal_terminal.state is not EvaluationRunState.COMPLETED
+            or bool(withdrawal_terminal.coverage_issues)
+        ):
             withdrawal_evidence_incomplete = True
         for case in ordered_cases:
             if roots[case.case_id] != key[0]:
@@ -839,7 +859,11 @@ def _time_and_lineage_metrics(
             if not after_withdrawal:
                 continue
             terminal = terminals_by_case.get(case.case_id)
-            if terminal is None or terminal.state is not EvaluationRunState.COMPLETED:
+            if (
+                terminal is None
+                or terminal.state is not EvaluationRunState.COMPLETED
+                or bool(terminal.coverage_issues)
+            ):
                 withdrawal_evidence_incomplete = True
             if terminal and terminal.state is EvaluationRunState.COMPLETED and any(
                 finding.fingerprint == key[1] and finding.lifecycle_state is FindingLifecycleState.ACTIVE
@@ -914,12 +938,16 @@ def _paired_comparisons(
         }
         expected = {finding.fingerprint for finding in truth_by_case[case.case_id].findings}
         recall = len(observations & expected) / len(expected) if expected else 1.0
+        if terminal is not None and terminal.coverage_issues:
+            recall = None
         result: dict[str, Optional[float]] = {
             "structured_output_rate": float(completed),
             "case_recall": recall,
             "false_interruption_rate": (
                 float(bool(observations))
-                if completed and truth_by_case[case.case_id].is_clean
+                if completed
+                and not terminal.coverage_issues
+                and truth_by_case[case.case_id].is_clean
                 else None
             ),
         }
@@ -1058,6 +1086,7 @@ def score_matched_arms(
         terminal_records: list[EvaluationRunRecord] = []
         escalation_known = 0
         clean_evidence_missing = 0
+        partial_coverage_case_count = 0
         for case in manifest.cases:
             truth = truth_by_case[case.case_id]
             truth_by_fingerprint = {finding.fingerprint: finding for finding in truth.findings}
@@ -1083,7 +1112,12 @@ def score_matched_arms(
             if truth.is_clean:
                 clean_checkpoint_count += 1
                 false_interruption_count += bool(unique_observations)
-                clean_evidence_missing += terminal is None or terminal.state is not EvaluationRunState.COMPLETED
+                clean_evidence_missing += (
+                    terminal is None
+                    or terminal.state is not EvaluationRunState.COMPLETED
+                    or bool(terminal.coverage_issues)
+                )
+            partial_coverage_case_count += terminal is not None and bool(terminal.coverage_issues)
             high_critical = any(
                 finding.severity in {FindingSeverity.HIGH, FindingSeverity.CRITICAL}
                 for finding in truth.findings
@@ -1149,11 +1183,32 @@ def score_matched_arms(
             or terminals_by_case[case.case_id].state is not EvaluationRunState.COMPLETED
             for case in manifest.cases
         )
+        unavailable_coverage_cases = sum(
+            case.case_id not in terminals_by_case
+            or terminals_by_case[case.case_id].state is not EvaluationRunState.COMPLETED
+            or bool(terminals_by_case[case.case_id].coverage_issues)
+            for case in manifest.cases
+        )
+        retry_records = [
+            record
+            for record in arm_records
+            if not (
+                arm.kind is not EvaluationArmKind.DETERMINISTIC
+                and record.state is not EvaluationRunState.COMPLETED
+                and record.model_id is None
+                and not record.stage_runs
+                and record.tokens.status is MeasurementStatus.UNAVAILABLE
+                and record.cost_usd.status is MeasurementStatus.UNAVAILABLE
+            )
+        ]
         retry_status = (
             MeasurementStatus.UNAVAILABLE
-            if not arm_records
+            if not retry_records
             else MeasurementStatus.PARTIAL
-            if len({record.case_id for record in arm_records}) < len(manifest.cases)
+            if (
+                len(retry_records) < len(arm_records)
+                or len({record.case_id for record in arm_records}) < len(manifest.cases)
+            )
             else MeasurementStatus.COMPLETE
         )
         metrics = {
@@ -1183,7 +1238,7 @@ def score_matched_arms(
                 high_critical_escalated_count, high_critical_case_count, high_critical_case_count
             ),
             "unavailable_coverage_rate": _ratio(
-                missing_or_failed_cases,
+                unavailable_coverage_cases,
                 len(manifest.cases),
                 len(manifest.cases),
             ),
@@ -1205,8 +1260,8 @@ def score_matched_arms(
             "total_cost_usd": total_cost,
             "total_retries": ScoreMetric(
                 retry_status,
-                float(sum(record.retry_count for record in arm_records)) if arm_records else None,
-                len(arm_records),
+                float(sum(record.retry_count for record in retry_records)) if retry_records else None,
+                len(retry_records),
             ),
             "cost_per_developer_hour": cost_per_hour,
             "cost_per_verified_finding": _measurement_ratio(
@@ -1219,6 +1274,11 @@ def score_matched_arms(
         }
         if escalation_known < len(manifest.cases):
             for name in ("escalation_precision", "high_critical_escalation_recall"):
+                metric = metrics[name]
+                if metric.status is MeasurementStatus.COMPLETE:
+                    metrics[name] = ScoreMetric(MeasurementStatus.PARTIAL, metric.value, metric.support)
+        if partial_coverage_case_count:
+            for name in ("verified_recall", "severity_weighted_recall"):
                 metric = metrics[name]
                 if metric.status is MeasurementStatus.COMPLETE:
                     metrics[name] = ScoreMetric(MeasurementStatus.PARTIAL, metric.value, metric.support)

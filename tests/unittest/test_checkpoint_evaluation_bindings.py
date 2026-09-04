@@ -105,7 +105,17 @@ def test_production_binding_inventory_is_exact_and_fail_closed():
     assert all(not item.available and item.blocker_codes for item in inventory.bindings)
     assert {binding.kind for binding in bindings} == set(EvaluationArmKind)
     assert all(not binding.available for binding in bindings)
-    assert all(binding.adapter is None for binding in bindings)
+    adapters = {binding.kind: binding.adapter for binding in bindings}
+    assert adapters[EvaluationArmKind.GENERAL_REVIEW] is not None
+    assert adapters[EvaluationArmKind.VERIFIED_SPECIALISTS] is not None
+    assert all(
+        adapters[kind] is None
+        for kind in (
+            EvaluationArmKind.DETERMINISTIC,
+            EvaluationArmKind.SPECIALISTS,
+            EvaluationArmKind.FULL_CASCADE,
+        )
+    )
     assert all(binding.publish_output is False for binding in bindings)
     assert all(binding.enforces_hard_cost_cap is False for binding in bindings)
 
@@ -113,9 +123,6 @@ def test_production_binding_inventory_is_exact_and_fail_closed():
         item for item in inventory.bindings if item.kind is EvaluationArmKind.FULL_CASCADE
     )
     assert set(full_cascade.blocker_codes) == {
-        "general_review_adapter_unavailable",
-        "finding_normalization_adapter_unavailable",
-        "verified_candidate_source_contract_unavailable",
         "frontier_stage_telemetry_contract_unavailable",
         "frontier_decision_semantics_unavailable",
         "hard_cost_cap_enforcement_unavailable",
@@ -124,10 +131,13 @@ def test_production_binding_inventory_is_exact_and_fail_closed():
         item for item in inventory.bindings if item.kind is EvaluationArmKind.GENERAL_REVIEW
     )
     assert set(general_review.blocker_codes) == {
-        "general_review_adapter_unavailable",
-        "finding_normalization_adapter_unavailable",
+        "general_review_severity_contract_unavailable",
         "hard_cost_cap_enforcement_unavailable",
     }
+    verified = next(
+        item for item in inventory.bindings if item.kind is EvaluationArmKind.VERIFIED_SPECIALISTS
+    )
+    assert verified.blocker_codes == ("hard_cost_cap_enforcement_unavailable",)
 
 
 def test_production_bindings_preserve_frozen_manifest_contracts():

@@ -56,13 +56,13 @@ build_shadow_pilot_acceptance = report_module.build_shadow_pilot_acceptance
 canonical_rollout_gate_specs = report_module.canonical_rollout_gate_specs
 
 _PINNED_TEST_COCOS_ACCEPTANCE_ID = (
-    "sha256:d934504cb16b48f81b661fae4962c07fe26d63adef67668e100845a99b2b2459"
+    "sha256:7c7e8915841187b571c729c409992a28660054fe46994a4b729bdcc60412fbdd"
 )
 _PINNED_TEST_SHADOW_ACCEPTANCE_ID = (
-    "sha256:509975310b252bc83d165ca343c7374888377e3a527ef913cf8daa1cd8822cc8"
+    "sha256:3b5bf3a5b7447ea16cb1790dd24a41288700bdfd44ee3c3bb1cbc88cd6272314"
 )
 _PINNED_TEST_SETTLED_ACCEPTANCE_ID = (
-    "sha256:fccce140bdb6b685f43e30b49bc38be04101bb6b09b91375c0a8a5312ce8693b"
+    "sha256:68f1db8cb937743fbf33cdc90210dc66f5592dc7ccb1f1eaab68f3e22e7de26c"
 )
 
 

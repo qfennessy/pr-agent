@@ -19,6 +19,7 @@ from pr_agent.algo.review_configuration import (
 from pr_agent.algo.review_execution_context import get_review_prompt_date, review_execution_is_isolated
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewSnapshot
 from pr_agent.algo.review_specialists import get_specialist_snapshot_context
+from pr_agent.algo.run_details import RunDetails
 from pr_agent.algo.skills_loader import get_skills_context
 
 
@@ -560,7 +561,7 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
             assert review_execution_is_isolated() is True
             return SimpleNamespace(
                 review={"review": {"key_issues_to_review": []}},
-                run_details=SimpleNamespace(
+                run_details=RunDetails(
                     model_used="model",
                     review_profile="bugs_only",
                     fallback_used=False,
@@ -571,7 +572,8 @@ async def test_execution_constructs_fresh_reviewer_inside_isolation_and_closes_s
                     total_cost_usd=Decimal("0.01"),
                     known_cost_call_count=1,
                     model_costs_usd={"model": Decimal("0.01")},
-                    duration_seconds=0.2,
+                    start_time=0.0,
+                    finish_time=0.2,
                 ),
             )
 

@@ -7,6 +7,8 @@ copied into ``asyncio`` child tasks while still referencing the same mutable
 stay isolated between concurrent requests.
 """
 
+import math
+import re
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -16,6 +18,10 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Iterator, Mapping, Optional
 
 from pr_agent.algo.ai_request_context import get_ai_request_options
+
+EVALUATION_RUN_DETAILS_SCHEMA_VERSION = "evaluation-run-details-v1"
+_STAGE_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_HASH_IDENTIFIER = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 _run_details: ContextVar[Optional["RunDetails"]] = ContextVar(
     "pr_agent_run_details", default=None
@@ -30,6 +36,8 @@ class SpecialistRunDetails:
     model_used: Optional[str] = None
     deployment_id: Optional[str] = None
     fallback_used: bool = False
+    route_attempts: int = 0
+    model_retry_attempts: int = 0
     prompt_version: Optional[str] = None
     input_schema_version: Optional[str] = None
     schema_version: Optional[str] = None
@@ -63,6 +71,8 @@ class SpecialistRunDetails:
             "model": self.model_used,
             "deployment": self.deployment_id,
             "fallback_used": self.fallback_used,
+            "route_attempts": self.route_attempts,
+            "model_retry_attempts": self.model_retry_attempts,
             "prompt_version": self.prompt_version,
             "input_schema_version": self.input_schema_version,
             "schema_version": self.schema_version,
@@ -237,6 +247,10 @@ class RunDetails:
     # Sticky: once a fallback has won, a later success on the primary model must not
     # clear this, or the comment would hide that a fallback ran at all.
     fallback_used: bool = False
+    # Provider-neutral model/deployment route entries attempted by the main review.
+    route_attempts: int = 0
+    # Observable retries within an already selected model/deployment route.
+    model_retry_attempts: int = 0
     # Input/output tokens summed over every AI call of the run. Named after litellm's
     # normalized usage object, which is what the collector reads. Both stay 0 when no usage
     # reaches the collector, e.g. streaming responses or the langchain handler.
@@ -294,6 +308,346 @@ class RunDetails:
         if self.known_cost_call_count == self.num_ai_calls:
             return "complete"
         return "partial"
+
+
+_EVALUATION_RUN_DETAILS_FIELDS = frozenset({
+    "schema_version", "model_used", "review_profile", "fallback_used", "prompt_tokens",
+    "completion_tokens", "total_tokens", "num_ai_calls", "total_cost_usd",
+    "known_cost_call_count", "model_costs_usd", "specialist_runs", "adjudication_runs",
+    "duration_seconds", "route_attempts", "model_retry_attempts",
+})
+_EVALUATION_SPECIALIST_FIELDS = frozenset({
+    "role", "model_used", "deployment_id", "fallback_used", "prompt_version",
+    "input_schema_version", "schema_version", "state", "latency_seconds", "prompt_tokens",
+    "completion_tokens", "total_tokens", "num_ai_calls", "total_cost_usd",
+    "known_cost_call_count", "model_costs_usd", "confidence", "failure_reason", "cached",
+    "input_token_reservation", "output_token_reservation", "route_attempts", "model_retry_attempts",
+})
+_EVALUATION_ADJUDICATION_FIELDS = frozenset({
+    "finding_id", "model_used", "provider", "model_revision", "deployment_id", "fallback_used",
+    "route_attempts", "model_attempts", "model_attempts_configured", "provider_attempts",
+    "provider_retries_configured", "prompt_version", "input_schema_version", "schema_version",
+    "state", "latency_seconds", "prompt_tokens", "completion_tokens", "total_tokens",
+    "num_ai_calls", "known_usage_call_count", "total_cost_usd", "known_cost_call_count",
+    "model_costs_usd", "confidence", "failure_reason", "cache_state",
+})
+
+
+def _evaluation_decimal(value: Any, field_name: str) -> Decimal:
+    if not isinstance(value, str) or len(value) > 128:
+        raise ValueError(f"invalid evaluation run details {field_name}")
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise ValueError(f"invalid evaluation run details {field_name}") from exc
+    if not parsed.is_finite() or parsed < 0:
+        raise ValueError(f"invalid evaluation run details {field_name}")
+    return parsed
+
+
+def _evaluation_int(value: Any, field_name: str, *, optional: bool = False) -> Optional[int]:
+    if optional and value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 10**12:
+        raise ValueError(f"invalid evaluation run details {field_name}")
+    return value
+
+
+def _evaluation_number(value: Any, field_name: str, *, optional: bool = False) -> Optional[float]:
+    if optional and value is None:
+        return None
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(f"invalid evaluation run details {field_name}")
+    return float(value)
+
+
+def _evaluation_string(value: Any, field_name: str, *, optional: bool = True) -> Optional[str]:
+    if optional and value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > 256:
+        raise ValueError(f"invalid evaluation run details {field_name}")
+    return value
+
+
+def _evaluation_costs(value: Any, field_name: str) -> dict[str, Decimal]:
+    if not isinstance(value, Mapping) or len(value) > 64:
+        raise ValueError(f"invalid evaluation run details {field_name}")
+    costs = {}
+    for model, raw_cost in value.items():
+        model_id = _evaluation_string(model, field_name, optional=False)
+        costs[model_id] = _evaluation_decimal(raw_cost, field_name)
+    return costs
+
+
+def serialize_run_details_for_evaluation(details: RunDetails) -> dict[str, Any]:
+    """Serialize only source-free production telemetry for checkpoint replay."""
+
+    if not isinstance(details, RunDetails):
+        raise TypeError("evaluation run details must use RunDetails")
+
+    def specialist_payload(run: SpecialistRunDetails) -> dict[str, Any]:
+        return {
+            "role": run.role,
+            "model_used": run.model_used,
+            "deployment_id": run.deployment_id,
+            "fallback_used": run.fallback_used,
+            "route_attempts": run.route_attempts,
+            "model_retry_attempts": run.model_retry_attempts,
+            "prompt_version": run.prompt_version,
+            "input_schema_version": run.input_schema_version,
+            "schema_version": run.schema_version,
+            "state": run.state,
+            "latency_seconds": run.latency_seconds,
+            "prompt_tokens": run.prompt_tokens,
+            "completion_tokens": run.completion_tokens,
+            "total_tokens": run.total_tokens,
+            "num_ai_calls": run.num_ai_calls,
+            "total_cost_usd": str(run.total_cost_usd),
+            "known_cost_call_count": run.known_cost_call_count,
+            "model_costs_usd": {model: str(cost) for model, cost in run.model_costs_usd.items()},
+            "confidence": run.confidence,
+            "failure_reason": run.failure_reason,
+            "cached": run.cached,
+            "input_token_reservation": run.input_token_reservation,
+            "output_token_reservation": run.output_token_reservation,
+        }
+
+    def adjudication_payload(run: AdjudicationRunDetails) -> dict[str, Any]:
+        return {
+            field_name: (
+                str(value)
+                if field_name == "total_cost_usd"
+                else {model: str(cost) for model, cost in value.items()}
+                if field_name == "model_costs_usd"
+                else value
+            )
+            for field_name in _EVALUATION_ADJUDICATION_FIELDS
+            for value in (getattr(run, field_name),)
+        }
+
+    payload = {
+        "schema_version": EVALUATION_RUN_DETAILS_SCHEMA_VERSION,
+        "model_used": details.model_used,
+        "review_profile": details.review_profile,
+        "fallback_used": details.fallback_used,
+        "route_attempts": details.route_attempts,
+        "model_retry_attempts": details.model_retry_attempts,
+        "prompt_tokens": details.prompt_tokens,
+        "completion_tokens": details.completion_tokens,
+        "total_tokens": details.total_tokens,
+        "num_ai_calls": details.num_ai_calls,
+        "total_cost_usd": str(details.total_cost_usd),
+        "known_cost_call_count": details.known_cost_call_count,
+        "model_costs_usd": {model: str(cost) for model, cost in details.model_costs_usd.items()},
+        "specialist_runs": {
+            role: specialist_payload(run) for role, run in sorted(details.specialist_runs.items())
+        },
+        "adjudication_runs": {
+            finding_id: adjudication_payload(run)
+            for finding_id, run in sorted(details.adjudication_runs.items())
+        },
+        "duration_seconds": details.duration_seconds,
+    }
+    return deserialize_run_details_for_evaluation(payload, _return_payload=True)
+
+
+def deserialize_run_details_for_evaluation(
+    value: Mapping[str, Any], *, _return_payload: bool = False
+) -> RunDetails | dict[str, Any]:
+    """Strictly validate and restore source-free checkpoint run telemetry."""
+
+    if not isinstance(value, Mapping) or set(value) != _EVALUATION_RUN_DETAILS_FIELDS:
+        raise ValueError("invalid evaluation run details fields")
+    if value.get("schema_version") != EVALUATION_RUN_DETAILS_SCHEMA_VERSION:
+        raise ValueError("unsupported evaluation run details version")
+    model_used = _evaluation_string(value.get("model_used"), "model_used")
+    review_profile = _evaluation_string(value.get("review_profile"), "review_profile")
+    if not isinstance(value.get("fallback_used"), bool):
+        raise ValueError("invalid evaluation run details fallback_used")
+    integer_fields = {
+        field_name: _evaluation_int(value.get(field_name), field_name)
+        for field_name in (
+            "prompt_tokens", "completion_tokens", "total_tokens", "num_ai_calls", "known_cost_call_count",
+            "route_attempts",
+            "model_retry_attempts",
+        )
+    }
+    if integer_fields["known_cost_call_count"] > integer_fields["num_ai_calls"]:
+        raise ValueError("invalid evaluation run details known_cost_call_count")
+    total_cost = _evaluation_decimal(value.get("total_cost_usd"), "total_cost_usd")
+    model_costs = _evaluation_costs(value.get("model_costs_usd"), "model_costs_usd")
+    duration = _evaluation_number(value.get("duration_seconds"), "duration_seconds")
+
+    raw_specialists = value.get("specialist_runs")
+    if not isinstance(raw_specialists, Mapping) or len(raw_specialists) > 32:
+        raise ValueError("invalid evaluation run details specialist_runs")
+    specialist_runs = {}
+    for role, raw_run in raw_specialists.items():
+        if (
+            not isinstance(role, str)
+            or not _STAGE_IDENTIFIER.fullmatch(role)
+            or not isinstance(raw_run, Mapping)
+            or set(raw_run) != _EVALUATION_SPECIALIST_FIELDS
+            or raw_run.get("role") != role
+        ):
+            raise ValueError("invalid evaluation run details specialist run")
+        run = SpecialistRunDetails(
+            role=role,
+            model_used=_evaluation_string(raw_run.get("model_used"), "specialist model_used"),
+            deployment_id=_evaluation_string(raw_run.get("deployment_id"), "specialist deployment_id"),
+            fallback_used=raw_run.get("fallback_used"),
+            route_attempts=_evaluation_int(raw_run.get("route_attempts"), "specialist route_attempts"),
+            model_retry_attempts=_evaluation_int(
+                raw_run.get("model_retry_attempts"), "specialist model retry attempts"
+            ),
+            prompt_version=_evaluation_string(raw_run.get("prompt_version"), "specialist prompt_version"),
+            input_schema_version=_evaluation_string(
+                raw_run.get("input_schema_version"), "specialist input_schema_version"
+            ),
+            schema_version=_evaluation_string(raw_run.get("schema_version"), "specialist schema_version"),
+            state=_evaluation_string(raw_run.get("state"), "specialist state"),
+            latency_seconds=_evaluation_number(raw_run.get("latency_seconds"), "specialist latency_seconds"),
+            prompt_tokens=_evaluation_int(raw_run.get("prompt_tokens"), "specialist prompt_tokens"),
+            completion_tokens=_evaluation_int(raw_run.get("completion_tokens"), "specialist completion_tokens"),
+            total_tokens=_evaluation_int(raw_run.get("total_tokens"), "specialist total_tokens"),
+            num_ai_calls=_evaluation_int(raw_run.get("num_ai_calls"), "specialist num_ai_calls"),
+            total_cost_usd=_evaluation_decimal(raw_run.get("total_cost_usd"), "specialist total_cost_usd"),
+            known_cost_call_count=_evaluation_int(
+                raw_run.get("known_cost_call_count"), "specialist known_cost_call_count"
+            ),
+            model_costs_usd=_evaluation_costs(
+                raw_run.get("model_costs_usd"), "specialist model_costs_usd"
+            ),
+            confidence=_evaluation_number(raw_run.get("confidence"), "specialist confidence", optional=True),
+            failure_reason=_evaluation_string(raw_run.get("failure_reason"), "specialist failure_reason"),
+            cached=raw_run.get("cached"),
+            input_token_reservation=_evaluation_int(
+                raw_run.get("input_token_reservation"), "specialist input_token_reservation"
+            ),
+            output_token_reservation=_evaluation_int(
+                raw_run.get("output_token_reservation"), "specialist output_token_reservation"
+            ),
+        )
+        if not isinstance(run.fallback_used, bool) or not isinstance(run.cached, bool):
+            raise ValueError("invalid evaluation run details specialist flags")
+        if run.confidence is not None and run.confidence > 1:
+            raise ValueError("invalid evaluation run details specialist confidence")
+        if run.known_cost_call_count > run.num_ai_calls:
+            raise ValueError("invalid evaluation run details specialist known_cost_call_count")
+        specialist_runs[role] = run
+
+    raw_adjudications = value.get("adjudication_runs")
+    if not isinstance(raw_adjudications, Mapping) or len(raw_adjudications) > 256:
+        raise ValueError("invalid evaluation run details adjudication_runs")
+    adjudication_runs = {}
+    for finding_id, raw_run in raw_adjudications.items():
+        if (
+            not isinstance(finding_id, str)
+            or not _HASH_IDENTIFIER.fullmatch(finding_id)
+            or not isinstance(raw_run, Mapping)
+            or set(raw_run) != _EVALUATION_ADJUDICATION_FIELDS
+            or raw_run.get("finding_id") != finding_id
+        ):
+            raise ValueError("invalid evaluation run details adjudication run")
+        integer_values = {
+            field_name: _evaluation_int(
+                raw_run.get(field_name), f"adjudication {field_name}", optional=field_name in {
+                    "model_attempts", "model_attempts_configured", "provider_attempts",
+                    "provider_retries_configured",
+                }
+            )
+            for field_name in (
+                "route_attempts", "model_attempts", "model_attempts_configured", "provider_attempts",
+                "provider_retries_configured", "prompt_tokens", "completion_tokens", "total_tokens",
+                "num_ai_calls", "known_usage_call_count", "known_cost_call_count",
+            )
+        }
+        run = AdjudicationRunDetails(
+            finding_id=finding_id,
+            model_used=_evaluation_string(raw_run.get("model_used"), "adjudication model_used"),
+            provider=_evaluation_string(raw_run.get("provider"), "adjudication provider"),
+            model_revision=_evaluation_string(raw_run.get("model_revision"), "adjudication model_revision"),
+            deployment_id=_evaluation_string(raw_run.get("deployment_id"), "adjudication deployment_id"),
+            fallback_used=raw_run.get("fallback_used"),
+            route_attempts=integer_values["route_attempts"],
+            model_attempts=integer_values["model_attempts"],
+            model_attempts_configured=integer_values["model_attempts_configured"],
+            provider_attempts=integer_values["provider_attempts"],
+            provider_retries_configured=integer_values["provider_retries_configured"],
+            prompt_version=_evaluation_string(raw_run.get("prompt_version"), "adjudication prompt_version"),
+            input_schema_version=_evaluation_string(
+                raw_run.get("input_schema_version"), "adjudication input_schema_version"
+            ),
+            schema_version=_evaluation_string(raw_run.get("schema_version"), "adjudication schema_version"),
+            state=_evaluation_string(raw_run.get("state"), "adjudication state"),
+            latency_seconds=_evaluation_number(raw_run.get("latency_seconds"), "adjudication latency_seconds"),
+            prompt_tokens=integer_values["prompt_tokens"],
+            completion_tokens=integer_values["completion_tokens"],
+            total_tokens=integer_values["total_tokens"],
+            num_ai_calls=integer_values["num_ai_calls"],
+            known_usage_call_count=integer_values["known_usage_call_count"],
+            total_cost_usd=_evaluation_decimal(raw_run.get("total_cost_usd"), "adjudication total_cost_usd"),
+            known_cost_call_count=integer_values["known_cost_call_count"],
+            model_costs_usd=_evaluation_costs(
+                raw_run.get("model_costs_usd"), "adjudication model_costs_usd"
+            ),
+            confidence=_evaluation_number(raw_run.get("confidence"), "adjudication confidence", optional=True),
+            failure_reason=_evaluation_string(raw_run.get("failure_reason"), "adjudication failure_reason"),
+            cache_state=_evaluation_string(raw_run.get("cache_state"), "adjudication cache_state", optional=False),
+        )
+        if not isinstance(run.fallback_used, bool):
+            raise ValueError("invalid evaluation run details adjudication fallback_used")
+        if run.confidence is not None and run.confidence > 1:
+            raise ValueError("invalid evaluation run details adjudication confidence")
+        if run.known_cost_call_count > run.num_ai_calls or run.known_usage_call_count > run.num_ai_calls:
+            raise ValueError("invalid evaluation run details adjudication call counts")
+        adjudication_runs[finding_id] = run
+
+    details = RunDetails(
+        model_used=model_used,
+        review_profile=review_profile,
+        fallback_used=value["fallback_used"],
+        route_attempts=integer_fields["route_attempts"],
+        model_retry_attempts=integer_fields["model_retry_attempts"],
+        prompt_tokens=integer_fields["prompt_tokens"],
+        completion_tokens=integer_fields["completion_tokens"],
+        total_tokens=integer_fields["total_tokens"],
+        num_ai_calls=integer_fields["num_ai_calls"],
+        total_cost_usd=total_cost,
+        known_cost_call_count=integer_fields["known_cost_call_count"],
+        model_costs_usd=model_costs,
+        specialist_runs=specialist_runs,
+        adjudication_runs=adjudication_runs,
+        start_time=0.0,
+        finish_time=duration,
+    )
+    if not _return_payload:
+        return details
+    return {
+        **dict(value),
+        "model_costs_usd": {model: str(cost) for model, cost in model_costs.items()},
+        "specialist_runs": {
+            role: {
+                **dict(value["specialist_runs"][role]),
+                "total_cost_usd": str(run.total_cost_usd),
+                "model_costs_usd": {model: str(cost) for model, cost in run.model_costs_usd.items()},
+            }
+            for role, run in specialist_runs.items()
+        },
+        "adjudication_runs": {
+            finding_id: {
+                **dict(value["adjudication_runs"][finding_id]),
+                "total_cost_usd": str(run.total_cost_usd),
+                "model_costs_usd": {model: str(cost) for model, cost in run.model_costs_usd.items()},
+            }
+            for finding_id, run in adjudication_runs.items()
+        },
+    }
 
 
 def init_run_details() -> RunDetails:
@@ -386,9 +740,13 @@ def record_specialist_model_attempt(
     model_attempts_configured: Optional[int] = None,
     provider_retries_configured: Optional[int] = None,
 ) -> None:
-    """Preserve the last attempted specialist route even when its output is rejected."""
+    """Preserve every attempted main or specialist route entry."""
 
+    details = get_run_details()
+    if details is None:
+        return
     if not attribution:
+        details.route_attempts += 1
         return
     adjudication = _get_adjudication_details(attribution)
     if adjudication is not None:
@@ -408,6 +766,7 @@ def record_specialist_model_attempt(
         return
     specialist.model_used = model
     specialist.deployment_id = deployment_id
+    specialist.route_attempts += 1
     if is_fallback:
         specialist.fallback_used = True
 
@@ -417,16 +776,25 @@ def record_model_request_attempt(attribution: Optional[str] = None) -> None:
 
     ``retry_with_fallback_models`` records the first attempt for every selected
     model/deployment route. Handler retry hooks call this function only before
-    subsequent invocations, so ``model_attempts - route_attempts`` is the exact
-    retry-attempt count.
+    subsequent invocations. Main and specialist runs retain that count directly;
+    adjudication runs retain total model attempts for their richer audit contract.
     """
 
     request_options = get_ai_request_options()
     attribution = attribution or (
         request_options.attribution if request_options is not None else None
     )
+    details = get_run_details()
+    if details is None:
+        return
+    if not attribution:
+        details.model_retry_attempts += 1
+        return
     adjudication = _get_adjudication_details(attribution)
     if adjudication is None:
+        specialist = _get_specialist_details(attribution)
+        if specialist is not None:
+            specialist.model_retry_attempts += 1
         return
     if adjudication.model_attempts is None:
         adjudication.model_attempts = 0
