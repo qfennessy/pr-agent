@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
 from pr_agent.algo.checkpoint_cost_authority import (
     CheckpointCostAuthorityError,
     FrozenCostAuthority,
-    gateway_api_base_identity_hash,
+    require_bound_gateway_api_base,
     use_checkpoint_cost_authority,
 )
 from pr_agent.algo.checkpoint_evaluation import EvaluationStagePlan
@@ -565,19 +565,9 @@ async def _execute_review(
             )
         ):
             raise CheckpointCostAuthorityError("cost authority belongs to a different snapshot")
-        checkpoint_gateway_api_base = review_configuration.checkpoint_gateway_api_base
-        if checkpoint_gateway_api_base is None:
-            raise CheckpointCostAuthorityError(
-                "checkpoint execution requires a frozen enforcing gateway api_base"
-            )
-        gateway_api_base_hash = gateway_api_base_identity_hash(checkpoint_gateway_api_base)
-        if any(
-            not hmac.compare_digest(quote.gateway_api_base_hash, gateway_api_base_hash)
-            for quote in cost_authority.quotes
-        ):
-            raise CheckpointCostAuthorityError(
-                "checkpoint gateway api_base does not match every cost quote"
-            )
+        checkpoint_gateway_api_base = require_bound_gateway_api_base(
+            review_configuration, cost_authority
+        )
     except CheckpointCostAuthorityError:
         return _failure_outcome(
             CheckpointReviewSubprocessState.FAILED,

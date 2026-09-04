@@ -154,6 +154,30 @@ def gateway_api_base_identity_hash(value: object) -> str:
     return content_hash({"gateway_api_base": f"https://{rendered_host}{port}{path}"})
 
 
+def require_bound_gateway_api_base(review_configuration: object, authority: object) -> str:
+    """Return the frozen gateway endpoint only when it binds every quote in the authority.
+
+    Shared by production preflight and the isolated worker so both reject the same
+    configurations, and so preflight fails before any artifact-store or paid-attempt
+    side effect rather than after one.
+    """
+
+    api_base = getattr(review_configuration, "checkpoint_gateway_api_base", None)
+    if api_base is None:
+        raise CheckpointCostAuthorityError(
+            "checkpoint execution requires a frozen enforcing gateway api_base"
+        )
+    api_base_hash = gateway_api_base_identity_hash(api_base)
+    if any(
+        not hmac.compare_digest(quote.gateway_api_base_hash, api_base_hash)
+        for quote in authority.quotes
+    ):
+        raise CheckpointCostAuthorityError(
+            "checkpoint gateway api_base does not match every cost quote"
+        )
+    return api_base
+
+
 @dataclass(frozen=True)
 class ProviderMaximumCharge:
     """One externally guaranteed maximum charge for an exact provider request."""

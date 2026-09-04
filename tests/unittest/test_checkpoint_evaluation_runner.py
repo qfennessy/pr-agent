@@ -14,6 +14,7 @@ from pr_agent.algo.candidate_verification import (
 from pr_agent.algo.checkpoint_cost_authority import (
     FrozenCostAuthority,
     ProviderMaximumCharge,
+    CheckpointCostAuthorityError,
     gateway_api_base_identity_hash,
 )
 from pr_agent.algo.checkpoint_evaluation import (
@@ -287,14 +288,18 @@ def _stage_plan(kind: EvaluationArmKind) -> tuple[EvaluationStagePlan, ...]:
     return tuple(plans)
 
 
-@lru_cache(maxsize=1)
-def _review_configuration():
+_CHECKPOINT_GATEWAY_API_BASE = "https://test-checkpoint-gateway.example/v1"
+
+
+@lru_cache(maxsize=2)
+def _review_configuration(checkpoint_gateway_api_base=_CHECKPOINT_GATEWAY_API_BASE):
     return materialize_review_configuration(
         skills_context="frozen specialist instructions",
         repo_context_files={"AGENTS.md": "frozen repository instructions"},
         repo_context_max_lines=100,
         prompt_date="2026-09-03",
         stage_sources=_stage_sources(),
+        checkpoint_gateway_api_base=checkpoint_gateway_api_base,
     )
 
 
@@ -858,7 +863,7 @@ def _cost_authorities(manifest, request, snapshot_paths):
                             model_revision=model_revision,
                             deployment_id_hash=deployment_id_hash,
                             gateway_api_base_hash=gateway_api_base_identity_hash(
-                                "https://test-checkpoint-gateway.example/v1"
+                                _CHECKPOINT_GATEWAY_API_BASE
                             ),
                             gateway_route_binding_id=_hash(
                                 f"test-gateway-route:{provider_id}:{model_revision}:{deployment_id_hash}"
@@ -1173,6 +1178,7 @@ def test_arm_stage_plan_accepts_snapshot_specific_verifier_evidence(tmp_path):
         repo_context_max_lines=100,
         prompt_date="2026-09-03",
         stage_sources=second_sources,
+        checkpoint_gateway_api_base=_CHECKPOINT_GATEWAY_API_BASE,
     )
     second_snapshot, second_path, second_artifact_hash = _write_snapshot(
         tmp_path,
@@ -1925,6 +1931,32 @@ def test_preflight_requires_all_five_kinds_and_the_exact_paid_decision(tmp_path)
     )
     with pytest.raises(ProductionDependencyUnavailable, match="hard per-call cost cap"):
         _runner(manifest, path, bindings, store, request, _decision).preflight()
+    assert store.calls == []
+
+
+@pytest.mark.parametrize(
+    ("gateway_api_base", "expected"),
+    [
+        (None, "requires a frozen enforcing gateway api_base"),
+        ("https://other-gateway.example/v1", "does not match every cost quote"),
+    ],
+)
+def test_preflight_rejects_an_unbound_gateway_before_touching_the_artifact_store(
+    tmp_path, gateway_api_base, expected
+):
+    """A deterministically invalid gateway must not consume an immutable paid attempt."""
+
+    configuration = _review_configuration(gateway_api_base)
+    snapshot, path, artifact_hash = _write_snapshot(
+        tmp_path, review_configuration=configuration
+    )
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+    store = _NoCallStore()
+
+    with pytest.raises(CheckpointCostAuthorityError, match=expected):
+        _runner(manifest, path, _bindings(manifest), store, request, decision).preflight()
+
     assert store.calls == []
 
 

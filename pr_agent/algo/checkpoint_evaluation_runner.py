@@ -21,7 +21,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Optional
 
-from pr_agent.algo.checkpoint_cost_authority import FrozenCostAuthority, validate_cost_authorities
+from pr_agent.algo.checkpoint_cost_authority import (
+    FrozenCostAuthority,
+    require_bound_gateway_api_base,
+    validate_cost_authorities,
+)
 from pr_agent.algo.checkpoint_evaluation import (
     CheckpointCase,
     EvaluationArm,
@@ -421,6 +425,12 @@ class ProductionEvaluationRunner:
                 snapshot_id=case.snapshot_id,
                 arm_configuration_hash=arm.configuration_hash,
                 review_configuration_hash=loaded_pairs[case_id].review_configuration.configuration_hash,
+            )
+            # The overall configuration hash above does not cover whether the frozen
+            # endpoint binds these quotes, and the worker only learns that after a
+            # paid attempt is already reserved. Fail here instead.
+            require_bound_gateway_api_base(
+                loaded_pairs[case_id].review_configuration, authority
             )
         self.artifact_store.bind_paid_request(self.manifest, self.paid_request)
         return ProductionEvaluationPreflight(
