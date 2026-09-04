@@ -1296,7 +1296,7 @@ def test_partial_candidate_verification_remains_safe_when_route_retains_a_findin
     reviewer.verified_review_data = {
         "review": {
             "key_issues_to_review": [
-                {"issue_header": "one"},
+                {"issue_header": "one", "normalized_severity": "high"},
                 {"issue_header": "two"},
             ]
         }
@@ -1312,7 +1312,8 @@ def test_partial_candidate_verification_remains_safe_when_route_retains_a_findin
         lambda *args, **kwargs: "verified review",
     )
 
-    review = reviewer._prepare_pr_review()
+    with patch("pr_agent.tools.pr_reviewer.github_action_output") as action_output:
+        review = reviewer._prepare_pr_review()
 
     assert review == "verified review"
     assert reviewer._candidate_verification_blocks_publication() is False
@@ -1321,6 +1322,38 @@ def test_partial_candidate_verification_remains_safe_when_route_retains_a_findin
         finding["issue_header"]
         for finding in structured["review"]["key_issues_to_review"]
     ] == ["one"]
+    assert "normalized_severity" not in structured["review"]["key_issues_to_review"][0]
+    action_data = action_output.call_args.args[0]
+    assert "normalized_severity" not in action_data["review"]["key_issues_to_review"][0]
+
+
+def test_forced_no_publish_review_retains_evaluation_severity(monkeypatch):
+    reviewer = _make_prediction_reviewer(MagicMock())
+    reviewer.review_profile = "full"
+    reviewer._force_no_publish = True
+    reviewer.verified_review_data = {
+        "review": {
+            "key_issues_to_review": [{
+                "issue_header": "verified",
+                "normalized_severity": "high",
+            }],
+        },
+    }
+    reviewer.candidate_verification_artifact = {
+        "status": "complete",
+        "publication_safe": True,
+        "verified_count": 1,
+    }
+    reviewer.set_review_labels = MagicMock()
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+        lambda *args, **kwargs: "verified review",
+    )
+
+    reviewer._prepare_pr_review()
+
+    finding = reviewer._structured_review_result["review"]["key_issues_to_review"][0]
+    assert finding["normalized_severity"] == "high"
 
 
 def test_complete_candidate_verification_can_publish_clean_after_route_budgeting(

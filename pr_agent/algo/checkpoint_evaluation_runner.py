@@ -458,7 +458,7 @@ class ProductionEvaluationRunner:
             if case.parent_case_id is not None and outcome.snapshot_result.state in {
                 ReviewResultState.FINDINGS,
                 ReviewResultState.NO_FINDINGS,
-            }:
+            } and _has_complete_lifecycle_coverage(arm, outcome):
                 if parent_record is None or parent_record.state is not EvaluationRunState.COMPLETED:
                     raise EvaluationValidationError(
                         f"pair {case.case_id}/{arm.arm_id} requires a completed terminal parent record"
@@ -874,4 +874,21 @@ def failed_production_arm_result(
         failure_reason_code=reason_code,
         latency_measurement=latency_seconds,
         model_identity=model_identity,
+    )
+
+
+def _has_complete_lifecycle_coverage(
+    arm: EvaluationArm,
+    outcome: ProductionArmResult,
+) -> bool:
+    """Require complete planned stages before inferring that a parent finding disappeared."""
+
+    if not arm.stage_plan:
+        return True
+    details = outcome.run_details
+    if details is None or set(details.specialist_runs) != {stage.stage for stage in arm.stage_plan}:
+        return False
+    return all(
+        stage.state in {"cached", "not_required", "success"}
+        for stage in details.specialist_runs.values()
     )

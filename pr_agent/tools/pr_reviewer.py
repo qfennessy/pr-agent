@@ -2857,6 +2857,12 @@ class PRReviewer:
             get_logger().exception("Failed to parse review data", artifact={"data": data})
             return ""
         data = self._normalize_bugs_only_review(data)
+        if not getattr(self, "_force_no_publish", False):
+            issues = (data.get("review") or {}).get("key_issues_to_review")
+            if isinstance(issues, list):
+                for issue in issues:
+                    if isinstance(issue, dict):
+                        issue.pop("normalized_severity", None)
         data = self._apply_finding_budget(data)
         data = self._apply_publication_budget(data)
         candidate_verification_blocked = self._candidate_verification_blocks_publication(

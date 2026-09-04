@@ -366,7 +366,7 @@ def _manifest(snapshot: ReviewSnapshot, artifact_hash: str, *, arms=None) -> Eva
 
 
 @pytest.mark.asyncio
-async def test_runner_executes_parent_first_and_derives_withdrawal(tmp_path):
+async def test_runner_executes_parent_first_and_derives_withdrawal_only_for_complete_coverage(tmp_path):
     parent_snapshot, parent_path, parent_hash = _write_snapshot(tmp_path, "parent")
     child_snapshot, child_path, child_hash = _write_snapshot(
         tmp_path,
@@ -406,6 +406,7 @@ async def test_runner_executes_parent_first_and_derives_withdrawal(tmp_path):
         severity=FindingSeverity.HIGH,
         stage="general_review",
     )
+    missing_finding = replace(finding, fingerprint=_hash("partial-lineage-finding"))
     calls = []
 
     def factory(arm):
@@ -422,6 +423,15 @@ async def test_runner_executes_parent_first_and_derives_withdrawal(tmp_path):
                     findings=(finding,),
                 )
             if (
+                arm.kind is EvaluationArmKind.VERIFIED_SPECIALISTS
+                and snapshot.snapshot_id == parent_snapshot.snapshot_id
+            ):
+                return replace(
+                    result,
+                    snapshot_result=replace(result.snapshot_result, state=ReviewResultState.FINDINGS),
+                    findings=(finding, missing_finding),
+                )
+            if (
                 arm.kind is EvaluationArmKind.GENERAL_REVIEW
                 and snapshot.snapshot_id == child_snapshot.snapshot_id
             ):
@@ -434,6 +444,21 @@ async def test_runner_executes_parent_first_and_derives_withdrawal(tmp_path):
                         review={"review": {"key_issues_to_review": []}},
                         latency_seconds=0.0,
                     ),
+                )
+            if (
+                arm.kind is EvaluationArmKind.VERIFIED_SPECIALISTS
+                and snapshot.snapshot_id == child_snapshot.snapshot_id
+            ):
+                result.run_details.specialist_runs["candidate_verification"] = _specialist_run(
+                    arm,
+                    role="candidate_verification",
+                    state="partial",
+                    failure_reason="verification_coverage_partial",
+                )
+                return replace(
+                    result,
+                    snapshot_result=replace(result.snapshot_result, state=ReviewResultState.FINDINGS),
+                    findings=(finding,),
                 )
             return result
 
@@ -466,6 +491,15 @@ async def test_runner_executes_parent_first_and_derives_withdrawal(tmp_path):
     assert child.findings == (replace(finding, lifecycle_state=FindingLifecycleState.WITHDRAWN),)
     assert child.tokens == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
     assert child.cost_usd == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+    partial_child = next(
+        record
+        for record in result.records
+        if record.case_id == "a-child" and record.arm_id == "arm-verified_specialists"
+    )
+    assert partial_child.findings == (finding,)
+    assert next(
+        stage for stage in partial_child.stage_runs if stage.stage == "candidate_verification"
+    ).coverage_status is MeasurementStatus.PARTIAL
 
 
 @pytest.mark.asyncio
