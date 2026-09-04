@@ -678,10 +678,11 @@ def test_prepare_review_uses_lifecycle_instead_of_legacy_inline_publication():
     reviewer._provider_mutations_allowed = MagicMock(return_value=True)
     reviewer.set_review_labels = MagicMock()
     reviewer.git_provider.is_supported = MagicMock(return_value=False)
+    action_output = MagicMock()
 
     with (
         patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_Settings(enabled=True)),
-        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+        patch("pr_agent.tools.pr_reviewer.github_action_output", action_output),
         patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", return_value="review"),
     ):
         rendered = reviewer._prepare_pr_review()
@@ -689,6 +690,33 @@ def test_prepare_review_uses_lifecycle_instead_of_legacy_inline_publication():
     assert rendered == "review"
     reviewer._apply_review_thread_lifecycle.assert_called_once()
     reviewer._publish_key_issues_as_inline_comments.assert_not_called()
+    action_output.assert_called_once_with(
+        {"review": {"key_issues_to_review": [_finding()]}},
+        "review",
+    )
+
+
+def test_threaded_bugs_only_finding_does_not_clear_the_persistent_review():
+    provider = _Provider()
+    provider.clear_persistent_review = MagicMock()
+    reviewer = _reviewer(provider)
+    reviewer.review_profile = "bugs_only"
+    reviewer.verified_review_data = {"review": {"key_issues_to_review": [_finding()]}}
+    reviewer.prediction = "review: {}"
+    reviewer._normalize_bugs_only_review = MagicMock(side_effect=lambda data: data)
+    reviewer._candidate_verification_blocks_publication = MagicMock(return_value=False)
+    reviewer._publish_structured_review_data = MagicMock()
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_Settings(enabled=True)),
+        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+    ):
+        rendered = reviewer._prepare_pr_review()
+        reviewer._clear_stale_persistent_bugs_only_review()
+
+    assert rendered == ""
+    assert reviewer._review_thread_lifecycle_threaded_findings is True
+    provider.clear_persistent_review.assert_not_called()
 
 
 def test_disabled_setting_preserves_legacy_inline_path():

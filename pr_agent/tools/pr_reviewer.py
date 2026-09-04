@@ -1388,6 +1388,7 @@ class PRReviewer:
         """Remove a prior persistent defect summary after a clean bugs-only rerun."""
         if (not self._provider_mutations_allowed() or
                 getattr(self, "_review_thread_lifecycle_blocks_summary", False) or
+                getattr(self, "_review_thread_lifecycle_threaded_findings", False) or
                 self._candidate_verification_blocks_publication() or
                 self._review_profile() != "bugs_only" or
                 not get_settings().config.publish_output or
@@ -2924,6 +2925,7 @@ class PRReviewer:
         the feedback.
         """
         self._prepared_push_output_payload = None
+        self._review_thread_lifecycle_threaded_findings = False
         data = copy.deepcopy(getattr(self, "verified_review_data", None)) or self._parse_review_prediction()
 
         if not isinstance(data, dict) or 'review' not in data:
@@ -2961,10 +2963,10 @@ class PRReviewer:
         if candidate_verification_blocked or getattr(self, "_review_thread_lifecycle_blocks_summary", False):
             return ""
 
-        data = lifecycle_data
-
         if self._provider_mutations_allowed():
             github_action_output(data, 'review')
+
+        data = lifecycle_data
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
         if 'key_issues_to_review' in data['review']:
@@ -3231,6 +3233,7 @@ class PRReviewer:
 
     def _apply_review_thread_lifecycle(self, data: dict) -> dict:
         """Reconcile verified GitHub findings while preserving a visible summary on failure."""
+        self._review_thread_lifecycle_threaded_findings = False
         self._review_thread_summary_fallbacks = ()
         self._review_thread_lifecycle_notice = None
         self._review_thread_lifecycle_blocks_summary = False
@@ -3394,6 +3397,7 @@ class PRReviewer:
             }
             and result.succeeded
         }
+        self._review_thread_lifecycle_threaded_findings = bool(threaded_finding_ids)
         finding_ids = [desired.identity.finding_id for desired in desired_threads]
         handled_finding_ids = (
             threaded_finding_ids | fallback_finding_ids | reused_fallback_finding_ids
