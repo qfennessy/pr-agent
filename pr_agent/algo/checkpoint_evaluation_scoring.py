@@ -930,6 +930,8 @@ def _paired_comparisons(
         }
         expected = {finding.fingerprint for finding in truth_by_case[case.case_id].findings}
         recall = len(observations & expected) / len(expected) if expected else 1.0
+        if terminal is not None and terminal.coverage_issues:
+            recall = None
         result: dict[str, Optional[float]] = {
             "structured_output_rate": float(completed),
             "case_recall": recall,

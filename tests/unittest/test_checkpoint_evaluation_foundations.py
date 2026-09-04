@@ -64,7 +64,7 @@ from pr_agent.algo.checkpoint_shadow_journal import (
     _append_private_line,
     load_shadow_journal,
 )
-from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshotResult
+from pr_agent.algo.review_snapshot import CoverageIssue, ReviewEvent, ReviewResultState, ReviewSnapshotResult
 from pr_agent.algo.run_details import RunDetails
 from pr_agent.cli import run
 
@@ -264,6 +264,48 @@ def test_small_paired_sample_uses_student_t_instead_of_the_normal_approximation(
     assert normal_lower > 0
     assert lower < 0
     assert upper > mean
+
+
+def test_paired_recall_gate_excludes_partial_coverage_cases():
+    case = _case("defect", EvaluationCohort.HOLDOUT, ReviewEvent.FILE_SAVE, 0)
+    arms = (
+        _arm("baseline", EvaluationArmKind.GENERAL_REVIEW),
+        _arm("candidate", EvaluationArmKind.FULL_CASCADE),
+    )
+    manifest = _manifest((case,), arms)
+    finding = FindingTruth(
+        finding_id="finding",
+        fingerprint="bug",
+        severity=FindingSeverity.HIGH,
+        earliest_opportunity=ReviewEvent.FILE_SAVE,
+        earliest_case_id=case.case_id,
+        required_context=("changed_hunk",),
+    )
+    truth = TruthArtifact(
+        manifest_id=manifest.manifest_id,
+        truths=(CheckpointTruth(case.case_id, False, _hash("truth"), (finding,)),),
+    )
+    observed = ObservedFinding("bug", FindingSeverity.HIGH)
+    baseline = _record(manifest, case, "baseline", findings=(observed,))
+    partial_candidate = replace(
+        _record(manifest, case, "candidate", findings=(observed,)),
+        coverage_issues=(CoverageIssue(reason="token_budget_omitted", path="other.py"),),
+    )
+
+    scorecard = score_matched_arms(manifest, truth, (baseline, partial_candidate))
+
+    assert not any(
+        comparison.arm_id == "candidate" and comparison.metric == "case_recall"
+        for comparison in scorecard.paired_comparisons
+    )
+    gate = evaluate_rollout_gate(
+        "live-shadow",
+        scorecard,
+        "candidate",
+        (GateRule("paired.case_recall.lower_95", GateComparator.AT_LEAST, 0.0),),
+    )
+    assert gate.status is GateStatus.NOT_EVALUABLE
+    assert gate.rule_results[0].observed is None
 
 
 @pytest.mark.parametrize(
