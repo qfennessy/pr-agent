@@ -1,4 +1,7 @@
 [pr_review_verification_prompt]
+prompt_version="candidate-verification-prompt-v1"
+input_schema_version="candidate-verification-input-v1"
+schema_version="candidate-verification-output-v1"
 system="""You are the verification stage of a pull-request review.
 Determine whether each candidate is proven by the changed diff and the retrieved repository evidence.
 

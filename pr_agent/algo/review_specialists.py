@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from math import isfinite
 from pathlib import PurePosixPath
 from threading import Lock
 from types import MappingProxyType
@@ -100,6 +101,11 @@ def _thaw_json(value: Any) -> Any:
 
 def _sha256(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode("utf-8", errors="surrogateescape")).hexdigest()
+
+
+def _require_exact_mapping(value: Mapping[str, Any], expected_fields: set[str], name: str) -> None:
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
+        raise SpecialistConfigurationError(f"invalid {name} fields")
 
 
 def _normalized_path(path: str) -> str:
@@ -233,6 +239,112 @@ class SpecialistRoleConfig:
     output_token_budget: int
     minimum_confidence: float
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "role": self.role.value,
+            "enabled": self.enabled,
+            "model": self.model,
+            "deployment": self.deployment,
+            "fallback_models": list(self.fallback_models),
+            "fallback_deployments": list(self.fallback_deployments),
+            "timeout_seconds": self.timeout_seconds,
+            "model_retries": self.model_retries,
+            "provider_retries": self.provider_retries,
+            "input_token_budget": self.input_token_budget,
+            "output_token_budget": self.output_token_budget,
+            "minimum_confidence": self.minimum_confidence,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "SpecialistRoleConfig":
+        expected_fields = {
+            "role",
+            "enabled",
+            "model",
+            "deployment",
+            "fallback_models",
+            "fallback_deployments",
+            "timeout_seconds",
+            "model_retries",
+            "provider_retries",
+            "input_token_budget",
+            "output_token_budget",
+            "minimum_confidence",
+        }
+        _require_exact_mapping(value, expected_fields, "specialist role configuration")
+        if not isinstance(value["enabled"], bool):
+            raise SpecialistConfigurationError("specialist role enabled must be a boolean")
+        if not isinstance(value["model"], str) or not value["model"].strip():
+            raise SpecialistConfigurationError("specialist role model cannot be blank")
+        deployment = value["deployment"]
+        if deployment is not None and (not isinstance(deployment, str) or not deployment.strip()):
+            raise SpecialistConfigurationError("specialist role deployment must be a non-blank string or null")
+        if not isinstance(value["fallback_models"], list) or any(
+            not isinstance(model, str) for model in value["fallback_models"]
+        ):
+            raise SpecialistConfigurationError("specialist role fallback_models must be a string list")
+        if not isinstance(value["fallback_deployments"], list) or any(
+            deployment is not None and not isinstance(deployment, str)
+            for deployment in value["fallback_deployments"]
+        ):
+            raise SpecialistConfigurationError(
+                "specialist role fallback_deployments must be a string-or-null list"
+            )
+        if any(not model.strip() for model in value["fallback_models"]):
+            raise SpecialistConfigurationError("specialist role fallback_models cannot contain blank entries")
+        if any(
+            deployment is not None and not deployment.strip()
+            for deployment in value["fallback_deployments"]
+        ):
+            raise SpecialistConfigurationError(
+                "specialist role fallback_deployments cannot contain blank entries"
+            )
+        fallback_models = tuple(value["fallback_models"])
+        fallback_deployments = tuple(value["fallback_deployments"])
+        if len(fallback_models) != len(fallback_deployments):
+            raise SpecialistConfigurationError(
+                "specialist role fallback_deployments must match fallback_models"
+            )
+        try:
+            role = SpecialistRole(value["role"])
+        except (TypeError, ValueError) as exc:
+            raise SpecialistConfigurationError("specialist role is invalid") from exc
+        integer_fields = ("model_retries", "provider_retries", "input_token_budget", "output_token_budget")
+        if any(not isinstance(value[field], int) or isinstance(value[field], bool) for field in integer_fields):
+            raise SpecialistConfigurationError("specialist role budgets and retry limits must be integers")
+        if (
+            not isinstance(value["timeout_seconds"], (int, float))
+            or isinstance(value["timeout_seconds"], bool)
+            or not isfinite(value["timeout_seconds"])
+        ):
+            raise SpecialistConfigurationError("specialist role timeout_seconds must be a finite number")
+        if (
+            not isinstance(value["minimum_confidence"], (int, float))
+            or isinstance(value["minimum_confidence"], bool)
+            or not isfinite(value["minimum_confidence"])
+        ):
+            raise SpecialistConfigurationError("specialist role minimum_confidence must be a finite number")
+        _positive_float(value["timeout_seconds"], "specialist role timeout_seconds")
+        _positive_int(value["model_retries"], "specialist role model_retries")
+        _nonnegative_int(value["provider_retries"], "specialist role provider_retries")
+        _positive_int(value["input_token_budget"], "specialist role input_token_budget")
+        _positive_int(value["output_token_budget"], "specialist role output_token_budget")
+        _confidence(value["minimum_confidence"], "specialist role minimum_confidence")
+        return cls(
+            role=role,
+            enabled=value["enabled"],
+            model=value["model"],
+            deployment=deployment,
+            fallback_models=fallback_models,
+            fallback_deployments=fallback_deployments,
+            timeout_seconds=value["timeout_seconds"],
+            model_retries=value["model_retries"],
+            provider_retries=value["provider_retries"],
+            input_token_budget=value["input_token_budget"],
+            output_token_budget=value["output_token_budget"],
+            minimum_confidence=value["minimum_confidence"],
+        )
+
     def model_route(self) -> AIModelRoute:
         return AIModelRoute(
             models=(self.model, *self.fallback_models),
@@ -257,6 +369,48 @@ class SpecialistPrompt:
     schema_version: str
     system: str
     user: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "role": self.role.value,
+            "prompt_version": self.prompt_version,
+            "input_schema_version": self.input_schema_version,
+            "schema_version": self.schema_version,
+            "system": self.system,
+            "user": self.user,
+            "content_hash": self.content_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "SpecialistPrompt":
+        expected_fields = {
+            "role",
+            "prompt_version",
+            "input_schema_version",
+            "schema_version",
+            "system",
+            "user",
+            "content_hash",
+        }
+        _require_exact_mapping(value, expected_fields, "specialist prompt")
+        string_fields = ("prompt_version", "input_schema_version", "schema_version", "system", "user")
+        if any(not isinstance(value[field], str) or not value[field].strip() for field in string_fields):
+            raise SpecialistConfigurationError("specialist prompt fields must be non-blank strings")
+        try:
+            role = SpecialistRole(value["role"])
+        except (TypeError, ValueError) as exc:
+            raise SpecialistConfigurationError("specialist prompt role is invalid") from exc
+        prompt = cls(
+            role=role,
+            prompt_version=value["prompt_version"],
+            input_schema_version=value["input_schema_version"],
+            schema_version=value["schema_version"],
+            system=value["system"],
+            user=value["user"],
+        )
+        if value["content_hash"] != prompt.content_hash:
+            raise SpecialistConfigurationError("specialist prompt content hash mismatch")
+        return prompt
 
     @property
     def content_hash(self) -> str:
@@ -289,6 +443,91 @@ class SpecialistPipelineConfig:
     prompts: tuple[SpecialistPrompt, ...]
     configuration_hash: str = field(init=False)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "mode": self.mode,
+            "aggregate_timeout_seconds": self.aggregate_timeout_seconds,
+            "aggregate_token_budget": self.aggregate_token_budget,
+            "max_concurrency": self.max_concurrency,
+            "cache_enabled": self.cache_enabled,
+            "cache_max_entries": self.cache_max_entries,
+            "cancel_stale_inputs": self.cancel_stale_inputs,
+            "allowed_change_labels": list(self.allowed_change_labels),
+            "roles": [role.to_dict() for role in self.roles],
+            "prompts": [prompt.to_dict() for prompt in self.prompts],
+            "configuration_hash": self.configuration_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "SpecialistPipelineConfig":
+        expected_fields = {
+            "enabled",
+            "mode",
+            "aggregate_timeout_seconds",
+            "aggregate_token_budget",
+            "max_concurrency",
+            "cache_enabled",
+            "cache_max_entries",
+            "cancel_stale_inputs",
+            "allowed_change_labels",
+            "roles",
+            "prompts",
+            "configuration_hash",
+        }
+        _require_exact_mapping(value, expected_fields, "specialist pipeline configuration")
+        boolean_fields = ("enabled", "cache_enabled", "cancel_stale_inputs")
+        if any(not isinstance(value[field], bool) for field in boolean_fields):
+            raise SpecialistConfigurationError("specialist pipeline flags must be booleans")
+        if not isinstance(value["mode"], str) or not value["mode"].strip():
+            raise SpecialistConfigurationError("specialist pipeline mode must be a non-blank string")
+        if not isinstance(value["allowed_change_labels"], list) or any(
+            not isinstance(label, str) for label in value["allowed_change_labels"]
+        ):
+            raise SpecialistConfigurationError("allowed_change_labels must be a string list")
+        if not isinstance(value["roles"], list) or not isinstance(value["prompts"], list):
+            raise SpecialistConfigurationError("specialist roles and prompts must be lists")
+        roles = tuple(SpecialistRoleConfig.from_dict(role) for role in value["roles"])
+        prompts = tuple(SpecialistPrompt.from_dict(prompt) for prompt in value["prompts"])
+        expected_roles = set(SpecialistRole)
+        if len(roles) != len(expected_roles) or {role.role for role in roles} != expected_roles:
+            raise SpecialistConfigurationError("specialist roles must contain each supported role exactly once")
+        if len(prompts) != len(expected_roles) or {prompt.role for prompt in prompts} != expected_roles:
+            raise SpecialistConfigurationError("specialist prompts must contain each supported role exactly once")
+        labels = _string_tuple(value["allowed_change_labels"], "allowed_change_labels")
+        canonical_labels = tuple(sorted(set(labels)))
+        if not labels or tuple(value["allowed_change_labels"]) != canonical_labels:
+            raise SpecialistConfigurationError("allowed_change_labels must use canonical sorted unique values")
+        integer_fields = ("aggregate_token_budget", "max_concurrency", "cache_max_entries")
+        if any(not isinstance(value[field], int) or isinstance(value[field], bool) for field in integer_fields):
+            raise SpecialistConfigurationError("specialist pipeline budgets and limits must be integers")
+        if (
+            not isinstance(value["aggregate_timeout_seconds"], (int, float))
+            or isinstance(value["aggregate_timeout_seconds"], bool)
+            or not isfinite(value["aggregate_timeout_seconds"])
+        ):
+            raise SpecialistConfigurationError("aggregate_timeout_seconds must be a finite number")
+        _positive_float(value["aggregate_timeout_seconds"], "aggregate_timeout_seconds")
+        _positive_int(value["aggregate_token_budget"], "aggregate_token_budget")
+        _positive_int(value["max_concurrency"], "max_concurrency")
+        _positive_int(value["cache_max_entries"], "cache_max_entries")
+        pipeline = cls(
+            enabled=value["enabled"],
+            mode=value["mode"],
+            aggregate_timeout_seconds=value["aggregate_timeout_seconds"],
+            aggregate_token_budget=value["aggregate_token_budget"],
+            max_concurrency=value["max_concurrency"],
+            cache_enabled=value["cache_enabled"],
+            cache_max_entries=value["cache_max_entries"],
+            cancel_stale_inputs=value["cancel_stale_inputs"],
+            allowed_change_labels=labels,
+            roles=roles,
+            prompts=prompts,
+        )
+        if value["configuration_hash"] != pipeline.configuration_hash:
+            raise SpecialistConfigurationError("specialist pipeline configuration hash mismatch")
+        return pipeline
+
     def __post_init__(self) -> None:
         if self.enabled and self.mode != "shadow":
             raise SpecialistConfigurationError("specialist_pipeline.mode must remain 'shadow'")
@@ -297,6 +536,7 @@ class SpecialistPipelineConfig:
             raise SpecialistConfigurationError("allowed_change_labels cannot contain blank entries")
         object.__setattr__(self, "allowed_change_labels", labels)
         identity = {
+            "enabled": self.enabled,
             "mode": self.mode,
             "aggregate_timeout_seconds": self.aggregate_timeout_seconds,
             "aggregate_token_budget": self.aggregate_token_budget,

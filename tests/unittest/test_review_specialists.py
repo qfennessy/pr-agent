@@ -6,6 +6,7 @@ import pytest
 
 from pr_agent.algo.ai_request_context import get_ai_request_options
 from pr_agent.algo.review_specialists import (
+    SpecialistConfigurationError,
     SpecialistOutputError,
     SpecialistPipelineConfig,
     SpecialistPrompt,
@@ -130,6 +131,93 @@ def _pipeline(
         roles=tuple(role_configs),
         prompts=tuple(_prompt(role, suffix=prompt_suffix) for role in SpecialistRole),
     )
+
+
+def test_specialist_configuration_contracts_round_trip_without_changing_identity():
+    role = _role_config(
+        SpecialistRole.CHANGE_CLASSIFICATION,
+        model="provider/model@revision",
+        deployment="primary-deployment",
+        fallback_models=("provider/fallback@revision",),
+        fallback_deployments=(None,),
+        timeout_seconds=1.25,
+        input_token_budget=9_001,
+        output_token_budget=777,
+    )
+    assert SpecialistRoleConfig.from_dict(role.to_dict()) == role
+
+    prompt = SpecialistPrompt(
+        role=SpecialistRole.CHANGE_CLASSIFICATION,
+        prompt_version="prompt-v2",
+        input_schema_version="input-v2",
+        schema_version="output-v2",
+        system="  Preserve this exact system prompt.\n",
+        user="Input: {{ specialist_input_json }}\n",
+    )
+    prompt_payload = prompt.to_dict()
+    restored_prompt = SpecialistPrompt.from_dict(prompt_payload)
+    assert restored_prompt == prompt
+    assert restored_prompt.content_hash == prompt.content_hash
+    assert restored_prompt.system == "  Preserve this exact system prompt.\n"
+
+    pipeline = _pipeline(roles=(role, *tuple(_role_config(item) for item in tuple(SpecialistRole)[1:])))
+    pipeline_payload = json.loads(json.dumps(pipeline.to_dict()))
+    restored_pipeline = SpecialistPipelineConfig.from_dict(pipeline_payload)
+    assert restored_pipeline == pipeline
+    assert restored_pipeline.configuration_hash == pipeline.configuration_hash
+    assert restored_pipeline.to_dict() == pipeline_payload
+
+
+@pytest.mark.parametrize(
+    "contract,payload",
+    [
+        (SpecialistRoleConfig, _role_config(SpecialistRole.CHANGE_CLASSIFICATION).to_dict()),
+        (SpecialistPrompt, _prompt(SpecialistRole.CHANGE_CLASSIFICATION).to_dict()),
+        (SpecialistPipelineConfig, _pipeline().to_dict()),
+    ],
+)
+def test_specialist_configuration_contracts_reject_unknown_and_missing_fields(contract, payload):
+    with_unknown = dict(payload)
+    with_unknown["unexpected"] = True
+    with pytest.raises(SpecialistConfigurationError, match="invalid .* fields"):
+        contract.from_dict(with_unknown)
+
+    with_missing = dict(payload)
+    with_missing.pop(next(iter(with_missing)))
+    with pytest.raises(SpecialistConfigurationError, match="invalid .* fields"):
+        contract.from_dict(with_missing)
+
+
+def test_specialist_configuration_contracts_reject_malformed_and_tampered_payloads():
+    malformed_role = _role_config(SpecialistRole.CHANGE_CLASSIFICATION).to_dict()
+    malformed_role["enabled"] = "true"
+    with pytest.raises(SpecialistConfigurationError, match="enabled must be a boolean"):
+        SpecialistRoleConfig.from_dict(malformed_role)
+
+    tampered_prompt = _prompt(SpecialistRole.CHANGE_CLASSIFICATION).to_dict()
+    tampered_prompt["system"] = "changed after hashing"
+    with pytest.raises(SpecialistConfigurationError, match="content hash mismatch"):
+        SpecialistPrompt.from_dict(tampered_prompt)
+
+    tampered_pipeline = _pipeline().to_dict()
+    tampered_pipeline["aggregate_token_budget"] += 1
+    with pytest.raises(SpecialistConfigurationError, match="configuration hash mismatch"):
+        SpecialistPipelineConfig.from_dict(tampered_pipeline)
+
+    enabled_tamper = _pipeline().to_dict()
+    enabled_tamper["enabled"] = False
+    with pytest.raises(SpecialistConfigurationError, match="configuration hash mismatch"):
+        SpecialistPipelineConfig.from_dict(enabled_tamper)
+
+    noncanonical_labels = _pipeline().to_dict()
+    noncanonical_labels["allowed_change_labels"] = ["tests", "schema", "other"]
+    with pytest.raises(SpecialistConfigurationError, match="canonical sorted unique values"):
+        SpecialistPipelineConfig.from_dict(noncanonical_labels)
+
+    malformed_pipeline = _pipeline().to_dict()
+    malformed_pipeline["roles"] = {"not": "a list"}
+    with pytest.raises(SpecialistConfigurationError, match="roles and prompts must be lists"):
+        SpecialistPipelineConfig.from_dict(malformed_pipeline)
 
 
 def _outputs_for_evidence(specialist_input, evidence, *, label="schema"):

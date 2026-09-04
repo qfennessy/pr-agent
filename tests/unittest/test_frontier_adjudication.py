@@ -2,6 +2,7 @@ import asyncio
 import json
 import threading
 import time
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ from pr_agent.algo.frontier_adjudication import (
     FrontierAdjudicationConfig,
     FrontierAdjudicationRequest,
     FrontierCandidate,
+    FrontierContractError,
     FrontierDecision,
     FrontierEvidence,
     FrontierModelIdentity,
@@ -175,6 +177,78 @@ def config(
         minimum_confidence=minimum_confidence,
         stage_timeout_seconds=stage_timeout,
     )
+
+
+def test_frontier_configuration_round_trips_exact_route_prompts_and_hashes():
+    stage_config = config(fallback=True)
+    deployments = ("primary-deployment", "fallback-deployment")
+    stage_config = replace(
+        stage_config,
+        route=replace(
+            stage_config.route,
+            deployments=deployments,
+            attribution="frontier-adjudication",
+        ),
+        model_identities=tuple(
+            replace(identity, deployment=deployment)
+            for identity, deployment in zip(stage_config.model_identities, deployments, strict=True)
+        ),
+        system_prompt="  Preserve exact system text.\n",
+        user_prompt="Evidence: {{ adjudication_input_json }}\n",
+        policy_version="frontier-policy-pinned-v2",
+    )
+    payload = json.loads(json.dumps(stage_config.to_dict()))
+
+    restored = FrontierAdjudicationConfig.from_dict(payload)
+
+    assert restored == stage_config
+    assert restored.configuration_hash == stage_config.configuration_hash
+    assert restored.prompt_hash == stage_config.prompt_hash
+    assert restored.system_prompt == "  Preserve exact system text.\n"
+    assert restored.route.deployments == deployments
+    assert restored.route.attribution == "frontier-adjudication"
+    assert restored.to_dict() == payload
+
+
+def test_frontier_configuration_rejects_unknown_missing_and_malformed_fields():
+    payload = config().to_dict()
+
+    with_unknown = dict(payload)
+    with_unknown["unexpected"] = True
+    with pytest.raises(FrontierContractError, match="invalid frontier adjudication configuration fields"):
+        FrontierAdjudicationConfig.from_dict(with_unknown)
+
+    with_missing = dict(payload)
+    with_missing.pop("policy_version")
+    with pytest.raises(FrontierContractError, match="invalid frontier adjudication configuration fields"):
+        FrontierAdjudicationConfig.from_dict(with_missing)
+
+    malformed = json.loads(json.dumps(payload))
+    malformed["route"]["collect_cost"] = "true"
+    with pytest.raises(FrontierContractError, match="collect_cost must be a boolean"):
+        FrontierAdjudicationConfig.from_dict(malformed)
+
+    unknown_route = json.loads(json.dumps(payload))
+    unknown_route["route"]["api_key"] = "must-not-be-accepted"
+    with pytest.raises(FrontierContractError, match="invalid frontier adjudication route fields"):
+        FrontierAdjudicationConfig.from_dict(unknown_route)
+
+
+def test_frontier_configuration_rejects_prompt_and_configuration_tampering():
+    prompt_tamper = config().to_dict()
+    prompt_tamper["system_prompt"] = "changed after hashing"
+    with pytest.raises(FrontierContractError, match="prompt hash mismatch"):
+        FrontierAdjudicationConfig.from_dict(prompt_tamper)
+
+    configuration_tamper = config().to_dict()
+    configuration_tamper["max_calls"] += 1
+    with pytest.raises(FrontierContractError, match="configuration hash mismatch"):
+        FrontierAdjudicationConfig.from_dict(configuration_tamper)
+
+    attribution_tamper = config().to_dict()
+    attribution_tamper["route"]["attribution"] = "changed-after-hashing"
+    with pytest.raises(FrontierContractError, match="configuration hash mismatch"):
+        FrontierAdjudicationConfig.from_dict(attribution_tamper)
 
 
 def request(stage_config, *, signals=None, snapshot_id="head-1", evidence=None):

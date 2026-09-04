@@ -1,16 +1,21 @@
 """Bounded repository-evidence retrieval and result validation for review candidates."""
 
 import asyncio
+import copy
 import fnmatch
 import hashlib
 import json
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from math import isfinite
+from numbers import Integral
 from pathlib import PurePosixPath
-from typing import Callable, Iterable, Mapping, Optional
+from types import MappingProxyType
+from typing import Any, Callable, Iterable, Mapping, Optional
 
+from pr_agent.algo.ai_request_context import AIModelRoute
 from pr_agent.algo.git_patch_processing import (
     RE_HUNK_HEADER,
     iter_git_patch_lines,
@@ -24,7 +29,13 @@ from pr_agent.algo.review_specialists import (
     SpecialistState,
 )
 from pr_agent.algo.types import EDIT_TYPE
+from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
+
+CANDIDATE_VERIFICATION_CONFIG_SCHEMA_VERSION = "candidate-verification-config-v1"
+CANDIDATE_VERIFICATION_PROMPT_VERSION = "candidate-verification-prompt-v1"
+CANDIDATE_VERIFICATION_INPUT_SCHEMA_VERSION = "candidate-verification-input-v1"
+CANDIDATE_VERIFICATION_OUTPUT_SCHEMA_VERSION = "candidate-verification-output-v1"
 
 _TELEMETRY_SAFE_DECISION_REASONS = frozenset({
     "duplicate_decision",
@@ -49,6 +60,11 @@ _PATCH_CHANGED_EVIDENCE_SOURCES = frozenset({"changed_patch", "changed_context_p
 _CHANGED_EVIDENCE_SOURCES = _ATOMIC_CHANGED_EVIDENCE_SOURCES | {"changed_context_head"}
 _MAX_CONTEXT_SYMBOLS_PER_CANDIDATE = 32
 _MAX_CONTEXT_SYMBOL_CHARACTERS = 256
+_SHA256_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+class CandidateVerificationOutputBudgetError(ValueError):
+    """Raised when no safe bounded verifier completion budget can be resolved."""
 
 
 def _is_atomic_prompt_evidence(item: Mapping) -> bool:
@@ -125,6 +141,670 @@ class VerificationBudgets:
     timeout_seconds: float = 10.0
 
 
+def _candidate_verification_hash(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _freeze_static_evidence_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_static_evidence_value(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_static_evidence_value(item) for item in value)
+    return value
+
+
+def _thaw_static_evidence_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_static_evidence_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_static_evidence_value(item) for item in value]
+    return value
+
+
+def _provider_control_value(value: Any) -> Any:
+    """Return a detached JSON value suitable for provider-control identity."""
+    if isinstance(value, Mapping):
+        return {str(key): _provider_control_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_provider_control_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def candidate_verification_provider_controls_hash(
+    settings: Any,
+    *,
+    claude_extended_thinking_models: Optional[tuple[str, ...] | list[str]] = None,
+) -> str:
+    """Bind ambient LiteLLM controls that can change verifier request semantics."""
+
+    def section_value(section_name: str, key: str, default: Any = None) -> Any:
+        section = getattr(settings, section_name, None)
+        if isinstance(section, Mapping):
+            return section.get(key, default)
+        getter = getattr(section, "get", None)
+        if callable(getter):
+            return getter(key, default)
+        return getattr(section, key, default) if section is not None else default
+
+    openrouter = settings.get("openrouter", {}) or {}
+    if not isinstance(openrouter, Mapping):
+        openrouter = {}
+    payload = {
+        "config": {
+            key: _provider_control_value(section_value("config", key, default))
+            for key, default in (
+                ("reasoning_effort", None),
+                ("custom_reasoning_model", False),
+                ("max_output_tokens", 0),
+                ("enable_claude_adaptive_thinking", False),
+                ("enable_claude_extended_thinking", False),
+                ("extended_thinking_budget_tokens", 2048),
+                ("extended_thinking_max_output_tokens", 4096),
+                ("claude_extended_thinking_models_override", []),
+                ("seed", -1),
+                ("add_user_to_requests", False),
+                ("git_provider", ""),
+            )
+        },
+        "openrouter": {
+            key: _provider_control_value(openrouter.get(key, default))
+            for key, default in (
+                ("provider_only", []),
+                ("provider_order", []),
+                ("allow_fallbacks", True),
+                ("reasoning_effort", ""),
+                ("reasoning_max_tokens", 0),
+                ("max_tokens", 0),
+            )
+        },
+        "litellm": {
+            key: _provider_control_value(section_value("litellm", key, default))
+            for key, default in (
+                ("cache_control_injection_points", None),
+                ("custom_llm_provider", ""),
+                ("extra_headers", None),
+                ("extra_body", None),
+                ("model_id", None),
+                ("enable_callbacks", False),
+            )
+        },
+        "claude_extended_thinking_models": _provider_control_value(
+            claude_extended_thinking_models
+        ),
+    }
+    return _candidate_verification_hash(payload)
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateVerificationConfig:
+    """One immutable candidate-verification route, budget, and prompt contract."""
+
+    route: AIModelRoute
+    budgets: VerificationBudgets
+    max_calls: int
+    max_sensitive_candidates: int
+    sensitive_path_globs: tuple[str, ...]
+    consume_specialist_prioritization: bool
+    temperature: float
+    strict_output_policy: bool
+    max_findings: int
+    static_analysis_evidence_hash: str
+    provider_controls_hash: str
+    effective_output_token_caps: tuple[int, ...]
+    system_prompt: str = field(repr=False)
+    user_prompt: str = field(repr=False)
+    static_analysis_evidence: tuple[Any, ...] = field(default=(), repr=False, compare=False)
+    prompt_version: str = CANDIDATE_VERIFICATION_PROMPT_VERSION
+    input_schema_version: str = CANDIDATE_VERIFICATION_INPUT_SCHEMA_VERSION
+    output_schema_version: str = CANDIDATE_VERIFICATION_OUTPUT_SCHEMA_VERSION
+    schema_version: str = CANDIDATE_VERIFICATION_CONFIG_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != CANDIDATE_VERIFICATION_CONFIG_SCHEMA_VERSION:
+            raise ValueError("unsupported candidate verification configuration schema")
+        if self.prompt_version != CANDIDATE_VERIFICATION_PROMPT_VERSION:
+            raise ValueError("unsupported candidate verification prompt version")
+        if self.input_schema_version != CANDIDATE_VERIFICATION_INPUT_SCHEMA_VERSION:
+            raise ValueError("unsupported candidate verification input schema")
+        if self.output_schema_version != CANDIDATE_VERIFICATION_OUTPUT_SCHEMA_VERSION:
+            raise ValueError("unsupported candidate verification output schema")
+        for name, value in (
+            ("max_calls", self.max_calls),
+            ("max_sensitive_candidates", self.max_sensitive_candidates),
+            ("max_findings", self.max_findings),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"candidate verification {name} must be a non-negative integer")
+        for name, value in (
+            ("max_candidates", self.budgets.max_candidates),
+            ("max_files", self.budgets.max_files),
+            ("max_lines_per_file", self.budgets.max_lines_per_file),
+            ("max_total_lines", self.budgets.max_total_lines),
+            ("max_context_tokens", self.budgets.max_context_tokens),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"candidate verification {name} must be a non-negative integer")
+        if (
+            not isinstance(self.budgets.timeout_seconds, (int, float))
+            or isinstance(self.budgets.timeout_seconds, bool)
+            or not isfinite(self.budgets.timeout_seconds)
+            or self.budgets.timeout_seconds < 0
+        ):
+            raise ValueError("candidate verification timeout_seconds must be finite and non-negative")
+        if (
+            not isinstance(self.temperature, (int, float))
+            or isinstance(self.temperature, bool)
+            or not isfinite(self.temperature)
+        ):
+            raise ValueError("candidate verification temperature must be finite")
+        if not isinstance(self.consume_specialist_prioritization, bool):
+            raise ValueError("candidate verification specialist prioritization flag must be boolean")
+        if not isinstance(self.strict_output_policy, bool):
+            raise ValueError("candidate verification strict output policy flag must be boolean")
+        if not isinstance(self.static_analysis_evidence_hash, str) or not _SHA256_ID_PATTERN.fullmatch(
+            self.static_analysis_evidence_hash
+        ):
+            raise ValueError("candidate verification static analysis evidence hash is invalid")
+        if not isinstance(self.provider_controls_hash, str) or not _SHA256_ID_PATTERN.fullmatch(
+            self.provider_controls_hash
+        ):
+            raise ValueError("candidate verification provider controls hash is invalid")
+        if (
+            not isinstance(self.effective_output_token_caps, tuple)
+            or len(self.effective_output_token_caps) != len(self.route.models)
+            or any(
+                isinstance(cap, bool) or not isinstance(cap, int) or cap < 1
+                for cap in self.effective_output_token_caps
+            )
+        ):
+            raise ValueError("candidate verification effective output token caps are invalid")
+        if not isinstance(self.static_analysis_evidence, tuple):
+            raise ValueError("candidate verification static analysis evidence must be an immutable tuple")
+        if _candidate_verification_hash(
+            _thaw_static_evidence_value(self.static_analysis_evidence)
+        ) != self.static_analysis_evidence_hash:
+            raise ValueError("candidate verification static analysis evidence hash mismatch")
+        if not isinstance(self.sensitive_path_globs, tuple):
+            raise ValueError("candidate verification sensitive path globs must be an immutable tuple")
+        if any(not isinstance(glob, str) or not glob.strip() for glob in self.sensitive_path_globs):
+            raise ValueError("candidate verification sensitive path globs must be non-blank strings")
+        if (
+            not isinstance(self.system_prompt, str)
+            or not self.system_prompt.strip()
+            or not isinstance(self.user_prompt, str)
+            or not self.user_prompt.strip()
+        ):
+            raise ValueError("candidate verification prompt must be non-blank")
+
+    def _configuration_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "route": {
+                "models": list(self.route.models),
+                "deployments": list(self.route.deployments),
+                "timeout_seconds": self.route.timeout_seconds,
+                "model_retries": self.route.model_retries,
+                "provider_retries": self.route.provider_retries,
+                "max_output_tokens": self.route.max_output_tokens,
+                "attribution": self.route.attribution,
+                "collect_cost": self.route.collect_cost,
+            },
+            "budgets": {
+                "max_candidates": self.budgets.max_candidates,
+                "max_files": self.budgets.max_files,
+                "max_lines_per_file": self.budgets.max_lines_per_file,
+                "max_total_lines": self.budgets.max_total_lines,
+                "max_context_tokens": self.budgets.max_context_tokens,
+                "timeout_seconds": self.budgets.timeout_seconds,
+            },
+            "max_calls": self.max_calls,
+            "max_sensitive_candidates": self.max_sensitive_candidates,
+            "sensitive_path_globs": list(self.sensitive_path_globs),
+            "consume_specialist_prioritization": self.consume_specialist_prioritization,
+            "temperature": self.temperature,
+            "strict_output_policy": self.strict_output_policy,
+            "max_findings": self.max_findings,
+            "static_analysis_evidence_hash": self.static_analysis_evidence_hash,
+            "provider_controls_hash": self.provider_controls_hash,
+            "effective_output_token_caps": list(self.effective_output_token_caps),
+            "prompt_version": self.prompt_version,
+            "input_schema_version": self.input_schema_version,
+            "output_schema_version": self.output_schema_version,
+        }
+
+    @property
+    def configuration_hash(self) -> str:
+        return _candidate_verification_hash(self._configuration_payload())
+
+    @property
+    def prompt_hash(self) -> str:
+        return _candidate_verification_hash({
+            "prompt_version": self.prompt_version,
+            "system": self.system_prompt,
+            "user": self.user_prompt,
+        })
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self._configuration_payload(),
+            "system_prompt": self.system_prompt,
+            "user_prompt": self.user_prompt,
+            "configuration_hash": self.configuration_hash,
+            "prompt_hash": self.prompt_hash,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        static_analysis_evidence: Optional[tuple[Any, ...] | list[Any]] = None,
+    ) -> "CandidateVerificationConfig":
+        expected_fields = {
+            "schema_version", "route", "budgets", "max_calls", "max_sensitive_candidates",
+            "sensitive_path_globs", "consume_specialist_prioritization", "temperature",
+            "strict_output_policy", "max_findings", "prompt_version", "input_schema_version",
+            "output_schema_version", "static_analysis_evidence_hash", "system_prompt", "user_prompt",
+            "provider_controls_hash", "effective_output_token_caps", "configuration_hash", "prompt_hash",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected_fields:
+            raise ValueError("invalid candidate verification configuration fields")
+        route = value.get("route")
+        budgets = value.get("budgets")
+        if not isinstance(route, Mapping) or not isinstance(budgets, Mapping):
+            raise ValueError("invalid candidate verification route or budgets")
+        if set(route) != {
+            "models", "deployments", "timeout_seconds", "model_retries", "provider_retries",
+            "max_output_tokens", "attribution", "collect_cost",
+        } or set(budgets) != {
+            "max_candidates", "max_files", "max_lines_per_file", "max_total_lines",
+            "max_context_tokens", "timeout_seconds",
+        }:
+            raise ValueError("invalid candidate verification route or budget fields")
+        if not isinstance(route.get("models"), list) or not isinstance(route.get("deployments"), list):
+            raise ValueError("invalid candidate verification route values")
+        models = route["models"]
+        deployments = route["deployments"]
+        if not models or any(not isinstance(model, str) or not model.strip() for model in models):
+            raise ValueError("invalid candidate verification route models")
+        if len(deployments) != len(models) or any(
+            deployment is not None
+            and (not isinstance(deployment, str) or not deployment.strip())
+            for deployment in deployments
+        ):
+            raise ValueError("invalid candidate verification route deployments")
+        timeout_seconds = route["timeout_seconds"]
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("invalid candidate verification route timeout")
+        model_retries = route["model_retries"]
+        provider_retries = route["provider_retries"]
+        max_output_tokens = route["max_output_tokens"]
+        if isinstance(model_retries, bool) or not isinstance(model_retries, int) or model_retries < 1:
+            raise ValueError("invalid candidate verification route model retries")
+        if isinstance(provider_retries, bool) or not isinstance(provider_retries, int) or provider_retries < 0:
+            raise ValueError("invalid candidate verification route provider retries")
+        if max_output_tokens is not None and (
+            isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or max_output_tokens < 1
+        ):
+            raise ValueError("invalid candidate verification route output cap")
+        if route["attribution"] != "candidate_verification" or not isinstance(route["collect_cost"], bool):
+            raise ValueError("invalid candidate verification route attribution")
+        if not isinstance(value.get("sensitive_path_globs"), list):
+            raise ValueError("invalid candidate verification sensitive path globs")
+        effective_output_token_caps = value.get("effective_output_token_caps")
+        if (
+            not isinstance(effective_output_token_caps, list)
+            or len(effective_output_token_caps) != len(models)
+            or any(
+                isinstance(cap, bool) or not isinstance(cap, int) or cap < 1
+                for cap in effective_output_token_caps
+            )
+        ):
+            raise ValueError("invalid candidate verification effective output token caps")
+        serialized_evidence_hash = value.get("static_analysis_evidence_hash")
+        if static_analysis_evidence is None:
+            if serialized_evidence_hash != _candidate_verification_hash([]):
+                raise ValueError("candidate verification replay requires static analysis evidence reattachment")
+            frozen_static_evidence: tuple[Any, ...] = ()
+        else:
+            if not isinstance(static_analysis_evidence, (list, tuple)):
+                raise ValueError("candidate verification static analysis evidence must be a list or tuple")
+            captured_static_evidence = copy.deepcopy(_thaw_static_evidence_value(static_analysis_evidence))
+            frozen_static_evidence = tuple(
+                _freeze_static_evidence_value(item) for item in captured_static_evidence
+            )
+        candidate = cls(
+            route=AIModelRoute(
+                models=tuple(models),
+                deployments=tuple(deployments),
+                timeout_seconds=timeout_seconds,
+                model_retries=model_retries,
+                provider_retries=provider_retries,
+                max_output_tokens=max_output_tokens,
+                attribution=route["attribution"],
+                collect_cost=route["collect_cost"],
+            ),
+            budgets=VerificationBudgets(
+                max_candidates=budgets.get("max_candidates"),
+                max_files=budgets.get("max_files"),
+                max_lines_per_file=budgets.get("max_lines_per_file"),
+                max_total_lines=budgets.get("max_total_lines"),
+                max_context_tokens=budgets.get("max_context_tokens"),
+                timeout_seconds=budgets.get("timeout_seconds"),
+            ),
+            max_calls=value.get("max_calls"),
+            max_sensitive_candidates=value.get("max_sensitive_candidates"),
+            sensitive_path_globs=tuple(value.get("sensitive_path_globs", ())),
+            consume_specialist_prioritization=value.get("consume_specialist_prioritization"),
+            temperature=value.get("temperature"),
+            strict_output_policy=value.get("strict_output_policy"),
+            max_findings=value.get("max_findings"),
+            static_analysis_evidence_hash=serialized_evidence_hash,
+            provider_controls_hash=value.get("provider_controls_hash"),
+            effective_output_token_caps=tuple(effective_output_token_caps),
+            system_prompt=value.get("system_prompt"),
+            user_prompt=value.get("user_prompt"),
+            static_analysis_evidence=frozen_static_evidence,
+            prompt_version=value.get("prompt_version"),
+            input_schema_version=value.get("input_schema_version"),
+            output_schema_version=value.get("output_schema_version"),
+            schema_version=value.get("schema_version"),
+        )
+        if value.get("configuration_hash") != candidate.configuration_hash:
+            raise ValueError("candidate verification configuration hash mismatch")
+        if value.get("prompt_hash") != candidate.prompt_hash:
+            raise ValueError("candidate verification prompt hash mismatch")
+        return candidate
+
+
+def parse_candidate_verification_config(
+    section: Mapping[str, Any],
+    prompt: Mapping[str, Any],
+    *,
+    primary_model: str,
+    global_deployment: Optional[str] = None,
+    azure: bool = False,
+    temperature: float = 0.0,
+    inherited_max_output_tokens: int = 0,
+    default_output_token_cap: int = 1500,
+    max_candidates_override: Optional[int] = None,
+    strict_output_policy: bool = False,
+    static_analysis_evidence_hash: Optional[str] = None,
+    static_analysis_evidence: tuple[Any, ...] = (),
+    provider_controls_hash: Optional[str] = None,
+    output_token_cap_resolver: Optional[Callable[[str, Optional[int]], Optional[int]]] = None,
+) -> CandidateVerificationConfig:
+    """Parse a verifier contract from explicit mappings without ambient settings reads."""
+
+    if not isinstance(section, Mapping) or not isinstance(prompt, Mapping):
+        raise ValueError("candidate verification settings and prompt must be mappings")
+
+    def integer(key: str, default: int) -> int:
+        raw = section.get(key, default)
+        if isinstance(raw, bool):
+            raise ValueError(f"{key} must be a non-boolean integer")
+        if isinstance(raw, Integral):
+            return int(raw)
+        if isinstance(raw, str):
+            try:
+                return int(raw.strip(), 10)
+            except ValueError as exc:
+                raise ValueError(f"{key} must be a non-boolean integer") from exc
+        raise ValueError(f"{key} must be a non-boolean integer")
+
+    def number(key: str, default: float) -> float:
+        raw = section.get(key, default)
+        if isinstance(raw, bool):
+            raise ValueError(f"{key} must be a non-boolean number")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be a non-boolean number") from exc
+        if not isfinite(value):
+            raise ValueError(f"{key} must be finite")
+        return value
+
+    def string_tuple(key: str) -> tuple[str, ...]:
+        raw = section.get(key, [])
+        if raw in (None, "", []):
+            return ()
+        if isinstance(raw, str):
+            values = tuple(part.strip() for part in raw.split(","))
+        elif isinstance(raw, (list, tuple)) and all(isinstance(part, str) for part in raw):
+            values = tuple(part.strip() for part in raw)
+        else:
+            raise ValueError(f"{key} must be a string list")
+        if any(not value for value in values):
+            raise ValueError(f"{key} cannot contain blank entries")
+        return values
+
+    def deployment_tuple(key: str) -> tuple[Optional[str], ...]:
+        raw = section.get(key, [])
+        if raw in (None, "", []):
+            return ()
+        if isinstance(raw, str):
+            values = raw.split(",")
+        elif isinstance(raw, (list, tuple)) and all(isinstance(part, str) for part in raw):
+            values = raw
+        else:
+            raise ValueError(f"{key} must be a string list")
+        return tuple(str(part).strip() or None for part in values)
+
+    configured_model = str(section.get("candidate_verification_model", "") or "").strip()
+    primary_model = str(primary_model or "").strip()
+    model = configured_model or primary_model
+    if not model:
+        raise ValueError("candidate verifier model cannot be blank")
+    fallback_models = string_tuple("candidate_verification_fallback_models")
+    global_deployment = str(global_deployment or "").strip() or None
+    explicit_deployment = str(section.get("candidate_verification_deployment", "") or "").strip() or None
+    azure_route = azure is True or global_deployment is not None
+    if explicit_deployment is not None:
+        deployment = explicit_deployment
+    elif not configured_model or model == primary_model:
+        deployment = global_deployment
+    elif azure_route:
+        raise ValueError("candidate_verification_deployment is required when the Azure verifier model differs")
+    else:
+        deployment = None
+    fallback_deployments = deployment_tuple("candidate_verification_fallback_deployments")
+    if fallback_deployments and len(fallback_deployments) != len(fallback_models):
+        raise ValueError("candidate_verification_fallback_deployments must match fallback models")
+    if not fallback_deployments:
+        if azure_route and fallback_models:
+            raise ValueError("Azure verifier fallback models require matching fallback deployments")
+        fallback_deployments = (None,) * len(fallback_models)
+    deployments = (deployment, *fallback_deployments)
+    if azure_route and any(item is None for item in deployments):
+        raise ValueError("every Azure verifier model requires a deployment")
+
+    configured_output_cap = integer("candidate_verification_max_output_tokens", 0)
+    if configured_output_cap < 0:
+        raise ValueError("candidate_verification_max_output_tokens cannot be negative")
+    inherited_output_cap = 0
+    if configured_output_cap == 0:
+        if isinstance(inherited_max_output_tokens, bool):
+            raise ValueError("max_output_tokens must be a non-boolean integer")
+        try:
+            inherited_output_cap = int(inherited_max_output_tokens)
+        except (TypeError, ValueError):
+            inherited_output_cap = 0
+    route_output_cap = configured_output_cap or inherited_output_cap or None
+    models = (model, *fallback_models)
+
+    def resolve_output_caps(request_cap: Optional[int]) -> tuple[Optional[int], ...]:
+        if output_token_cap_resolver is None:
+            return tuple(request_cap for _ in models)
+        return tuple(output_token_cap_resolver(route_model, request_cap) for route_model in models)
+
+    try:
+        effective_output_caps = resolve_output_caps(route_output_cap)
+    except ValueError as exc:
+        raise CandidateVerificationOutputBudgetError(str(exc)) from exc
+    if any(cap is None for cap in effective_output_caps):
+        if (
+            isinstance(default_output_token_cap, bool)
+            or not isinstance(default_output_token_cap, int)
+            or default_output_token_cap < 1
+        ):
+            raise ValueError("default_output_token_cap must be a positive integer")
+        route_output_cap = default_output_token_cap
+        try:
+            effective_output_caps = resolve_output_caps(route_output_cap)
+        except ValueError as exc:
+            raise CandidateVerificationOutputBudgetError(str(exc)) from exc
+    if any(
+        cap is None or isinstance(cap, bool) or not isinstance(cap, int) or cap < 1
+        for cap in effective_output_caps
+    ):
+        raise CandidateVerificationOutputBudgetError("candidate verifier output cap could not be resolved")
+    if max_candidates_override is not None and (
+        isinstance(max_candidates_override, bool)
+        or not isinstance(max_candidates_override, int)
+        or max_candidates_override <= 0
+    ):
+        raise ValueError("routed max_verification_candidates must be a positive integer")
+    max_candidates = (
+        max_candidates_override
+        if max_candidates_override is not None
+        else max(0, integer("candidate_verification_max_candidates", 3))
+    )
+    timeout_seconds = max(0.0, number("candidate_verification_timeout_seconds", 10))
+    globs = string_tuple("candidate_verification_sensitive_path_globs")
+    specialist_value = section.get("candidate_verification_consume_specialist_prioritization", False)
+    if isinstance(specialist_value, str):
+        specialist_value = specialist_value.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        specialist_value = bool(specialist_value)
+
+    def prompt_string(key: str, default: Optional[str] = None) -> str:
+        raw = prompt.get(key, default)
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"candidate verification prompt {key} must be a non-blank string")
+        return raw
+
+    return CandidateVerificationConfig(
+        route=AIModelRoute(
+            models=models,
+            deployments=deployments,
+            timeout_seconds=max(0.001, timeout_seconds),
+            model_retries=1,
+            provider_retries=0,
+            max_output_tokens=route_output_cap,
+            attribution="candidate_verification",
+        ),
+        budgets=VerificationBudgets(
+            max_candidates=max_candidates,
+            max_files=max(0, integer("candidate_verification_max_files", 6)),
+            max_lines_per_file=max(0, integer("candidate_verification_max_lines_per_file", 160)),
+            max_total_lines=max(0, integer("candidate_verification_max_total_lines", 600)),
+            max_context_tokens=max(0, integer("candidate_verification_max_context_tokens", 6000)),
+            timeout_seconds=timeout_seconds,
+        ),
+        max_calls=max(0, integer("candidate_verification_max_model_calls", 1)),
+        max_sensitive_candidates=max(0, integer("candidate_verification_max_sensitive_candidates", 6)),
+        sensitive_path_globs=globs,
+        consume_specialist_prioritization=specialist_value,
+        temperature=float(temperature),
+        strict_output_policy=strict_output_policy,
+        max_findings=max(0, integer("num_max_findings", 3)),
+        static_analysis_evidence_hash=(
+            static_analysis_evidence_hash
+            if static_analysis_evidence_hash is not None
+            else _candidate_verification_hash([])
+        ),
+        provider_controls_hash=(
+            provider_controls_hash
+            if provider_controls_hash is not None
+            else _candidate_verification_hash({})
+        ),
+        effective_output_token_caps=tuple(effective_output_caps),
+        system_prompt=prompt_string("system"),
+        user_prompt=prompt_string("user"),
+        static_analysis_evidence=static_analysis_evidence,
+        prompt_version=prompt_string("prompt_version", CANDIDATE_VERIFICATION_PROMPT_VERSION),
+        input_schema_version=prompt_string("input_schema_version", CANDIDATE_VERIFICATION_INPUT_SCHEMA_VERSION),
+        output_schema_version=prompt_string("schema_version", CANDIDATE_VERIFICATION_OUTPUT_SCHEMA_VERSION),
+    )
+
+
+def load_production_candidate_verification_config(
+    *,
+    settings: Any = None,
+    azure: bool = False,
+    max_candidates_override: Optional[int] = None,
+    strict_output_policy: bool = False,
+    default_output_token_cap: int = 1500,
+    claude_extended_thinking_models: Optional[tuple[str, ...] | list[str]] = None,
+    output_token_cap_resolver: Optional[Callable[[str, Optional[int]], Optional[int]]] = None,
+) -> CandidateVerificationConfig:
+    """Capture the production verifier settings and prompt once for one run."""
+
+    settings = settings if settings is not None else get_settings()
+    prompt_section = settings.pr_review_verification_prompt
+    prompt = {
+        key: value
+        for key in ("system", "user", "prompt_version", "input_schema_version", "schema_version")
+        if (value := getattr(prompt_section, key, None)) is not None
+    }
+    runtime_data = settings.get("data", {}) or {}
+    raw_static_evidence = (
+        runtime_data.get("static_analysis_evidence", [])
+        if isinstance(runtime_data, Mapping)
+        else []
+    )
+    if not isinstance(raw_static_evidence, list):
+        raw_static_evidence = []
+    captured_static_evidence = copy.deepcopy(raw_static_evidence)
+    static_analysis_evidence_hash = _candidate_verification_hash(captured_static_evidence)
+    frozen_static_evidence = tuple(
+        _freeze_static_evidence_value(item)
+        for item in captured_static_evidence
+    )
+    provider_controls_hash = candidate_verification_provider_controls_hash(
+        settings,
+        claude_extended_thinking_models=claude_extended_thinking_models,
+    )
+    config = parse_candidate_verification_config(
+        dict(settings.pr_reviewer),
+        prompt,
+        primary_model=settings.config.model,
+        global_deployment=settings.get("openai.deployment_id", ""),
+        azure=azure,
+        temperature=settings.config.temperature,
+        inherited_max_output_tokens=settings.config.get("max_output_tokens", 0),
+        default_output_token_cap=default_output_token_cap,
+        max_candidates_override=max_candidates_override,
+        strict_output_policy=strict_output_policy,
+        static_analysis_evidence_hash=static_analysis_evidence_hash,
+        static_analysis_evidence=frozen_static_evidence,
+        provider_controls_hash=provider_controls_hash,
+        output_token_cap_resolver=output_token_cap_resolver,
+    )
+    if candidate_verification_provider_controls_hash(
+        settings,
+        claude_extended_thinking_models=claude_extended_thinking_models,
+    ) != provider_controls_hash:
+        raise ValueError("candidate verification provider controls changed during capture")
+    return config
+
+
 _COMPLETE_RETRIEVAL_REQUEST_STATUSES = frozenset({
     "retrieved",
     "satisfied_by_changed_head",
@@ -196,6 +876,20 @@ def telemetry_safe_artifact(artifact: dict) -> dict:
     for key in scalar_keys:
         if key in artifact and isinstance(artifact[key], (str, int, float, bool, type(None))):
             safe[key] = artifact[key]
+    for key in (
+        "configuration_hash", "prompt_hash", "static_analysis_evidence_hash", "provider_controls_hash",
+    ):
+        value = artifact.get(key)
+        if isinstance(value, str) and _SHA256_ID_PATTERN.fullmatch(value):
+            safe[key] = value
+    for key, expected in (
+        ("config_schema_version", CANDIDATE_VERIFICATION_CONFIG_SCHEMA_VERSION),
+        ("prompt_version", CANDIDATE_VERIFICATION_PROMPT_VERSION),
+        ("input_schema_version", CANDIDATE_VERIFICATION_INPUT_SCHEMA_VERSION),
+        ("output_schema_version", CANDIDATE_VERIFICATION_OUTPUT_SCHEMA_VERSION),
+    ):
+        if artifact.get(key) == expected:
+            safe[key] = expected
     for key in mapping_keys:
         value = artifact.get(key)
         if isinstance(value, dict):
@@ -232,6 +926,9 @@ def telemetry_safe_artifact(artifact: dict) -> dict:
                 )
                 if key in item
             }
+            trusted_stable_key = item.get("trusted_stable_key")
+            if isinstance(trusted_stable_key, str) and _SHA256_ID_PATTERN.fullmatch(trusted_stable_key):
+                decision["trusted_stable_key"] = trusted_stable_key
             if "reason" in item:
                 reason = str(item.get("reason") or "")
                 decision["reason"] = (
@@ -1220,10 +1917,10 @@ def _select_excerpt(
     return "\n".join(lines[start - 1:end]), start, end
 
 
-def _matching_static_evidence(candidate: dict, static_evidence: list) -> list[dict]:
+def _matching_static_evidence(candidate: dict, static_evidence: Any) -> list[dict]:
     matches = []
-    for item in static_evidence if isinstance(static_evidence, list) else []:
-        if not isinstance(item, dict):
+    for item in static_evidence if isinstance(static_evidence, (list, tuple)) else []:
+        if not isinstance(item, Mapping):
             continue
         candidate_id = str(item.get("candidate_id") or "").strip()
         path = safe_repo_path(item.get("path"))
@@ -1533,7 +2230,7 @@ def _retrieval_evidence_id(candidate_id: str, path: str, source: str) -> str:
 
 
 async def retrieve_evidence(git_provider, candidates: list[dict], budgets: VerificationBudgets,
-                            static_evidence: list, diff_files: Optional[list] = None,
+                            static_evidence: Any, diff_files: Optional[list] = None,
                             token_counter: Optional[Callable[[str], int]] = None,
                             prefer_pr_head: bool = False) -> tuple[list[dict], dict]:
     """Fetch bounded repository excerpts and return them with an auditable retrieval record."""
@@ -2858,6 +3555,7 @@ def apply_verification_decisions(
         seen_findings.add(finding_key)
         seen_identities.add(identity)
         verified_findings.append(finding)
+        record["trusted_stable_key"] = identity[1]
         record["evidence_paths"] = normalized_citations
         result_records.append(record)
 
