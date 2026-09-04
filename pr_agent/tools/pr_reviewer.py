@@ -2396,6 +2396,12 @@ class PRReviewer:
             budgets = verification_config.budgets
             sensitive_globs = verification_config.sensitive_path_globs
             diff_files = self.git_provider.get_diff_files()
+            # A truncated provider patch hides code the first pass never saw, so a
+            # clean run over it can never be authoritative evidence of absence.
+            artifact["reviewed_patches_complete"] = bool(diff_files) and all(
+                getattr(diff_file, "patch_is_complete", False) is True
+                for diff_file in diff_files
+            )
             candidates, candidate_rejections = prepare_candidates(
                 review_data,
                 diff_files,
@@ -3118,6 +3124,7 @@ class PRReviewer:
             or artifact.get("publication_safe") is not True
             or artifact.get("status") not in {"complete", "no_candidates"}
             or artifact.get("first_pass_generation_complete") is not True
+            or artifact.get("reviewed_patches_complete") is not True
             or bool(getattr(incremental, "is_incremental", False))
             or bool(getattr(self, "_review_shadow_only", False))
             or bool(getattr(self, "remaining_files_list", []))
