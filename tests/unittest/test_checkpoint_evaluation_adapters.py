@@ -13,7 +13,7 @@ from pr_agent.algo.checkpoint_review_subprocess import (
     CheckpointReviewSubprocessState,
 )
 from pr_agent.algo.review_configuration import materialize_review_configuration
-from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshot
+from pr_agent.algo.review_snapshot import CoverageIssue, ReviewEvent, ReviewResultState, ReviewSnapshot
 from pr_agent.algo.run_details import RunDetails, SpecialistRunDetails, serialize_run_details_for_evaluation
 
 
@@ -118,11 +118,32 @@ def test_adapter_retains_omitted_file_as_unavailable_coverage():
 
     assert result.snapshot_result.state is ReviewResultState.COVERAGE_UNAVAILABLE
     assert [(issue.reason, issue.path) for issue in result.snapshot_result.coverage_issues] == [
-        ("diff_compression_omitted", "example.py"),
+        ("token_budget_omitted", "example.py"),
     ]
     assert result.findings == ()
     assert result.terminal is False
     assert result.failure_reason_code == "production_coverage_unavailable"
+
+
+def test_adapter_retains_preexisting_snapshot_coverage():
+    configuration = materialize_review_configuration(repo_context_files={})
+    snapshot = ReviewSnapshot(
+        event=ReviewEvent.PRE_COMMIT,
+        repository_root="/private/checkpoint/repository",
+        base_revision="a" * 40,
+        changed_paths=("example.py",),
+        diff="diff --git a/example.py b/example.py\n+changed = True\n",
+        policy_version="policy-v1",
+        created_at="2026-09-04T12:00:00Z",
+        review_configuration_hash=configuration.configuration_hash,
+        coverage_issues=(CoverageIssue(reason="file_too_large", path="example.py"),),
+    )
+    outcome = _outcome(snapshot, {"review": {"key_issues_to_review": []}})
+
+    result = adapt_checkpoint_review_outcome(snapshot, EvaluationArmKind.GENERAL_REVIEW, outcome)
+
+    assert result.snapshot_result.state is ReviewResultState.COVERAGE_UNAVAILABLE
+    assert result.snapshot_result.coverage_issues == snapshot.coverage_issues
 
 
 def test_adapter_retains_deleted_file_as_unavailable_coverage():

@@ -127,10 +127,11 @@ def _coverage_issues(
     unexpected_paths = (set(omitted_files) | set(deleted_files)) - set(snapshot.changed_paths)
     if unexpected_paths:
         raise EvaluationValidationError("production review output names an unexpected coverage path")
-    issues = [
-        CoverageIssue(reason="diff_compression_omitted", path=path)
+    issues = list(snapshot.coverage_issues)
+    issues.extend(
+        CoverageIssue(reason="token_budget_omitted", path=path)
         for path in sorted(set(omitted_files))
-    ]
+    )
     issues.extend(
         CoverageIssue(reason="deleted_file_unsupported", path=path)
         for path in sorted(set(deleted_files))
