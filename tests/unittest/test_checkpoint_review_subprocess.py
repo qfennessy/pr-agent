@@ -13,11 +13,14 @@ from unittest.mock import AsyncMock
 import pytest
 
 from pr_agent.algo import checkpoint_review_subprocess as review_subprocess
+from pr_agent.algo.ai_request_context import AIModelRoute
 from pr_agent.algo.checkpoint_cost_authority import (
+    CheckpointCostAuthorityError,
     FrozenCostAuthority,
     ProviderMaximumCharge,
     gateway_api_base_identity_hash,
 )
+from pr_agent.algo.pr_processing import retry_with_fallback_models
 from pr_agent.algo.review_configuration import (
     materialize_review_configuration,
     snapshot_review_configuration_hash,
@@ -571,6 +574,32 @@ async def test_worker_does_not_leak_execution_exception_text():
     assert outcome.failure_reason_code == "review_execution_failed"
     assert b"source line" not in encoded
     assert b"credential" not in encoded
+
+
+@pytest.mark.asyncio
+async def test_worker_preserves_cost_denial_without_trying_fallback_models():
+    attempted_models = []
+    route = AIModelRoute(
+        models=("model", "fallback-model"),
+        deployments=(None, None),
+        attribution="general_review",
+    )
+
+    async def executor(snapshot, _review_configuration, _cost_authority):
+        async def deny(model):
+            attempted_models.append(model)
+            raise CheckpointCostAuthorityError("gateway route is not authorized")
+
+        await retry_with_fallback_models(deny, model_route=route)
+        return _completed_outcome(snapshot)
+
+    outcome = await review_subprocess._handle_worker_request(
+        _request_bytes(_snapshot()),
+        executor=executor,
+    )
+
+    assert outcome.failure_reason_code == "cost_authority_rejected"
+    assert attempted_models == ["model"]
 
 
 @pytest.mark.asyncio
