@@ -5723,6 +5723,45 @@ async def test_verifier_fails_closed_when_provider_controls_mutate_after_capture
 
 
 @pytest.mark.asyncio
+async def test_verifier_detects_context_window_override_mutation_before_prompt_budgeting():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    chat_completion = AsyncMock()
+    reviewer.ai_handler.chat_completion = chat_completion
+    settings = _verification_settings()
+    settings.config.update({
+        "custom_model_max_tokens": 20_000,
+        "max_model_tokens": 18_000,
+    })
+    get_max_tokens_mock = MagicMock(return_value=10_000)
+
+    def mutate_context_window_controls(model):
+        settings.config["custom_model_max_tokens"] = 8_000
+        settings.config["max_model_tokens"] = 6_000
+        return _CharacterEncoder()
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch(
+            "pr_agent.tools.pr_reviewer.TokenEncoder.get_token_encoder",
+            side_effect=mutate_context_window_controls,
+        ),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", get_max_tokens_mock),
+    ):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "verifier_request_context_changed"
+    assert artifact["failure"] == "provider_controls_changed"
+    assert artifact["publication_safe"] is False
+    get_max_tokens_mock.assert_not_called()
+    chat_completion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_openrouter_reasoning_only_verifier_route_fails_closed_before_model_call():
     provider = MagicMock()
     provider.supports_repo_file_fetching.return_value = True

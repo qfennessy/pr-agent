@@ -205,6 +205,8 @@ def candidate_verification_provider_controls_hash(
                 ("reasoning_effort", None),
                 ("custom_reasoning_model", False),
                 ("max_output_tokens", 0),
+                ("custom_model_max_tokens", 0),
+                ("max_model_tokens", 0),
                 ("enable_claude_adaptive_thinking", False),
                 ("enable_claude_extended_thinking", False),
                 ("extended_thinking_budget_tokens", 2048),
