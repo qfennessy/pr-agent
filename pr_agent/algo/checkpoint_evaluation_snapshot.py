@@ -8,12 +8,23 @@ any review arm.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from pr_agent.algo.checkpoint_evaluation import CheckpointCase, EvaluationValidationError, _answer_only_paths
-from pr_agent.algo.local_artifact_io import read_regular_file_without_symlinks
+from pr_agent.algo.local_artifact_io import (
+    read_private_regular_file_without_symlinks,
+    read_regular_file_without_symlinks,
+)
+from pr_agent.algo.review_configuration import (
+    MAX_REVIEW_CONFIGURATION_BYTES,
+    ReviewConfigurationBundle,
+    review_configuration_artifact_name,
+    review_configuration_canonical_bytes,
+)
 from pr_agent.algo.review_snapshot import SNAPSHOT_SCHEMA_VERSION, CoverageIssue, ReviewEvent, ReviewSnapshot
 
 MAX_REVIEW_SNAPSHOT_ARTIFACT_BYTES = 10_000_000
@@ -36,6 +47,14 @@ _SNAPSHOT_FIELDS = {
     "task_intent",
 }
 _COVERAGE_ISSUE_FIELDS = {"fingerprint", "path", "reason"}
+
+
+@dataclass(frozen=True)
+class LoadedReviewSnapshotAndConfiguration:
+    """One validated source snapshot and its exact replay configuration."""
+
+    snapshot: ReviewSnapshot
+    review_configuration: ReviewConfigurationBundle
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -77,10 +96,44 @@ def _load_json_object(raw: bytes) -> Mapping[str, Any]:
         )
     except EvaluationValidationError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise EvaluationValidationError("ReviewSnapshot artifact is not strict UTF-8 JSON") from exc
     if not isinstance(value, Mapping):
         raise EvaluationValidationError("ReviewSnapshot artifact must contain one JSON object")
+    return value
+
+
+def _reject_configuration_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, child in pairs:
+        if key in value:
+            raise EvaluationValidationError(
+                f"ReviewConfiguration artifact contains a duplicate JSON key: {key}"
+            )
+        value[key] = child
+    return value
+
+
+def _reject_configuration_non_finite_constant(value: str) -> None:
+    raise EvaluationValidationError(
+        f"ReviewConfiguration artifact contains a non-finite JSON number: {value}"
+    )
+
+
+def _load_configuration_json_object(raw: bytes) -> Mapping[str, Any]:
+    try:
+        decoded = raw.decode("utf-8")
+        value = json.loads(
+            decoded,
+            object_pairs_hook=_reject_configuration_duplicate_keys,
+            parse_constant=_reject_configuration_non_finite_constant,
+        )
+    except EvaluationValidationError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise EvaluationValidationError("ReviewConfiguration artifact is not strict UTF-8 JSON") from exc
+    if not isinstance(value, Mapping):
+        raise EvaluationValidationError("ReviewConfiguration artifact must contain one JSON object")
     return value
 
 
@@ -161,6 +214,10 @@ def load_review_snapshot_artifact(
             "ReviewSnapshot artifact bytes do not match checkpoint snapshot_artifact_hash"
         )
 
+    return _load_review_snapshot_bytes(raw, checkpoint_case)
+
+
+def _load_review_snapshot_bytes(raw: bytes, checkpoint_case: CheckpointCase) -> ReviewSnapshot:
     payload = _load_json_object(raw)
     unknown = sorted(set(payload) - _SNAPSHOT_FIELDS)
     missing = sorted(_SNAPSHOT_FIELDS - set(payload))
@@ -213,3 +270,71 @@ def load_review_snapshot_artifact(
     if snapshot.event is not checkpoint_case.event:
         raise EvaluationValidationError("ReviewSnapshot event does not match checkpoint case")
     return snapshot
+
+
+def load_review_snapshot_and_configuration_artifacts(
+    snapshot_path: str | Path,
+    checkpoint_case: CheckpointCase,
+    *,
+    review_configuration_artifact_hash: str,
+    max_snapshot_bytes: int = MAX_REVIEW_SNAPSHOT_ARTIFACT_BYTES,
+    max_configuration_bytes: int = MAX_REVIEW_CONFIGURATION_BYTES,
+) -> LoadedReviewSnapshotAndConfiguration:
+    """Load a private snapshot and its deterministic immutable configuration sibling."""
+
+    if not isinstance(checkpoint_case, CheckpointCase):
+        raise EvaluationValidationError("checkpoint_case must be a validated CheckpointCase")
+    snapshot_path = Path(snapshot_path)
+    snapshot_raw = read_private_regular_file_without_symlinks(
+        snapshot_path,
+        label="ReviewSnapshot artifact",
+        max_bytes=max_snapshot_bytes,
+    )
+    actual_snapshot_hash = _sha256_bytes(snapshot_raw)
+    if not hmac.compare_digest(actual_snapshot_hash, checkpoint_case.snapshot_artifact_hash):
+        raise EvaluationValidationError(
+            "ReviewSnapshot artifact bytes do not match checkpoint snapshot_artifact_hash"
+        )
+    snapshot = _load_review_snapshot_bytes(snapshot_raw, checkpoint_case)
+
+    configuration_hash = snapshot.review_configuration_hash
+    try:
+        configuration_filename = review_configuration_artifact_name(configuration_hash)
+    except ValueError as exc:
+        raise EvaluationValidationError(
+            "ReviewSnapshot review_configuration_hash must identify an immutable configuration"
+        ) from exc
+    configuration_path = snapshot_path.with_name(configuration_filename)
+    configuration_raw = read_private_regular_file_without_symlinks(
+        configuration_path,
+        label="ReviewConfiguration artifact",
+        max_bytes=max_configuration_bytes,
+    )
+    actual_configuration_artifact_hash = _sha256_bytes(configuration_raw)
+    if not isinstance(review_configuration_artifact_hash, str) or not hmac.compare_digest(
+        actual_configuration_artifact_hash,
+        review_configuration_artifact_hash,
+    ):
+        raise EvaluationValidationError(
+            "ReviewConfiguration artifact bytes do not match expected artifact hash"
+        )
+
+    payload = _load_configuration_json_object(configuration_raw)
+    try:
+        review_configuration = ReviewConfigurationBundle.from_dict(payload)
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise EvaluationValidationError("ReviewConfiguration artifact is invalid") from exc
+    if configuration_raw != review_configuration_canonical_bytes(review_configuration):
+        raise EvaluationValidationError("ReviewConfiguration artifact bytes are not canonical")
+    if not hmac.compare_digest(review_configuration.configuration_hash, configuration_hash):
+        raise EvaluationValidationError(
+            "ReviewConfiguration hash does not match ReviewSnapshot review_configuration_hash"
+        )
+    try:
+        review_configuration.require_compatible_runtime()
+    except ValueError as exc:
+        raise EvaluationValidationError("ReviewConfiguration artifact runtime mismatch") from exc
+    return LoadedReviewSnapshotAndConfiguration(
+        snapshot=snapshot,
+        review_configuration=review_configuration,
+    )

@@ -1,9 +1,9 @@
-"""Credential-free materialization of clean checkpoint-control artifacts.
+"""Private materialization of clean checkpoint-control replay artifacts.
 
-The caller supplies already captured :class:`ReviewSnapshot` objects.  This module
-never captures repository state, calls a model, or performs network I/O.  It only
-validates those snapshots through the shared plain-diff parser and writes immutable,
-private artifacts for the evaluation runner.
+The caller supplies already captured snapshots and model-visible configuration
+bundles. This module never captures repository state, calls a model, or performs
+network I/O. It validates and atomically writes the source-sensitive inputs for a
+future evaluation runner.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -37,11 +38,16 @@ from pr_agent.algo.checkpoint_evaluation import (
 )
 from pr_agent.algo.checkpoint_evaluation_cocos import CHECKPOINT_CONTROL_SCHEMA_VERSION
 from pr_agent.algo.local_artifact_io import _open_parent_directory, read_regular_file_without_symlinks
+from pr_agent.algo.review_configuration import (
+    ReviewConfigurationBundle,
+    review_configuration_artifact_name,
+    review_configuration_canonical_bytes,
+)
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewSnapshot
 from pr_agent.git_providers.plain_diff_provider import parse_plain_diff
 
 CHECKPOINT_CONTROL_MATERIALIZATION_SCHEMA_VERSION = "checkpoint-control-materialization-v1"
-CHECKPOINT_CONTROL_ARTIFACT_INDEX_SCHEMA_VERSION = "checkpoint-control-artifact-index-v1"
+CHECKPOINT_CONTROL_ARTIFACT_INDEX_SCHEMA_VERSION = "checkpoint-control-artifact-index-v2"
 MAX_CHECKPOINT_CONTROL_SPEC_BYTES = 1_000_000
 MAX_REVIEW_SNAPSHOT_ARTIFACT_BYTES = 10_000_000
 _DARWIN_RENAME_EXCL = 0x00000004
@@ -405,7 +411,7 @@ def _read_private_file_at(
     payload: bytes,
     *,
     expected_identity: tuple[int, int] | None = None,
-) -> None:
+) -> tuple[int, int]:
     _validate_artifact_name(filename, "checkpoint artifact filename")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -421,24 +427,34 @@ def _read_private_file_at(
             or metadata.st_uid != os.geteuid()
             or stat.S_IMODE(metadata.st_mode) != 0o600
             or metadata.st_nlink != 1
-            or (
-                expected_identity is not None
-                and (metadata.st_dev, metadata.st_ino) != expected_identity
-            )
         ):
             raise EvaluationValidationError(
                 f"existing checkpoint artifact is not private and single-link: {filename}"
             )
+        if expected_identity is not None and (metadata.st_dev, metadata.st_ino) != expected_identity:
+            raise EvaluationValidationError(
+                f"checkpoint artifact identity changed while it was verified: {filename}"
+            )
         existing = _read_descriptor(descriptor, max(len(payload), 1))
         final_metadata = os.fstat(descriptor)
         if (
-            (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+            (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
             != (
                 final_metadata.st_dev,
                 final_metadata.st_ino,
                 final_metadata.st_size,
                 final_metadata.st_mtime_ns,
+                final_metadata.st_ctime_ns,
             )
+            or final_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(final_metadata.st_mode) != 0o600
+            or final_metadata.st_nlink != 1
         ):
             raise EvaluationValidationError(f"checkpoint artifact changed while it was read: {filename}")
         try:
@@ -451,6 +467,9 @@ def _read_private_file_at(
             not stat.S_ISREG(bound_metadata.st_mode)
             or (bound_metadata.st_dev, bound_metadata.st_ino)
             != (final_metadata.st_dev, final_metadata.st_ino)
+            or bound_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(bound_metadata.st_mode) != 0o600
+            or bound_metadata.st_nlink != 1
         ):
             raise EvaluationValidationError(
                 f"checkpoint artifact path changed while it was read: {filename}"
@@ -459,6 +478,7 @@ def _read_private_file_at(
         os.close(descriptor)
     if existing != payload:
         raise EvaluationValidationError(f"immutable checkpoint artifact content changed: {filename}")
+    return final_metadata.st_dev, final_metadata.st_ino
 
 
 def _write_staged_file(directory_fd: int, filename: str, payload: bytes) -> tuple[int, int]:
@@ -652,6 +672,7 @@ def _publish_single_file(path: Path, payload: bytes) -> None:
 
 
 def _verify_existing_bundle(directory_fd: int, payloads: Mapping[str, bytes]) -> None:
+    initial_directory_metadata = os.fstat(directory_fd)
     actual_names = set(os.listdir(directory_fd))
     expected_names = set(payloads)
     if actual_names != expected_names:
@@ -659,8 +680,45 @@ def _verify_existing_bundle(directory_fd: int, payloads: Mapping[str, bytes]) ->
             "existing checkpoint bundle is incomplete or contains unknown artifacts; "
             f"missing={sorted(expected_names - actual_names)}, extra={sorted(actual_names - expected_names)}"
         )
+    verified_identities = {
+        filename: _read_private_file_at(directory_fd, filename, payload)
+        for filename, payload in payloads.items()
+    }
+    intermediate_names = set(os.listdir(directory_fd))
+    if intermediate_names != expected_names:
+        raise EvaluationValidationError(
+            "checkpoint bundle changed while it was verified; "
+            f"missing={sorted(expected_names - intermediate_names)}, "
+            f"extra={sorted(intermediate_names - expected_names)}"
+        )
     for filename, payload in payloads.items():
-        _read_private_file_at(directory_fd, filename, payload)
+        _read_private_file_at(
+            directory_fd,
+            filename,
+            payload,
+            expected_identity=verified_identities[filename],
+        )
+    final_names = set(os.listdir(directory_fd))
+    if final_names != expected_names:
+        raise EvaluationValidationError(
+            "checkpoint bundle changed while it was verified; "
+            f"missing={sorted(expected_names - final_names)}, extra={sorted(final_names - expected_names)}"
+        )
+    final_directory_metadata = os.fstat(directory_fd)
+    if (
+        initial_directory_metadata.st_dev,
+        initial_directory_metadata.st_ino,
+        initial_directory_metadata.st_size,
+        initial_directory_metadata.st_mtime_ns,
+        initial_directory_metadata.st_ctime_ns,
+    ) != (
+        final_directory_metadata.st_dev,
+        final_directory_metadata.st_ino,
+        final_directory_metadata.st_size,
+        final_directory_metadata.st_mtime_ns,
+        final_directory_metadata.st_ctime_ns,
+    ):
+        raise EvaluationValidationError("checkpoint bundle directory changed while it was verified")
 
 
 def _publish_bundle(path: Path, payloads: Mapping[str, bytes]) -> None:
@@ -744,6 +802,9 @@ class SnapshotArtifactReference:
     relative_path: str
     snapshot_id: str
     snapshot_artifact_hash: str
+    review_configuration_relative_path: str
+    review_configuration_hash: str
+    review_configuration_artifact_hash: str
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -751,6 +812,9 @@ class SnapshotArtifactReference:
             "relative_path": self.relative_path,
             "snapshot_id": self.snapshot_id,
             "snapshot_artifact_hash": self.snapshot_artifact_hash,
+            "review_configuration_relative_path": self.review_configuration_relative_path,
+            "review_configuration_hash": self.review_configuration_hash,
+            "review_configuration_artifact_hash": self.review_configuration_artifact_hash,
         }
 
 
@@ -779,6 +843,7 @@ def materialize_checkpoint_controls(
     snapshots: Mapping[str, ReviewSnapshot],
     output_root: str | Path,
     *,
+    review_configurations: Mapping[str, ReviewConfigurationBundle],
     name: str,
     policy_hash: str,
     configuration_hash: str,
@@ -786,10 +851,11 @@ def materialize_checkpoint_controls(
 ) -> MaterializedCheckpointControls:
     """Validate and persist one clean checkpoint-control evaluation inventory.
 
-    ``snapshots`` is an in-memory mapping populated by the production
-    ``LocalPairReview`` capture path.  No repository path, provider, model, or
-    credential is accepted by this API.  The caller must choose an owner-only
-    output directory outside model-visible and version-controlled artifact paths.
+    ``snapshots`` and ``review_configurations`` are in-memory objects populated by
+    the production capture path. No filesystem source path, provider client, or
+    credential argument is accepted by this API. The caller must choose an
+    owner-only output directory outside version-controlled and published artifact
+    paths because the bundle can contain sensitive prompt and repository text.
     """
 
     entries = _parse_entries(_load_spec(spec))
@@ -803,15 +869,72 @@ def materialize_checkpoint_controls(
             f"missing={sorted(expected_case_ids - supplied_case_ids)}, "
             f"extra={sorted(supplied_case_ids - expected_case_ids)}"
         )
+    if not isinstance(review_configurations, Mapping):
+        raise EvaluationValidationError(
+            "review_configurations must map checkpoint ids to ReviewConfigurationBundle objects"
+        )
+    supplied_configuration_case_ids = set(review_configurations)
+    if supplied_configuration_case_ids != expected_case_ids:
+        raise EvaluationValidationError(
+            "supplied review configurations do not match checkpoint entries; "
+            f"missing={sorted(expected_case_ids - supplied_configuration_case_ids)}, "
+            f"extra={sorted(supplied_configuration_case_ids - expected_case_ids)}"
+        )
 
     references: list[SnapshotArtifactReference] = []
     snapshot_payloads: list[tuple[str, bytes]] = []
+    configuration_payloads: dict[str, bytes] = {}
+    configuration_artifact_hashes: dict[str, str] = {}
+    runtime_validated_configuration_hashes: set[str] = set()
     snapshot_ids: set[str] = set()
     artifact_hashes: set[str] = set()
     all_identity_hashes: set[str] = {entry.adjudication_hash for entry in entries}
     for entry in entries:
         snapshot = snapshots[entry.case_id]
+        review_configuration = review_configurations[entry.case_id]
         _validate_captured_snapshot(snapshot)
+        if not isinstance(review_configuration, ReviewConfigurationBundle):
+            raise EvaluationValidationError(
+                f"checkpoint {entry.case_id} review configuration is not a ReviewConfigurationBundle"
+            )
+        if review_configuration.configuration_hash not in runtime_validated_configuration_hashes:
+            try:
+                review_configuration.require_compatible_runtime()
+            except ValueError as exc:
+                raise EvaluationValidationError(
+                    f"checkpoint {entry.case_id} review configuration runtime mismatch"
+                ) from exc
+            runtime_validated_configuration_hashes.add(review_configuration.configuration_hash)
+        if (
+            not isinstance(snapshot.review_configuration_hash, str)
+            or not hmac.compare_digest(
+                snapshot.review_configuration_hash,
+                review_configuration.configuration_hash,
+            )
+        ):
+            raise EvaluationValidationError(
+                f"checkpoint {entry.case_id} ReviewSnapshot is not bound to its review configuration"
+            )
+        configuration_payload = review_configuration_canonical_bytes(review_configuration)
+        configuration_filename = review_configuration_artifact_name(
+            review_configuration.configuration_hash
+        )
+        configuration_artifact_hash = _sha256_bytes(configuration_payload)
+        existing_configuration_payload = configuration_payloads.get(configuration_filename)
+        if existing_configuration_payload is not None and existing_configuration_payload != configuration_payload:
+            raise EvaluationValidationError("review configuration content hash collision")
+        if existing_configuration_payload is None:
+            configuration_identities = {
+                review_configuration.configuration_hash,
+                configuration_artifact_hash,
+            }
+            if len(configuration_identities) != 2 or configuration_identities & all_identity_hashes:
+                raise EvaluationValidationError(
+                    "review configuration identities must be role-separated"
+                )
+            all_identity_hashes.update(configuration_identities)
+            configuration_payloads[configuration_filename] = configuration_payload
+            configuration_artifact_hashes[configuration_filename] = configuration_artifact_hash
         if snapshot.event is not entry.event:
             raise EvaluationValidationError(
                 f"checkpoint {entry.case_id} stage does not match its ReviewSnapshot event"
@@ -852,6 +975,9 @@ def materialize_checkpoint_controls(
                 relative_path=filename,
                 snapshot_id=snapshot.snapshot_id,
                 snapshot_artifact_hash=artifact_hash,
+                review_configuration_relative_path=configuration_filename,
+                review_configuration_hash=review_configuration.configuration_hash,
+                review_configuration_artifact_hash=configuration_artifact_hash,
             )
         )
 
@@ -880,6 +1006,7 @@ def materialize_checkpoint_controls(
     corpus_hash = content_hash({
         "checkpoint_control_ledger_hash": ledger_hash,
         "snapshot_artifact_hashes": sorted(reference.snapshot_artifact_hash for reference in references),
+        "review_configuration_artifact_hashes": sorted(configuration_artifact_hashes.values()),
     })
     cases = tuple(
         CheckpointCase(
@@ -931,6 +1058,7 @@ def materialize_checkpoint_controls(
         for filename, payload in named_payloads.items()
     }
     bundle_payloads = dict(snapshot_payloads)
+    bundle_payloads.update(configuration_payloads)
     bundle_payloads.update(named_payloads)
     _publish_bundle(Path(output_root), bundle_payloads)
     return MaterializedCheckpointControls(

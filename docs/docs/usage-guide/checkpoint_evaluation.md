@@ -92,12 +92,14 @@ Credentials, callback configuration, telemetry headers, and output sinks have no
 The isolated worker disables publication, callback and OpenTelemetry delivery, push outputs, and
 run-detail printing before importing the reviewer. It also passes only the standard OpenAI runtime
 credential and a minimal process environment; proxy, endpoint, Dynaconf, and other provider
-controls are not inherited. The bundle can be sent through the bounded local worker pipe, but it is
-not yet attached to the snapshot artifact path and is not part of a source-free manifest, journal,
-or pilot report. Existing provider-neutral local-pair snapshots retain their legacy hash for local
-workflows, but this production replay seam rejects them unless the exact immutable bundle is also
-supplied. That bundle still cannot make the production binding available until its source-bearing
-snapshot persistence path is implemented.
+controls are not inherited. Checkpoint materialization writes the canonical bundle beside its
+source-bearing snapshot in the same atomic, owner-only local directory. Shared bundles are stored
+once, while the private snapshot index records each pair's deterministic relative paths, bundle
+identity, and exact artifact-byte hash. Loading rejects non-canonical bytes, unsafe links or
+permissions, snapshot/bundle hash mismatches, and incompatible runtime identity before any adapter
+or model can run. Bundle content is never copied into a source-free manifest, journal, report, or
+log. Existing provider-neutral local-pair snapshots retain their legacy hash for local workflows,
+but they cannot enter this paired evaluation path without the exact immutable bundle.
 
 Production bindings declare their telemetry shape. The deterministic arm must be model-free,
 the general-review arm must name one selected pinned model, and specialist, verified-specialist,
@@ -408,9 +410,8 @@ source-bearing or unknown fields and final clean PR heads as substitutes, and in
 control artifact hash in the pilot corpus identity. Its file, corpus root, and every supplied
 parent component must be real directories/files rather than symlinks. The evaluation manifest
 cannot receive a canonical Cocos binding when this control inventory is absent, incomplete,
-outside the 15–20 range, or missing its validated hash.
-must bind that exact resulting corpus identity. Until the ledger is supplied, its status is
-`not_evaluable`.
+outside the 15–20 range, or missing its validated hash, and must bind that exact resulting
+corpus identity. Until the ledger is supplied, its status is `not_evaluable`.
 
 ## Reproduction, privacy, and rollback
 
@@ -448,9 +449,9 @@ the complete request before importing model handlers, disables working-tree enri
 output sink, and returns only structured review data plus bounded run telemetry. Process-wide
 settings, callbacks, credentials, and environment mutations die with the child process.
 
-This is still not a runnable production evaluation arm. General-review findings do not yet expose
-the normalized fingerprint/severity contract required by `ProductionArmResult`, effective review
-configuration does not yet have an immutable child-process replay contract, and paid calls do not
-yet have an enforceable pre-call dollar cap. The worker refuses execution when it cannot reproduce
-the snapshot's source-free configuration hash. Those blockers remain fail-closed for general review
-and the full cascade.
+This is still not a runnable production evaluation arm. The immutable configuration can now be
+persisted and reloaded with its snapshot, but no production binding yet threads that validated pair
+into the subprocess. General-review findings also do not expose the normalized fingerprint/severity
+contract required by `ProductionArmResult`, and paid calls do not yet have an enforceable pre-call
+dollar cap. Full-cascade replay additionally needs the specialist and verification source contracts.
+Those blockers remain fail-closed.

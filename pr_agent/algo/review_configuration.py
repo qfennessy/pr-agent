@@ -639,6 +639,14 @@ def review_configuration_canonical_bytes(bundle: ReviewConfigurationBundle) -> b
     return _canonical_json_bytes(bundle.to_dict())
 
 
+def review_configuration_artifact_name(configuration_hash: str) -> str:
+    """Return the deterministic local filename for one configuration bundle."""
+
+    if not _is_hash(configuration_hash):
+        raise ValueError("review configuration artifact hash is invalid")
+    return f"review-configuration-{configuration_hash.removeprefix(_HASH_PATTERN_PREFIX)}.json"
+
+
 @contextmanager
 def replay_review_configuration(bundle: ReviewConfigurationBundle) -> Iterator[None]:
     """Install only the captured review settings for one isolated worker execution."""

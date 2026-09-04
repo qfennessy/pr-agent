@@ -3,12 +3,17 @@ import json
 import os
 import stat
 from dataclasses import replace
+from functools import lru_cache
 
 import pytest
 
 import pr_agent.algo.checkpoint_evaluation_materialize as materialize_module
 from pr_agent.algo.checkpoint_evaluation import EvaluationArm, EvaluationArmKind, EvaluationValidationError
-from pr_agent.algo.checkpoint_evaluation_snapshot import load_review_snapshot_artifact
+from pr_agent.algo.checkpoint_evaluation_snapshot import (
+    load_review_snapshot_and_configuration_artifacts,
+    load_review_snapshot_artifact,
+)
+from pr_agent.algo.review_configuration import ReviewConfigurationBundle, materialize_review_configuration
 from pr_agent.algo.review_snapshot import CoverageIssue, ReviewEvent, ReviewSnapshot
 
 CHECKPOINT_CONTROL_MATERIALIZATION_SCHEMA_VERSION = (
@@ -31,7 +36,13 @@ def _arm() -> EvaluationArm:
     )
 
 
+@lru_cache(maxsize=1)
+def _review_configuration() -> ReviewConfigurationBundle:
+    return materialize_review_configuration("pinned skills", {"AGENTS.md": "pinned repository rules"})
+
+
 def _fixture() -> tuple[dict, dict[str, ReviewSnapshot]]:
+    review_configuration = _review_configuration()
     scenarios = (
         "partial_correct_save",
         "coherent_clean_worktree",
@@ -71,7 +82,7 @@ def _fixture() -> tuple[dict, dict[str, ReviewSnapshot]]:
             ),
             policy_version="snapshot-policy-v1",
             created_at=f"2026-08-30T12:{index:02d}:00+00:00",
-            review_configuration_hash=_hash("review-configuration"),
+            review_configuration_hash=review_configuration.configuration_hash,
             parent_snapshot_id=parent_snapshot_id,
         )
         entries.append({
@@ -94,12 +105,19 @@ def _fixture() -> tuple[dict, dict[str, ReviewSnapshot]]:
     }, snapshots
 
 
-def _materialize(tmp_path, spec=None, snapshots=None):
+def _materialize(tmp_path, spec=None, snapshots=None, review_configurations=None):
     default_spec, default_snapshots = _fixture()
+    selected_snapshots = snapshots or default_snapshots
+    selected_configurations = (
+        {case_id: _review_configuration() for case_id in selected_snapshots}
+        if review_configurations is None
+        else review_configurations
+    )
     return materialize_checkpoint_controls(
         spec or default_spec,
-        snapshots or default_snapshots,
+        selected_snapshots,
         tmp_path / "checkpoint-bundle",
+        review_configurations=selected_configurations,
         name="cocos-clean-checkpoints",
         policy_hash=_hash("policy"),
         configuration_hash=_hash("configuration"),
@@ -139,6 +157,8 @@ def test_materializes_exact_private_snapshots_and_source_free_artifacts(tmp_path
     assert "/private/cocos-story" not in serialized_public_contracts
     assert "diff --git" not in serialized_public_contracts
     assert "value =" not in serialized_public_contracts
+    assert "pinned skills" not in serialized_public_contracts
+    assert "pinned repository rules" not in serialized_public_contracts
 
     cases_by_id = {case.case_id: case for case in materialized.manifest.cases}
     for artifact in materialized.artifact_index["artifacts"]:
@@ -149,6 +169,24 @@ def test_materializes_exact_private_snapshots_and_source_free_artifacts(tmp_path
         assert _hash_bytes(path.read_bytes()) == artifact["snapshot_artifact_hash"]
         loaded = load_review_snapshot_artifact(path, cases_by_id[artifact["case_id"]])
         assert loaded.to_dict() == snapshots[artifact["case_id"]].to_dict()
+        configuration_path = (
+            tmp_path / "checkpoint-bundle" / artifact["review_configuration_relative_path"]
+        )
+        assert _hash_bytes(configuration_path.read_bytes()) == artifact[
+            "review_configuration_artifact_hash"
+        ]
+        assert artifact["review_configuration_hash"] == snapshots[
+            artifact["case_id"]
+        ].review_configuration_hash
+        loaded_pair = load_review_snapshot_and_configuration_artifacts(
+            path,
+            cases_by_id[artifact["case_id"]],
+            review_configuration_artifact_hash=artifact[
+                "review_configuration_artifact_hash"
+            ],
+        )
+        assert loaded_pair.snapshot.to_dict() == snapshots[artifact["case_id"]].to_dict()
+        assert loaded_pair.review_configuration == _review_configuration()
     for filename in (
         "checkpoint-controls.json",
         "evaluation-manifest.json",
@@ -158,6 +196,11 @@ def test_materializes_exact_private_snapshots_and_source_free_artifacts(tmp_path
         metadata = (tmp_path / "checkpoint-bundle" / filename).stat()
         assert stat.S_IMODE(metadata.st_mode) == 0o600
         assert metadata.st_nlink == 1
+    configuration_artifacts = list((tmp_path / "checkpoint-bundle").glob("review-configuration-*.json"))
+    assert len(configuration_artifacts) == 1
+    assert b"pinned skills" in configuration_artifacts[0].read_bytes()
+    assert stat.S_IMODE(configuration_artifacts[0].stat().st_mode) == 0o600
+    assert configuration_artifacts[0].stat().st_nlink == 1
 
     repeated = _materialize(tmp_path, spec, snapshots)
     assert repeated.manifest.manifest_id == materialized.manifest.manifest_id
@@ -179,6 +222,26 @@ def test_writes_one_supplied_snapshot_with_exact_canonical_hash(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert path.stat().st_nlink == 1
     assert write_review_snapshot_artifact(snapshots["checkpoint-0"], path) == artifact_hash
+
+
+def test_materialization_requires_one_exact_configuration_per_snapshot(tmp_path):
+    spec, snapshots = _fixture()
+    output = tmp_path / "output"
+    output.mkdir(mode=0o700)
+    configurations = {case_id: _review_configuration() for case_id in snapshots}
+    configurations.pop("checkpoint-14")
+
+    with pytest.raises(EvaluationValidationError, match="review configurations do not match"):
+        _materialize(output, spec, snapshots, configurations)
+    _assert_no_bundle_or_staging(output)
+
+    configurations["checkpoint-14"] = materialize_review_configuration(
+        "different pinned skills",
+        {"AGENTS.md": "pinned repository rules"},
+    )
+    with pytest.raises(EvaluationValidationError, match="not bound to its review configuration"):
+        _materialize(output, spec, snapshots, configurations)
+    _assert_no_bundle_or_staging(output)
 
 
 def test_accepts_the_generated_answer_only_ledger_as_a_replay_lock(tmp_path):
@@ -315,6 +378,57 @@ def test_validates_every_snapshot_before_persisting_source_bearing_files(tmp_pat
     assert list(output.iterdir()) == []
 
 
+def test_runtime_incompatible_configuration_is_rejected_before_persisting(tmp_path):
+    spec, snapshots = _fixture()
+    incompatible_configuration = replace(
+        _review_configuration(),
+        runtime_version="incompatible-runtime",
+    )
+    incompatible_snapshots = {
+        case_id: replace(
+            snapshot,
+            review_configuration_hash=incompatible_configuration.configuration_hash,
+        )
+        for case_id, snapshot in snapshots.items()
+    }
+    configurations = {
+        case_id: incompatible_configuration
+        for case_id in incompatible_snapshots
+    }
+    output = tmp_path / "runtime-mismatch"
+    output.mkdir(mode=0o700)
+
+    with pytest.raises(EvaluationValidationError, match="review configuration runtime mismatch"):
+        _materialize(
+            output,
+            spec,
+            incompatible_snapshots,
+            configurations,
+        )
+
+    _assert_no_bundle_or_staging(output)
+
+
+def test_shared_configuration_runtime_is_validated_once(tmp_path, monkeypatch):
+    calls = 0
+    real_require_compatible_runtime = ReviewConfigurationBundle.require_compatible_runtime
+
+    def count_runtime_validation(review_configuration):
+        nonlocal calls
+        calls += 1
+        real_require_compatible_runtime(review_configuration)
+
+    monkeypatch.setattr(
+        ReviewConfigurationBundle,
+        "require_compatible_runtime",
+        count_runtime_validation,
+    )
+
+    _materialize(tmp_path)
+
+    assert calls == 1
+
+
 def test_private_write_rejects_symlink_hard_link_and_permissive_output_root(tmp_path):
     spec, snapshots = _fixture()
     output = tmp_path / "output"
@@ -384,7 +498,7 @@ def test_partial_single_file_write_never_exposes_final_bytes_and_retry_succeeds(
     assert artifact_hash == _hash_bytes(output.read_bytes())
 
 
-@pytest.mark.parametrize("boundary", range(1, 20))
+@pytest.mark.parametrize("boundary", range(1, 21))
 def test_bundle_failure_at_each_completed_file_boundary_is_invisible_and_retryable(
     tmp_path,
     monkeypatch,
@@ -412,7 +526,7 @@ def test_bundle_failure_at_each_completed_file_boundary_is_invisible_and_retryab
 
     monkeypatch.setattr(materialize_module, "_write_staged_file", real_write_staged_file)
     _materialize(output)
-    assert len(list((output / "checkpoint-bundle").iterdir())) == 19
+    assert len(list((output / "checkpoint-bundle").iterdir())) == 20
 
 
 @pytest.mark.parametrize(
@@ -420,12 +534,12 @@ def test_bundle_failure_at_each_completed_file_boundary_is_invisible_and_retryab
     [
         (1, False),
         (1, True),
-        (20, False),
-        (20, True),
         (21, False),
         (21, True),
         (22, False),
         (22, True),
+        (23, False),
+        (23, True),
     ],
 )
 def test_bundle_fsync_faults_before_and_after_flush_leave_no_visible_bundle(
@@ -526,3 +640,37 @@ def test_hard_link_race_after_staging_is_rejected_and_final_bundle_is_removed(tm
 
     _assert_no_bundle_or_staging(output)
     assert alias.is_file()
+
+
+def test_same_name_replacement_during_verification_is_rejected(tmp_path, monkeypatch):
+    output = tmp_path / "replacement-race"
+    output.mkdir(mode=0o700)
+    real_read = materialize_module._read_private_file_at
+    replaced = False
+
+    def replace_after_first_read(directory_fd, filename, payload, **kwargs):
+        nonlocal replaced
+        identity = real_read(directory_fd, filename, payload, **kwargs)
+        if not replaced and filename.startswith("review-snapshot-"):
+            replacement_name = f"replacement-{filename}"
+            descriptor = os.open(
+                replacement_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            try:
+                os.write(descriptor, b"corrupted")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(replacement_name, filename, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            replaced = True
+        return identity
+
+    monkeypatch.setattr(materialize_module, "_read_private_file_at", replace_after_first_read)
+
+    with pytest.raises(EvaluationValidationError, match="identity changed while it was verified"):
+        _materialize(output)
+
+    _assert_no_bundle_or_staging(output)
