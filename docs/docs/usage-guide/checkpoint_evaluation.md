@@ -30,8 +30,11 @@ isolated no-publish replay seam with the exact immutable snapshot/configuration 
 source-free per-stage telemetry across the subprocess protocol, and fail closed while joining trusted
 verifier identity to normalized severity. Evaluation-only root-cause metadata never changes the ordinary
 published finding shape, but the general-review arm remains blocked until production provides an explicit
-severity contract rather than an inferred default. Both bindings also remain unavailable until the model
-boundary can enforce a genuine pre-call dollar cap. The general replay contract remains limited to the
+severity contract rather than an inferred default. Both bindings also remain unavailable until an operator
+supplies a current, immutable provider/gateway maximum-charge authority for every frozen route and the bound
+runtime controls pass preflight. The model boundary can now consume that authority immediately before every
+underlying provider request, but the repository does not ship an authority or treat a LiteLLM price estimate
+as one. The general replay contract remains limited to the
 standard OpenAI route; unsupported routes continue to fail configuration capture.
 Issue #27 must still complete those contracts and the source/telemetry contracts needed to integrate
 the production orchestration delivered by issues #26, #12, #11, #9, and #33. A frozen
@@ -197,6 +200,33 @@ orchestration; planning alone is not authorization.
 Before a paid adapter starts, the artifact store exclusively persists its attempt number
 and hard-cap reservation. A crash, raised adapter exception, or rejected result leaves an
 unreconciled reservation that blocks resume instead of repeating a possibly charged call.
+
+### Provider/gateway maximum-charge authority
+
+`checkpoint-cost-authority-v1` is a separate source-free contract for one manifest, paid request,
+case, arm, snapshot, review configuration, and per-attempt cap. It names an immutable authority
+revision and hashes the external provider or enforcing-gateway guarantee. Each quote pins one exact
+stage, model, provider, revision, deployment identity, maximum output-token cap, and worst-case charge.
+It also expires. Unknown fields, mutable revision aliases, ambiguous routes, incomplete route coverage,
+and any quote larger than the attempt cap fail validation locally.
+
+The isolated single-review worker installs one consume-only ledger process-wide and in its coroutine
+context, so both worker threads and concurrent specialist, verifier, and frontier tasks share it.
+Immediately before every LiteLLM `acompletion` call, including same-model
+retries, fallback routes, streaming calls, and the Bedrock credential fallback, the ledger atomically
+reserves the quote's full worst-case charge. It does not refund reservations based on estimated actual
+usage. A request is denied before the provider client when its route is unquoted, the output cap is
+missing or larger than quoted, provider SDK retries are not exactly zero, the authority is expired or
+mismatched, or the next reservation would exceed the cap. Post-response cost and identity telemetry
+still must be complete and agree with the frozen arm; the authority does not turn missing telemetry into
+zero.
+
+This boundary depends on an external provider/gateway guarantee that the quoted maximum is actually
+enforced for the bound request regardless of its eventual input or output usage. Operator guesses and
+the ordinary LiteLLM pricing table are observational estimates, not
+spending authority. Consequently the default production binding inventory keeps
+`hard_cost_cap_enforcement_unavailable` until a real authority is supplied and its frozen route controls
+are proven. This repository change alone does not authorize or execute a paid request.
 
 ## Resumable raw attempt artifacts
 
@@ -460,7 +490,8 @@ rendered artifacts off. It requires an outer isolation boundary and a fresh revi
 
 `checkpoint_review_subprocess` wraps construction and execution in a dedicated child process.
 Its versioned pipe protocol is disabled unless model execution is explicitly allowed, validates
-the complete request before importing model handlers, disables working-tree enrichment and every
+the complete request and source-free cost authority before importing model handlers, disables
+working-tree enrichment and every
 output sink, and returns only structured review data plus bounded run telemetry. Process-wide
 settings, callbacks, credentials, and environment mutations die with the child process.
 
@@ -475,6 +506,8 @@ aggregate, specialist, verifier, and frontier telemetry. Parent checkpoints exec
 and the runner derives withdrawals only from completed terminal parent records; children with unavailable
 parents are not reserved or executed. Clean empty-diff outcomes persist an unambiguous zero-call record
 with observed zero tokens and cost; missing telemetry after a model call remains unavailable. Paid
-calls still lack an enforceable pre-call dollar cap. General-review severity,
+calls remain unavailable because no authoritative provider/gateway maximum-charge contract is supplied
+by the repository, although the worker now enforces such a contract at every underlying call.
+General-review severity,
 deterministic/specialist finding contracts, and full-cascade frontier decision and aggregate-stage semantics
 also remain fail-closed.

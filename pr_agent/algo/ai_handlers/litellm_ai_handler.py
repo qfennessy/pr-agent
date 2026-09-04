@@ -1434,6 +1434,12 @@ class LiteLLMAIHandler(BaseAiHandler):
                     get_logger().warning(f"Error during LLM inference: {e}")
                     raise
             except Exception as e:
+                from pr_agent.algo.checkpoint_cost_authority import CheckpointCostAuthorityError
+
+                if isinstance(e, CheckpointCostAuthorityError):
+                    # A denied spending reservation is a deterministic local gate,
+                    # not a provider failure. Never wrap it in APIError or retry it.
+                    raise
                 get_logger().warning(f"Unknown error during LLM inference: {e}")
                 raise openai.APIError(
                     str(e),
@@ -1464,6 +1470,16 @@ class LiteLLMAIHandler(BaseAiHandler):
         Wrapper that automatically handles streaming for required models.
         """
         model = kwargs["model"]
+        from pr_agent.algo.checkpoint_cost_authority import reserve_checkpoint_provider_attempt
+
+        request_options = get_ai_request_options()
+        reserve_checkpoint_provider_attempt(
+            model_id=display_model or model,
+            deployment_id=kwargs.get("deployment_id"),
+            max_output_tokens=kwargs.get("max_tokens"),
+            provider_max_retries=kwargs.get("max_retries"),
+            attribution=request_options.attribution if request_options is not None else None,
+        )
         custom_llm_provider = str(kwargs.get("custom_llm_provider") or "").strip().lower()
         # Double the prefix so LiteLLM strips its provider prefix but preserves
         # OpenRouter's native router ID; leave other explicit providers unchanged.

@@ -19,6 +19,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
 
+from pr_agent.algo.checkpoint_cost_authority import (
+    CheckpointCostAuthorityError,
+    FrozenCostAuthority,
+    use_checkpoint_cost_authority,
+)
 from pr_agent.algo.checkpoint_evaluation import EvaluationStagePlan
 from pr_agent.algo.checkpoint_stage_sources import (
     CheckpointStageSources,
@@ -40,7 +45,7 @@ from pr_agent.algo.run_details import (
 if TYPE_CHECKING:
     from pr_agent.algo.review_configuration import ReviewConfigurationBundle
 
-CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION = "checkpoint-review-subprocess-v4"
+CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION = "checkpoint-review-subprocess-v5"
 DEFAULT_REVIEW_SUBPROCESS_TIMEOUT_SECONDS = 180.0
 MAX_REVIEW_SUBPROCESS_TIMEOUT_SECONDS = 900.0
 MAX_REVIEW_SUBPROCESS_REQUEST_BYTES = 12_250_000
@@ -117,6 +122,7 @@ _ANSWER_ONLY_KEYS = frozenset({
 })
 _REQUEST_FIELDS = {
     "allow_model_execution",
+    "cost_authority",
     "evaluation_stage_plan",
     "review_configuration",
     "schema_version",
@@ -215,6 +221,7 @@ class _CheckpointReviewSubprocessRequest:
     review_configuration: "ReviewConfigurationBundle"
     evaluation_stage_plan: tuple[EvaluationStagePlan, ...]
     allow_model_execution: bool
+    cost_authority: Optional[FrozenCostAuthority] = None
     schema_version: str = CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -229,6 +236,8 @@ class _CheckpointReviewSubprocessRequest:
         object.__setattr__(self, "evaluation_stage_plan", tuple(self.evaluation_stage_plan))
         if any(not isinstance(stage, EvaluationStagePlan) for stage in self.evaluation_stage_plan):
             raise TypeError("checkpoint review subprocess request requires an EvaluationStagePlan tuple")
+        if self.cost_authority is not None and not isinstance(self.cost_authority, FrozenCostAuthority):
+            raise TypeError("checkpoint review subprocess request requires a FrozenCostAuthority")
         if not isinstance(self.allow_model_execution, bool):
             raise TypeError("allow_model_execution must be a boolean")
 
@@ -239,6 +248,7 @@ class _CheckpointReviewSubprocessRequest:
             "snapshot": self.snapshot.to_dict(),
             "review_configuration": self.review_configuration.to_dict(),
             "evaluation_stage_plan": [stage.to_dict() for stage in self.evaluation_stage_plan],
+            "cost_authority": None if self.cost_authority is None else self.cost_authority.to_dict(),
         }
 
 
@@ -414,10 +424,16 @@ def _request_from_dict(payload: Mapping[str, Any]) -> _CheckpointReviewSubproces
     if not isinstance(raw_stage_plan, list) or any(not isinstance(stage, Mapping) for stage in raw_stage_plan):
         raise ValueError("invalid_evaluation_stage_plan")
 
+    raw_cost_authority = payload.get("cost_authority")
+    if raw_cost_authority is not None and not isinstance(raw_cost_authority, Mapping):
+        raise ValueError("invalid_cost_authority")
     return _CheckpointReviewSubprocessRequest(
         snapshot=_snapshot_from_dict(payload.get("snapshot")),
         review_configuration=ReviewConfigurationBundle.from_dict(payload.get("review_configuration")),
         evaluation_stage_plan=tuple(EvaluationStagePlan.from_dict(stage) for stage in raw_stage_plan),
+        cost_authority=(
+            None if raw_cost_authority is None else FrozenCostAuthority.from_dict(raw_cost_authority)
+        ),
         allow_model_execution=payload["allow_model_execution"],
         schema_version=payload["schema_version"],
     )
@@ -497,6 +513,7 @@ def _worker_environment() -> dict[str, str]:
 async def _execute_review(
     snapshot: ReviewSnapshot,
     review_configuration: "ReviewConfigurationBundle",
+    cost_authority: Optional[FrozenCostAuthority],
 ) -> CheckpointReviewSubprocessOutcome:
     """Import and run production review code only after request validation."""
 
@@ -530,6 +547,28 @@ async def _execute_review(
             snapshot_id=snapshot.snapshot_id,
             review={"review": {"key_issues_to_review": []}},
             latency_seconds=0.0,
+        )
+    if cost_authority is None:
+        return _failure_outcome(
+            CheckpointReviewSubprocessState.FAILED,
+            "cost_authority_unverified",
+            snapshot_id=snapshot.snapshot_id,
+        )
+    try:
+        cost_authority.require_active()
+        if (
+            not hmac.compare_digest(cost_authority.snapshot_id, snapshot.snapshot_id)
+            or not hmac.compare_digest(
+                cost_authority.review_configuration_hash,
+                review_configuration.configuration_hash,
+            )
+        ):
+            raise CheckpointCostAuthorityError("cost authority belongs to a different snapshot")
+    except CheckpointCostAuthorityError:
+        return _failure_outcome(
+            CheckpointReviewSubprocessState.FAILED,
+            "cost_authority_unverified",
+            snapshot_id=snapshot.snapshot_id,
         )
 
     from pr_agent.algo.review_configuration import replay_review_configuration
@@ -595,6 +634,7 @@ async def _execute_review(
                 pin_review_prompt_date(review_configuration.prompt_date),
                 pin_skills_context(review_configuration.skills_context),
                 use_specialist_snapshot_context(snapshot, lambda: snapshot.snapshot_id),
+                use_checkpoint_cost_authority(cost_authority),
             ):
                 reviewer = PRReviewer("checkpoint-review-subprocess")
                 # PlainDiffGitProvider enables its normal stdout publication setting
@@ -619,7 +659,8 @@ async def _handle_worker_request(
     raw: bytes,
     *,
     executor: Callable[
-        [ReviewSnapshot, "ReviewConfigurationBundle"], Awaitable[CheckpointReviewSubprocessOutcome]
+        [ReviewSnapshot, "ReviewConfigurationBundle", Optional[FrozenCostAuthority]],
+        Awaitable[CheckpointReviewSubprocessOutcome],
     ] = _execute_review,
 ) -> CheckpointReviewSubprocessOutcome:
     """Validate a worker request completely before entering the execution seam."""
@@ -636,6 +677,12 @@ async def _handle_worker_request(
             "model_execution_not_authorized",
             snapshot_id=request.snapshot.snapshot_id,
         )
+    if request.snapshot.diff.strip() and request.cost_authority is None:
+        return _failure_outcome(
+            CheckpointReviewSubprocessState.FAILED,
+            "cost_authority_unverified",
+            snapshot_id=request.snapshot.snapshot_id,
+        )
     try:
         sources = request.review_configuration.stage_sources
         if request.evaluation_stage_plan and sources is None:
@@ -646,7 +693,17 @@ async def _handle_worker_request(
             else sources.for_stage_plan(request.evaluation_stage_plan)
         )
         with use_checkpoint_stage_sources(selected_sources):
-            outcome = await executor(request.snapshot, request.review_configuration)
+            outcome = await executor(
+                request.snapshot,
+                request.review_configuration,
+                request.cost_authority,
+            )
+    except CheckpointCostAuthorityError:
+        return _failure_outcome(
+            CheckpointReviewSubprocessState.FAILED,
+            "cost_authority_rejected",
+            snapshot_id=request.snapshot.snapshot_id,
+        )
     except Exception:
         return _failure_outcome(
             CheckpointReviewSubprocessState.FAILED,
@@ -714,6 +771,7 @@ async def run_checkpoint_review_subprocess(
     *,
     review_configuration: Optional["ReviewConfigurationBundle"] = None,
     evaluation_stage_plan: tuple[EvaluationStagePlan, ...] = (),
+    cost_authority: Optional[FrozenCostAuthority] = None,
     allow_model_execution: bool = False,
     timeout_seconds: float = DEFAULT_REVIEW_SUBPROCESS_TIMEOUT_SECONDS,
 ) -> CheckpointReviewSubprocessOutcome:
@@ -740,6 +798,8 @@ async def run_checkpoint_review_subprocess(
         not isinstance(stage, EvaluationStagePlan) for stage in evaluation_stage_plan
     ):
         raise TypeError("evaluation_stage_plan must be an EvaluationStagePlan tuple")
+    if cost_authority is not None and not isinstance(cost_authority, FrozenCostAuthority):
+        raise TypeError("cost_authority must be a FrozenCostAuthority")
 
     from pr_agent.algo.checkpoint_evaluation_materialize import review_snapshot_canonical_bytes
     from pr_agent.algo.review_configuration import (
@@ -772,6 +832,22 @@ async def run_checkpoint_review_subprocess(
                 evaluation_stage_plan,
                 arm_kind=infer_checkpoint_arm_kind(evaluation_stage_plan),
             )
+        if snapshot.diff.strip():
+            if cost_authority is None:
+                return _failure_outcome(
+                    CheckpointReviewSubprocessState.FAILED,
+                    "cost_authority_unverified",
+                    snapshot_id=snapshot.snapshot_id,
+                )
+            cost_authority.require_active()
+            if (
+                not hmac.compare_digest(cost_authority.snapshot_id, snapshot.snapshot_id)
+                or not hmac.compare_digest(
+                    cost_authority.review_configuration_hash,
+                    review_configuration.configuration_hash,
+                )
+            ):
+                raise CheckpointCostAuthorityError("cost authority belongs to a different snapshot")
         canonical_snapshot = _decode_json_object(
             review_snapshot_canonical_bytes(snapshot),
             "snapshot",
@@ -779,6 +855,12 @@ async def run_checkpoint_review_subprocess(
         canonical_review_configuration = _decode_json_object(
             review_configuration_canonical_bytes(review_configuration),
             "review_configuration",
+        )
+    except CheckpointCostAuthorityError:
+        return _failure_outcome(
+            CheckpointReviewSubprocessState.FAILED,
+            "cost_authority_unverified",
+            snapshot_id=snapshot.snapshot_id,
         )
     except (TypeError, ValueError, RecursionError):
         return _failure_outcome(
@@ -793,6 +875,7 @@ async def run_checkpoint_review_subprocess(
             "snapshot": canonical_snapshot,
             "review_configuration": canonical_review_configuration,
             "evaluation_stage_plan": [stage.to_dict() for stage in evaluation_stage_plan],
+            "cost_authority": None if cost_authority is None else cost_authority.to_dict(),
         },
         allow_nan=False,
         ensure_ascii=True,

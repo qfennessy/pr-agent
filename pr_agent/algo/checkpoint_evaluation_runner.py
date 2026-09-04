@@ -21,6 +21,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Optional
 
+from pr_agent.algo.checkpoint_cost_authority import FrozenCostAuthority, validate_cost_authorities
 from pr_agent.algo.checkpoint_evaluation import (
     CheckpointCase,
     EvaluationArm,
@@ -65,6 +66,7 @@ PRE_EXECUTION_ZERO_COST_FAILURE_CODES = frozenset({
     "review_configuration_unverified",
     "review_configuration_mismatch",
     "stage_sources_unverified",
+    "cost_authority_unverified",
     "worker_start_failed",
 })
 
@@ -106,6 +108,7 @@ class ProductionArmContext:
     prompt_hash: str
     model_visible_metadata: Mapping[str, object]
     review_configuration: ReviewConfigurationBundle = field(repr=False)
+    cost_authority: Optional[FrozenCostAuthority] = field(default=None, repr=False)
     stage_plan: tuple[EvaluationStagePlan, ...] = field(default_factory=tuple)
     hard_cost_cap_usd: Optional[float] = None
     publish_output: bool = False
@@ -115,6 +118,8 @@ class ProductionArmContext:
             raise EvaluationValidationError("checkpoint production bindings cannot publish output")
         if not isinstance(self.review_configuration, ReviewConfigurationBundle):
             raise EvaluationValidationError("production adapter context requires a review configuration bundle")
+        if self.cost_authority is not None and not isinstance(self.cost_authority, FrozenCostAuthority):
+            raise EvaluationValidationError("production adapter context requires a frozen cost authority")
         object.__setattr__(self, "stage_plan", tuple(self.stage_plan))
         if any(not isinstance(stage, EvaluationStagePlan) for stage in self.stage_plan):
             raise EvaluationValidationError("production adapter context requires an evaluation stage plan")
@@ -322,6 +327,10 @@ class ProductionEvaluationPreflight:
     review_configurations_by_case_id: Mapping[str, ReviewConfigurationBundle] = field(repr=False)
     arms_by_kind: Mapping[EvaluationArmKind, EvaluationArm]
     bindings_by_kind: Mapping[EvaluationArmKind, ProductionArmBinding]
+    cost_authorities_by_pair: Mapping[tuple[str, str], FrozenCostAuthority] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "snapshots_by_case_id", MappingProxyType(dict(self.snapshots_by_case_id)))
@@ -332,6 +341,11 @@ class ProductionEvaluationPreflight:
         )
         object.__setattr__(self, "arms_by_kind", MappingProxyType(dict(self.arms_by_kind)))
         object.__setattr__(self, "bindings_by_kind", MappingProxyType(dict(self.bindings_by_kind)))
+        object.__setattr__(
+            self,
+            "cost_authorities_by_pair",
+            MappingProxyType(dict(self.cost_authorities_by_pair)),
+        )
 
 
 @dataclass(frozen=True)
@@ -356,6 +370,7 @@ class ProductionEvaluationRunner:
         evaluation_enabled: bool,
         allow_paid_execution: bool,
         publish_output: bool,
+        cost_authorities: Sequence[FrozenCostAuthority] = (),
     ) -> None:
         self.manifest = manifest
         self.snapshot_paths = MappingProxyType(dict(snapshot_paths))
@@ -369,6 +384,7 @@ class ProductionEvaluationRunner:
         self.evaluation_enabled = evaluation_enabled
         self.allow_paid_execution = allow_paid_execution
         self.publish_output = publish_output
+        self.cost_authorities = tuple(cost_authorities)
 
     def preflight(self) -> ProductionEvaluationPreflight:
         """Validate the complete run before any adapter or artifact-store call."""
@@ -388,6 +404,24 @@ class ProductionEvaluationRunner:
             self.review_configuration_artifact_hashes,
         )
         _validate_loaded_stage_sources(arms_by_kind, loaded_pairs)
+        cost_authorities_by_pair = (
+            validate_cost_authorities(self.manifest, self.paid_request, self.cost_authorities)
+            if self.cost_authorities
+            else MappingProxyType({})
+        )
+        cases_by_id = {case.case_id: case for case in self.manifest.cases}
+        arms_by_id = {arm.arm_id: arm for arm in self.manifest.arms if arm.enabled}
+        for (case_id, arm_id), authority in cost_authorities_by_pair.items():
+            case = cases_by_id[case_id]
+            arm = arms_by_id[arm_id]
+            authority.require_context(
+                manifest_id=self.manifest.manifest_id,
+                case_id=case_id,
+                arm_id=arm_id,
+                snapshot_id=case.snapshot_id,
+                arm_configuration_hash=arm.configuration_hash,
+                review_configuration_hash=loaded_pairs[case_id].review_configuration.configuration_hash,
+            )
         self.artifact_store.bind_paid_request(self.manifest, self.paid_request)
         return ProductionEvaluationPreflight(
             manifest_id=self.manifest.manifest_id,
@@ -397,6 +431,7 @@ class ProductionEvaluationRunner:
             },
             arms_by_kind=arms_by_kind,
             bindings_by_kind=bindings_by_kind,
+            cost_authorities_by_pair=cost_authorities_by_pair,
         )
 
     async def run(self) -> ProductionEvaluationResult:
@@ -464,6 +499,7 @@ class ProductionEvaluationRunner:
                 prompt_hash=arm.prompt_hash,
                 model_visible_metadata=case.model_visible_metadata,
                 review_configuration=review_configuration,
+                cost_authority=preflight.cost_authorities_by_pair.get((case.case_id, arm.arm_id)),
                 stage_plan=arm.stage_plan,
                 hard_cost_cap_usd=(
                     paid_budget.hard_cost_cap_per_attempt_usd

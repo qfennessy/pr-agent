@@ -1,6 +1,7 @@
 import hashlib
 import json
 from dataclasses import replace
+from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,6 +12,7 @@ from pr_agent.algo.candidate_verification import (
     candidate_verification_provider_controls_hash,
     parse_candidate_verification_config,
 )
+from pr_agent.algo.checkpoint_cost_authority import FrozenCostAuthority, ProviderMaximumCharge
 from pr_agent.algo.checkpoint_evaluation import (
     EvaluationArmKind,
     EvaluationStageModelIdentity,
@@ -47,6 +49,34 @@ from pr_agent.config_loader import get_settings
 def _hash_json(value) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _cost_authority(snapshot: ReviewSnapshot, configuration: ReviewConfigurationBundle) -> FrozenCostAuthority:
+    return FrozenCostAuthority(
+        manifest_id=_hash_json("manifest"),
+        paid_request_id=_hash_json("paid-request"),
+        case_id="case-one",
+        arm_id="arm-full-cascade",
+        snapshot_id=snapshot.snapshot_id,
+        arm_configuration_hash=_hash_json("arm-configuration"),
+        review_configuration_hash=configuration.configuration_hash,
+        hard_cost_cap_usd=Decimal("0.01"),
+        authority_name="test-gateway",
+        authority_revision="test-rate-card-v1",
+        authority_reference_hash=_hash_json("test-authority"),
+        expires_at="2099-01-01T00:00:00Z",
+        quotes=(
+            ProviderMaximumCharge(
+                stage="specialists",
+                model_id="model-security",
+                provider_id="provider",
+                model_revision="model-revision-v1",
+                deployment_id_hash=None,
+                max_output_tokens=128,
+                maximum_charge_usd=Decimal("0.01"),
+            ),
+        ),
+    )
 
 
 def _specialists() -> SpecialistPipelineConfig:
@@ -415,9 +445,10 @@ async def test_subprocess_request_revalidates_and_injects_selected_stage_sources
         review_configuration_hash=configuration.configuration_hash,
     )
 
-    async def execute(received_snapshot, received_configuration):
+    async def execute(received_snapshot, received_configuration, received_cost_authority):
         assert received_snapshot is not snapshot
         assert received_configuration.stage_sources is not sources
+        assert received_cost_authority.snapshot_id == snapshot.snapshot_id
         assert checkpoint_specialist_pipeline().configuration_hash == sources.specialist_pipeline.configuration_hash
         assert checkpoint_candidate_verification_config(strict_output_policy=True).configuration_hash == (
             sources.full_cascade_candidate_verification.configuration_hash
@@ -437,6 +468,7 @@ async def test_subprocess_request_revalidates_and_injects_selected_stage_sources
         review_configuration=configuration,
         evaluation_stage_plan=plan,
         allow_model_execution=True,
+        cost_authority=_cost_authority(snapshot, configuration),
     )
     outcome = await review_subprocess._handle_worker_request(
         json.dumps(request.to_dict()).encode(),
