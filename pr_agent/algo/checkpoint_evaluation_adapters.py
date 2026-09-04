@@ -98,6 +98,27 @@ def _verified_findings(review: Mapping[str, object]):
     return normalize_verified_findings(findings, severity_by_fingerprint=severity_by_key)
 
 
+def _verified_output_truncated(review: Mapping[str, object], published_count: int) -> bool:
+    artifact = review.get("candidate_verification")
+    if artifact is None and published_count == 0:
+        return False
+    if not isinstance(artifact, Mapping):
+        raise EvaluationValidationError("verified production output omits verifier telemetry")
+    counts = {}
+    for field_name in ("finding_limit_dropped", "verified_count", "verifier_verified_count"):
+        value = artifact.get(field_name)
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise EvaluationValidationError(f"verified production output has invalid {field_name}")
+        counts[field_name] = value
+    return (
+        counts.get("finding_limit_dropped", 0) > 0
+        or counts.get("verified_count", published_count) != published_count
+        or counts.get("verifier_verified_count", published_count) > published_count
+    )
+
+
 def _coverage_issues(
     snapshot: ReviewSnapshot,
     kind: EvaluationArmKind,
@@ -137,6 +158,10 @@ def _coverage_issues(
         for path in sorted(set(deleted_files))
     )
     if kind is EvaluationArmKind.VERIFIED_SPECIALISTS:
+        if _verified_output_truncated(review, len(_review_findings(review))):
+            issues.append(
+                CoverageIssue(reason="verified_finding_truncated", path="candidate_verification")
+            )
         issues.extend(
             CoverageIssue(reason="stage_coverage_unavailable", path=stage)
             for stage, stage_details in sorted(details.specialist_runs.items())

@@ -259,6 +259,59 @@ def test_verified_adapter_preserves_findings_from_partial_stage_coverage():
     assert result.failure_reason_code is None
 
 
+@pytest.mark.parametrize(
+    "counts",
+    (
+        {"verified_count": 1, "verifier_verified_count": 2, "finding_limit_dropped": 1},
+        {"verified_count": 2, "verifier_verified_count": 2, "finding_limit_dropped": 0},
+    ),
+)
+def test_verified_adapter_marks_verifier_or_publication_truncation_as_partial(counts):
+    snapshot = _snapshot()
+    stable_key = _hash("published-stable-key")
+    dropped_key = _hash("dropped-stable-key")
+    finding = {
+        "relevant_file": "example.py",
+        "issue_header": "Bug",
+        "issue_content": "Verified failure",
+        "start_line": 1,
+        "end_line": 1,
+        "root_cause_id": _hash("root-cause"),
+        "trusted_stable_key": stable_key,
+        "normalized_severity": "high",
+    }
+    outcome = _outcome(snapshot, {
+        "review": {"key_issues_to_review": [finding]},
+        "candidate_verification": {
+            "status": "complete",
+            "publication_safe": True,
+            "decisions": [
+                {
+                    "candidate_id": "candidate-1",
+                    "verdict": "verified",
+                    "trusted_stable_key": stable_key,
+                    "normalized_severity": "high",
+                },
+                {
+                    "candidate_id": "candidate-2",
+                    "verdict": "verified",
+                    "trusted_stable_key": dropped_key,
+                    "normalized_severity": "medium",
+                },
+            ],
+            **counts,
+        },
+    })
+
+    result = adapt_checkpoint_review_outcome(snapshot, EvaluationArmKind.VERIFIED_SPECIALISTS, outcome)
+
+    assert result.snapshot_result.state is ReviewResultState.FINDINGS
+    assert [finding.fingerprint for finding in result.findings] == [stable_key]
+    assert [(issue.reason, issue.path) for issue in result.snapshot_result.coverage_issues] == [
+        ("verified_finding_truncated", "candidate_verification"),
+    ]
+
+
 @pytest.mark.parametrize("mutation", ("missing", "conflicting", "duplicate"))
 def test_verified_adapter_rejects_untrusted_severity_joins(mutation):
     snapshot = _snapshot()
