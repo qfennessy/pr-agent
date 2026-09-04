@@ -6295,6 +6295,7 @@ async def test_genuinely_empty_first_pass_candidate_list_is_a_safe_no_candidate_
     assert artifact["proposed_candidate_count"] == 0
     assert artifact["accepted_model_candidate_count"] == 0
     assert artifact["candidate_rejection_count"] == 0
+    assert artifact["finding_limit_dropped"] == 0
     assert artifact["model_candidate_coverage"] == {
         "status": "complete",
         "proposed_count": 0,

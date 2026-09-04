@@ -2491,7 +2491,11 @@ class PRReviewer:
                         "publication_safe": False,
                     })
                 else:
-                    artifact.update({"status": "no_candidates", "publication_safe": True})
+                    artifact.update({
+                        "status": "no_candidates",
+                        "publication_safe": True,
+                        "finding_limit_dropped": 0,
+                    })
                 return
 
             verifier_route = verification_config.route
