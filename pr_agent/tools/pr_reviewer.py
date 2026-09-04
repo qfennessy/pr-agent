@@ -248,6 +248,7 @@ class PRReviewer:
         self.remaining_files_list = []
         self.deleted_files_list = []
         self.prediction = None
+        self._review_prediction_finish_reason = None
         self.candidate_verification_artifact = None
         self.frontier_adjudication_artifact = None
         self._frontier_adjudication_config = None
@@ -1393,9 +1394,20 @@ class PRReviewer:
                 not get_settings().config.publish_output or
                 not get_settings().pr_reviewer.persistent_comment or self.incremental.is_incremental):
             return
+        threaded_findings = getattr(self, "_review_thread_lifecycle_threaded_findings", False)
+        if (
+            self._review_thread_lifecycle_enabled()
+            and self._review_thread_lifecycle_provider_supported()
+            and not threaded_findings
+            and (
+                not isinstance(getattr(self, "review_thread_reconciliation_artifact", None), Mapping)
+                or self.review_thread_reconciliation_artifact.get("authoritative_absence") is not True
+            )
+        ):
+            return
         clear_review = (
             self.git_provider.clear_persistent_review_comment
-            if getattr(self, "_review_thread_lifecycle_threaded_findings", False)
+            if threaded_findings
             else self.git_provider.clear_persistent_review
         )
         clear_review(
@@ -1612,12 +1624,15 @@ class PRReviewer:
         system_prompt = environment.from_string(get_settings().pr_review_prompt.system).render(variables)
         user_prompt = environment.from_string(get_settings().pr_review_prompt.user).render(variables)
 
+        self._review_prediction_finish_reason = None
         response, finish_reason = await self.ai_handler.chat_completion(
             model=model,
             temperature=get_settings().config.temperature,
             system=system_prompt,
             user=user_prompt
         )
+        normalized_finish_reason = str(finish_reason or "").strip().casefold()
+        self._review_prediction_finish_reason = normalized_finish_reason or None
 
         return response
 
@@ -2267,6 +2282,10 @@ class PRReviewer:
             "status": "initializing",
             "model_calls": 0,
             "publication_safe": False,
+            "first_pass_finish_reason": getattr(self, "_review_prediction_finish_reason", None),
+            "first_pass_generation_complete": (
+                getattr(self, "_review_prediction_finish_reason", None) == "stop"
+            ),
             "specialist_prioritization": {"status": "initializing"},
         }
         verifier_started = None
@@ -3098,6 +3117,7 @@ class PRReviewer:
             not isinstance(artifact, Mapping)
             or artifact.get("publication_safe") is not True
             or artifact.get("status") not in {"complete", "no_candidates"}
+            or artifact.get("first_pass_generation_complete") is not True
             or bool(getattr(incremental, "is_incremental", False))
             or bool(getattr(self, "_review_shadow_only", False))
             or bool(getattr(self, "remaining_files_list", []))

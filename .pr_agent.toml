@@ -41,6 +41,11 @@ frontier_adjudication_max_output_tokens = 2048
 frontier_adjudication_minimum_confidence = 0.0
 frontier_adjudication_max_calls = 3
 
+[review_thread_lifecycle]
+# Keep stable GitHub review-thread publication disabled until the #27 rollout gates pass.
+enabled = false
+obsolete_thread_policy = "keep"
+
 [github_app]
 pr_commands = [
     "/describe --pr_description.publish_description_as_comment=true",

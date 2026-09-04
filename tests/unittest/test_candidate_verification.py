@@ -5211,6 +5211,7 @@ def _reviewer_for_orchestration(provider):
     reviewer = PRReviewer.__new__(PRReviewer)
     reviewer.git_provider = provider
     reviewer.prediction = "review: {}"
+    reviewer._review_prediction_finish_reason = "stop"
     reviewer.patches_diff = "+changed"
     reviewer.remaining_files_list = []
     reviewer.deleted_files_list = []
@@ -6292,6 +6293,8 @@ async def test_genuinely_empty_first_pass_candidate_list_is_a_safe_no_candidate_
     artifact = reviewer.candidate_verification_artifact
     assert artifact["status"] == "no_candidates"
     assert artifact["publication_safe"] is True
+    assert artifact["first_pass_finish_reason"] == "stop"
+    assert artifact["first_pass_generation_complete"] is True
     assert artifact["proposed_candidate_count"] == 0
     assert artifact["accepted_model_candidate_count"] == 0
     assert artifact["candidate_rejection_count"] == 0
@@ -6303,6 +6306,28 @@ async def test_genuinely_empty_first_pass_candidate_list_is_a_safe_no_candidate_
         "rejected_count": 0,
     }
     reviewer.ai_handler.chat_completion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_length_truncated_first_pass_is_recorded_as_generation_incomplete():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    reviewer = _reviewer_for_orchestration(provider)
+    reviewer._review_prediction_finish_reason = "length"
+    reviewer._parse_review_prediction = MagicMock(return_value=_review_data())
+
+    with patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_verification_settings()):
+        await reviewer._run_candidate_verification()
+
+    artifact = reviewer.candidate_verification_artifact
+    assert artifact["status"] == "no_candidates"
+    assert artifact["publication_safe"] is True
+    assert artifact["first_pass_finish_reason"] == "length"
+    assert artifact["first_pass_generation_complete"] is False
+    safe_artifact = telemetry_safe_artifact(artifact)
+    assert safe_artifact["first_pass_finish_reason"] == "length"
+    assert safe_artifact["first_pass_generation_complete"] is False
 
 
 @pytest.mark.asyncio

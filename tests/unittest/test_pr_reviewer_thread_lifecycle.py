@@ -1,3 +1,5 @@
+import tomllib
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -236,6 +238,7 @@ def _reviewer(provider, *, artifact=None, incremental=False, remaining_files=())
     reviewer.candidate_verification_artifact = artifact or {
         "status": "complete",
         "publication_safe": True,
+        "first_pass_generation_complete": True,
         "proposed_candidate_count": 1,
         "verified_count": 1,
         "finding_limit_dropped": 0,
@@ -256,6 +259,18 @@ def _apply(reviewer, findings, *, settings=None):
 
 def _mutation_calls(provider):
     return [call for call in provider.calls if call[0] in {"create", "update", "resolve"}]
+
+
+def test_review_thread_lifecycle_defaults_are_disabled_and_mirrored():
+    repository = tomllib.loads(Path(".pr_agent.toml").read_text(encoding="utf-8"))["review_thread_lifecycle"]
+    defaults = tomllib.loads(
+        Path("pr_agent/settings/configuration.toml").read_text(encoding="utf-8")
+    )["review_thread_lifecycle"]
+
+    assert repository == defaults == {
+        "enabled": False,
+        "obsolete_thread_policy": "keep",
+    }
 
 
 def test_new_verified_finding_creates_one_thread_and_removes_it_from_the_summary_body():
@@ -527,6 +542,7 @@ def test_complete_full_clean_run_may_resolve_an_obsolete_bot_owned_thread():
     reviewer = _reviewer(provider, artifact={
         "status": "no_candidates",
         "publication_safe": True,
+        "first_pass_generation_complete": True,
         "proposed_candidate_count": 0,
         "verified_count": 0,
         "finding_limit_dropped": 0,
@@ -543,6 +559,7 @@ def test_incremental_clean_run_cannot_resolve_an_obsolete_thread():
     reviewer = _reviewer(provider, incremental=True, artifact={
         "status": "no_candidates",
         "publication_safe": True,
+        "first_pass_generation_complete": True,
         "proposed_candidate_count": 0,
         "verified_count": 0,
         "finding_limit_dropped": 0,
@@ -558,6 +575,7 @@ def test_omitted_or_budgeted_findings_make_absence_non_authoritative():
     artifact = {
         "status": "complete",
         "publication_safe": True,
+        "first_pass_generation_complete": True,
         "proposed_candidate_count": 1,
         "verified_count": 1,
         "finding_limit_dropped": 0,
@@ -588,6 +606,7 @@ def test_generation_cap_saturation_and_malformed_counts_make_absence_non_authori
     reviewer = _reviewer(_Provider(), artifact={
         "status": "complete",
         "publication_safe": True,
+        "first_pass_generation_complete": True,
         "proposed_candidate_count": proposed_count,
         "verified_count": published_count,
         "finding_limit_dropped": 0,
@@ -600,10 +619,30 @@ def test_generation_cap_saturation_and_malformed_counts_make_absence_non_authori
         assert reviewer._review_thread_absence_is_authoritative(published_count) is expected
 
 
+@pytest.mark.parametrize("generation_complete", [False, None])
+def test_incomplete_or_missing_first_pass_completion_makes_absence_non_authoritative(
+    generation_complete,
+):
+    artifact = {
+        "status": "complete",
+        "publication_safe": True,
+        "proposed_candidate_count": 1,
+        "verified_count": 1,
+        "finding_limit_dropped": 0,
+    }
+    if generation_complete is not None:
+        artifact["first_pass_generation_complete"] = generation_complete
+    reviewer = _reviewer(_Provider(), artifact=artifact)
+
+    with patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_Settings()):
+        assert reviewer._review_thread_absence_is_authoritative(1) is False
+
+
 def test_applied_route_generation_cap_controls_authoritative_absence():
     reviewer = _reviewer(_Provider(), artifact={
         "status": "complete",
         "publication_safe": True,
+        "first_pass_generation_complete": True,
         "proposed_candidate_count": 2,
         "verified_count": 2,
         "finding_limit_dropped": 0,
@@ -629,6 +668,7 @@ def test_saturated_run_reconciles_current_finding_without_resolving_absent_threa
     reviewer = _reviewer(provider, artifact={
         "status": "complete",
         "publication_safe": True,
+        "first_pass_generation_complete": True,
         "proposed_candidate_count": 1,
         "verified_count": 1,
         "finding_limit_dropped": 0,
@@ -725,6 +765,36 @@ def test_threaded_bugs_only_finding_clears_stale_comment_without_rewriting_the_c
         identity_marker="<!-- pr-agent:review:bugs-only -->",
         name="bugs-only review",
     )
+
+
+def test_non_authoritative_clean_lifecycle_run_preserves_the_persistent_review():
+    provider = _Provider()
+    provider.clear_persistent_review = MagicMock()
+    provider.clear_persistent_review_comment = MagicMock()
+    reviewer = _reviewer(provider, artifact={
+        "status": "no_candidates",
+        "publication_safe": True,
+        "first_pass_generation_complete": False,
+        "proposed_candidate_count": 0,
+        "verified_count": 0,
+        "finding_limit_dropped": 0,
+    })
+    reviewer.review_profile = "bugs_only"
+    reviewer.verified_review_data = {"review": {"key_issues_to_review": []}}
+    reviewer.prediction = "review: {}"
+    reviewer._publish_structured_review_data = MagicMock()
+
+    with (
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=_Settings(enabled=True)),
+        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+    ):
+        rendered = reviewer._prepare_pr_review()
+        reviewer._clear_stale_persistent_bugs_only_review()
+
+    assert rendered == ""
+    assert reviewer.review_thread_reconciliation_artifact["authoritative_absence"] is False
+    provider.clear_persistent_review.assert_not_called()
+    provider.clear_persistent_review_comment.assert_not_called()
 
 
 def test_disabled_setting_preserves_legacy_inline_path():
