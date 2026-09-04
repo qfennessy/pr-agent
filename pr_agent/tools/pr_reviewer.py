@@ -1028,17 +1028,24 @@ class PRReviewer:
         if not isinstance(role_configs, tuple):
             return False
         enabled_roles = []
+        enabled_role_configs = {}
         for config in role_configs:
             role = getattr(config, "role", None)
             enabled = getattr(config, "enabled", None)
+            model = getattr(config, "model", None)
+            deployment = getattr(config, "deployment", None)
             if (
                 not isinstance(role, SpecialistRole)
                 or not isinstance(enabled, bool)
                 or role in enabled_roles
+                or not isinstance(model, str)
+                or not model.strip()
+                or (deployment is not None and not isinstance(deployment, str))
             ):
                 return False
             if enabled:
                 enabled_roles.append(role)
+                enabled_role_configs[role] = config
         if len(result.records) != len(enabled_roles):
             return False
 
@@ -1070,8 +1077,8 @@ class PRReviewer:
                 return False
             expected_role_record = {
                 "role": role.value,
-                "model": None,
-                "deployment": None,
+                "model": enabled_role_configs[role].model,
+                "deployment": enabled_role_configs[role].deployment,
                 "fallback_used": False,
                 "prompt_version": prompt.prompt_version,
                 "input_schema_version": prompt.input_schema_version,

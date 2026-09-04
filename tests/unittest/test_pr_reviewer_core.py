@@ -4445,9 +4445,15 @@ def _unavailable_specialist_fixture():
         input_schema_version="specialist-input-v1",
         schema_version="specialist-output-v1",
     )
+    role_config = SimpleNamespace(
+        role=role,
+        enabled=True,
+        model="model-risk_recommendation",
+        deployment="deployment-risk_recommendation",
+    )
     pipeline = SimpleNamespace(
         configuration_hash="configuration-hash",
-        roles=(SimpleNamespace(role=role, enabled=True),),
+        roles=(role_config,),
         prompt=lambda requested_role: prompt if requested_role is role else None,
     )
     batch = unavailable_specialist_batch(pipeline, failure_reason=reason)

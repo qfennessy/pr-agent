@@ -862,6 +862,11 @@ async def test_aggregate_reservations_prevent_calls_beyond_budget():
 
     assert handler.calls == []
     assert all(record.state is SpecialistState.AGGREGATE_BUDGET_EXHAUSTED for record in result.records)
+    for role, record in result.to_dict()["roles"].items():
+        assert record["model"] == f"model-{role}"
+        assert record["deployment"] == f"deployment-{role}"
+        assert record["fallback_used"] is False
+        assert record["usage"]["ai_calls"] == 0
 
 
 @pytest.mark.asyncio
