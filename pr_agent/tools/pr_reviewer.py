@@ -17,10 +17,12 @@ from pr_agent.algo.ai_handlers.litellm_ai_handler import (
 )
 from pr_agent.algo.ai_request_context import AIModelRoute, get_ai_request_options
 from pr_agent.algo.candidate_verification import (
-    VerificationBudgets,
+    CandidateVerificationOutputBudgetError,
     apply_specialist_prioritization,
     apply_verification_decisions,
     bounded_verification_evidence,
+    candidate_verification_provider_controls_hash,
+    load_production_candidate_verification_config,
     prepare_candidates,
     prompt_evidence_coverage,
     render_verification_payload,
@@ -1786,114 +1788,6 @@ class PRReviewer:
             return "missing_decision"
         return None
 
-    @staticmethod
-    def _candidate_specialist_prioritization_enabled() -> bool:
-        value = get_settings().pr_reviewer.get(
-            "candidate_verification_consume_specialist_prioritization", False
-        )
-        if isinstance(value, str):
-            return value.strip().lower() in ("1", "true", "yes", "on")
-        return bool(value)
-
-    def _candidate_verifier_model_route(self, config) -> AIModelRoute:
-        """Build an immutable verifier route without inheriting an incompatible Azure deployment."""
-
-        def string_tuple(value, key: str) -> tuple[str, ...]:
-            if value in (None, "", []):
-                return ()
-            if isinstance(value, str):
-                values = [part.strip() for part in value.split(",")]
-            elif isinstance(value, (list, tuple)):
-                values = [str(part).strip() for part in value]
-            else:
-                raise ValueError(f"{key} must be a string list")
-            if any(not part for part in values):
-                raise ValueError(f"{key} cannot contain blank entries")
-            return tuple(values)
-
-        def deployment_tuple(value, key: str) -> tuple[Optional[str], ...]:
-            if value in (None, "", []):
-                return ()
-            if isinstance(value, str):
-                values = value.split(",")
-            elif isinstance(value, (list, tuple)):
-                values = value
-            else:
-                raise ValueError(f"{key} must be a string list")
-            return tuple(str(part).strip() or None for part in values)
-
-        settings = get_settings()
-        primary_model = str(settings.config.model).strip()
-        configured_model = str(config.get("candidate_verification_model", "") or "").strip()
-        model = configured_model or primary_model
-        if not model:
-            raise ValueError("candidate verifier model cannot be blank")
-        fallback_models = string_tuple(
-            config.get("candidate_verification_fallback_models", []),
-            "candidate_verification_fallback_models",
-        )
-
-        global_deployment = str(
-            settings.get("openai.deployment_id", "") or ""
-        ).strip() or None
-        explicit_deployment = str(
-            config.get("candidate_verification_deployment", "") or ""
-        ).strip() or None
-        azure_route = getattr(self.ai_handler, "azure", False) is True or global_deployment is not None
-        if explicit_deployment is not None:
-            deployment = explicit_deployment
-        elif not configured_model or model == primary_model:
-            deployment = global_deployment
-        elif azure_route:
-            raise ValueError(
-                "candidate_verification_deployment is required when the Azure verifier model differs"
-            )
-        else:
-            deployment = None
-
-        fallback_deployments = deployment_tuple(
-            config.get("candidate_verification_fallback_deployments", []),
-            "candidate_verification_fallback_deployments",
-        )
-        if fallback_deployments and len(fallback_deployments) != len(fallback_models):
-            raise ValueError(
-                "candidate_verification_fallback_deployments must match fallback models"
-            )
-        if not fallback_deployments:
-            if azure_route and fallback_models:
-                raise ValueError(
-                    "Azure verifier fallback models require matching fallback deployments"
-                )
-            fallback_deployments = (None,) * len(fallback_models)
-        deployments = (deployment, *fallback_deployments)
-        if azure_route and any(item is None for item in deployments):
-            raise ValueError("every Azure verifier model requires a deployment")
-
-        configured_output_cap = config.get("candidate_verification_max_output_tokens", 0)
-        try:
-            output_cap = int(configured_output_cap)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("candidate_verification_max_output_tokens must be an integer") from exc
-        if output_cap < 0:
-            raise ValueError("candidate_verification_max_output_tokens cannot be negative")
-        if output_cap == 0:
-            try:
-                output_cap = int(settings.config.get("max_output_tokens", 0))
-            except (TypeError, ValueError):
-                output_cap = 0
-
-        return AIModelRoute(
-            models=(model, *fallback_models),
-            deployments=deployments,
-            timeout_seconds=max(
-                0.001, float(config.get("candidate_verification_timeout_seconds", 10))
-            ),
-            model_retries=1,
-            provider_retries=0,
-            max_output_tokens=output_cap or None,
-            attribution="candidate_verification",
-        )
-
     def _parse_review_prediction(self) -> dict:
         return load_yaml(
             self.prediction.strip(),
@@ -2262,8 +2156,6 @@ class PRReviewer:
 
     async def _run_candidate_verification(self) -> None:
         """Verify review candidates against bounded base-branch repository evidence."""
-        config = get_settings().pr_reviewer
-        consume_specialist_prioritization = self._candidate_specialist_prioritization_enabled()
         frontier_enabled = self._frontier_adjudication_enabled()
         frontier_dependency_artifact = None
         if frontier_enabled:
@@ -2274,9 +2166,7 @@ class PRReviewer:
             "status": "initializing",
             "model_calls": 0,
             "publication_safe": False,
-            "specialist_prioritization": {
-                "status": "pending" if consume_specialist_prioritization else "disabled"
-            },
+            "specialist_prioritization": {"status": "initializing"},
         }
         verifier_started = None
         details_before = None
@@ -2315,44 +2205,83 @@ class PRReviewer:
                 artifact.update({"status": "unsupported_provider", "verified_count": 0})
                 return
 
-            route_candidate_cap = getattr(
-                self, "_review_max_verification_candidates", None
-            )
-            if route_candidate_cap is not None and (
-                isinstance(route_candidate_cap, bool)
-                or not isinstance(route_candidate_cap, int)
-                or route_candidate_cap <= 0
-            ):
-                raise ValueError(
-                    "routed max_verification_candidates must be a positive integer"
+            runtime_settings = get_settings()
+            route_candidate_cap = getattr(self, "_review_max_verification_candidates", None)
+
+            def current_claude_extended_thinking_models() -> Optional[tuple[str, ...]]:
+                raw_models = getattr(self.ai_handler, "claude_extended_thinking_models", None)
+                if (
+                    isinstance(raw_models, (list, tuple))
+                    and all(isinstance(item, str) and item.strip() for item in raw_models)
+                ):
+                    return tuple(raw_models)
+                return None
+
+            claude_extended_thinking_models = current_claude_extended_thinking_models()
+
+            def provider_controls_unchanged() -> bool:
+                current_claude_models = current_claude_extended_thinking_models()
+                return (
+                    current_claude_models == claude_extended_thinking_models
+                    and candidate_verification_provider_controls_hash(
+                        get_settings(),
+                        claude_extended_thinking_models=current_claude_models,
+                    ) == verification_config.provider_controls_hash
                 )
-            budgets = VerificationBudgets(
-                max_candidates=(
-                    route_candidate_cap
-                    if route_candidate_cap is not None
-                    else max(
-                        0,
-                        int(config.get("candidate_verification_max_candidates", 3)),
-                    )
-                ),
-                max_files=max(0, int(config.get("candidate_verification_max_files", 6))),
-                max_lines_per_file=max(0, int(config.get("candidate_verification_max_lines_per_file", 160))),
-                max_total_lines=max(0, int(config.get("candidate_verification_max_total_lines", 600))),
-                max_context_tokens=max(0, int(config.get("candidate_verification_max_context_tokens", 6000))),
-                timeout_seconds=max(0.0, float(config.get("candidate_verification_timeout_seconds", 10))),
-            )
-            sensitive_globs = config.get("candidate_verification_sensitive_path_globs", []) or []
-            if isinstance(sensitive_globs, str):
-                sensitive_globs = [sensitive_globs]
+
+            def resolve_verifier_output_cap(route_model: str, request_cap: Optional[int]) -> Optional[int]:
+                kwargs = {"require_bounded_reasoning": True}
+                if claude_extended_thinking_models is not None:
+                    kwargs["claude_extended_thinking_models"] = list(claude_extended_thinking_models)
+                return get_effective_litellm_output_token_cap(route_model, request_cap, **kwargs)
+
+            try:
+                verification_config = load_production_candidate_verification_config(
+                    settings=runtime_settings,
+                    azure=getattr(self.ai_handler, "azure", False) is True,
+                    max_candidates_override=route_candidate_cap,
+                    strict_output_policy=frontier_enabled,
+                    default_output_token_cap=OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+                    claude_extended_thinking_models=claude_extended_thinking_models,
+                    output_token_cap_resolver=resolve_verifier_output_cap,
+                )
+            except CandidateVerificationOutputBudgetError:
+                artifact.update({
+                    "status": "verifier_route_invalid",
+                    "failure": "invalid_output_budget",
+                    "verified_count": 0,
+                })
+                return
+            except (TypeError, ValueError):
+                artifact.update({
+                    "status": "verifier_route_invalid",
+                    "failure": "invalid_model_route",
+                    "verified_count": 0,
+                })
+                return
+            consume_specialist_prioritization = verification_config.consume_specialist_prioritization
+            artifact.update({
+                "configuration_hash": verification_config.configuration_hash,
+                "prompt_hash": verification_config.prompt_hash,
+                "config_schema_version": verification_config.schema_version,
+                "prompt_version": verification_config.prompt_version,
+                "input_schema_version": verification_config.input_schema_version,
+                "output_schema_version": verification_config.output_schema_version,
+                "static_analysis_evidence_hash": verification_config.static_analysis_evidence_hash,
+                "provider_controls_hash": verification_config.provider_controls_hash,
+                "specialist_prioritization": {
+                    "status": "pending" if consume_specialist_prioritization else "disabled"
+                },
+            })
+            budgets = verification_config.budgets
+            sensitive_globs = verification_config.sensitive_path_globs
             diff_files = self.git_provider.get_diff_files()
             candidates, candidate_rejections = prepare_candidates(
                 review_data,
                 diff_files,
                 sensitive_globs,
                 budgets.max_candidates,
-                max_sensitive_candidates=max(
-                    0, int(config.get("candidate_verification_max_sensitive_candidates", 6))
-                ),
+                max_sensitive_candidates=verification_config.max_sensitive_candidates,
             )
             sensitive_candidates = [
                 candidate for candidate in candidates if candidate.get("sensitive_path")
@@ -2421,9 +2350,7 @@ class PRReviewer:
             sensitive_coverage_incomplete = bool(sensitive_rejections)
             artifact["sensitive_audit_coverage"] = {
                 "status": "incomplete" if sensitive_coverage_incomplete else "complete",
-                "budget": max(
-                    0, int(config.get("candidate_verification_max_sensitive_candidates", 6))
-                ),
+                "budget": verification_config.max_sensitive_candidates,
                 "total_count": sensitive_total_count,
                 "selected_count": sensitive_selected_count,
                 "candidate_count": len(sensitive_candidates),
@@ -2471,25 +2398,15 @@ class PRReviewer:
                     artifact.update({"status": "no_candidates", "publication_safe": True})
                 return
 
-            try:
-                verifier_route = self._candidate_verifier_model_route(config)
-            except (TypeError, ValueError):
-                artifact.update({
-                    "status": "verifier_route_invalid",
-                    "failure": "invalid_model_route",
-                    "verified_count": 0,
-                })
-                return
+            verifier_route = verification_config.route
             model = verifier_route.models[0]
             artifact["model"] = model
             encoder = TokenEncoder.get_token_encoder(model)
-            runtime_data = get_settings().get("data", {}) or {}
-            static_evidence = runtime_data.get("static_analysis_evidence", []) if isinstance(runtime_data, dict) else []
             evidence, retrieval_artifact = await retrieve_evidence(
                 self.git_provider,
                 candidates,
                 budgets,
-                static_evidence,
+                verification_config.static_analysis_evidence,
                 diff_files=diff_files,
                 token_counter=lambda value: len(encoder.encode(value, disallowed_special=())),
                 prefer_pr_head=bool(
@@ -2497,7 +2414,7 @@ class PRReviewer:
                 ),
             )
             artifact["retrieval"] = retrieval_artifact
-            if int(config.get("candidate_verification_max_model_calls", 1)) < 1:
+            if verification_config.max_calls < 1:
                 artifact["status"] = "model_call_budget_exhausted"
                 return
 
@@ -2505,45 +2422,22 @@ class PRReviewer:
                 autoescape=select_autoescape(default_for_string=False),
                 undefined=StrictUndefined,
             )
-            verification_prompt = get_settings().pr_review_verification_prompt
             route_encoders = {
                 route_model: TokenEncoder.get_token_encoder(route_model)
                 for route_model in verifier_route.models
             }
-            try:
-                route_completion_reserves = {
-                    route_model: get_effective_litellm_output_token_cap(
-                        route_model,
-                        verifier_route.max_output_tokens,
-                        require_bounded_reasoning=True,
-                    )
-                    for route_model in verifier_route.models
-                }
-                if any(cap is None for cap in route_completion_reserves.values()):
-                    verifier_route = AIModelRoute(
-                        models=verifier_route.models,
-                        deployments=verifier_route.deployments,
-                        timeout_seconds=verifier_route.timeout_seconds,
-                        model_retries=verifier_route.model_retries,
-                        provider_retries=verifier_route.provider_retries,
-                        max_output_tokens=OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
-                        attribution=verifier_route.attribution,
-                    )
-                    route_completion_reserves = {
-                        route_model: get_effective_litellm_output_token_cap(
-                            route_model,
-                            verifier_route.max_output_tokens,
-                            require_bounded_reasoning=True,
-                        )
-                        for route_model in verifier_route.models
-                    }
-            except ValueError:
+            if not provider_controls_unchanged():
                 artifact.update({
-                    "status": "verifier_route_invalid",
-                    "failure": "invalid_output_budget",
+                    "status": "verifier_request_context_changed",
+                    "failure": "provider_controls_changed",
                     "verified_count": 0,
                 })
                 return
+            route_completion_reserves = dict(zip(
+                verifier_route.models,
+                verification_config.effective_output_token_caps,
+                strict=True,
+            ))
             route_model_max_tokens = {
                 route_model: get_max_tokens(route_model)
                 for route_model in verifier_route.models
@@ -2570,8 +2464,8 @@ class PRReviewer:
                         changed_diff_fraction=changed_diff_fraction,
                     ),
                 }
-                rendered_system = environment.from_string(verification_prompt.system).render(variables)
-                rendered_user = environment.from_string(verification_prompt.user).render(variables)
+                rendered_system = environment.from_string(verification_config.system_prompt).render(variables)
+                rendered_user = environment.from_string(verification_config.user_prompt).render(variables)
                 prompt_tokens = max(
                     len(route_encoder.encode(rendered_system, disallowed_special=()))
                     + len(route_encoder.encode(rendered_user, disallowed_special=()))
@@ -2665,12 +2559,16 @@ class PRReviewer:
 
             async def call_verifier(attempt_model: str):
                 artifact["verifier_attempts"] += 1
+                if not provider_controls_unchanged():
+                    raise RuntimeError("candidate verifier provider controls changed after capture")
                 prediction_result = await self.ai_handler.chat_completion(
                     model=attempt_model,
-                    temperature=get_settings().config.temperature,
+                    temperature=verification_config.temperature,
                     system=system_prompt,
                     user=user_prompt,
                 )
+                if not provider_controls_unchanged():
+                    raise RuntimeError("candidate verifier provider controls changed during request")
                 artifact["model"] = attempt_model
                 return prediction_result
 
@@ -2685,7 +2583,7 @@ class PRReviewer:
                                    "start_line:", "end_line:", "evidence_paths:"],
                     first_key="verification",
                     last_key="decisions",
-                    reject_duplicate_keys=frontier_enabled,
+                    reject_duplicate_keys=verification_config.strict_output_policy,
                 )
             except DuplicateYamlKeyError:
                 artifact.update({
@@ -2724,7 +2622,7 @@ class PRReviewer:
                     prompt_evidence,
                     decisions,
                 )
-            max_findings = max(0, int(config.get("num_max_findings", 3)))
+            max_findings = verification_config.max_findings
             published_findings = (
                 [] if model_candidate_coverage_incomplete
                 else verified_findings[:max_findings]

@@ -71,6 +71,11 @@ class FrontierContractError(ValueError):
     """Raised when an adjudication contract is incomplete or malformed."""
 
 
+def _require_exact_mapping(value: Mapping[str, Any], expected_fields: set[str], name: str) -> None:
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
+        raise FrontierContractError(f"invalid {name} fields")
+
+
 @dataclass(frozen=True, slots=True)
 class FrontierModelIdentity:
     """One exact provider/model/revision identity in an availability route."""
@@ -340,6 +345,184 @@ class FrontierAdjudicationConfig:
         if self.output_schema_version != FRONTIER_OUTPUT_SCHEMA_VERSION:
             raise FrontierContractError("unsupported frontier output schema")
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "route": {
+                "models": list(self.route.models),
+                "deployments": list(self.route.deployments),
+                "timeout_seconds": self.route.timeout_seconds,
+                "model_retries": self.route.model_retries,
+                "provider_retries": self.route.provider_retries,
+                "max_output_tokens": self.route.max_output_tokens,
+                "attribution": self.route.attribution,
+                "collect_cost": self.route.collect_cost,
+            },
+            "model_identities": [
+                {
+                    "model": identity.model,
+                    "provider": identity.provider,
+                    "revision": identity.revision,
+                    "deployment": identity.deployment,
+                }
+                for identity in self.model_identities
+            ],
+            "system_prompt": self.system_prompt,
+            "user_prompt": self.user_prompt,
+            "prompt_version": self.prompt_version,
+            "input_schema_version": self.input_schema_version,
+            "output_schema_version": self.output_schema_version,
+            "policy_version": self.policy_version,
+            "minimum_confidence": self.minimum_confidence,
+            "stage_timeout_seconds": self.stage_timeout_seconds,
+            "max_calls": self.max_calls,
+            "configuration_hash": self.configuration_hash,
+            "prompt_hash": self.prompt_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "FrontierAdjudicationConfig":
+        expected_fields = {
+            "enabled",
+            "route",
+            "model_identities",
+            "system_prompt",
+            "user_prompt",
+            "prompt_version",
+            "input_schema_version",
+            "output_schema_version",
+            "policy_version",
+            "minimum_confidence",
+            "stage_timeout_seconds",
+            "max_calls",
+            "configuration_hash",
+            "prompt_hash",
+        }
+        _require_exact_mapping(value, expected_fields, "frontier adjudication configuration")
+        route_value = value["route"]
+        route_fields = {
+            "models",
+            "deployments",
+            "timeout_seconds",
+            "model_retries",
+            "provider_retries",
+            "max_output_tokens",
+            "attribution",
+            "collect_cost",
+        }
+        _require_exact_mapping(route_value, route_fields, "frontier adjudication route")
+        if not isinstance(value["enabled"], bool):
+            raise FrontierContractError("frontier enabled must be a boolean")
+        if not isinstance(route_value["models"], list) or any(
+            not isinstance(model, str) or not model.strip() for model in route_value["models"]
+        ):
+            raise FrontierContractError("frontier route models must be a non-blank string list")
+        if not isinstance(route_value["deployments"], list) or any(
+            deployment is not None and (not isinstance(deployment, str) or not deployment.strip())
+            for deployment in route_value["deployments"]
+        ):
+            raise FrontierContractError("frontier route deployments must be a non-blank string-or-null list")
+        if len(route_value["deployments"]) != len(route_value["models"]):
+            raise FrontierContractError("frontier route deployments must match models")
+        if not isinstance(route_value["collect_cost"], bool):
+            raise FrontierContractError("frontier route collect_cost must be a boolean")
+        attribution = route_value["attribution"]
+        if attribution is not None and (not isinstance(attribution, str) or not attribution.strip()):
+            raise FrontierContractError("frontier route attribution must be a non-blank string or null")
+        timeout = route_value["timeout_seconds"]
+        if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise FrontierContractError("frontier route timeout_seconds must be finite and positive")
+        for field_name, minimum in (("model_retries", 1), ("provider_retries", 0), ("max_output_tokens", 1)):
+            field_value = route_value[field_name]
+            if not isinstance(field_value, int) or isinstance(field_value, bool) or field_value < minimum:
+                raise FrontierContractError(f"frontier route {field_name} is invalid")
+        if not isinstance(value["model_identities"], list):
+            raise FrontierContractError("frontier model_identities must be a list")
+        identity_fields = {"model", "provider", "revision", "deployment"}
+        identities = []
+        for identity_value in value["model_identities"]:
+            _require_exact_mapping(identity_value, identity_fields, "frontier model identity")
+            if any(
+                not isinstance(identity_value[field], str) or not identity_value[field].strip()
+                for field in ("model", "provider", "revision")
+            ):
+                raise FrontierContractError("frontier model identity fields must be non-blank strings")
+            identity_deployment = identity_value["deployment"]
+            if identity_deployment is not None and (
+                not isinstance(identity_deployment, str) or not identity_deployment.strip()
+            ):
+                raise FrontierContractError("frontier model identity deployment must be a non-blank string or null")
+            identities.append(
+                FrontierModelIdentity(
+                    model=identity_value["model"],
+                    provider=identity_value["provider"],
+                    revision=identity_value["revision"],
+                    deployment=identity_deployment,
+                )
+            )
+        for field_name in (
+            "system_prompt",
+            "user_prompt",
+            "prompt_version",
+            "input_schema_version",
+            "output_schema_version",
+            "policy_version",
+        ):
+            if not isinstance(value[field_name], str) or not value[field_name].strip():
+                raise FrontierContractError(f"frontier {field_name} must be a non-blank string")
+        minimum_confidence = value["minimum_confidence"]
+        if (
+            not isinstance(minimum_confidence, (int, float))
+            or isinstance(minimum_confidence, bool)
+            or not isfinite(minimum_confidence)
+        ):
+            raise FrontierContractError("frontier minimum_confidence must be finite")
+        stage_timeout = value["stage_timeout_seconds"]
+        if (
+            not isinstance(stage_timeout, (int, float))
+            or isinstance(stage_timeout, bool)
+            or not isfinite(stage_timeout)
+            or stage_timeout <= 0
+        ):
+            raise FrontierContractError("frontier stage_timeout_seconds must be finite and positive")
+        max_calls = value["max_calls"]
+        if not isinstance(max_calls, int) or isinstance(max_calls, bool) or max_calls < 0:
+            raise FrontierContractError("frontier max_calls must be a non-negative integer")
+        route = AIModelRoute(
+            models=tuple(route_value["models"]),
+            deployments=tuple(route_value["deployments"]),
+            timeout_seconds=timeout,
+            model_retries=route_value["model_retries"],
+            provider_retries=route_value["provider_retries"],
+            max_output_tokens=route_value["max_output_tokens"],
+            attribution=attribution,
+            collect_cost=route_value["collect_cost"],
+        )
+        config = cls(
+            enabled=value["enabled"],
+            route=route,
+            model_identities=tuple(identities),
+            system_prompt=value["system_prompt"],
+            user_prompt=value["user_prompt"],
+            prompt_version=value["prompt_version"],
+            input_schema_version=value["input_schema_version"],
+            output_schema_version=value["output_schema_version"],
+            policy_version=value["policy_version"],
+            minimum_confidence=minimum_confidence,
+            stage_timeout_seconds=stage_timeout,
+            max_calls=max_calls,
+        )
+        if value["configuration_hash"] != config.configuration_hash:
+            raise FrontierContractError("frontier configuration hash mismatch")
+        if value["prompt_hash"] != config.prompt_hash:
+            raise FrontierContractError("frontier prompt hash mismatch")
+        return config
+
     @property
     def configuration_hash(self) -> str:
         payload = {
@@ -364,6 +547,7 @@ class FrontierAdjudicationConfig:
             "model_retries": self.route.model_retries,
             "provider_retries": self.route.provider_retries,
             "max_output_tokens": self.route.max_output_tokens,
+            "route_attribution": self.route.attribution,
             "collect_cost": self.route.collect_cost,
         }
         return _hash_json(payload)
