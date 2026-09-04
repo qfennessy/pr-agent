@@ -259,7 +259,6 @@ async def test_litellm_provider_boundary_reserves_before_each_actual_call(monkey
         "messages": [],
         "api_base": _GATEWAY_API_BASE,
         "max_tokens": 64,
-        "max_retries": 0,
     }
     with use_checkpoint_cost_authority(authority), use_ai_request_options(options):
         response = await handler._get_completion(display_model="openai/model-primary", **kwargs)
@@ -270,6 +269,7 @@ async def test_litellm_provider_boundary_reserves_before_each_actual_call(monkey
     completion.assert_awaited_once()
     sent_headers = completion.await_args.kwargs["extra_headers"]
     assert sent_headers[CHECKPOINT_GATEWAY_ROUTE_HEADER] == authority.quotes[0].gateway_route_binding_id
+    assert completion.await_args.kwargs["max_retries"] == 0
 
 
 @pytest.mark.asyncio

@@ -1472,10 +1472,13 @@ class LiteLLMAIHandler(BaseAiHandler):
         model = kwargs["model"]
         from pr_agent.algo.checkpoint_cost_authority import (
             apply_checkpoint_gateway_route_binding,
+            get_checkpoint_cost_authority_ledger,
             reserve_checkpoint_provider_attempt,
         )
 
         request_options = get_ai_request_options()
+        if get_checkpoint_cost_authority_ledger() is not None and kwargs.get("max_retries") is None:
+            kwargs["max_retries"] = 0
         reservation = reserve_checkpoint_provider_attempt(
             model_id=display_model or model,
             deployment_id=kwargs.get("deployment_id"),
