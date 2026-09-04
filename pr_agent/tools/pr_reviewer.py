@@ -22,7 +22,6 @@ from pr_agent.algo.candidate_verification import (
     apply_verification_decisions,
     bounded_verification_evidence,
     candidate_verification_provider_controls_hash,
-    load_production_candidate_verification_config,
     prepare_candidates,
     prompt_evidence_coverage,
     render_verification_payload,
@@ -33,6 +32,15 @@ from pr_agent.algo.candidate_verification import (
     validated_specialist_prioritization,
     verified_finding_identity,
 )
+from pr_agent.algo.checkpoint_stage_sources import (
+    checkpoint_candidate_verification_config,
+    checkpoint_candidate_verification_enabled,
+    checkpoint_frontier_adjudication_config,
+    checkpoint_frontier_adjudication_enabled,
+    checkpoint_specialist_pipeline,
+    checkpoint_specialists_enabled,
+    get_checkpoint_stage_sources,
+)
 from pr_agent.algo.config_utils import parse_env_bool
 from pr_agent.algo.frontier_adjudication import (
     FrontierAdjudicationRequest,
@@ -41,7 +49,6 @@ from pr_agent.algo.frontier_adjudication import (
     FrontierSignals,
     NormalizedSeverity,
     build_frontier_evidence,
-    load_frontier_adjudication_config,
     normalize_severity,
     run_frontier_adjudication,
 )
@@ -82,9 +89,7 @@ from pr_agent.algo.review_specialists import (
     SpecialistState,
     build_specialist_input,
     get_specialist_snapshot_context,
-    load_specialist_pipeline_config,
     run_shadow_specialists,
-    specialists_enabled,
     unavailable_specialist_batch,
     validate_specialist_output,
 )
@@ -125,6 +130,11 @@ from pr_agent.git_providers.git_provider import (
 from pr_agent.log import get_logger
 from pr_agent.servers.help import HelpMessage
 from pr_agent.tools.ticket_pr_compliance_check import extract_and_cache_pr_tickets
+
+load_production_candidate_verification_config = checkpoint_candidate_verification_config
+load_frontier_adjudication_config = checkpoint_frontier_adjudication_config
+load_specialist_pipeline_config = checkpoint_specialist_pipeline
+specialists_enabled = checkpoint_specialists_enabled
 
 MAX_REVIEW_COVERAGE_FILES = 50
 _SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
@@ -1651,6 +1661,8 @@ class PRReviewer:
 
     @staticmethod
     def _candidate_verification_enabled() -> bool:
+        if get_checkpoint_stage_sources() is not None:
+            return checkpoint_candidate_verification_enabled()
         value = get_settings().pr_reviewer.get("enable_candidate_verification", False)
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
@@ -1800,6 +1812,8 @@ class PRReviewer:
 
     @staticmethod
     def _frontier_adjudication_enabled() -> bool:
+        if get_checkpoint_stage_sources() is not None:
+            return checkpoint_frontier_adjudication_enabled()
         value = get_settings().pr_reviewer.get("enable_frontier_adjudication", False)
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")

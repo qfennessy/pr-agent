@@ -64,6 +64,7 @@ def _request_bytes(
         "allow_model_execution": allow_model_execution,
         "snapshot": snapshot.to_dict(),
         "review_configuration": configuration.to_dict(),
+        "evaluation_stage_plan": [],
     }).encode("utf-8")
 
 

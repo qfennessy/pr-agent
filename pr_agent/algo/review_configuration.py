@@ -12,11 +12,14 @@ from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Iterator, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, Optional
 from urllib.parse import urlsplit
 
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.config_loader import get_settings
+
+if TYPE_CHECKING:
+    from pr_agent.algo.checkpoint_stage_sources import CheckpointStageSources
 
 REVIEW_CONFIGURATION_SCHEMA_VERSION = "checkpoint-review-configuration-v1"
 MAX_REVIEW_CONFIGURATION_BYTES = 2_000_000
@@ -458,6 +461,12 @@ def _unset_setting(settings: Any, path: str) -> None:
             return
 
 
+def _load_checkpoint_stage_sources(value: Mapping[str, Any]) -> CheckpointStageSources:
+    from pr_agent.algo.checkpoint_stage_sources import CheckpointStageSources
+
+    return CheckpointStageSources.from_dict(value)
+
+
 @dataclass(frozen=True)
 class ReviewConfigurationBundle:
     """Exact model-visible general-review settings without credentials or sinks."""
@@ -470,6 +479,7 @@ class ReviewConfigurationBundle:
     repo_context_files: Mapping[str, str]
     repo_context_max_lines: int
     prompt_date: str = ""
+    stage_sources: Optional[CheckpointStageSources] = field(default=None, repr=False)
     schema_version: str = REVIEW_CONFIGURATION_SCHEMA_VERSION
     configuration_hash: str = field(init=False)
 
@@ -486,6 +496,11 @@ class ReviewConfigurationBundle:
             raise ValueError("review configuration skills context is invalid")
         if len(self.skills_context.encode("utf-8")) > MAX_SKILLS_CONTEXT_BYTES:
             raise ValueError("review configuration skills context is too large")
+        if self.stage_sources is not None:
+            from pr_agent.algo.checkpoint_stage_sources import CheckpointStageSources
+
+            if not isinstance(self.stage_sources, CheckpointStageSources):
+                raise TypeError("review configuration stage_sources must use CheckpointStageSources")
 
         raw_settings = dict(self.settings)
         if set(raw_settings) - _ALLOWED_SETTING_PATHS:
@@ -539,7 +554,7 @@ class ReviewConfigurationBundle:
             raise ValueError("review configuration bundle is too large")
 
     def _identity_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "runtime_version": self.runtime_version,
             "runtime_artifact_hash": self.runtime_artifact_hash,
@@ -550,13 +565,16 @@ class ReviewConfigurationBundle:
             "repo_context_max_lines": self.repo_context_max_lines,
             "prompt_date": self.prompt_date,
         }
+        if self.stage_sources is not None:
+            payload["stage_sources"] = self.stage_sources.to_dict()
+        return payload
 
     def to_dict(self) -> dict[str, Any]:
         return {**self._identity_payload(), "configuration_hash": self.configuration_hash}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ReviewConfigurationBundle":
-        expected_fields = {
+        legacy_fields = {
             "schema_version",
             "runtime_version",
             "runtime_artifact_hash",
@@ -568,13 +586,20 @@ class ReviewConfigurationBundle:
             "prompt_date",
             "configuration_hash",
         }
-        if not isinstance(value, Mapping) or set(value) != expected_fields:
+        extended_fields = legacy_fields | {"stage_sources"}
+        if not isinstance(value, Mapping) or (
+            set(value) != legacy_fields and set(value) != extended_fields
+        ):
             raise ValueError("invalid review configuration fields")
         if not isinstance(value.get("settings"), Mapping):
             raise ValueError("invalid review configuration settings")
         if not isinstance(value.get("missing_settings"), list):
             raise ValueError("invalid review configuration missing_settings")
         repo_context_files = _repo_context_from_payload(value.get("repo_context_files"))
+        has_stage_sources = set(value) == extended_fields
+        raw_stage_sources = value.get("stage_sources")
+        if has_stage_sources and not isinstance(raw_stage_sources, Mapping):
+            raise ValueError("invalid review configuration stage_sources")
         bundle = cls(
             runtime_version=value.get("runtime_version"),
             runtime_artifact_hash=value.get("runtime_artifact_hash"),
@@ -584,6 +609,7 @@ class ReviewConfigurationBundle:
             repo_context_files=repo_context_files,
             repo_context_max_lines=value.get("repo_context_max_lines"),
             prompt_date=value.get("prompt_date"),
+            stage_sources=_load_checkpoint_stage_sources(raw_stage_sources) if has_stage_sources else None,
             schema_version=value.get("schema_version"),
         )
         if value.get("configuration_hash") != bundle.configuration_hash:
@@ -601,10 +627,13 @@ def materialize_review_configuration(
     *,
     repo_context_max_lines: Optional[int] = None,
     prompt_date: str = "",
+    stage_sources: Optional[CheckpointStageSources] = None,
 ) -> ReviewConfigurationBundle:
     """Capture the allowlisted review inputs once without reading credential fields."""
 
     settings = get_settings()
+    if stage_sources is not None:
+        stage_sources = stage_sources.for_checkpoint_replay(settings)
     for path in _UNSUPPORTED_NONEMPTY_PATHS:
         if settings.get(path, None):
             raise ValueError(f"review configuration contains unsupported setting: {path}")
@@ -630,6 +659,7 @@ def materialize_review_configuration(
         repo_context_files={} if repo_context_files is None else repo_context_files,
         repo_context_max_lines=repo_context_max_lines,
         prompt_date=prompt_date,
+        stage_sources=stage_sources,
     )
 
 
