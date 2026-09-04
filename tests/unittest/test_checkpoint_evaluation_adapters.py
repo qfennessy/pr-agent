@@ -188,7 +188,11 @@ def test_adapter_retains_complete_pruned_diff_coverage_without_model_execution()
             "review": {"key_issues_to_review": []},
             "metadata": {"omitted_files": ["example.py"]},
         },
-        run_details=serialize_run_details_for_evaluation(RunDetails(start_time=0.0, finish_time=0.0)),
+        run_details=serialize_run_details_for_evaluation(RunDetails(
+            route_attempts=1,
+            start_time=0.0,
+            finish_time=0.0,
+        )),
         latency_seconds=0.0,
     )
 

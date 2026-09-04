@@ -268,7 +268,7 @@ def adapt_checkpoint_review_outcome(
     retry_count = _production_retry_count(kind, outcome.review, details)
     no_model_execution = (
         details.num_ai_calls == 0
-        and details.route_attempts == 0
+        and details.route_attempts <= 1
         and details.model_retry_attempts == 0
         and not details.has_token_usage
         and details.known_cost_call_count == 0

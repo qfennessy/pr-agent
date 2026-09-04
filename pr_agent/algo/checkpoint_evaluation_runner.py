@@ -224,7 +224,8 @@ class ProductionArmResult:
                 )
                 or details is None
                 or details.num_ai_calls != 0
-                or details.route_attempts != 0
+                or details.route_attempts not in {0, 1}
+                or (self.failure_state is not None and details.route_attempts != 0)
                 or details.model_retry_attempts != 0
                 or details.has_token_usage
                 or details.known_cost_call_count != 0
