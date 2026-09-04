@@ -57,6 +57,15 @@ from pr_agent.algo.run_details import RunDetails
 ModelIdentity = tuple[Optional[str], Optional[str], Optional[str]]
 ProductionArmAdapter = Callable[[ReviewSnapshot, "ProductionArmContext"], Awaitable["ProductionArmResult"]]
 _FAILURE_REASON_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+PRE_EXECUTION_ZERO_COST_FAILURE_CODES = frozenset({
+    "invalid_request",
+    "invalid_snapshot",
+    "model_execution_not_authorized",
+    "request_too_large",
+    "review_configuration_mismatch",
+    "stage_sources_unverified",
+    "worker_start_failed",
+})
 
 
 class ProductionDependencyUnavailable(EvaluationValidationError):
@@ -192,7 +201,10 @@ class ProductionArmResult:
                     ReviewResultState.COVERAGE_UNAVAILABLE,
                 }
                 or has_active_findings
-                or self.failure_state is not None
+                or (
+                    self.failure_state is not None
+                    and self.failure_reason_code not in PRE_EXECUTION_ZERO_COST_FAILURE_CODES
+                )
                 or self.model_identity is not None
                 or self.terminal is not (
                     self.snapshot_result.state is ReviewResultState.NO_FINDINGS
@@ -206,7 +218,9 @@ class ProductionArmResult:
                 or details.specialist_runs
                 or details.adjudication_runs
             ):
-                raise EvaluationValidationError("no-model production results must be empty successful executions")
+                raise EvaluationValidationError(
+                    "no-model production results must be empty successful or pre-execution failure outcomes"
+                )
         if (
             self.snapshot_result.state not in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
             and self.findings
@@ -797,8 +811,8 @@ def _record_from_production_result(
         no_model_execution=outcome.no_model_execution,
     )
     no_model_execution = outcome.no_model_execution
-    if no_model_execution and snapshot.diff.strip():
-        raise EvaluationValidationError("only empty snapshots may claim no model execution")
+    if no_model_execution and snapshot.diff.strip() and outcome.failure_state is None:
+        raise EvaluationValidationError("only empty successful snapshots may claim no model execution")
     has_stage_runs = bool(record.stage_runs)
     if telemetry_shape is ModelTelemetryShape.NONE and has_stage_runs:
         raise EvaluationValidationError("deterministic production bindings cannot emit model stage telemetry")
@@ -860,6 +874,7 @@ def failed_production_arm_result(
     run_details: Optional[RunDetails] = None,
     model_identity: Optional[ModelIdentity] = None,
     stage_latencies_seconds: Optional[Mapping[str, NumericMeasurement]] = None,
+    no_model_execution: bool = False,
 ) -> ProductionArmResult:
     """Build a source-free, resumable adapter failure with explicit retry telemetry."""
     if not isinstance(reason_code, str) or not _FAILURE_REASON_CODE.fullmatch(reason_code):
@@ -888,6 +903,7 @@ def failed_production_arm_result(
         failure_reason_code=reason_code,
         latency_measurement=latency_seconds,
         model_identity=model_identity,
+        no_model_execution=no_model_execution,
     )
 
 

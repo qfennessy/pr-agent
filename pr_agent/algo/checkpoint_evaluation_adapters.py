@@ -17,6 +17,7 @@ from pr_agent.algo.checkpoint_evaluation_findings import (
     normalize_verified_findings,
 )
 from pr_agent.algo.checkpoint_evaluation_runner import (
+    PRE_EXECUTION_ZERO_COST_FAILURE_CODES,
     ProductionArmContext,
     ProductionArmResult,
     failed_production_arm_result,
@@ -188,6 +189,7 @@ def adapt_checkpoint_review_outcome(
         outcome.latency_seconds,
     )
     if outcome.state is not CheckpointReviewSubprocessState.COMPLETED:
+        no_model_execution = outcome.failure_reason_code in PRE_EXECUTION_ZERO_COST_FAILURE_CODES
         failure_state = (
             EvaluationRunState.TIMEOUT
             if outcome.state is CheckpointReviewSubprocessState.TIMEOUT
@@ -201,6 +203,8 @@ def adapt_checkpoint_review_outcome(
             reason_code=outcome.failure_reason_code or "production_review_failed",
             latency_seconds=latency,
             retry_count=0,
+            run_details=RunDetails(start_time=0.0, finish_time=0.0) if no_model_execution else None,
+            no_model_execution=no_model_execution,
         )
     if outcome.snapshot_id != snapshot.snapshot_id:
         raise EvaluationValidationError("production review output names a different snapshot")

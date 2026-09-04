@@ -383,6 +383,27 @@ def test_subprocess_failure_becomes_retained_production_failure():
     assert result.failure_state is EvaluationRunState.TIMEOUT
     assert result.failure_reason_code == "worker_timeout"
     assert result.latency_measurement.value == 2.0
+    assert result.no_model_execution is False
+    assert result.run_details is None
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    ("invalid_request", "invalid_snapshot", "request_too_large", "worker_start_failed"),
+)
+def test_pre_execution_subprocess_failure_records_authoritative_zero_model_execution(reason_code):
+    snapshot = _snapshot()
+    outcome = CheckpointReviewSubprocessOutcome(
+        state=CheckpointReviewSubprocessState.FAILED,
+        snapshot_id=snapshot.snapshot_id,
+        failure_reason_code=reason_code,
+    )
+
+    result = adapt_checkpoint_review_outcome(snapshot, EvaluationArmKind.GENERAL_REVIEW, outcome)
+
+    assert result.no_model_execution is True
+    assert result.run_details is not None
+    assert result.run_details.num_ai_calls == 0
 
 
 @pytest.mark.parametrize(

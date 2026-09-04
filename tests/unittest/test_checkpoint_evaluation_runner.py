@@ -841,6 +841,21 @@ def test_no_findings_result_rejects_active_lifecycle_observations(tmp_path):
         replace(_success(arm, snapshot), findings=(active,))
 
 
+def test_unknown_cost_failure_cannot_claim_zero_model_execution(tmp_path):
+    snapshot, _path, _artifact_hash = _write_snapshot(tmp_path)
+
+    with pytest.raises(EvaluationValidationError, match="pre-execution failure"):
+        failed_production_arm_result(
+            snapshot,
+            state=EvaluationRunState.PROVIDER_FAILURE,
+            reason_code="provider_unavailable",
+            latency_seconds=NumericMeasurement(MeasurementStatus.UNAVAILABLE, None),
+            retry_count=0,
+            run_details=RunDetails(start_time=0.0, finish_time=0.0),
+            no_model_execution=True,
+        )
+
+
 def _specialist_run(arm: EvaluationArm, *, role="change_classification", **overrides):
     plan = arm.required_stage(role)
     selected_index = next(
@@ -1879,6 +1894,47 @@ async def test_nonterminal_failure_is_retained_and_only_that_pair_resumes(tmp_pa
     assert second.records[0].state is EvaluationRunState.COMPLETED
     deterministic_attempts = [record for record in store.load_records(manifest) if record.arm_id == "arm-deterministic"]
     assert [record.attempt for record in deterministic_attempts] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_pre_execution_paid_failure_retains_zero_cost_and_remains_retryable(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+    store = EvaluationArtifactStore(tmp_path / "pre-execution-resume")
+    calls = []
+
+    def factory(arm):
+        async def adapter(loaded_snapshot, _context):
+            calls.append(arm.kind)
+            if arm.kind is EvaluationArmKind.GENERAL_REVIEW and calls.count(arm.kind) == 1:
+                return adapt_checkpoint_review_outcome(
+                    loaded_snapshot,
+                    arm.kind,
+                    CheckpointReviewSubprocessOutcome(
+                        state=CheckpointReviewSubprocessState.FAILED,
+                        snapshot_id=loaded_snapshot.snapshot_id,
+                        failure_reason_code="worker_start_failed",
+                    ),
+                )
+            return _success(arm, loaded_snapshot)
+
+        return adapter
+
+    bindings = _bindings(manifest, factory)
+    first = await _runner(manifest, path, bindings, store, request, decision).run()
+    failure = next(record for record in first.records if record.arm_id == "arm-general_review")
+
+    assert failure.state is EvaluationRunState.PROVIDER_FAILURE
+    assert failure.cost_usd == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+    assert failure.tokens == NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+
+    second = await _runner(manifest, path, bindings, store, request, decision).run()
+
+    assert len(second.records) == 1
+    assert second.records[0].arm_id == "arm-general_review"
+    assert second.records[0].attempt == 2
+    assert second.records[0].state is EvaluationRunState.COMPLETED
 
 
 @pytest.mark.asyncio
