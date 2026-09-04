@@ -36,6 +36,7 @@ class SpecialistRunDetails:
     model_used: Optional[str] = None
     deployment_id: Optional[str] = None
     fallback_used: bool = False
+    route_attempts: int = 0
     prompt_version: Optional[str] = None
     input_schema_version: Optional[str] = None
     schema_version: Optional[str] = None
@@ -69,6 +70,7 @@ class SpecialistRunDetails:
             "model": self.model_used,
             "deployment": self.deployment_id,
             "fallback_used": self.fallback_used,
+            "route_attempts": self.route_attempts,
             "prompt_version": self.prompt_version,
             "input_schema_version": self.input_schema_version,
             "schema_version": self.schema_version,
@@ -243,6 +245,8 @@ class RunDetails:
     # Sticky: once a fallback has won, a later success on the primary model must not
     # clear this, or the comment would hide that a fallback ran at all.
     fallback_used: bool = False
+    # Provider-neutral model/deployment route entries attempted by the main review.
+    route_attempts: int = 0
     # Input/output tokens summed over every AI call of the run. Named after litellm's
     # normalized usage object, which is what the collector reads. Both stay 0 when no usage
     # reaches the collector, e.g. streaming responses or the langchain handler.
@@ -306,14 +310,14 @@ _EVALUATION_RUN_DETAILS_FIELDS = frozenset({
     "schema_version", "model_used", "review_profile", "fallback_used", "prompt_tokens",
     "completion_tokens", "total_tokens", "num_ai_calls", "total_cost_usd",
     "known_cost_call_count", "model_costs_usd", "specialist_runs", "adjudication_runs",
-    "duration_seconds",
+    "duration_seconds", "route_attempts",
 })
 _EVALUATION_SPECIALIST_FIELDS = frozenset({
     "role", "model_used", "deployment_id", "fallback_used", "prompt_version",
     "input_schema_version", "schema_version", "state", "latency_seconds", "prompt_tokens",
     "completion_tokens", "total_tokens", "num_ai_calls", "total_cost_usd",
     "known_cost_call_count", "model_costs_usd", "confidence", "failure_reason", "cached",
-    "input_token_reservation", "output_token_reservation",
+    "input_token_reservation", "output_token_reservation", "route_attempts",
 })
 _EVALUATION_ADJUDICATION_FIELDS = frozenset({
     "finding_id", "model_used", "provider", "model_revision", "deployment_id", "fallback_used",
@@ -388,6 +392,7 @@ def serialize_run_details_for_evaluation(details: RunDetails) -> dict[str, Any]:
             "model_used": run.model_used,
             "deployment_id": run.deployment_id,
             "fallback_used": run.fallback_used,
+            "route_attempts": run.route_attempts,
             "prompt_version": run.prompt_version,
             "input_schema_version": run.input_schema_version,
             "schema_version": run.schema_version,
@@ -425,6 +430,7 @@ def serialize_run_details_for_evaluation(details: RunDetails) -> dict[str, Any]:
         "model_used": details.model_used,
         "review_profile": details.review_profile,
         "fallback_used": details.fallback_used,
+        "route_attempts": details.route_attempts,
         "prompt_tokens": details.prompt_tokens,
         "completion_tokens": details.completion_tokens,
         "total_tokens": details.total_tokens,
@@ -460,7 +466,8 @@ def deserialize_run_details_for_evaluation(
     integer_fields = {
         field_name: _evaluation_int(value.get(field_name), field_name)
         for field_name in (
-            "prompt_tokens", "completion_tokens", "total_tokens", "num_ai_calls", "known_cost_call_count"
+            "prompt_tokens", "completion_tokens", "total_tokens", "num_ai_calls", "known_cost_call_count",
+            "route_attempts",
         )
     }
     if integer_fields["known_cost_call_count"] > integer_fields["num_ai_calls"]:
@@ -487,6 +494,7 @@ def deserialize_run_details_for_evaluation(
             model_used=_evaluation_string(raw_run.get("model_used"), "specialist model_used"),
             deployment_id=_evaluation_string(raw_run.get("deployment_id"), "specialist deployment_id"),
             fallback_used=raw_run.get("fallback_used"),
+            route_attempts=_evaluation_int(raw_run.get("route_attempts"), "specialist route_attempts"),
             prompt_version=_evaluation_string(raw_run.get("prompt_version"), "specialist prompt_version"),
             input_schema_version=_evaluation_string(
                 raw_run.get("input_schema_version"), "specialist input_schema_version"
@@ -594,6 +602,7 @@ def deserialize_run_details_for_evaluation(
         model_used=model_used,
         review_profile=review_profile,
         fallback_used=value["fallback_used"],
+        route_attempts=integer_fields["route_attempts"],
         prompt_tokens=integer_fields["prompt_tokens"],
         completion_tokens=integer_fields["completion_tokens"],
         total_tokens=integer_fields["total_tokens"],
@@ -720,9 +729,13 @@ def record_specialist_model_attempt(
     model_attempts_configured: Optional[int] = None,
     provider_retries_configured: Optional[int] = None,
 ) -> None:
-    """Preserve the last attempted specialist route even when its output is rejected."""
+    """Preserve every attempted main or specialist route entry."""
 
+    details = get_run_details()
+    if details is None:
+        return
     if not attribution:
+        details.route_attempts += 1
         return
     adjudication = _get_adjudication_details(attribution)
     if adjudication is not None:
@@ -742,6 +755,7 @@ def record_specialist_model_attempt(
         return
     specialist.model_used = model
     specialist.deployment_id = deployment_id
+    specialist.route_attempts += 1
     if is_fallback:
         specialist.fallback_used = True
 

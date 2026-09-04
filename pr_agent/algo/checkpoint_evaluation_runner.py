@@ -62,6 +62,7 @@ PRE_EXECUTION_ZERO_COST_FAILURE_CODES = frozenset({
     "invalid_snapshot",
     "model_execution_not_authorized",
     "request_too_large",
+    "review_configuration_unverified",
     "review_configuration_mismatch",
     "stage_sources_unverified",
     "worker_start_failed",
@@ -223,6 +224,7 @@ class ProductionArmResult:
                 )
                 or details is None
                 or details.num_ai_calls != 0
+                or details.route_attempts != 0
                 or details.has_token_usage
                 or details.known_cost_call_count != 0
                 or details.total_cost_usd != 0

@@ -172,25 +172,29 @@ def _coverage_issues(
     return tuple(issues)
 
 
-def _verifier_retry_count(
+def _production_retry_count(
     kind: EvaluationArmKind,
     review: Mapping[str, object] | None,
+    details: RunDetails,
 ) -> int:
-    """Convert observed verifier attempts into retry telemetry."""
+    """Aggregate observed provider-neutral route retries across production stages."""
 
-    if kind is not EvaluationArmKind.VERIFIED_SPECIALISTS or review is None:
-        return 0
-    artifact = review.get("candidate_verification")
-    if artifact is None:
-        return 0
-    if not isinstance(artifact, Mapping):
-        raise EvaluationValidationError("verified production output has invalid verifier telemetry")
-    attempts = artifact.get("verifier_attempts")
-    if attempts is None:
-        return 0
-    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
-        raise EvaluationValidationError("verified production output has invalid verifier attempt count")
-    return max(0, attempts - 1)
+    retry_count = max(0, details.route_attempts - 1)
+    retry_count += sum(max(0, run.route_attempts - 1) for run in details.specialist_runs.values())
+    retry_count += sum(max(0, run.route_attempts - 1) for run in details.adjudication_runs.values())
+    if kind is EvaluationArmKind.VERIFIED_SPECIALISTS and review is not None:
+        artifact = review.get("candidate_verification")
+        if artifact is not None:
+            if not isinstance(artifact, Mapping):
+                raise EvaluationValidationError("verified production output has invalid verifier telemetry")
+            attempts = artifact.get("verifier_attempts")
+            if attempts is not None:
+                if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
+                    raise EvaluationValidationError("verified production output has invalid verifier attempt count")
+                verifier_run = details.specialist_runs.get("candidate_verification")
+                if verifier_run is None or verifier_run.route_attempts != attempts:
+                    raise EvaluationValidationError("verified production output has inconsistent verifier attempts")
+    return retry_count
 
 
 def adapt_checkpoint_review_outcome(
@@ -232,14 +236,15 @@ def adapt_checkpoint_review_outcome(
         raise EvaluationValidationError("production review output names a different snapshot")
     if outcome.review is None:
         raise EvaluationValidationError("completed production review output is incomplete")
-    retry_count = _verifier_retry_count(kind, outcome.review)
     raw_findings = _review_findings(outcome.review)
     if outcome.run_details is None:
         details = RunDetails(start_time=0.0, finish_time=0.0)
     else:
         details = deserialize_run_details_for_evaluation(outcome.run_details)
+    retry_count = _production_retry_count(kind, outcome.review, details)
     no_model_execution = (
         details.num_ai_calls == 0
+        and details.route_attempts == 0
         and not details.has_token_usage
         and details.known_cost_call_count == 0
         and details.total_cost_usd == 0
@@ -304,14 +309,16 @@ def build_checkpoint_review_adapter(kind: EvaluationArmKind):
             evaluation_stage_plan=context.stage_plan,
             allow_model_execution=True,
         )
-        retry_count = 0
         try:
-            retry_count = _verifier_retry_count(kind, outcome.review)
             return adapt_checkpoint_review_outcome(snapshot, kind, outcome)
         except EvaluationValidationError:
             if outcome.run_details is None:
                 raise
             details = deserialize_run_details_for_evaluation(outcome.run_details)
+            try:
+                retry_count = _production_retry_count(kind, outcome.review, details)
+            except EvaluationValidationError:
+                retry_count = 0
             return failed_production_arm_result(
                 snapshot,
                 state=EvaluationRunState.MALFORMED,

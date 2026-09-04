@@ -16,6 +16,7 @@ from pr_agent.algo.run_details import (
     record_model_used,
     record_review_profile,
     record_review_route,
+    record_specialist_model_attempt,
     record_specialist_result,
     serialize_run_details_for_evaluation,
     specialist_runs_to_dict,
@@ -26,6 +27,7 @@ def test_evaluation_round_trip_retains_source_free_stage_telemetry_only():
     details = RunDetails(
         model_used="main-model",
         review_profile="bugs_only",
+        route_attempts=2,
         num_ai_calls=1,
         total_cost_usd=Decimal("0.01"),
         known_cost_call_count=1,
@@ -34,6 +36,7 @@ def test_evaluation_round_trip_retains_source_free_stage_telemetry_only():
             "candidate_verification": SpecialistRunDetails(
                 role="candidate_verification",
                 model_used="verifier-model",
+                route_attempts=3,
                 prompt_version="prompt-v1",
                 input_schema_version="input-v1",
                 schema_version="output-v1",
@@ -68,6 +71,8 @@ def test_evaluation_round_trip_retains_source_free_stage_telemetry_only():
     assert "output" not in payload["specialist_runs"]["candidate_verification"]
     assert restored.specialist_runs["candidate_verification"].output is None
     assert restored.specialist_runs["candidate_verification"].model_used == "verifier-model"
+    assert restored.route_attempts == 2
+    assert restored.specialist_runs["candidate_verification"].route_attempts == 3
     assert restored.adjudication_runs["sha256:" + "a" * 64].provider == "openai"
     assert restored.duration_seconds == 1.5
 
@@ -101,6 +106,7 @@ def test_init_returns_fresh_instance_with_zeroed_counters():
     assert details.model_used is None
     assert details.review_profile is None
     assert details.fallback_used is False
+    assert details.route_attempts == 0
     assert details.prompt_tokens == 0
     assert details.completion_tokens == 0
     assert details.total_tokens == 0
@@ -123,6 +129,30 @@ def test_init_replaces_previous_instance():
     assert get_run_details() is second
     assert second.model_used is None
     assert second.fallback_used is False
+
+
+def test_route_attempts_are_attributed_to_main_and_specialist_runs():
+    details = init_run_details()
+
+    record_specialist_model_attempt(
+        "main-model",
+        attribution=None,
+        deployment_id=None,
+        is_fallback=False,
+    )
+    record_specialist_model_attempt(
+        "specialist-model",
+        attribution="candidate_verification",
+        deployment_id="specialist-deployment",
+        is_fallback=True,
+    )
+
+    assert details.route_attempts == 1
+    specialist = details.specialist_runs["candidate_verification"]
+    assert specialist.route_attempts == 1
+    assert specialist.model_used == "specialist-model"
+    assert specialist.deployment_id == "specialist-deployment"
+    assert specialist.fallback_used is True
 
 
 def test_freeze_duration_stops_elapsed_time(monkeypatch):

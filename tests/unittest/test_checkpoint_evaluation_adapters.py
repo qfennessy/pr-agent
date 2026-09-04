@@ -41,12 +41,17 @@ def _snapshot(*, diff="diff --git a/example.py b/example.py\n+changed = True\n")
     )
 
 
-def _outcome(snapshot: ReviewSnapshot, review: dict) -> CheckpointReviewSubprocessOutcome:
+def _outcome(
+    snapshot: ReviewSnapshot,
+    review: dict,
+    *,
+    details: RunDetails | None = None,
+) -> CheckpointReviewSubprocessOutcome:
     return CheckpointReviewSubprocessOutcome(
         state=CheckpointReviewSubprocessState.COMPLETED,
         snapshot_id=snapshot.snapshot_id,
         review=review,
-        run_details=serialize_run_details_for_evaluation(RunDetails(
+        run_details=serialize_run_details_for_evaluation(details or RunDetails(
             model_used="openai/gpt-test",
             review_profile="bugs_only",
             num_ai_calls=1,
@@ -69,13 +74,21 @@ def test_general_review_adapter_uses_production_root_cause_and_severity():
             "root_cause": "Shared invariant is broken",
             "normalized_severity": "high",
         }]},
-    })
+    }, details=RunDetails(
+        model_used="openai/gpt-test",
+        fallback_used=True,
+        route_attempts=2,
+        num_ai_calls=1,
+        start_time=0.0,
+        finish_time=0.25,
+    ))
 
     result = adapt_checkpoint_review_outcome(snapshot, EvaluationArmKind.GENERAL_REVIEW, outcome)
 
     assert len(result.findings) == 1
     assert result.findings[0].severity is FindingSeverity.HIGH
     assert result.findings[0].stage == "general_review"
+    assert result.retry_count == 1
 
 
 def test_verified_adapter_joins_trusted_identity_to_verifier_severity():
@@ -104,14 +117,29 @@ def test_verified_adapter_joins_trusted_identity_to_verifier_severity():
                 "normalized_severity": "critical",
             }],
         },
-    })
+    }, details=RunDetails(
+        model_used="openai/gpt-test",
+        route_attempts=2,
+        num_ai_calls=1,
+        specialist_runs={
+            "candidate_verification": SpecialistRunDetails(
+                role="candidate_verification",
+                model_used="openai/verifier-test",
+                fallback_used=True,
+                route_attempts=3,
+                num_ai_calls=1,
+            ),
+        },
+        start_time=0.0,
+        finish_time=0.25,
+    ))
 
     result = adapt_checkpoint_review_outcome(snapshot, EvaluationArmKind.VERIFIED_SPECIALISTS, outcome)
 
     assert result.findings[0].fingerprint == stable_key
     assert result.findings[0].severity is FindingSeverity.CRITICAL
     assert result.findings[0].stage == "candidate_verification"
-    assert result.retry_count == 2
+    assert result.retry_count == 3
 
 
 def test_verified_adapter_rejects_invalid_verifier_attempt_count():
@@ -449,7 +477,13 @@ def test_subprocess_failure_becomes_retained_production_failure():
 
 @pytest.mark.parametrize(
     "reason_code",
-    ("invalid_request", "invalid_snapshot", "request_too_large", "worker_start_failed"),
+    (
+        "invalid_request",
+        "invalid_snapshot",
+        "request_too_large",
+        "review_configuration_unverified",
+        "worker_start_failed",
+    ),
 )
 def test_pre_execution_subprocess_failure_records_authoritative_zero_model_execution(reason_code):
     snapshot = _snapshot()
@@ -603,7 +637,22 @@ async def test_production_adapter_retains_verifier_retries_on_malformed_output(m
             "verifier_attempts": 3,
             "decisions": [],
         },
-    })
+    }, details=RunDetails(
+        model_used="openai/gpt-test",
+        route_attempts=1,
+        num_ai_calls=1,
+        specialist_runs={
+            "candidate_verification": SpecialistRunDetails(
+                role="candidate_verification",
+                model_used="openai/verifier-test",
+                fallback_used=True,
+                route_attempts=3,
+                num_ai_calls=1,
+            ),
+        },
+        start_time=0.0,
+        finish_time=0.25,
+    ))
 
     async def run_subprocess(*_args, **_kwargs):
         return outcome
