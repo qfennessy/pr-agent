@@ -2193,39 +2193,6 @@ class PRReviewer:
         details_before = None
         self.candidate_verification_artifact = artifact
         try:
-            review_data = self._parse_review_prediction()
-            if not isinstance(review_data, dict) or not isinstance(review_data.get("review"), dict):
-                artifact.update({"status": "candidate_parse_failed", "verified_count": 0})
-                return
-            raw_candidate_input = review_data["review"].get("key_issues_to_review")
-            raw_candidate_list_valid = isinstance(raw_candidate_input, list)
-            proposed_candidate_count = (
-                len(raw_candidate_input) if raw_candidate_list_valid else 0
-            )
-            artifact.update({
-                "proposal_source": "first_pass_review",
-                "proposal_shape": "list" if raw_candidate_list_valid else "invalid",
-                "proposed_candidate_count": proposed_candidate_count,
-            })
-            self.verified_review_data = copy.deepcopy(review_data)
-            self.verified_review_data["review"]["key_issues_to_review"] = []
-
-            if not raw_candidate_list_valid:
-                artifact.update({
-                    "status": "candidate_input_invalid",
-                    "candidate_count": 0,
-                    "accepted_model_candidate_count": 0,
-                    "candidate_rejection_count": 0,
-                    "verified_count": 0,
-                    "publication_safe": False,
-                })
-                return
-
-            capability = getattr(self.git_provider, "supports_repo_file_fetching", None)
-            if not callable(capability) or not capability():
-                artifact.update({"status": "unsupported_provider", "verified_count": 0})
-                return
-
             runtime_settings = get_settings()
             route_candidate_cap = getattr(self, "_review_max_verification_candidates", None)
 
@@ -2279,6 +2246,38 @@ class PRReviewer:
                     "failure": "invalid_model_route",
                     "verified_count": 0,
                 })
+                return
+            review_data = self._parse_review_prediction()
+            if not isinstance(review_data, dict) or not isinstance(review_data.get("review"), dict):
+                artifact.update({"status": "candidate_parse_failed", "verified_count": 0})
+                return
+            raw_candidate_input = review_data["review"].get("key_issues_to_review")
+            raw_candidate_list_valid = isinstance(raw_candidate_input, list)
+            proposed_candidate_count = (
+                len(raw_candidate_input) if raw_candidate_list_valid else 0
+            )
+            artifact.update({
+                "proposal_source": "first_pass_review",
+                "proposal_shape": "list" if raw_candidate_list_valid else "invalid",
+                "proposed_candidate_count": proposed_candidate_count,
+            })
+            self.verified_review_data = copy.deepcopy(review_data)
+            self.verified_review_data["review"]["key_issues_to_review"] = []
+
+            if not raw_candidate_list_valid:
+                artifact.update({
+                    "status": "candidate_input_invalid",
+                    "candidate_count": 0,
+                    "accepted_model_candidate_count": 0,
+                    "candidate_rejection_count": 0,
+                    "verified_count": 0,
+                    "publication_safe": False,
+                })
+                return
+
+            capability = getattr(self.git_provider, "supports_repo_file_fetching", None)
+            if not callable(capability) or not capability():
+                artifact.update({"status": "unsupported_provider", "verified_count": 0})
                 return
             consume_specialist_prioritization = verification_config.consume_specialist_prioritization
             artifact.update({

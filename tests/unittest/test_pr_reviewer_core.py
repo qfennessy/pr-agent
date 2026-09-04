@@ -2685,7 +2685,9 @@ async def test_candidate_verification_early_exit_distinguishes_frontier_disabled
     frontier_enabled,
 ):
     reviewer = _make_reviewer()
+    reviewer.ai_handler = SimpleNamespace(azure=False, claude_extended_thinking_models=[])
     reviewer._parse_review_prediction = MagicMock(return_value=None)
+    init_run_details()
     settings = get_settings()
     snapshot = snapshot_settings(("pr_reviewer.enable_frontier_adjudication",))
     try:
@@ -2695,6 +2697,11 @@ async def test_candidate_verification_early_exit_distinguishes_frontier_disabled
         restore_settings(snapshot)
 
     assert reviewer.candidate_verification_artifact["status"] == "candidate_parse_failed"
+    stage = get_run_details().specialist_runs["candidate_verification"]
+    assert stage.state == "unavailable"
+    assert stage.failure_reason == "candidate_parse_failed"
+    assert stage.model_used is not None
+    assert stage.num_ai_calls == 0
     expected = (
         {
             "enabled": True,
