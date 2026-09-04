@@ -222,6 +222,13 @@ safe to persist and contains no credential, source, prompt, or endpoint URL. It 
 mutable revision aliases, ambiguous routes, incomplete route coverage,
 and any quote larger than the attempt cap fail validation locally.
 
+Every authority amount is bounded before it is used: at most 32 significant digits, a magnitude below
+10^16 USD, and no more than 18 fractional digits. Values outside that range are rejected when the
+authority is loaded, so a compact but enormous exponent cannot force an unbounded fixed-point rendering
+while an identity is derived. Cumulative reservation arithmetic then runs in a local decimal context wide
+enough to hold any sum of accepted values exactly, with inexact results trapped, so a rounded total can
+never compare below the hard cap.
+
 The raw gateway base URL is stored only in the private review-configuration bundle, where it is validated as
 bounded, HTTPS, and free of URL credentials, query parameters, and fragments. It is not stored in the authority,
 manifest, journal, report, or environment. Operators must treat the endpoint as non-secret configuration and

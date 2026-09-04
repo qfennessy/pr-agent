@@ -16,6 +16,7 @@ from pr_agent.algo.checkpoint_cost_authority import (
     CostAuthorityLedger,
     FrozenCostAuthority,
     ProviderMaximumCharge,
+    _positive_decimal,
     checkpoint_cost_stage,
     gateway_api_base_identity_hash,
     reserve_checkpoint_provider_attempt,
@@ -357,3 +358,68 @@ def test_context_reservation_rejects_missing_enforcing_gateway_binding():
                 provider_max_retries=0,
                 attribution="general_review",
             )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1e1000000000",
+        "1E+999999999",
+        "1e-1000000000",
+        "0." + "1" * 33,
+        "1" + "0" * 16,
+        "0.50000000000000000000000000004",
+    ],
+)
+def test_authority_rejects_decimals_outside_the_supported_range(value):
+    """An external authority cannot force unbounded fixed-point rendering or inexact sums."""
+
+    _manifest, _request, _case, _arm, authority = _contracts()
+    tampered = authority.to_dict()
+    tampered["hard_cost_cap_usd"] = value
+
+    with pytest.raises(CheckpointCostAuthorityError):
+        FrozenCostAuthority.from_dict(tampered)
+
+    tampered_quote = authority.to_dict()
+    tampered_quote["quotes"][0]["maximum_charge_usd"] = value
+    with pytest.raises(CheckpointCostAuthorityError):
+        FrozenCostAuthority.from_dict(tampered_quote)
+
+
+@pytest.mark.parametrize("value", ["0.01", "1.00", "0.0000003", "0.000000000000000001", "1000000"])
+def test_authority_accepts_ordinary_cost_precision(value):
+    assert _positive_decimal("cost", value) == Decimal(value)
+
+
+def test_cumulative_reservation_is_not_rounded_before_the_cap_comparison():
+    """Two quotes whose exact sum exceeds the cap must not both be admitted."""
+
+    _manifest, _request, _case, _arm, authority = _contracts()
+    # High precision, but inside the accepted bounds. The value that actually
+    # defeated the old default context carried more significant digits than the
+    # authority now accepts at all, and is covered by the rejection test above.
+    charge = Decimal("0.5" + "0" * 15 + "4")
+    quote = replace(authority.quotes[0], maximum_charge_usd=charge)
+    authority = replace(authority, hard_cost_cap_usd=Decimal("1"), quotes=(quote,))
+    ledger = CostAuthorityLedger(authority)
+
+    first = ledger.reserve(
+        stage=quote.stage,
+        model_id=quote.model_id,
+        deployment_id=None,
+        gateway_api_base=_GATEWAY_API_BASE,
+        max_output_tokens=quote.max_output_tokens,
+        provider_max_retries=0,
+    )
+    assert first.cumulative_reserved_usd == charge
+
+    with pytest.raises(CheckpointCostAuthorityError, match="hard cost cap"):
+        ledger.reserve(
+            stage=quote.stage,
+            model_id=quote.model_id,
+            deployment_id=None,
+            gateway_api_base=_GATEWAY_API_BASE,
+            max_output_tokens=quote.max_output_tokens,
+            provider_max_retries=0,
+        )

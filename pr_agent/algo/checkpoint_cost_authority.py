@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Context, Decimal, Inexact, InvalidOperation, Overflow, localcontext
 from types import MappingProxyType
 from typing import Any, Iterator, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
@@ -39,6 +39,19 @@ FRONTIER_ADJUDICATION_COST_STAGE = "frontier_adjudication"
 _HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _STAGE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _MUTABLE_REVISIONS = frozenset({"default", "latest", "main", "stable"})
+# An external authority is untrusted input. Bound its decimals so fixed-point
+# rendering cannot be used to allocate an unbounded string, and so cumulative
+# reservation arithmetic below stays exact.
+_MAX_AUTHORITY_SIGNIFICANT_DIGITS = 32
+_MAX_AUTHORITY_ADJUSTED_EXPONENT = 15
+_MIN_AUTHORITY_EXPONENT = -18
+# Comfortably wider than any sum of bounded values above, so accumulation never
+# rounds. Inexact is trapped as well, so a rounded total fails closed instead of
+# silently comparing below the cap.
+_AUTHORITY_ARITHMETIC_CONTEXT = Context(
+    prec=_MAX_AUTHORITY_ADJUSTED_EXPONENT + abs(_MIN_AUTHORITY_EXPONENT) + _MAX_AUTHORITY_SIGNIFICANT_DIGITS + 16,
+    traps=[Inexact, InvalidOperation, Overflow],
+)
 
 
 class CheckpointCostAuthorityError(EvaluationValidationError):
@@ -80,6 +93,15 @@ def _positive_decimal(name: str, value: object) -> Decimal:
         raise CheckpointCostAuthorityError(f"{name} must be an exact decimal string") from exc
     if not decimal_value.is_finite() or decimal_value <= 0:
         raise CheckpointCostAuthorityError(f"{name} must be finite and positive")
+    _, digits, exponent = decimal_value.as_tuple()
+    if len(digits) > _MAX_AUTHORITY_SIGNIFICANT_DIGITS:
+        raise CheckpointCostAuthorityError(
+            f"{name} must not exceed {_MAX_AUTHORITY_SIGNIFICANT_DIGITS} significant digits"
+        )
+    # adjusted() is the exponent of the most significant digit, so these two
+    # bounds also bound the width of the fixed-point rendering below.
+    if decimal_value.adjusted() > _MAX_AUTHORITY_ADJUSTED_EXPONENT or exponent < _MIN_AUTHORITY_EXPONENT:
+        raise CheckpointCostAuthorityError(f"{name} must be within the supported decimal range")
     return decimal_value
 
 
@@ -576,7 +598,14 @@ class CostAuthorityLedger:
         if max_output_tokens > quote.max_output_tokens:
             raise CheckpointCostAuthorityError("checkpoint provider request exceeds its quoted output cap")
         with self._lock:
-            cumulative = self._reserved_usd + quote.maximum_charge_usd
+            try:
+                with localcontext(_AUTHORITY_ARITHMETIC_CONTEXT):
+                    cumulative = self._reserved_usd + quote.maximum_charge_usd
+            except ArithmeticError as exc:
+                # Never compare a rounded total against the cap.
+                raise CheckpointCostAuthorityError(
+                    "checkpoint provider request could not be reserved exactly"
+                ) from exc
             if cumulative > self.authority.hard_cost_cap_usd:
                 raise CheckpointCostAuthorityError("checkpoint provider request would exceed the hard cost cap")
             reservation = ProviderAttemptReservation(
