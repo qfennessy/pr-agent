@@ -18,8 +18,11 @@ from pr_agent.algo.checkpoint_evaluation import (
     EvaluationStagePlan,
     EvaluationStageRun,
     EvaluationValidationError,
+    FindingLifecycleState,
+    FindingSeverity,
     MeasurementStatus,
     NumericMeasurement,
+    ObservedFinding,
     deployment_identity_hash,
 )
 from pr_agent.algo.checkpoint_evaluation_execution import (
@@ -208,6 +211,35 @@ def _success(arm: EvaluationArm, snapshot: ReviewSnapshot, *, details=True) -> P
         ),
         run_details=run_details,
     )
+
+
+def test_no_findings_result_retains_withdrawn_lifecycle_observations(tmp_path):
+    snapshot, _path, _artifact_hash = _write_snapshot(tmp_path)
+    arm = _arm(EvaluationArmKind.GENERAL_REVIEW)
+    withdrawn = ObservedFinding(
+        fingerprint=_hash("resolved-finding"),
+        severity=FindingSeverity.HIGH,
+        lifecycle_state=FindingLifecycleState.WITHDRAWN,
+        stage="general_review",
+    )
+
+    result = replace(_success(arm, snapshot), findings=(withdrawn,))
+
+    assert result.findings == (withdrawn,)
+
+
+def test_no_findings_result_rejects_active_lifecycle_observations(tmp_path):
+    snapshot, _path, _artifact_hash = _write_snapshot(tmp_path)
+    arm = _arm(EvaluationArmKind.GENERAL_REVIEW)
+    active = ObservedFinding(
+        fingerprint=_hash("active-finding"),
+        severity=FindingSeverity.HIGH,
+        lifecycle_state=FindingLifecycleState.ACTIVE,
+        stage="general_review",
+    )
+
+    with pytest.raises(EvaluationValidationError, match="only withdrawn"):
+        replace(_success(arm, snapshot), findings=(active,))
 
 
 def _specialist_run(arm: EvaluationArm, *, role="change_classification", **overrides):

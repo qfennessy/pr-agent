@@ -30,6 +30,7 @@ from pr_agent.algo.checkpoint_evaluation import (
     EvaluationRunState,
     EvaluationStagePlan,
     EvaluationValidationError,
+    FindingLifecycleState,
     MeasurementStatus,
     NumericMeasurement,
     ObservedFinding,
@@ -164,10 +165,19 @@ class ProductionArmResult:
             raise EvaluationValidationError("production arm retry_count must be a non-negative integer")
         if not isinstance(self.terminal, bool):
             raise EvaluationValidationError("production arm terminal must be a boolean")
-        if self.snapshot_result.state is ReviewResultState.FINDINGS and not self.findings:
-            raise EvaluationValidationError("a findings result requires normalized finding fingerprints")
-        if self.snapshot_result.state is not ReviewResultState.FINDINGS and self.findings:
-            raise EvaluationValidationError("only a findings result may include normalized findings")
+        has_active_findings = any(
+            finding.lifecycle_state is FindingLifecycleState.ACTIVE
+            for finding in self.findings
+        )
+        if self.snapshot_result.state is ReviewResultState.FINDINGS and not has_active_findings:
+            raise EvaluationValidationError("a findings result requires an active normalized finding")
+        if self.snapshot_result.state is ReviewResultState.NO_FINDINGS and has_active_findings:
+            raise EvaluationValidationError("a no-findings result may include only withdrawn findings")
+        if (
+            self.snapshot_result.state not in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
+            and self.findings
+        ):
+            raise EvaluationValidationError("only completed results may include normalized findings")
         if (
             self.snapshot_result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
             and not self.terminal
