@@ -1,0 +1,3065 @@
+<!DOCTYPE html><html lang="en" class="no-js"><head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../local_snapshot_review/">
+      
+      
+        <link rel="next" href="../local_git_provider/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/favicon.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Checkpoint Evaluation Planning - PR-Agent</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&amp;display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../css/custom.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  <link href="../../assets/stylesheets/glightbox.min.css" rel="stylesheet"><script src="../../assets/javascripts/glightbox.min.js"></script><style id="glightbox-style">
+            html.glightbox-open { overflow: initial; height: 100%; }
+            .gslide-title { margin-top: 0px; user-select: text; }
+            .gslide-desc { color: #666; user-select: text; }
+            .gslide-image img { background: white; }
+            .gscrollbar-fixer { padding-right: 15px; }
+            .gdesc-inner { font-size: 0.75rem; }
+            body[data-md-color-scheme="slate"] .gdesc-inner { background: var(--md-default-bg-color); }
+            body[data-md-color-scheme="slate"] .gslide-title { color: var(--md-default-fg-color); }
+            body[data-md-color-scheme="slate"] .gslide-desc { color: var(--md-default-fg-color); }
+        </style></head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#checkpoint-evaluation-planning" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+              <button class="md-banner__button md-icon" aria-label="Don't show this again">
+                
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"></path></svg>
+              </button>
+            
+            
+  Open source PR Agent documentation. For the Qodo free version for open-source projects, visit: <a href="https://www.qodo.ai/solutions/open-source/">https://www.qodo.ai/solutions/open-source/</a>
+
+          </div>
+          
+            <script>var el=document.querySelector("[data-md-component=announce]");if(el){var content=el.querySelector(".md-typeset");__md_hash(content.innerHTML)===__md_get("__announce")&&(el.hidden=!0)}</script>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="PR-Agent" class="md-header__button md-logo" aria-label="PR-Agent" data-md-component="logo">
+      
+  <img src="../../assets/favicon.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"></path></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            PR-Agent
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Checkpoint Evaluation Planning
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo" aria-label="Switch to light mode" type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden="">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m14.3 16-.7-2h-3.2l-.7 2H7.8L11 7h2l3.2 9zM20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12zm-9.15 3.96h2.3L12 9z"></path></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="custom" data-md-color-accent="custom" aria-label="Switch to dark mode" type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_2" hidden="">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M17 6H7c-3.31 0-6 2.69-6 6s2.69 6 6 6h10c3.31 0 6-2.69 6-6s-2.69-6-6-6m0 10H7c-2.21 0-4-1.79-4-4s1.79-4 4-4h10c2.21 0 4 1.79 4 4s-1.79 4-4 4M7 9c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3"></path></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="custom" aria-label="Switch to light mode" type="radio" name="__palette" id="__palette_2">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden="">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M17 7H7a5 5 0 0 0-5 5 5 5 0 0 0 5 5h10a5 5 0 0 0 5-5 5 5 0 0 0-5-5m0 8a3 3 0 0 1-3-3 3 3 0 0 1 3-3 3 3 0 0 1 3 3 3 3 0 0 1-3 3"></path></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"></path></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required="">
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"></path></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"></path></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"></path></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix="">
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/the-pr-agent/pr-agent" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"></path></svg>
+  </div>
+  <div class="md-source__repository">
+    the-pr-agent/pr-agent
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../.." class="md-tabs__link">
+          
+  
+  
+    
+  
+  Overview
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../installation/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Installation
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Usage Guide
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../tools/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Tools
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../core-abilities/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Core Abilities
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../development/ci/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Development
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../designs/specialist_review_pipeline/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Design Proposals
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation">
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="PR-Agent" class="md-nav__button md-logo" aria-label="PR-Agent" data-md-component="logo">
+      
+  <img src="../../assets/favicon.svg" alt="logo">
+
+    </a>
+    PR-Agent
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/the-pr-agent/pr-agent" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"></path></svg>
+  </div>
+  <div class="md-source__repository">
+    the-pr-agent/pr-agent
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix="">
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+    
+    
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_1">
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../.." class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_1" id="__nav_1_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Overview
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix="">
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../overview/data_privacy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Data Privacy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2">
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../installation/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_2" id="__nav_2_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Installation
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix="">
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../installation/pr_agent/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    PR-Agent
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../installation/locally/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Locally
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../installation/github/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    GitHub Integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../installation/gitlab/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    GitLab Integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../installation/bitbucket/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    BitBucket Integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../installation/azure/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Azure DevOps Integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../installation/gitea/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Gitea Integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked="">
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Usage Guide
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Usage Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix="">
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../introduction/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Introduction
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../configuration_options/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration File
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../automations_and_usage/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Usage and Automation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../mail_notifications/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Managing Mail Notifications
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changing_a_model/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Changing a Model
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../extending_pr_agent/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Extending PR-Agent
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../additional_configurations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Additional Configurations
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../plain_diff_mode/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plain-Diff Mode
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../local_snapshot_review/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Local Snapshot Review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Checkpoint Evaluation Planning
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Checkpoint Evaluation Planning
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+  
+
+<nav class="md-nav md-nav--secondary" aria-label="On this page">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      On this page
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix="">
+      
+        <li class="md-nav__item">
+  <a href="#artifact-boundary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Artifact boundary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#credential-free-list-and-dry-run" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Credential-free list and dry run
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#paid-execution-is-fail-closed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Paid execution is fail closed
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Paid execution is fail closed">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#providergateway-maximum-charge-authority" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Provider/gateway maximum-charge authority
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#resumable-raw-attempt-artifacts" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Resumable raw attempt artifacts
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#privacy-safe-live-shadow-journal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Privacy-safe live shadow journal
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#scoring-and-gate-interpretation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scoring and gate interpretation
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Scoring and gate interpretation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#canonical-pilot-report-and-rollout-gates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Canonical pilot report and rollout gates
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#external-cocos-story-corpus-adapter" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        External Cocos Story corpus adapter
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../local_git_provider/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Local Git Provider
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../faq/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Frequently Asked Questions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4">
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../tools/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tools
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Tools
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix="">
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tools/describe/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Describe
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tools/review/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tools/improve/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Improve
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tools/ask/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Ask
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tools/add_docs/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Add Docs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tools/generate_labels/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Generate Labels
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tools/similar_issues/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Similar Issues
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tools/help/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Help
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tools/help_docs/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Help Docs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tools/update_changelog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Update Changelog
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_5">
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../core-abilities/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Core Abilities
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_5" id="__nav_5_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Core Abilities
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix="">
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../core-abilities/agent_skills/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Agent skills
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../core-abilities/compression_strategy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compression strategy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../core-abilities/dynamic_context/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Dynamic context
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../core-abilities/fetching_ticket_context/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fetching ticket context
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../core-abilities/metadata/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Local and global metadata
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../core-abilities/self_reflection/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Self-reflection
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+    
+    
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_6">
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Development
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix="">
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/ci/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CI configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+    
+    
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_7">
+        
+          
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Design Proposals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Design Proposals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix="">
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../designs/specialist_review_pipeline/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Specialist review pipeline
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc">
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+  
+
+<nav class="md-nav md-nav--secondary" aria-label="On this page">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      On this page
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix="">
+      
+        <li class="md-nav__item">
+  <a href="#artifact-boundary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Artifact boundary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#credential-free-list-and-dry-run" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Credential-free list and dry run
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#paid-execution-is-fail-closed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Paid execution is fail closed
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Paid execution is fail closed">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#providergateway-maximum-charge-authority" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Provider/gateway maximum-charge authority
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#resumable-raw-attempt-artifacts" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Resumable raw attempt artifacts
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#privacy-safe-live-shadow-journal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Privacy-safe live shadow journal
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#scoring-and-gate-interpretation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scoring and gate interpretation
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Scoring and gate interpretation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#canonical-pilot-report-and-rollout-gates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Canonical pilot report and rollout gates
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#external-cocos-story-corpus-adapter" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        External Cocos Story corpus adapter
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+                
+
+
+
+
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="checkpoint-evaluation-planning">Checkpoint evaluation planning<a class="headerlink" href="#checkpoint-evaluation-planning" title="Permanent link">¶</a></h1>
+<p>Checkpoint evaluation artifacts describe how to replay the same immutable local-review
+snapshot through several production review arms. List and dry-run modes remain limited to
+local validation and deterministic planning. The separately authorized production runner
+can call the frozen arms, but it cannot publish a review or enable developer-visible behavior.</p>
+<p>All runtime settings remain disabled:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">[checkpoint_evaluation]</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">allow_paid_execution</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">shadow_journal_enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">publish_output</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">paid_cost_cap_usd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.0</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="n">shadow_journal_path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">""</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="n">shadow_journal_max_queue_entries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">256</span>
+</code></pre></div>
+<p>The credential-free plan reports a separate, versioned <code>production_binding_inventory</code>
+beside the frozen plan. Its own schema hash and content-derived inventory ID bind the readiness
+claims to the immutable manifest. Every entry remains unavailable until all its named source-free
+blocker contracts are implemented. A completed adapter may remain dormant behind an unavailable
+binding; unavailable status or missing hard-cost-cap enforcement still stops production preflight
+before the artifact store or any model client is touched.</p>
+<p>The general-review and verified-specialists arms now have dormant production adapters. They call the
+isolated no-publish replay seam with the exact immutable snapshot/configuration pair, preserve
+source-free per-stage telemetry across the subprocess protocol, and fail closed while joining trusted
+verifier identity to normalized severity. Evaluation-only root-cause metadata never changes the ordinary
+published finding shape, but the general-review arm remains blocked until production provides an explicit
+severity contract rather than an inferred default. Both bindings also remain unavailable until an operator
+supplies a current, immutable provider/gateway maximum-charge authority for every frozen route and the bound
+runtime controls pass preflight. The model boundary can now consume that authority immediately before every
+underlying provider request, but the repository does not ship an authority or treat a LiteLLM price estimate
+as one. A quote must include a non-secret, immutable gateway route-binding identifier for its exact provider and
+revision. The source-free review bundle freezes a validated, credential-free HTTPS gateway endpoint and the worker
+rejects it unless its identity matches every authority quote. The model boundary sends the binding identifier only
+to that endpoint; generic LiteLLM provider routes do not enforce this contract. No enforcing gateway binding is
+installed, so general-review
+and checkpoint-stage execution remain unavailable. The general replay contract remains limited to the
+standard OpenAI route; unsupported routes continue to fail configuration capture.
+Issue #27 must still complete those contracts and the source/telemetry contracts needed to integrate
+the production orchestration delivered by issues #26, #12, #11, #9, and #33. A frozen
+target-repository replay and one week of live shadow evidence are also required before any rollout
+gate can grant permission.</p>
+<h2 id="artifact-boundary">Artifact boundary<a class="headerlink" href="#artifact-boundary" title="Permanent link">¶</a></h2>
+<p>The <code>checkpoint-evaluation-v2</code> contracts use content-derived SHA-256 identities, including
+a hash of the concrete field/enum schema rather than only its version label, and keep
+five artifact types separate:</p>
+<ul>
+<li><code>EvaluationManifest</code> freezes corpus, policy, configuration, arms, and source-free
+  references to serialized <code>ReviewSnapshot</code> artifacts.</li>
+<li><code>CheckpointCase</code> contains only a snapshot identity, event lineage, cohort assignment,
+  and explicitly model-visible metadata.</li>
+<li><code>TruthArtifact</code> and <code>CheckpointTruth</code> contain clean-control labels, adjudicated findings,
+  severity, earliest opportunity, and required context. They are loaded separately and
+  never appear in an execution plan or <code>model_visible_payload()</code>.</li>
+<li><code>EvaluationRunRecord</code> binds one retained attempt to a manifest, case, arm, and snapshot.
+  It maps shipped <code>ReviewSnapshotResult</code> and <code>RunDetails</code> telemetry without turning missing
+  tokens, cost, latency, or coverage into zero. Optional route, cache, stage-latency,
+  overlap, and lifecycle fields remain structured and source-free. Model-backed specialist
+  arms retain one <code>EvaluationStageRun</code> per required role, including its pinned
+  model/provider/revision, one-way deployment identity hash, configuration and prompt
+  hashes, prompt and schema versions, coverage and failure state, latency, tokens, priced
+  cost, cache/fallback state, and confidence. Full specialist output and deployment names
+  are excluded because they can contain source or environment-specific details.</li>
+<li><code>RolloutGateDecision</code> records <code>passed</code>, <code>failed</code>, or <code>not_evaluable</code> for explicit metrics,
+  thresholds, and minimum support.</li>
+</ul>
+<p>Unknown fields are rejected when artifacts are loaded. Answer-only field names are also
+rejected recursively inside model-visible metadata. Hash metadata must be a full SHA-256
+identity, string metadata is a bounded lowercase identifier, and stage and change-size values
+use closed enums/ranges. Before execution, the runner independently derives snapshot-backed
+metadata and rejects a mismatch. A manifest cannot reuse snapshot
+identities, mix one lineage across cohorts, or accept a supplied content id that does not
+match its canonical JSON.</p>
+<p>Before the production runner uses a source-bearing snapshot, it must call
+<code>load_review_snapshot_artifact()</code>. The loader reads one bounded regular file without
+following any supplied path component (using descriptor-relative component walking), rejects
+duplicate keys and non-finite JSON, verifies the exact file-byte hash against the checkpoint,
+reconstructs the <code>ReviewSnapshot</code>, and then verifies its content-derived snapshot id and
+event. Unknown snapshot fields and answer-only keys in deterministic evidence fail closed.
+Nested deterministic evidence is copied into immutable mappings and tuples before the
+validated snapshot is returned, while <code>to_dict()</code> still emits ordinary JSON-compatible
+copies. Loading performs no network or model call.</p>
+<p>The evaluation artifacts above contain no source text, full diff, secret, hidden reasoning,
+provider request identifier, or credential. The separate serialized <code>ReviewSnapshot</code> is
+source-bearing, stays in local source storage outside published artifact directories, and is
+referenced by its exact byte hash.</p>
+<p>The separate <code>checkpoint-review-configuration-v1</code> bundle is also local and model-visible. It
+stores the exact allowlisted general-review settings, resolved skill text, resolved repository
+context in prompt order with its rendering line budget, pinned prompt date, package and installed
+dependency versions, plus a hash of the executable review code and default settings. It accounts
+explicitly for every supported setting as present or missing, rejects unknown or case-colliding
+data, and revalidates its content hash and runtime identity before use.
+An optional private <code>checkpoint-stage-sources-v1</code> extension carries the exact specialist,
+candidate-verification, and frontier configurations, prompts, routes, and static-analysis evidence.
+The extension is included in the bundle content hash, is never rendered in object representations,
+and is not copied into manifests, reports, journals, or other source-free artifacts. Legacy bundles
+without the extension keep their original canonical shape and identity. Extended bundles must match
+every planned stage hash, version, model route, and deployment identity before the artifact store or
+worker process is touched. The worker receives the validated stage plan and exposes only the sources
+selected for that arm; production review code falls back to ambient configuration only outside this
+checkpoint execution context. Verifier stage-plan hashes cover controls shared across the arm, while
+each review-configuration bundle separately content-addresses checkpoint-specific static-analysis
+evidence so evolving evidence does not invalidate later cases in the same paired run.
+Credentials, callback configuration, telemetry headers, and output sinks have no bundle fields. A checkpoint
+bundle may carry one credential-free HTTPS gateway base URL: it is part of the content-derived configuration
+identity, never read from the worker environment, and must not contain a token or other secret.
+The isolated worker disables publication, callback and OpenTelemetry delivery, push outputs, and
+run-detail printing before importing the reviewer. It also passes only the standard OpenAI runtime
+credential and a minimal process environment; proxy, ambient endpoint, Dynaconf, and other provider
+controls are not inherited. If the bundle supplies the checkpoint gateway endpoint, the worker hash-matches it
+to every authority quote before reviewer construction and then replays that exact endpoint. A non-empty snapshot
+without this frozen endpoint fails preflight before reviewer construction. Checkpoint
+materialization writes the canonical bundle beside its
+source-bearing snapshot in the same atomic, owner-only local directory. Shared bundles are stored
+once, while the private snapshot index records each pair's deterministic relative paths, bundle
+identity, and exact artifact-byte hash. Loading rejects non-canonical bytes, unsafe links or
+permissions, snapshot/bundle hash mismatches, and incompatible runtime identity before any adapter
+or model can run. Bundle content is never copied into a source-free manifest, journal, report, or
+log. Existing provider-neutral local-pair snapshots retain their legacy hash for local workflows,
+but they cannot enter this paired evaluation path without the exact immutable bundle.</p>
+<p>Production bindings declare their telemetry shape. The deterministic arm must be model-free,
+the general-review arm must name one selected pinned model, and specialist, verified-specialist,
+and full-cascade arms freeze an exact, nonempty stage plan. Each required stage fixes its
+name, primary/fallback route, hashed deployment identity, configuration and prompt hashes,
+and prompt/input/output schema versions. Runtime telemetry must contain that exact set once
+each; missing, duplicate, unexpected, mismatched, or unpinned stages fail closed. A stage
+identity and every model named in its priced-cost map must belong to that stage's frozen
+route. Missing, partial, ambiguous, or unpinned identities fail before an artifact is written.
+A specialist-only record may omit
+the top-level model triple only when it contains complete nonempty per-stage identities. Role
+telemetry is also folded into the arm's token and cost totals because production <code>RunDetails</code>
+intentionally keeps specialist usage separate from the main review footer.</p>
+<p>The role collector cannot prove how many calls reported token usage, so any observed role-token
+subtotal is <code>partial</code>; an absent subtotal is <code>unavailable</code>. Cost is <code>complete</code> only when every
+successful role call was priced, <code>partial</code> when only some were priced, and <code>unavailable</code> when
+none were. A default numeric zero is never persisted as measured latency, tokens, or cost. A
+failed role cannot turn a <code>no_findings</code> result into apparently clean coverage.</p>
+<h2 id="credential-free-list-and-dry-run">Credential-free list and dry run<a class="headerlink" href="#credential-free-list-and-dry-run" title="Permanent link">¶</a></h2>
+<p>Validate a local manifest and list its cases and enabled arms:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>python<span class="w"> </span>-m<span class="w"> </span>pr_agent.cli<span class="w"> </span>evaluation-plan<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span>--manifest<span class="w"> </span>artifacts/evaluation-manifest.json<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span>--list
+</code></pre></div>
+<p>Expand the deterministic paired plan:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>python<span class="w"> </span>-m<span class="w"> </span>pr_agent.cli<span class="w"> </span>evaluation-plan<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span>--manifest<span class="w"> </span>artifacts/evaluation-manifest.json<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span>--dry-run
+</code></pre></div>
+<p>Optionally validate the separately stored answers at the same time:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>python<span class="w"> </span>-m<span class="w"> </span>pr_agent.cli<span class="w"> </span>evaluation-plan<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span>--manifest<span class="w"> </span>artifacts/evaluation-manifest.json<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span>--truth<span class="w"> </span>private/adjudicated-truth.json<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span>--dry-run
+</code></pre></div>
+<p>Both modes are local-only. Their machine-readable output states <code>network_calls: 0</code> and
+<code>model_calls: 0</code>. The plan includes the same <code>snapshot_id</code> for every enabled arm paired
+with a checkpoint, freezes its serialized-artifact hash and every arm's prompt,
+configuration, provider, model, revision, and source-free per-stage contract, and never
+includes truth. The separately versioned readiness inventory reports each arm's current
+production-binding availability and bounded blocker codes without importing a model handler
+or probing credentials.</p>
+<h2 id="paid-execution-is-fail-closed">Paid execution is fail closed<a class="headerlink" href="#paid-execution-is-fail-closed" title="Permanent link">¶</a></h2>
+<p><code>evaluate_paid_execution()</code> is the mandatory boundary for a future production-backed
+runner. It returns <code>denied</code> unless all of these facts are true at the same time:</p>
+<ul>
+<li>evaluation and paid execution were explicitly enabled;</li>
+<li>publication is still disabled;</li>
+<li>every model-backed case/arm pair has a positive hard per-attempt cost cap and a bounded
+  maximum attempt count whose full reservation fits a positive cap for this exact manifest;</li>
+<li>every enabled model arm pins a model revision; and</li>
+<li>the process has a credential for every named provider.</li>
+</ul>
+<p>The request records only credential presence booleans. It never serializes an environment
+variable name, token, key, credential value, or provider request identifier. The request is
+immutably bound beside the manifest. Before every adapter call, the runner reloads retained
+attempts, requires complete cost telemetry, and checks cumulative spend plus all remaining
+reserved attempts against the cap. Every model-backed binding must also declare hard-cap
+support and receives the immutable per-attempt cap in its adapter context; a binding that
+cannot enforce that cap before provider calls is unavailable. A final failed attempt is
+terminalized at its immutable limit, so restarting cannot create unbounded retries. The default cost cap is zero and
+therefore cannot authorize spending. A caller must invoke
+<code>PaidExecutionDecision.require_authorized()</code> immediately before entering production
+orchestration; planning alone is not authorization.</p>
+<p>Before a paid adapter starts, the artifact store exclusively persists its attempt number
+and hard-cap reservation. A crash, raised adapter exception, or rejected result leaves an
+unreconciled reservation that blocks resume instead of repeating a possibly charged call.</p>
+<h3 id="providergateway-maximum-charge-authority">Provider/gateway maximum-charge authority<a class="headerlink" href="#providergateway-maximum-charge-authority" title="Permanent link">¶</a></h3>
+<p><code>checkpoint-cost-authority-v1</code> is a separate source-free contract for one manifest, paid request,
+case, arm, snapshot, review configuration, and per-attempt cap. It names an immutable authority
+revision and hashes the external provider or enforcing-gateway guarantee. Each quote pins one exact
+stage, model, provider, revision, deployment identity, hashed HTTPS gateway endpoint, non-secret immutable
+gateway route-binding identifier, maximum output-token cap, and worst-case charge. The binding identifier is
+safe to persist and contains no credential, source, prompt, or endpoint URL. It also expires. Unknown fields,
+mutable revision aliases, ambiguous routes, incomplete route coverage,
+and any quote larger than the attempt cap fail validation locally.</p>
+<p>Every authority amount is bounded before it is used: at most 32 significant digits, a magnitude below
+10^16 USD, and no more than 18 fractional digits. Values outside that range are rejected when the
+authority is loaded, so a compact but enormous exponent cannot force an unbounded fixed-point rendering
+while an identity is derived. Cumulative reservation arithmetic then runs in a local decimal context wide
+enough to hold any sum of accepted values exactly, with inexact results trapped, so a rounded total can
+never compare below the hard cap.</p>
+<p>The raw gateway base URL is stored only in the private review-configuration bundle, where it is validated as
+bounded, HTTPS, and free of URL credentials, query parameters, and fragments. It is not stored in the authority,
+manifest, journal, report, or environment. Operators must treat the endpoint as non-secret configuration and
+must never embed credentials in its path.</p>
+<p>The isolated single-review worker installs one consume-only ledger process-wide and in its coroutine
+context, so both worker threads and concurrent specialist, verifier, and frontier tasks share it.
+Immediately before every LiteLLM <code>acompletion</code> call, including same-model
+retries, fallback routes, streaming calls, and the Bedrock credential fallback, the ledger atomically
+reserves the quote's full worst-case charge. It does not refund reservations based on estimated actual
+usage. A request is denied before the provider client when its route is unquoted, the output cap is
+missing or larger than quoted, provider SDK retries are not exactly zero, the authority is expired or
+mismatched, the explicit gateway endpoint does not match the quote, the route binding conflicts with an existing
+header, or the next reservation would exceed the cap. After reservation, the handler attaches the exact binding as
+<code>X-PR-Agent-Checkpoint-Route</code> on the actual <code>acompletion</code> request. The external gateway contract must guarantee
+that it rejects an unknown or mismatched identifier and routes a recognized identifier only to the quoted provider
+and immutable revision. This header is not a credential and must never be replaced with a secret token. Dynamic
+per-finding frontier telemetry attribution is normalized to
+the fixed <code>frontier_adjudication</code> stage only for quote lookup; full attribution remains in telemetry.
+Post-response cost and identity telemetry
+still must be complete and agree with the frozen arm; the authority does not turn missing telemetry into
+zero.</p>
+<p>This boundary depends on an external provider/gateway guarantee that the quoted maximum is actually
+enforced for the bound request regardless of its eventual input or output usage. Operator guesses and
+the ordinary LiteLLM pricing table are observational estimates, not
+spending authority. Consequently the default production binding inventory keeps
+<code>hard_cost_cap_enforcement_unavailable</code> until a real authority is supplied and its frozen route controls
+are proven. A direct or generic LiteLLM provider endpoint that ignores the route header does not qualify. This
+repository change alone does not authorize or execute a paid request.</p>
+<h2 id="resumable-raw-attempt-artifacts">Resumable raw attempt artifacts<a class="headerlink" href="#resumable-raw-attempt-artifacts" title="Permanent link">¶</a></h2>
+<p><code>EvaluationArtifactStore</code> writes one content-addressed JSON file per attempt with private
+permissions and exclusive creation. The store retains successful, malformed, timed-out,
+stale, cancelled, provider-failed, and unavailable-coverage records. A later retry gets a
+new attempt number and cannot overwrite an earlier failure. The manifest is written once,
+and a changed manifest, corrupt record, wrong snapshot, wrong model/provider/revision,
+skipped attempt, second terminal record, mixed manifest, non-private path, symlink, or
+unexpected file fails resume.</p>
+<p><code>resume_plan()</code> omits only case/arm pairs that already have one terminal record. For every
+other pair it returns the next attempt number and the identities of all retained attempts.
+<code>inventory()</code> produces the hashes needed for a pilot report without copying source or
+model-visible snapshot bytes into the report. Resume loading and scoring both revalidate each
+aggregate or stage identity, stage name/cardinality, stage contract version, deployment
+identity hash, and each priced-cost model key against the same frozen arm.</p>
+<h2 id="privacy-safe-live-shadow-journal">Privacy-safe live shadow journal<a class="headerlink" href="#privacy-safe-live-shadow-journal" title="Permanent link">¶</a></h2>
+<p><code>ShadowJournalWriter</code> is disabled unless explicitly opted in. When enabled, checkpoint
+code calls only bounded <code>put_nowait</code>; a daemon worker appends source-free NDJSON in the
+background. A full queue or write failure drops telemetry rather than delaying or failing
+a save. Explicit shutdown may flush the queue, but the save path never waits for disk.
+Enabling a writer first durably creates a private, source-free session-open boundary tied to
+the prior journal tail. Until clean shutdown removes that boundary, report loading rejects the
+journal, so a crash before the first queued record reaches disk cannot leave an older sealed
+inventory looking current. Shutdown marks submission closed under the submission lock, releases
+the lock, and only then waits for queue capacity; concurrent checkpoints return <code>CLOSED</code> immediately.
+Each accepted entry is wrapped by the writer with a contiguous sequence, UTC ingestion time,
+and writer-owned monotonic developer-time basis. Reports derive duration and cost-hour evidence
+only from parsed, identity-checked journal records; caller-supplied timestamps or elapsed-time
+wrappers cannot satisfy a gate.
+At explicit shutdown, the writer seals the last retained record in each session with immutable
+submitted, queued, and dropped counts plus writer-failure status. A missing seal, any dropped
+submission, or any writer failure makes the raw inventory unavailable and keeps retained latency
+and cost samples partial, so a biased subset cannot satisfy the live-shadow gate.</p>
+<p>The schema allowlists snapshot and lineage hashes, event and configuration versions,
+selected depth and machine reason codes, model/provider identities, hashed finding
+fingerprints and lifecycle state, coverage/failure/cache/retry status, tokens, cost, and
+latency. Specialist-only entries keep the same source-free per-stage identity, version,
+coverage, failure, latency, token, and priced-cost records as their immutable raw attempt.
+Creating a journal entry requires the exact frozen arm and revalidates aggregate identities,
+the exact required stage set, every stage identity and contract version, and every per-model
+cost key. It has no field for source, a diff, task
+intent, prompt text, model output, deployment name, secret, credential, provider request id,
+or hidden reasoning. Fingerprints are re-hashed before persistence. Only a completed review
+whose complete required stage plan is present and covered marks aggregate coverage complete;
+an empty or partial stage set can never pass by vacuous truth. Timeout, malformed, stale,
+cancelled, provider-failed, stage-failed, and explicit coverage-unavailable attempts
+keep coverage unavailable.</p>
+<h2 id="scoring-and-gate-interpretation">Scoring and gate interpretation<a class="headerlink" href="#scoring-and-gate-interpretation" title="Permanent link">¶</a></h2>
+<p><code>score_matched_arms()</code> requires one truth entry for every manifest case. Missing terminal
+records, provider failures, malformed output, timeouts, stale runs, and unavailable
+coverage remain in the denominator. A later successful retry does not delete its earlier
+failed attempt. The scorecard reports:</p>
+<ul>
+<li>structured-output, verified-precision, verified-recall, and severity-weighted-recall
+  rates, broken out by cohort with support;</li>
+<li>time to first valid finding and incremental recall at each checkpoint event;</li>
+<li>false interruptions per independently adjudicated clean checkpoint and developer-hour;</li>
+<li>escalation precision and high/critical escalation recall;</li>
+<li>stale-finding withdrawal, deterministic overlap, and duplicate-finding counts;</li>
+<li>p50/p95 latency overall, by event, and by recorded production stage;</li>
+<li>tokens, retries, dollar totals, cost per developer-hour, and cost per verified finding;</li>
+<li>unavailable-coverage, failed/missing-case, and failed-attempt rates; and</li>
+<li>matched per-snapshot quality, interruption, structured-output, latency, token, and cost
+  deltas with a two-sided 95% paired Student-t interval and exact support.</li>
+</ul>
+<p>Lineage timing is explicit evaluation metadata and never model-visible. A truth finding may
+name an exact earliest checkpoint and a later withdrawal checkpoint. Descendant checkpoints
+may be clean after a temporary defect self-corrects. Missing timing, escalation, pricing,
+or duration makes the affected metric partial or unavailable, so it cannot pass a gate.</p>
+<p><code>evaluate_rollout_gate()</code> accepts explicit <code>GateRule</code> thresholds. A known threshold miss
+returns <code>failed</code>. An absent metric, partial/unavailable measurement, or insufficient sample
+returns <code>not_evaluable</code>; it never becomes permission to roll out. Loaded rule-result and
+top-level decision statuses are recomputed from their frozen evidence, so a serialized
+artifact cannot claim <code>passed</code> over failed or missing measurements.</p>
+<h3 id="canonical-pilot-report-and-rollout-gates">Canonical pilot report and rollout gates<a class="headerlink" href="#canonical-pilot-report-and-rollout-gates" title="Permanent link">¶</a></h3>
+<p><code>build_checkpoint_pilot_report()</code> is the source-free report boundary for the target-repository
+pilot. It loads every retained attempt through <code>EvaluationArtifactStore</code>, calls
+<code>score_matched_arms()</code> with the frozen incumbent, and evaluates the canonical rules through
+<code>evaluate_rollout_gate()</code>. The report records the manifest, corpus, schema, policy,
+configuration, arm-configuration, prompt, and hashed model identities; the raw replay, shadow,
+and settled-candidate artifact hash inventories; terminal and incomplete pair counts; the exact scorecard id;
+the full source-free scorecard with cohort support and paired uncertainty; accepted budgets;
+source-free observed measurements; and all five gate decisions. It does not
+serialize source, diffs, truth or adjudication identifiers, model/provider identifiers,
+provider request ids, or credentials.</p>
+<p>The canonical rules are:</p>
+<table>
+<thead>
+<tr>
+<th>Gate</th>
+<th>Rules that must have complete evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Offline replay</td>
+<td>Structured-output rate at least 99.5%, complete immutable replay inventory, an independently pinned no-holdout-leakage artifact bound to the exact model-visible holdout inventory, and retry limits derived from the immutable paid request</td>
+</tr>
+<tr>
+<td>Live shadow</td>
+<td>At least seven real elapsed days with both file-save and worktree events, a raw shadow-artifact inventory, and complete p95-latency and cost-per-developer-hour measurements within explicitly accepted positive budgets</td>
+</tr>
+<tr>
+<td>Opt-in pair review</td>
+<td>Verified precision at least 80%, no negative high-severity recall delta on the temporal cohort, and complete replay artifacts</td>
+</tr>
+<tr>
+<td>Default pair review</td>
+<td>Actionable precision at least 90% derived from the exact accepted inventory of at least 100 settled candidates, observed false interruptions no greater than an explicitly accepted non-negative threshold, and complete shadow artifacts</td>
+</tr>
+<tr>
+<td>PR publication</td>
+<td>A strictly positive lower 95% bound for the cascade's quality advantage across all 18 cases in the locked Cocos Story holdout, complete holdout cost within an explicitly accepted positive ceiling, and complete replay artifacts</td>
+</tr>
+</tbody>
+</table>
+<p>Create <code>PilotRolloutBudgets</code> only from thresholds a maintainer has actually accepted.
+<code>PilotRolloutEvidence</code> carries only separately bound replay declarations and a content-bound
+leakage-check artifact; a bare leakage boolean cannot satisfy a gate. The checker revision and
+exact model-visible holdout inventory are hashed, and a separate maintainer change must pin the
+check id before it counts. Evidence cannot accept shadow
+timestamps, counts, metrics, artifact hashes, or a settled-candidate precision claim. The report
+derives settled-candidate precision, temporal high-severity
+recall, frozen-holdout paired recall uncertainty, and holdout cost directly from accepted records,
+immutable attempts, and the separate answer ledger. Callers cannot supply those rollout measurements.
+The publication comparison also requires the validated <code>CocosCorpusInventory</code> and a separately
+reviewed <code>CocosPilotAcceptance</code>. <code>build_cocos_pilot_acceptance()</code> generates a source-free artifact
+containing the canonical adapter lock, manifest schema version/hash, corpus hash, and the full
+ordered case inventory. Every assignment records only its case id, snapshot identity/artifact hash,
+cohort, event, and parent case. It therefore commits to every calibration, holdout, temporal, and
+control assignment without copying source. Generation does not approve it. A maintainer must
+independently review that artifact and pin its
+content-derived <code>acceptance_id</code> as <code>CANONICAL_COCOS_PILOT_ACCEPTANCE_ID</code> in a separate change before
+publication can pass. This prevents one report call from supplying both the evidence and the values
+that supposedly accept it.</p>
+<p>The inventory must use the checked-in canonical Cocos lock and its exact cohort counts, the manifest
+and inventory must match the pinned artifact's schema and corpus identities, and every manifest case
+must match the accepted ordered assignment tuple exactly. Substitution, reordering, extra or missing
+cases, a changed cohort, and a changed snapshot hash are rejected even when the aggregate count stays
+18. The report records only the acceptance id, a reproducible source-free inventory hash, and those
+accepted identities; it omits the assignment details, corpus path, and source revision. Missing or
+generated-but-unpinned acceptance produces <code>not_evaluable</code>, while a conflicting acceptance id, lock,
+schema, corpus, assignment, cohort count, or holdout hash is invalid input. Eighteen arbitrary cases,
+19 cases, or a one-case point estimate cannot be represented as a passing confidence bound.</p>
+<p>Live shadow evidence follows the same two-step boundary. <code>ShadowJournalRecord</code> binds one actual
+<code>ShadowJournalEntry</code> content id to the writer-stamped ingestion time in UTC, contiguous sequence,
+and writer-owned monotonic developer-time
+denominator. The last record in each writer session also binds the writer-owned submission,
+retention, drop, and failure summary. An outstanding durable session-open boundary rejects parsing
+before acceptance can be generated. <code>build_shadow_pilot_acceptance()</code> verifies the journal entries use the exact manifest
+policy, configuration, target arm, aggregate model identity, required stage plan, primary/fallback
+route, deployment identity, prompt/configuration/schema versions, cost model identities, and journal
+schema. It also rejects negative aggregate or stage latency, token, cost, or developer-time
+measurements, preserves the records' observed order, and emits the complete source-free record
+inventory and journal hash. Generation alone cannot pass a gate; a maintainer must independently pin
+its content id as <code>CANONICAL_SHADOW_PILOT_ACCEPTANCE_ID</code>.</p>
+<p>Report construction then matches every parsed accepted record id and entry id in order. Truncated, extra,
+substituted, duplicated, or reordered journal records fail validation. Duration is recomputed from
+the first and last UTC ingestion records, p95 latency from every entry's recorded latency, event counts
+from the recorded event enum, and cost per developer-hour from recorded costs and accepted developer
+elapsed denominators. Missing, partial, or unpriced entries remain partial or unavailable. The report
+also refuses to call the raw inventory complete, or the retained latency and cost samples complete,
+when a writer session lacks its final seal or reports any drop or write failure. The report
+contains only the accepted journal and record hashes, UTC span, derived counts, and derived metrics;
+it does not expose journal model/provider identities or entry payloads.</p>
+<p>Default pair-review evidence has the same independent boundary. Each <code>SettledCandidateRecord</code>
+contains only a hashed candidate identity, its independent adjudication hash, and the boolean
+actionable result. <code>build_settled_pilot_acceptance()</code> commits to the full ordered source-free record
+inventory and binds it to the exact manifest, policy, configuration, and target arm. A maintainer must
+review that artifact and separately pin its content id as
+<code>CANONICAL_SETTLED_PILOT_ACCEPTANCE_ID</code>. Report construction rejects truncated, extra, substituted,
+duplicated, or reordered records, then derives both the settled denominator and actionable precision
+from the accepted records. A caller-supplied point estimate and generated-but-unpinned records remain
+<code>not_evaluable</code>; they can never satisfy the 100-candidate or 90% thresholds.</p>
+<p>A missing budget is represented as <code>None</code>, not zero. Missing or empty duration, event
+denominator, raw inventory, cap, accepted false-interruption threshold, or partial/unavailable
+measurement produces <code>not_evaluable</code>. A complete measurement that misses its threshold
+produces <code>failed</code>.</p>
+<p>The report's model identity values are one-way hashes over the frozen manifest identities.
+The separately stored answer ledger is used for scoring but its id and contents never enter
+the report. Keep the report JSON publishable and keep the manifest, source-bearing snapshots,
+truth ledger, raw attempt files, and shadow journals in their existing private stores.</p>
+<p><code>evaluate_output_permission()</code> separately binds opt-in advice, default advice, or PR
+publication to its exact passed gate plus every preceding offline-replay and rollout gate
+for the same arm and scorecard id. Missing decisions, stale
+scorecards, duplicate decisions, failed gates, and <code>not_evaluable</code> gates deny output.
+Gate rules may target a cohort explicitly with names such as
+<code>cohort.temporal.verified_recall</code>, so a healthy aggregate cannot hide a temporal regression.
+They may also gate a target arm's matched advantage over the incumbent with names such as
+<code>paired.case_recall.lower_95</code> or <code>paired.cost_usd.upper_95</code>. The general-review arm is the
+default incumbent when present; callers may freeze another explicit baseline. Output
+permission also requires the exact maintainer-approved gate-spec hash, so a weaker ad hoc
+threshold cannot enable advice or publication.</p>
+<h2 id="external-cocos-story-corpus-adapter">External Cocos Story corpus adapter<a class="headerlink" href="#external-cocos-story-corpus-adapter" title="Permanent link">¶</a></h2>
+<p>The Cocos corpus stays in its own checkout. PR-Agent accepts a source path plus a lock that
+pins the accepted source commit; exact hashes for the primary, temporal, control, specialist,
+sealed-confirmation, and confirmation-annotation ledgers; the original cohort counts; and
+hashes of every <code>id/split/target_sha</code> assignment. The adapter rejects symlinks (including a
+symlinked confirmation directory), changed bytes, changed assignments, wrong repositories,
+answer-visible annotations, an unsealed confirmation policy, mismatched confirmation
+ledger/annotation ids or target SHAs, or changed 12/18/10/16/16 and 55-snapshot counts. Its
+output contains only hashes, counts, and a one-way local-root identity. The 16 confirmation
+cases remain a sealed measurement cohort: their defect targets cannot be used for prompt or
+architecture selection and are never copied into a model-visible manifest.</p>
+<p>The checked-in <code>cocos_story_corpus_lock.json</code> pins the corpus accepted in Cocos Story PR</p>
+<h1 id="9425-at-merge-commit-6b98bae67bae4056c4567187454e24cca78b9467-it-contains-hashes-and-counts">9425 at merge commit <code>6b98bae67bae4056c4567187454e24cca78b9467</code>. It contains hashes and counts,<a class="headerlink" href="#9425-at-merge-commit-6b98bae67bae4056c4567187454e24cca78b9467-it-contains-hashes-and-counts" title="Permanent link">¶</a></h1>
+<p>not corpus examples, source, diffs, context, or answers.</p>
+<p>Validate the external corpus while expanding the no-call plan:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>python<span class="w"> </span>-m<span class="w"> </span>pr_agent.cli<span class="w"> </span>evaluation-plan<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span>--manifest<span class="w"> </span>artifacts/evaluation-manifest.json<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span>--cocos-corpus-root<span class="w"> </span>/path/to/cocos-story/docs/testing/code-review-agent-corpus-2025-12-29_2026-08-29<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">  </span>--cocos-lock<span class="w"> </span>docs/docs/usage-guide/cocos_story_corpus_lock.json<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">  </span>--checkpoint-controls<span class="w"> </span>private/checkpoint-controls.json<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">  </span>--dry-run
+</code></pre></div>
+<p>The separate answer-only checkpoint-control ledger must declare exact schema version
+<code>cocos-story-checkpoint-controls-v1</code> and contain 15–20 unique,
+hash-addressed, independently adjudicated clean intermediate checkpoints. It must cover
+partial-but-correct saves, coherent clean worktrees, temporary mistakes corrected before
+commit, staged checkpoints, and stale-candidate withdrawal lineages. The adapter rejects
+source-bearing or unknown fields and final clean PR heads as substitutes, and includes the
+control artifact hash in the pilot corpus identity. Its file, corpus root, and every supplied
+parent component must be real directories/files rather than symlinks. The evaluation manifest
+cannot receive a canonical Cocos binding when this control inventory is absent, incomplete,
+outside the 15–20 range, or missing its validated hash, and must bind that exact resulting
+corpus identity. Until the ledger is supplied, its status is <code>not_evaluable</code>.</p>
+<h2 id="reproduction-privacy-and-rollback">Reproduction, privacy, and rollback<a class="headerlink" href="#reproduction-privacy-and-rollback" title="Permanent link">¶</a></h2>
+<p>To reproduce a run, keep the immutable manifest, Cocos lock, serialized snapshot hashes,
+every attempt file, truth artifact, scorecard, gate decisions, explicit budgets, and raw
+artifact inventory. Re-run list/dry-run first, confirm its manifest id, then resume the same
+artifact store. Never edit or replace a failed attempt.</p>
+<p>Keep snapshot/source storage and answer-only truth outside model-visible directories and
+outside published reports. Shadow journals use private permissions and should live outside
+the source tree, normally below the Git common directory. Delete or archive them according
+to the target repository's approved retention policy; do not publish them as PR artifacts.</p>
+<p>Rollback is configuration-only while evaluation remains disabled: stop the shadow writer,
+set all four behavior switches to false, clear the untracked journal/artifact path, and
+continue using the incumbent reviewer. Historical evidence stays immutable. Rollback never
+changes a <code>failed</code> or <code>not_evaluable</code> gate to <code>passed</code>.</p>
+<p>Still required to complete issue #27: resolve the blocker contracts reported by
+<code>production_binding_inventory</code> and make each production arm available; create the independent
+checkpoint controls and serialized snapshots; run the
+frozen paid replay within an authorized cap; collect at least one week of opt-in live shadow
+telemetry; publish the pilot inventory, scorecard, budgets, and gate decisions; and prove
+that the cascade beats the incumbent before enabling local advice or GitHub publication.</p>
+<p>Production review orchestration now has an internal, single-use
+<code>PRReviewer._run_structured_no_publish_once()</code> execution primitive. It returns the same enriched
+structured review payload and request-local run telemetry, with elapsed time frozen at completion,
+while forcing provider publication, GitHub Action output, external output sinks, and process-local
+rendered artifacts off. It requires an outer isolation boundary and a fresh reviewer instance.</p>
+<p><code>checkpoint_review_subprocess</code> wraps construction and execution in a dedicated child process.
+Its versioned pipe protocol is disabled unless model execution is explicitly allowed, validates
+the complete request and source-free cost authority before importing model handlers, disables
+working-tree enrichment and every
+output sink, and returns only structured review data plus bounded run telemetry. Process-wide
+settings, callbacks, credentials, and environment mutations die with the child process.</p>
+<p>This is still not an authorized runnable production evaluation. Preflight loads each immutable
+snapshot/configuration pair before artifact-store access and supplies the exact bundle in the frozen
+adapter context. Provider-neutral normalizers derive versioned general-review fingerprints, preserve
+trusted verified-finding keys, and compute active/withdrawn lifecycle transitions from parent
+checkpoints rather than model fields. They fail closed when production output omits durable root-cause
+identity or trusted severity instead of accepting model-controlled fingerprints or location-derived
+identity. The subprocess protocol excludes source-bearing specialist output while retaining strict
+aggregate, specialist, verifier, and frontier telemetry. Parent checkpoints execute before children,
+and the runner derives withdrawals only from completed terminal parent records; children with unavailable
+parents are not reserved or executed. Clean empty-diff outcomes persist an unambiguous zero-call record
+with observed zero tokens and cost; missing telemetry after a model call remains unavailable. Paid
+calls remain unavailable because no authoritative provider/gateway maximum-charge contract is supplied
+by the repository, although the worker now enforces such a contract at every underlying call.
+An enforcing gateway route binding, general-review severity,
+deterministic/specialist finding contracts, and full-cascade frontier decision and aggregate-stage semantics
+also remain fail-closed.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden="">
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"></path></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        
+
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Footer</title>
+<style>
+  body {
+    margin: 0;
+    padding: 0;
+    font-family: Arial, sans-serif;
+    font-size: 16px;
+  }
+
+  .wrapper {
+    background-color: #1a202c;
+  }
+
+  .container {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    color: white;
+    padding: 20px;
+    max-width: 61rem;
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+  .footer-links, .social-icons {
+    padding: 0;
+    list-style-type: none;
+    display: flex;
+    justify-content: center;
+    gap: 20px;
+    align-items: center;
+  }
+
+  .footer-links a:hover, .social-icons a:hover {
+    color: #a0aec0;
+  }
+
+  .social-icons svg {
+    width: 24px;
+    height: auto;
+    fill: white;
+  }
+
+  .footer-text {
+    width: 240px;
+  }
+
+  @media (max-width: 768px) {
+    .container {
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+    }
+
+    .footer-links, .social-icons, .footer-text {
+      width: 100%;
+      justify-content: center;
+      margin: 10px 0;
+    }
+
+    .footer-links {
+      order: 1;
+    }
+
+    .social-icons {
+      order: 2;
+    }
+
+    .footer-text {
+      order: 3;
+    }
+  }
+</style>
+
+
+
+<footer class="wrapper">
+  <div class="container">
+    <p class="footer-text">© 2026 PR-Agent Contributors</p>
+    <div class="footer-links">
+      <a href="https://github.com/the-pr-agent/pr-agent">GitHub</a>
+    </div>
+    <div class="social-icons">
+      <a href="https://github.com/the-pr-agent/pr-agent" target="_blank" rel="noopener" title="github.com" class="social-link">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.5.1 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2023 Fonticons, Inc.--><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"></path></svg>
+      </a>
+    </div>
+  </div>
+</footer>
+
+
+
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.expand", "navigation.path", "navigation.top", "navigation.tracking", "navigation.indexes", "search.suggest", "search.highlight", "content.tabs.link", "content.code.annotation", "content.code.copy", "announce.dismiss"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+  
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+
+    <!-- Google Tag Manager (noscript) -->
+    <noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-5C9KZBM3" height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+    <!-- End Google Tag Manager (noscript) -->
+
+  
+<script id="init-glightbox">const lightbox = GLightbox({"touchNavigation": true, "loop": false, "zoomable": true, "draggable": true, "openEffect": "zoom", "closeEffect": "zoom", "slideEffect": "slide"});
+document$.subscribe(()=>{ lightbox.reload(); });
+</script></body></html>
