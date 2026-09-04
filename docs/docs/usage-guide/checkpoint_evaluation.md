@@ -90,6 +90,17 @@ context in prompt order with its rendering line budget, pinned prompt date, pack
 dependency versions, plus a hash of the executable review code and default settings. It accounts
 explicitly for every supported setting as present or missing, rejects unknown or case-colliding
 data, and revalidates its content hash and runtime identity before use.
+An optional private `checkpoint-stage-sources-v1` extension carries the exact specialist,
+candidate-verification, and frontier configurations, prompts, routes, and static-analysis evidence.
+The extension is included in the bundle content hash, is never rendered in object representations,
+and is not copied into manifests, reports, journals, or other source-free artifacts. Legacy bundles
+without the extension keep their original canonical shape and identity. Extended bundles must match
+every planned stage hash, version, model route, and deployment identity before the artifact store or
+worker process is touched. The worker receives the validated stage plan and exposes only the sources
+selected for that arm; production review code falls back to ambient configuration only outside this
+checkpoint execution context. Verifier stage-plan hashes cover controls shared across the arm, while
+each review-configuration bundle separately content-addresses checkpoint-specific static-analysis
+evidence so evolving evidence does not invalidate later cases in the same paired run.
 Credentials, callback configuration, telemetry headers, and output sinks have no bundle fields.
 The isolated worker disables publication, callback and OpenTelemetry delivery, push outputs, and
 run-detail printing before importing the reviewer. It also passes only the standard OpenAI runtime

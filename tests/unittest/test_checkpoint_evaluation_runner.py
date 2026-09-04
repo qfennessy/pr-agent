@@ -6,6 +6,11 @@ from functools import lru_cache
 
 import pytest
 
+from pr_agent.algo.ai_request_context import AIModelRoute
+from pr_agent.algo.candidate_verification import (
+    candidate_verification_provider_controls_hash,
+    parse_candidate_verification_config,
+)
 from pr_agent.algo.checkpoint_evaluation import (
     CheckpointCase,
     EvaluationArm,
@@ -39,13 +44,22 @@ from pr_agent.algo.checkpoint_evaluation_runner import (
     ProductionEvaluationRunner,
     failed_production_arm_result,
 )
+from pr_agent.algo.checkpoint_stage_sources import CheckpointStageSources
+from pr_agent.algo.frontier_adjudication import FrontierAdjudicationConfig, FrontierModelIdentity
 from pr_agent.algo.review_configuration import (
     materialize_review_configuration,
     review_configuration_artifact_name,
     review_configuration_canonical_bytes,
 )
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, ReviewSnapshot, ReviewSnapshotResult
+from pr_agent.algo.review_specialists import (
+    SpecialistPipelineConfig,
+    SpecialistPrompt,
+    SpecialistRole,
+    SpecialistRoleConfig,
+)
 from pr_agent.algo.run_details import RunDetails, SpecialistRunDetails
+from pr_agent.config_loader import get_settings
 
 
 def _hash(value: str) -> str:
@@ -56,6 +70,205 @@ def _artifact_hash(payload: bytes) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+def _json_hash(value) -> str:
+    payload = json.dumps(value, allow_nan=False, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return _hash(payload)
+
+
+@lru_cache(maxsize=1)
+def _stage_sources() -> CheckpointStageSources:
+    cascade_models = tuple(f"model-{kind.value}" for kind in (
+        EvaluationArmKind.SPECIALISTS,
+        EvaluationArmKind.VERIFIED_SPECIALISTS,
+        EvaluationArmKind.FULL_CASCADE,
+    ))
+    roles = tuple(
+        SpecialistRoleConfig(
+            role=role,
+            enabled=role is SpecialistRole.CHANGE_CLASSIFICATION,
+            model=cascade_models[0] if role is SpecialistRole.CHANGE_CLASSIFICATION else f"model-{role.value}",
+            deployment="private-deployment-name",
+            fallback_models=cascade_models[1:] if role is SpecialistRole.CHANGE_CLASSIFICATION else (),
+            fallback_deployments=("private-deployment-name", "private-deployment-name")
+            if role is SpecialistRole.CHANGE_CLASSIFICATION
+            else (),
+            timeout_seconds=5.0,
+            model_retries=1,
+            provider_retries=0,
+            input_token_budget=4000,
+            output_token_budget=600,
+            minimum_confidence=0.6,
+        )
+        for role in SpecialistRole
+    )
+    prompts = tuple(
+        SpecialistPrompt(
+            role=role,
+            prompt_version=f"{role.value.replace('_', '-')}-prompt-v2",
+            input_schema_version=f"{role.value.replace('_', '-')}-input-v2",
+            schema_version=f"{role.value.replace('_', '-')}-output-v2",
+            system=f"private system prompt for {role.value}",
+            user=f"private user prompt for {role.value}",
+        )
+        for role in SpecialistRole
+    )
+    def verifier(strict_output_policy: bool):
+        return parse_candidate_verification_config(
+            {},
+            {"system": "private verifier system", "user": "private verifier user"},
+            primary_model="model-verifier",
+            static_analysis_evidence_hash=_hash("[]"),
+            static_analysis_evidence=(),
+            provider_controls_hash=candidate_verification_provider_controls_hash(get_settings()),
+            strict_output_policy=strict_output_policy,
+        )
+    frontier = FrontierAdjudicationConfig(
+        enabled=True,
+        route=AIModelRoute(
+            models=("model-frontier",),
+            deployments=("private-frontier-deployment",),
+            timeout_seconds=60.0,
+            model_retries=1,
+            provider_retries=0,
+            max_output_tokens=2048,
+            collect_cost=True,
+        ),
+        model_identities=(
+            FrontierModelIdentity(
+                model="model-frontier",
+                provider="provider-v1",
+                revision="revision-frontier-2026-08-30",
+                deployment="private-frontier-deployment",
+            ),
+        ),
+        system_prompt="private frontier system",
+        user_prompt="private frontier user",
+    )
+    pipeline = SpecialistPipelineConfig(
+            enabled=True,
+            mode="shadow",
+            aggregate_timeout_seconds=8.0,
+            aggregate_token_budget=12000,
+            max_concurrency=1,
+            cache_enabled=True,
+            cache_max_entries=128,
+            cancel_stale_inputs=True,
+            allowed_change_labels=("tests",),
+            roles=roles,
+            prompts=prompts,
+        )
+    specialist_identities = {
+        role.role.value: tuple(
+            EvaluationStageModelIdentity(
+                model_id=model,
+                provider_id="provider-v1",
+                model_revision=f"revision-{model.removeprefix('model-')}-2026-08-30",
+                deployment_id_hash=deployment_identity_hash(deployment),
+            )
+            for model, deployment in zip(role.model_route().models, role.model_route().deployments, strict=True)
+        )
+        for role in pipeline.roles
+        if role.enabled
+    }
+    verifier_identities = (
+        EvaluationStageModelIdentity(
+            model_id="model-verifier",
+            provider_id="provider-v1",
+            model_revision="revision-verifier-2026-08-30",
+            deployment_id_hash=deployment_identity_hash(None),
+        ),
+    )
+    return CheckpointStageSources(
+        specialist_pipeline=pipeline,
+        specialist_model_identities=specialist_identities,
+        candidate_verification=verifier(False),
+        candidate_verification_model_identities=verifier_identities,
+        full_cascade_candidate_verification=verifier(True),
+        full_cascade_candidate_verification_model_identities=verifier_identities,
+        frontier_adjudication=frontier,
+    ).for_checkpoint_replay(get_settings())
+
+
+def _stage_plan(kind: EvaluationArmKind) -> tuple[EvaluationStagePlan, ...]:
+    sources = _stage_sources()
+    pipeline = sources.specialist_pipeline
+    assert pipeline is not None
+    role = next(item for item in pipeline.roles if item.role is SpecialistRole.CHANGE_CLASSIFICATION)
+    prompt = pipeline.prompt(role.role)
+    plans = [
+        EvaluationStagePlan(
+            stage=role.role.value,
+            model_route=tuple(
+                EvaluationStageModelIdentity(
+                    model_id=model,
+                    provider_id="provider-v1",
+                    model_revision=f"revision-{model.removeprefix('model-')}-2026-08-30",
+                    deployment_id_hash=deployment_identity_hash(deployment),
+                )
+                for model, deployment in zip(
+                    role.model_route().models,
+                    role.model_route().deployments,
+                    strict=True,
+                )
+            ),
+            configuration_hash=pipeline.configuration_hash,
+            prompt_hash=prompt.content_hash,
+            prompt_version=prompt.prompt_version,
+            input_schema_version=prompt.input_schema_version,
+            output_schema_version=prompt.schema_version,
+        ),
+    ]
+    if kind in {EvaluationArmKind.VERIFIED_SPECIALISTS, EvaluationArmKind.FULL_CASCADE}:
+        verifier = (
+            sources.full_cascade_candidate_verification
+            if kind is EvaluationArmKind.FULL_CASCADE
+            else sources.candidate_verification
+        )
+        assert verifier is not None
+        plans.append(
+            EvaluationStagePlan(
+                stage="candidate_verification",
+                model_route=tuple(
+                    EvaluationStageModelIdentity(
+                        model_id=model,
+                        provider_id="provider-v1",
+                        model_revision="revision-verifier-2026-08-30",
+                        deployment_id_hash=deployment_identity_hash(deployment),
+                    )
+                    for model, deployment in zip(verifier.route.models, verifier.route.deployments, strict=True)
+                ),
+                configuration_hash=verifier.stage_plan_configuration_hash,
+                prompt_hash=verifier.prompt_hash,
+                prompt_version=verifier.prompt_version,
+                input_schema_version=verifier.input_schema_version,
+                output_schema_version=verifier.output_schema_version,
+            )
+        )
+    if kind is EvaluationArmKind.FULL_CASCADE:
+        frontier = sources.frontier_adjudication
+        assert frontier is not None
+        plans.append(
+            EvaluationStagePlan(
+                stage="frontier_adjudication",
+                model_route=tuple(
+                    EvaluationStageModelIdentity(
+                        model_id=identity.model,
+                        provider_id=identity.provider,
+                        model_revision=identity.revision,
+                        deployment_id_hash=deployment_identity_hash(identity.deployment),
+                    )
+                    for identity in frontier.model_identities
+                ),
+                configuration_hash=frontier.configuration_hash,
+                prompt_hash=frontier.prompt_hash,
+                prompt_version=frontier.prompt_version,
+                input_schema_version=frontier.input_schema_version,
+                output_schema_version=frontier.output_schema_version,
+            )
+        )
+    return tuple(plans)
+
+
 @lru_cache(maxsize=1)
 def _review_configuration():
     return materialize_review_configuration(
@@ -63,6 +276,7 @@ def _review_configuration():
         repo_context_files={"AGENTS.md": "frozen repository instructions"},
         repo_context_max_lines=100,
         prompt_date="2026-09-03",
+        stage_sources=_stage_sources(),
     )
 
 
@@ -72,8 +286,9 @@ def _write_snapshot(
     *,
     parent_snapshot_id=None,
     changed_path="src/example.py",
+    review_configuration=None,
 ) -> tuple[ReviewSnapshot, object, str]:
-    review_configuration = _review_configuration()
+    review_configuration = review_configuration or _review_configuration()
     snapshot = ReviewSnapshot(
         event=ReviewEvent.FILE_SAVE,
         repository_root=str(tmp_path / "source-repository"),
@@ -114,24 +329,7 @@ def _arm(kind: EvaluationArmKind) -> EvaluationArm:
             "model_revision": f"revision-{kind.value}-2026-08-30",
         }
         if kind is not EvaluationArmKind.GENERAL_REVIEW:
-            kwargs["stage_plan"] = (
-                EvaluationStagePlan(
-                    stage="change_classification",
-                    model_route=(
-                        EvaluationStageModelIdentity(
-                            model_id=f"model-{kind.value}",
-                            provider_id="provider-v1",
-                            model_revision=f"revision-{kind.value}-2026-08-30",
-                            deployment_id_hash=deployment_identity_hash("private-deployment-name"),
-                        ),
-                    ),
-                    configuration_hash=_hash(f"change-classification-config-{kind.value}"),
-                    prompt_hash=_hash(f"change-classification-prompt-{kind.value}"),
-                    prompt_version="change-classification-prompt-v2",
-                    input_schema_version="change-classification-input-v2",
-                    output_schema_version="change-classification-output-v2",
-                ),
-            )
+            kwargs["stage_plan"] = _stage_plan(kind)
     return EvaluationArm(
         arm_id=f"arm-{kind.value}",
         kind=kind,
@@ -199,7 +397,8 @@ def _success(arm: EvaluationArm, snapshot: ReviewSnapshot, *, details=True) -> P
             )
         else:
             run_details = RunDetails()
-            run_details.specialist_runs["change_classification"] = _specialist_run(arm)
+            for stage in arm.stage_plan:
+                run_details.specialist_runs[stage.stage] = _specialist_run(arm, role=stage.stage)
     return ProductionArmResult(
         snapshot_result=ReviewSnapshotResult(
             snapshot_id=snapshot.snapshot_id,
@@ -243,14 +442,24 @@ def test_no_findings_result_rejects_active_lifecycle_observations(tmp_path):
 
 
 def _specialist_run(arm: EvaluationArm, *, role="change_classification", **overrides):
-    version_role = role.replace("_", "-")
+    plan = arm.required_stage(role)
+    selected_index = next(
+        (index for index, identity in enumerate(plan.model_route) if identity.model_id == arm.model_id),
+        0,
+    )
+    selected_identity = plan.model_route[selected_index]
+    deployment_id = {
+        "change_classification": "private-deployment-name",
+        "candidate_verification": None,
+        "frontier_adjudication": "private-frontier-deployment",
+    }[role]
     values = {
         "role": role,
-        "model_used": arm.model_id,
-        "deployment_id": "private-deployment-name",
-        "prompt_version": f"{version_role}-prompt-v2",
-        "input_schema_version": f"{version_role}-input-v2",
-        "schema_version": f"{version_role}-output-v2",
+        "model_used": selected_identity.model_id,
+        "deployment_id": deployment_id,
+        "prompt_version": plan.prompt_version,
+        "input_schema_version": plan.input_schema_version,
+        "schema_version": plan.output_schema_version,
         "state": "success",
         "latency_seconds": 0.2,
         "prompt_tokens": 7,
@@ -259,8 +468,9 @@ def _specialist_run(arm: EvaluationArm, *, role="change_classification", **overr
         "num_ai_calls": 1,
         "total_cost_usd": Decimal("0.001"),
         "known_cost_call_count": 1,
-        "model_costs_usd": {arm.model_id: Decimal("0.001")},
+        "model_costs_usd": {selected_identity.model_id: Decimal("0.001")},
         "confidence": 0.9,
+        "fallback_used": selected_index > 0,
     }
     values.update(overrides)
     return SpecialistRunDetails(**values)
@@ -342,6 +552,202 @@ class _NoCallStore:
     def append_record(self, _manifest, _record):
         self.calls.append("append_record")
         raise AssertionError("artifact store must not be touched")
+
+
+def test_stage_plan_without_private_sources_stops_before_store_calls(tmp_path):
+    legacy_configuration = materialize_review_configuration(
+        skills_context="frozen specialist instructions",
+        repo_context_files={"AGENTS.md": "frozen repository instructions"},
+        repo_context_max_lines=100,
+        prompt_date="2026-09-03",
+    )
+    snapshot, path, artifact_hash = _write_snapshot(
+        tmp_path,
+        review_configuration=legacy_configuration,
+    )
+    manifest = _manifest(snapshot, artifact_hash)
+    request, decision = _paid_authorization(manifest)
+    store = _NoCallStore()
+
+    with pytest.raises(EvaluationValidationError, match="stage sources are unavailable"):
+        _runner(manifest, path, _bindings(manifest), store, request, decision).preflight()
+
+    assert store.calls == []
+
+
+def test_mismatched_stage_sources_stop_before_store_calls(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    arms = tuple(
+        replace(
+            arm,
+            stage_plan=(replace(arm.stage_plan[0], prompt_hash=_hash("tampered-stage-prompt")),),
+        )
+        if arm.kind is EvaluationArmKind.SPECIALISTS
+        else arm
+        for arm in manifest.arms
+    )
+    manifest = replace(manifest, arms=arms)
+    request, decision = _paid_authorization(manifest)
+    store = _NoCallStore()
+
+    with pytest.raises(EvaluationValidationError, match="stage sources do not match"):
+        _runner(manifest, path, _bindings(manifest), store, request, decision).preflight()
+
+    assert store.calls == []
+
+
+def test_arm_stage_plan_accepts_snapshot_specific_verifier_evidence(tmp_path):
+    first_sources = _stage_sources()
+    first_configuration = _review_configuration()
+    first_snapshot, first_path, first_artifact_hash = _write_snapshot(
+        tmp_path,
+        name="first-snapshot",
+        review_configuration=first_configuration,
+    )
+    evidence = ({"candidate_id": "candidate-two", "content": "later checkpoint evidence"},)
+
+    def with_evidence(verifier):
+        assert verifier is not None
+        return replace(
+            verifier,
+            static_analysis_evidence=evidence,
+            static_analysis_evidence_hash=_json_hash(list(evidence)),
+        )
+
+    second_sources = replace(
+        first_sources,
+        candidate_verification=with_evidence(first_sources.candidate_verification),
+        full_cascade_candidate_verification=with_evidence(
+            first_sources.full_cascade_candidate_verification
+        ),
+    )
+    second_configuration = materialize_review_configuration(
+        skills_context="frozen specialist instructions",
+        repo_context_files={"AGENTS.md": "frozen repository instructions"},
+        repo_context_max_lines=100,
+        prompt_date="2026-09-03",
+        stage_sources=second_sources,
+    )
+    second_snapshot, second_path, second_artifact_hash = _write_snapshot(
+        tmp_path,
+        name="second-snapshot",
+        changed_path="src/later.py",
+        review_configuration=second_configuration,
+    )
+    first_manifest = _manifest(first_snapshot, first_artifact_hash)
+    first_case = first_manifest.cases[0]
+    second_case = replace(
+        first_case,
+        case_id="case-two",
+        snapshot_id=second_snapshot.snapshot_id,
+        snapshot_artifact_hash=second_artifact_hash,
+    )
+    manifest = replace(first_manifest, cases=(first_case, second_case))
+    request, decision = _paid_authorization(manifest)
+
+    runner = ProductionEvaluationRunner(
+        manifest,
+        snapshot_paths={"case-one": first_path, "case-two": second_path},
+        review_configuration_artifact_hashes={
+            "case-one": _configuration_artifact_hash(first_path),
+            "case-two": _configuration_artifact_hash(second_path),
+        },
+        bindings=_bindings(manifest),
+        artifact_store=EvaluationArtifactStore(tmp_path / "evolving-evidence"),
+        paid_request=request,
+        paid_decision=decision,
+        evaluation_enabled=True,
+        allow_paid_execution=True,
+        publish_output=False,
+    )
+
+    preflight = runner.preflight()
+
+    assert len(preflight.snapshots_by_case_id) == 2
+    assert len(preflight.review_configurations_by_case_id) == 2
+    assert first_sources.sources_hash != second_sources.sources_hash
+    assert (
+        first_sources.candidate_verification.configuration_hash
+        != second_sources.candidate_verification.configuration_hash
+    )
+    assert (
+        first_sources.candidate_verification.stage_plan_configuration_hash
+        == second_sources.candidate_verification.stage_plan_configuration_hash
+    )
+
+
+@pytest.mark.parametrize("mutation", ("missing_verifier", "extra_verifier", "out_of_order"))
+def test_stage_plan_kind_semantics_stop_before_store_calls(tmp_path, mutation):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    arms_by_kind = {arm.kind: arm for arm in manifest.arms}
+    if mutation == "missing_verifier":
+        target = arms_by_kind[EvaluationArmKind.VERIFIED_SPECIALISTS]
+        changed = replace(target, stage_plan=arms_by_kind[EvaluationArmKind.SPECIALISTS].stage_plan)
+    elif mutation == "extra_verifier":
+        target = arms_by_kind[EvaluationArmKind.SPECIALISTS]
+        changed = replace(target, stage_plan=arms_by_kind[EvaluationArmKind.VERIFIED_SPECIALISTS].stage_plan)
+    else:
+        target = arms_by_kind[EvaluationArmKind.FULL_CASCADE]
+        changed = replace(target, stage_plan=(target.stage_plan[0], target.stage_plan[2], target.stage_plan[1]))
+    manifest = replace(
+        manifest,
+        arms=tuple(changed if arm.kind is target.kind else arm for arm in manifest.arms),
+    )
+    request, decision = _paid_authorization(manifest)
+    store = _NoCallStore()
+
+    with pytest.raises(EvaluationValidationError, match="required cascade order"):
+        _runner(manifest, path, _bindings(manifest), store, request, decision).preflight()
+
+    assert store.calls == []
+
+
+def test_swapped_full_cascade_verifier_source_stops_before_store_calls(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    arms_by_kind = {arm.kind: arm for arm in manifest.arms}
+    verified_plan = arms_by_kind[EvaluationArmKind.VERIFIED_SPECIALISTS].stage_plan
+    full = arms_by_kind[EvaluationArmKind.FULL_CASCADE]
+    changed_full = replace(full, stage_plan=(full.stage_plan[0], verified_plan[1], full.stage_plan[2]))
+    manifest = replace(
+        manifest,
+        arms=tuple(changed_full if arm.kind is EvaluationArmKind.FULL_CASCADE else arm for arm in manifest.arms),
+    )
+    request, decision = _paid_authorization(manifest)
+    store = _NoCallStore()
+
+    with pytest.raises(EvaluationValidationError, match="stage sources do not match"):
+        _runner(manifest, path, _bindings(manifest), store, request, decision).preflight()
+
+    assert store.calls == []
+
+
+def test_specialist_provider_revision_mismatch_stops_before_store_calls(tmp_path):
+    snapshot, path, artifact_hash = _write_snapshot(tmp_path)
+    manifest = _manifest(snapshot, artifact_hash)
+    specialist = next(arm for arm in manifest.arms if arm.kind is EvaluationArmKind.SPECIALISTS)
+    stage = specialist.stage_plan[0]
+    forged_identity = replace(stage.model_route[0], model_revision="forged-revision")
+    changed_specialist = replace(
+        specialist,
+        stage_plan=(replace(stage, model_route=(forged_identity, *stage.model_route[1:])),),
+    )
+    manifest = replace(
+        manifest,
+        arms=tuple(
+            changed_specialist if arm.kind is EvaluationArmKind.SPECIALISTS else arm
+            for arm in manifest.arms
+        ),
+    )
+    request, decision = _paid_authorization(manifest)
+    store = _NoCallStore()
+
+    with pytest.raises(EvaluationValidationError, match="stage sources do not match"):
+        _runner(manifest, path, _bindings(manifest), store, request, decision).preflight()
+
+    assert store.calls == []
 
 
 @pytest.mark.asyncio
@@ -1153,13 +1559,15 @@ async def test_adapter_cost_above_its_hard_cap_is_rejected_and_left_unreconciled
         async def adapter(loaded_snapshot, _context):
             calls.append(arm.kind)
             if arm.kind is EvaluationArmKind.FULL_CASCADE:
-                details = RunDetails()
+                success = _success(arm, loaded_snapshot)
+                details = success.run_details
+                assert details is not None
                 details.specialist_runs["change_classification"] = _specialist_run(
                     arm,
                     total_cost_usd=Decimal("0.10"),
                     model_costs_usd={arm.model_id: Decimal("0.10")},
                 )
-                return replace(_success(arm, loaded_snapshot, details=False), run_details=details)
+                return replace(success, run_details=details)
             return _success(arm, loaded_snapshot)
 
         return adapter

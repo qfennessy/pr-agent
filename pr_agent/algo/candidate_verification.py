@@ -183,6 +183,7 @@ def candidate_verification_provider_controls_hash(
     settings: Any,
     *,
     claude_extended_thinking_models: Optional[tuple[str, ...] | list[str]] = None,
+    checkpoint_replay: bool = False,
 ) -> str:
     """Bind ambient LiteLLM controls that can change verifier request semantics."""
 
@@ -243,6 +244,11 @@ def candidate_verification_provider_controls_hash(
             claude_extended_thinking_models
         ),
     }
+    if checkpoint_replay:
+        payload["config"]["add_user_to_requests"] = False
+        payload["config"]["git_provider"] = "plain-diff"
+        payload["litellm"]["extra_headers"] = {}
+        payload["litellm"]["enable_callbacks"] = False
     return _candidate_verification_hash(payload)
 
 
@@ -386,6 +392,14 @@ class CandidateVerificationConfig:
     @property
     def configuration_hash(self) -> str:
         return _candidate_verification_hash(self._configuration_payload())
+
+    @property
+    def stage_plan_configuration_hash(self) -> str:
+        """Hash only verifier controls shared by every case in one evaluation arm."""
+
+        payload = self._configuration_payload()
+        payload.pop("static_analysis_evidence_hash")
+        return _candidate_verification_hash(payload)
 
     @property
     def prompt_hash(self) -> str:

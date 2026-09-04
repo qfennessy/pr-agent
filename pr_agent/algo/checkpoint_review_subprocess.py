@@ -20,6 +20,12 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
 
+from pr_agent.algo.checkpoint_evaluation import EvaluationStagePlan
+from pr_agent.algo.checkpoint_stage_sources import (
+    CheckpointStageSources,
+    infer_checkpoint_arm_kind,
+    use_checkpoint_stage_sources,
+)
 from pr_agent.algo.review_snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
     CoverageIssue,
@@ -31,7 +37,7 @@ from pr_agent.algo.review_snapshot import (
 if TYPE_CHECKING:
     from pr_agent.algo.review_configuration import ReviewConfigurationBundle
 
-CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION = "checkpoint-review-subprocess-v2"
+CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION = "checkpoint-review-subprocess-v3"
 DEFAULT_REVIEW_SUBPROCESS_TIMEOUT_SECONDS = 180.0
 MAX_REVIEW_SUBPROCESS_TIMEOUT_SECONDS = 900.0
 MAX_REVIEW_SUBPROCESS_REQUEST_BYTES = 12_250_000
@@ -106,7 +112,13 @@ _ANSWER_ONLY_KEYS = frozenset({
     "truth",
     "verdict",
 })
-_REQUEST_FIELDS = {"allow_model_execution", "review_configuration", "schema_version", "snapshot"}
+_REQUEST_FIELDS = {
+    "allow_model_execution",
+    "evaluation_stage_plan",
+    "review_configuration",
+    "schema_version",
+    "snapshot",
+}
 _OUTCOME_FIELDS = {
     "failure_reason_code",
     "latency_seconds",
@@ -211,6 +223,7 @@ class CheckpointReviewSubprocessOutcome:
 class _CheckpointReviewSubprocessRequest:
     snapshot: ReviewSnapshot
     review_configuration: "ReviewConfigurationBundle"
+    evaluation_stage_plan: tuple[EvaluationStagePlan, ...]
     allow_model_execution: bool
     schema_version: str = CHECKPOINT_REVIEW_SUBPROCESS_SCHEMA_VERSION
 
@@ -223,6 +236,9 @@ class _CheckpointReviewSubprocessRequest:
 
         if not isinstance(self.review_configuration, ReviewConfigurationBundle):
             raise TypeError("checkpoint review subprocess request requires a ReviewConfigurationBundle")
+        object.__setattr__(self, "evaluation_stage_plan", tuple(self.evaluation_stage_plan))
+        if any(not isinstance(stage, EvaluationStagePlan) for stage in self.evaluation_stage_plan):
+            raise TypeError("checkpoint review subprocess request requires an EvaluationStagePlan tuple")
         if not isinstance(self.allow_model_execution, bool):
             raise TypeError("allow_model_execution must be a boolean")
 
@@ -232,6 +248,7 @@ class _CheckpointReviewSubprocessRequest:
             "allow_model_execution": self.allow_model_execution,
             "snapshot": self.snapshot.to_dict(),
             "review_configuration": self.review_configuration.to_dict(),
+            "evaluation_stage_plan": [stage.to_dict() for stage in self.evaluation_stage_plan],
         }
 
 
@@ -403,9 +420,14 @@ def _request_from_dict(payload: Mapping[str, Any]) -> _CheckpointReviewSubproces
         raise ValueError("invalid_model_execution_permission")
     from pr_agent.algo.review_configuration import ReviewConfigurationBundle
 
+    raw_stage_plan = payload.get("evaluation_stage_plan")
+    if not isinstance(raw_stage_plan, list) or any(not isinstance(stage, Mapping) for stage in raw_stage_plan):
+        raise ValueError("invalid_evaluation_stage_plan")
+
     return _CheckpointReviewSubprocessRequest(
         snapshot=_snapshot_from_dict(payload.get("snapshot")),
         review_configuration=ReviewConfigurationBundle.from_dict(payload.get("review_configuration")),
+        evaluation_stage_plan=tuple(EvaluationStagePlan.from_dict(stage) for stage in raw_stage_plan),
         allow_model_execution=payload["allow_model_execution"],
         schema_version=payload["schema_version"],
     )
@@ -682,7 +704,16 @@ async def _handle_worker_request(
             snapshot_id=request.snapshot.snapshot_id,
         )
     try:
-        outcome = await executor(request.snapshot, request.review_configuration)
+        sources = request.review_configuration.stage_sources
+        if request.evaluation_stage_plan and sources is None:
+            raise ValueError("checkpoint stage sources are unavailable")
+        selected_sources = (
+            CheckpointStageSources()
+            if sources is None
+            else sources.for_stage_plan(request.evaluation_stage_plan)
+        )
+        with use_checkpoint_stage_sources(selected_sources):
+            outcome = await executor(request.snapshot, request.review_configuration)
     except Exception:
         return _failure_outcome(
             CheckpointReviewSubprocessState.FAILED,
@@ -749,6 +780,7 @@ async def run_checkpoint_review_subprocess(
     snapshot: ReviewSnapshot,
     *,
     review_configuration: Optional["ReviewConfigurationBundle"] = None,
+    evaluation_stage_plan: tuple[EvaluationStagePlan, ...] = (),
     allow_model_execution: bool = False,
     timeout_seconds: float = DEFAULT_REVIEW_SUBPROCESS_TIMEOUT_SECONDS,
 ) -> CheckpointReviewSubprocessOutcome:
@@ -771,6 +803,10 @@ async def run_checkpoint_review_subprocess(
         or not 0 < timeout_seconds <= MAX_REVIEW_SUBPROCESS_TIMEOUT_SECONDS
     ):
         raise ValueError("timeout_seconds must be finite and within the supported bound")
+    if not isinstance(evaluation_stage_plan, tuple) or any(
+        not isinstance(stage, EvaluationStagePlan) for stage in evaluation_stage_plan
+    ):
+        raise TypeError("evaluation_stage_plan must be an EvaluationStagePlan tuple")
 
     from pr_agent.algo.checkpoint_evaluation_materialize import review_snapshot_canonical_bytes
     from pr_agent.algo.review_configuration import (
@@ -790,6 +826,18 @@ async def run_checkpoint_review_subprocess(
                 CheckpointReviewSubprocessState.FAILED,
                 "review_configuration_mismatch",
                 snapshot_id=snapshot.snapshot_id,
+            )
+        stage_sources = review_configuration.stage_sources
+        if evaluation_stage_plan and stage_sources is None:
+            return _failure_outcome(
+                CheckpointReviewSubprocessState.FAILED,
+                "stage_sources_unverified",
+                snapshot_id=snapshot.snapshot_id,
+            )
+        if stage_sources is not None:
+            stage_sources.validate_stage_plan(
+                evaluation_stage_plan,
+                arm_kind=infer_checkpoint_arm_kind(evaluation_stage_plan),
             )
         canonical_snapshot = _decode_json_object(
             review_snapshot_canonical_bytes(snapshot),
@@ -811,6 +859,7 @@ async def run_checkpoint_review_subprocess(
             "allow_model_execution": True,
             "snapshot": canonical_snapshot,
             "review_configuration": canonical_review_configuration,
+            "evaluation_stage_plan": [stage.to_dict() for stage in evaluation_stage_plan],
         },
         allow_nan=False,
         ensure_ascii=True,

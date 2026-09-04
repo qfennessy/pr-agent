@@ -80,6 +80,7 @@ class ProductionArmContext:
     prompt_hash: str
     model_visible_metadata: Mapping[str, object]
     review_configuration: ReviewConfigurationBundle = field(repr=False)
+    stage_plan: tuple[EvaluationStagePlan, ...] = field(default_factory=tuple)
     hard_cost_cap_usd: Optional[float] = None
     publish_output: bool = False
 
@@ -88,6 +89,9 @@ class ProductionArmContext:
             raise EvaluationValidationError("checkpoint production bindings cannot publish output")
         if not isinstance(self.review_configuration, ReviewConfigurationBundle):
             raise EvaluationValidationError("production adapter context requires a review configuration bundle")
+        object.__setattr__(self, "stage_plan", tuple(self.stage_plan))
+        if any(not isinstance(stage, EvaluationStagePlan) for stage in self.stage_plan):
+            raise EvaluationValidationError("production adapter context requires an evaluation stage plan")
         if self.hard_cost_cap_usd is not None and (
             not isinstance(self.hard_cost_cap_usd, (int, float))
             or isinstance(self.hard_cost_cap_usd, bool)
@@ -325,6 +329,7 @@ class ProductionEvaluationRunner:
             self.snapshot_paths,
             self.review_configuration_artifact_hashes,
         )
+        _validate_loaded_stage_sources(arms_by_kind, loaded_pairs)
         self.artifact_store.bind_paid_request(self.manifest, self.paid_request)
         return ProductionEvaluationPreflight(
             manifest_id=self.manifest.manifest_id,
@@ -374,6 +379,7 @@ class ProductionEvaluationRunner:
                 prompt_hash=arm.prompt_hash,
                 model_visible_metadata=case.model_visible_metadata,
                 review_configuration=review_configuration,
+                stage_plan=arm.stage_plan,
                 hard_cost_cap_usd=(
                     paid_budget.hard_cost_cap_per_attempt_usd
                     if paid_budget is not None
@@ -610,6 +616,51 @@ def _load_all_snapshot_configuration_pairs(
             )
         _validate_loaded_snapshot_metadata(case, snapshot)
     return MappingProxyType(loaded_pairs)
+
+
+def _validate_loaded_stage_sources(
+    arms_by_kind: Mapping[EvaluationArmKind, EvaluationArm],
+    loaded_pairs: Mapping[str, LoadedReviewSnapshotAndConfiguration],
+) -> None:
+    """Validate extended private bundles before touching the artifact store.
+
+    Legacy v1 bundles have no stage-source extension and remain loadable only
+    when the manifest has no stage-backed arm. Every stage-backed arm requires
+    an exact typed source contract.
+    """
+
+    stage_plans = tuple(arm.stage_plan for arm in arms_by_kind.values() if arm.stage_plan)
+    for case_id, pair in loaded_pairs.items():
+        sources = pair.review_configuration.stage_sources
+        if sources is None:
+            if stage_plans:
+                raise EvaluationValidationError(
+                    f"checkpoint {case_id} stage sources are unavailable for its evaluation plan"
+                )
+            continue
+        for kind in (
+            EvaluationArmKind.SPECIALISTS,
+            EvaluationArmKind.VERIFIED_SPECIALISTS,
+            EvaluationArmKind.FULL_CASCADE,
+        ):
+            expected = sources.required_stage_names(kind)
+            actual = tuple(stage.stage for stage in arms_by_kind[kind].stage_plan)
+            if actual != expected:
+                raise EvaluationValidationError(
+                    f"checkpoint {case_id} {kind.value} stage plan does not match its required cascade order"
+                )
+        for kind in (
+            EvaluationArmKind.SPECIALISTS,
+            EvaluationArmKind.VERIFIED_SPECIALISTS,
+            EvaluationArmKind.FULL_CASCADE,
+        ):
+            stage_plan = arms_by_kind[kind].stage_plan
+            try:
+                sources.validate_stage_plan(stage_plan, arm_kind=kind)
+            except EvaluationValidationError as exc:
+                raise EvaluationValidationError(
+                    f"checkpoint {case_id} stage sources do not match its evaluation plan"
+                ) from exc
 
 
 def _validate_loaded_snapshot_metadata(case: CheckpointCase, snapshot: ReviewSnapshot) -> None:

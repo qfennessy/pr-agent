@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import pr_agent.algo.candidate_verification as candidate_verification
+from pr_agent.algo import CLAUDE_EXTENDED_THINKING_MODELS
 from pr_agent.algo.ai_request_context import get_ai_request_options
 from pr_agent.algo.candidate_verification import (
     _REPO_FETCH_MAX_WORKERS,
@@ -29,6 +30,8 @@ from pr_agent.algo.candidate_verification import (
     telemetry_safe_artifact,
     validated_specialist_prioritization,
 )
+from pr_agent.algo.checkpoint_evaluation import EvaluationStageModelIdentity, deployment_identity_hash
+from pr_agent.algo.checkpoint_stage_sources import CheckpointStageSources, use_checkpoint_stage_sources
 from pr_agent.algo.review_specialists import (
     RoleExecution,
     SpecialistBatchResult,
@@ -5242,6 +5245,53 @@ def _verification_settings():
     )
     settings.get = lambda key, default=None: default
     return settings
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_verifier_accepts_sanitized_replay_controls_and_reaches_handler():
+    provider = MagicMock()
+    provider.supports_repo_file_fetching.return_value = True
+    provider.get_diff_files.return_value = [_diff_file()]
+    provider.get_repo_file_content.return_value = "def call_service(): return service().value"
+    reviewer = _reviewer_for_orchestration(provider)
+    settings = _verification_settings()
+    settings.config.update({"git_provider": "github", "add_user_to_requests": True})
+    claude_models = tuple(CLAUDE_EXTENDED_THINKING_MODELS)
+    config = load_production_candidate_verification_config(
+        settings=settings,
+        strict_output_policy=False,
+        claude_extended_thinking_models=claude_models,
+    )
+    identities = (
+        EvaluationStageModelIdentity(
+            model_id=config.route.models[0],
+            provider_id="provider-v1",
+            model_revision="revision-v1",
+            deployment_id_hash=deployment_identity_hash(config.route.deployments[0]),
+        ),
+    )
+    sources = CheckpointStageSources(
+        candidate_verification=config,
+        candidate_verification_model_identities=identities,
+    ).for_checkpoint_replay(settings)
+
+    settings.config.update({"git_provider": "plain-diff", "add_user_to_requests": False})
+    settings.litellm = _SettingsDict(extra_headers={}, enable_callbacks=False)
+    reviewer.ai_handler.claude_extended_thinking_models = list(claude_models)
+    reviewer.ai_handler.chat_completion = AsyncMock(
+        return_value=(_rejected_verification_response("candidate-1"), None)
+    )
+
+    with (
+        use_checkpoint_stage_sources(sources),
+        patch("pr_agent.tools.pr_reviewer.get_settings", return_value=settings),
+        patch("pr_agent.tools.pr_reviewer.TokenEncoder.get_token_encoder", return_value=_CharacterEncoder()),
+        patch("pr_agent.tools.pr_reviewer.get_max_tokens", return_value=20_000),
+    ):
+        await reviewer._run_candidate_verification()
+
+    assert reviewer.candidate_verification_artifact["status"] == "complete"
+    reviewer.ai_handler.chat_completion.assert_awaited_once()
 
 
 def test_candidate_verification_config_round_trips_and_binds_prompt_identity():
