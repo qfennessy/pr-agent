@@ -70,6 +70,11 @@ def _artifact_hash(payload: bytes) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+def _json_hash(value) -> str:
+    payload = json.dumps(value, allow_nan=False, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return _hash(payload)
+
+
 @lru_cache(maxsize=1)
 def _stage_sources() -> CheckpointStageSources:
     cascade_models = tuple(f"model-{kind.value}" for kind in (
@@ -232,7 +237,7 @@ def _stage_plan(kind: EvaluationArmKind) -> tuple[EvaluationStagePlan, ...]:
                     )
                     for model, deployment in zip(verifier.route.models, verifier.route.deployments, strict=True)
                 ),
-                configuration_hash=verifier.configuration_hash,
+                configuration_hash=verifier.stage_plan_configuration_hash,
                 prompt_hash=verifier.prompt_hash,
                 prompt_version=verifier.prompt_version,
                 input_schema_version=verifier.input_schema_version,
@@ -590,6 +595,86 @@ def test_mismatched_stage_sources_stop_before_store_calls(tmp_path):
         _runner(manifest, path, _bindings(manifest), store, request, decision).preflight()
 
     assert store.calls == []
+
+
+def test_arm_stage_plan_accepts_snapshot_specific_verifier_evidence(tmp_path):
+    first_sources = _stage_sources()
+    first_configuration = _review_configuration()
+    first_snapshot, first_path, first_artifact_hash = _write_snapshot(
+        tmp_path,
+        name="first-snapshot",
+        review_configuration=first_configuration,
+    )
+    evidence = ({"candidate_id": "candidate-two", "content": "later checkpoint evidence"},)
+
+    def with_evidence(verifier):
+        assert verifier is not None
+        return replace(
+            verifier,
+            static_analysis_evidence=evidence,
+            static_analysis_evidence_hash=_json_hash(list(evidence)),
+        )
+
+    second_sources = replace(
+        first_sources,
+        candidate_verification=with_evidence(first_sources.candidate_verification),
+        full_cascade_candidate_verification=with_evidence(
+            first_sources.full_cascade_candidate_verification
+        ),
+    )
+    second_configuration = materialize_review_configuration(
+        skills_context="frozen specialist instructions",
+        repo_context_files={"AGENTS.md": "frozen repository instructions"},
+        repo_context_max_lines=100,
+        prompt_date="2026-09-03",
+        stage_sources=second_sources,
+    )
+    second_snapshot, second_path, second_artifact_hash = _write_snapshot(
+        tmp_path,
+        name="second-snapshot",
+        changed_path="src/later.py",
+        review_configuration=second_configuration,
+    )
+    first_manifest = _manifest(first_snapshot, first_artifact_hash)
+    first_case = first_manifest.cases[0]
+    second_case = replace(
+        first_case,
+        case_id="case-two",
+        snapshot_id=second_snapshot.snapshot_id,
+        snapshot_artifact_hash=second_artifact_hash,
+    )
+    manifest = replace(first_manifest, cases=(first_case, second_case))
+    request, decision = _paid_authorization(manifest)
+
+    runner = ProductionEvaluationRunner(
+        manifest,
+        snapshot_paths={"case-one": first_path, "case-two": second_path},
+        review_configuration_artifact_hashes={
+            "case-one": _configuration_artifact_hash(first_path),
+            "case-two": _configuration_artifact_hash(second_path),
+        },
+        bindings=_bindings(manifest),
+        artifact_store=EvaluationArtifactStore(tmp_path / "evolving-evidence"),
+        paid_request=request,
+        paid_decision=decision,
+        evaluation_enabled=True,
+        allow_paid_execution=True,
+        publish_output=False,
+    )
+
+    preflight = runner.preflight()
+
+    assert len(preflight.snapshots_by_case_id) == 2
+    assert len(preflight.review_configurations_by_case_id) == 2
+    assert first_sources.sources_hash != second_sources.sources_hash
+    assert (
+        first_sources.candidate_verification.configuration_hash
+        != second_sources.candidate_verification.configuration_hash
+    )
+    assert (
+        first_sources.candidate_verification.stage_plan_configuration_hash
+        == second_sources.candidate_verification.stage_plan_configuration_hash
+    )
 
 
 @pytest.mark.parametrize("mutation", ("missing_verifier", "extra_verifier", "out_of_order"))

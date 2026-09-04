@@ -363,7 +363,7 @@ class CheckpointStageSources:
         matches = [
             candidate
             for candidate in candidates
-            if candidate is not None and candidate.configuration_hash == plan.configuration_hash
+            if candidate is not None and candidate.stage_plan_configuration_hash == plan.configuration_hash
         ]
         if len(matches) != 1:
             raise EvaluationValidationError("checkpoint verification stage source is unavailable or ambiguous")
@@ -435,7 +435,7 @@ class CheckpointStageSources:
                 )
             self._validate_plan_contract(
                 plan_by_name["candidate_verification"],
-                configuration_hash=verifier.configuration_hash,
+                configuration_hash=verifier.stage_plan_configuration_hash,
                 prompt_hash=verifier.prompt_hash,
                 prompt_version=verifier.prompt_version,
                 input_schema_version=verifier.input_schema_version,

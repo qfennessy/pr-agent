@@ -205,7 +205,7 @@ def _stage_plan(sources: CheckpointStageSources) -> tuple[EvaluationStagePlan, .
                     deployment_id_hash=deployment_identity_hash(verifier.route.deployments[0]),
                 ),
             ),
-            configuration_hash=verifier.configuration_hash,
+            configuration_hash=verifier.stage_plan_configuration_hash,
             prompt_hash=verifier.prompt_hash,
             prompt_version=verifier.prompt_version,
             input_schema_version=verifier.input_schema_version,
@@ -242,7 +242,7 @@ def _verified_stage_plan(sources: CheckpointStageSources) -> tuple[EvaluationSta
     candidate_stage = EvaluationStagePlan(
         stage="candidate_verification",
         model_route=identity,
-        configuration_hash=verifier.configuration_hash,
+        configuration_hash=verifier.stage_plan_configuration_hash,
         prompt_hash=verifier.prompt_hash,
         prompt_version=verifier.prompt_version,
         input_schema_version=verifier.input_schema_version,
@@ -349,6 +349,21 @@ def test_stage_plan_requires_exact_hash_versions_route_and_dependencies():
             (*plan[:-2], swapped_verifier, plan[-1]),
             arm_kind=EvaluationArmKind.FULL_CASCADE,
         )
+
+
+def test_verifier_stage_plan_hash_excludes_per_checkpoint_evidence():
+    sources = _sources()
+    verifier = sources.candidate_verification
+    assert verifier is not None
+    evidence = ({"candidate_id": "candidate-2", "content": "later checkpoint evidence"},)
+    changed = replace(
+        verifier,
+        static_analysis_evidence=evidence,
+        static_analysis_evidence_hash=_hash_json(list(evidence)),
+    )
+
+    assert changed.configuration_hash != verifier.configuration_hash
+    assert changed.stage_plan_configuration_hash == verifier.stage_plan_configuration_hash
 
 
 def test_execution_context_exposes_only_sources_selected_by_validated_plan():

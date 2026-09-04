@@ -394,6 +394,14 @@ class CandidateVerificationConfig:
         return _candidate_verification_hash(self._configuration_payload())
 
     @property
+    def stage_plan_configuration_hash(self) -> str:
+        """Hash only verifier controls shared by every case in one evaluation arm."""
+
+        payload = self._configuration_payload()
+        payload.pop("static_analysis_evidence_hash")
+        return _candidate_verification_hash(payload)
+
+    @property
     def prompt_hash(self) -> str:
         return _candidate_verification_hash({
             "prompt_version": self.prompt_version,
