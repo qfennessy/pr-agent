@@ -276,3 +276,75 @@ class TestALostReviewIsVisible:
 
         assert oct(marker.stat().st_mode)[-3:] == "600"
         assert "SessionBoundaryHeld" in marker.read_text(encoding="utf-8")
+
+
+class TestTheMarkerCannotBeUsedToWriteElsewhere:
+    """A repository-local .pr_agent.toml can choose shadow_journal_path."""
+
+    def test_a_symlinked_marker_is_refused_rather_than_followed(self, tmp_path):
+        private = tmp_path / "journal-dir"
+        private.mkdir(mode=0o700)
+        victim = tmp_path / "victim.txt"
+        victim.write_text("untouched", encoding="utf-8")
+        target = private / "shadow.ndjson"
+        marker = shadow_journal_drop_marker_path(target)
+        marker.symlink_to(victim)
+
+        with pytest.raises(Exception):
+            record_shadow_journal_drop(target, "SessionBoundaryHeld")
+
+        # The planted link must not have been written through or re-permissioned.
+        assert victim.read_text(encoding="utf-8") == "untouched"
+        assert oct(victim.stat().st_mode)[-3:] != "600"
+
+    def test_a_world_readable_parent_is_refused(self, tmp_path):
+        loose = tmp_path / "loose"
+        loose.mkdir(mode=0o755)
+
+        with pytest.raises(Exception):
+            record_shadow_journal_drop(loose / "shadow.ndjson", "SessionBoundaryHeld")
+
+
+class TestTheReportHonoursLostReviews:
+    """The marker is worthless if the production report path never looks at it."""
+
+    def test_acceptance_accepts_a_journal_path(self):
+        import inspect
+
+        from pr_agent.algo.checkpoint_evaluation_report import (
+            _build_shadow_pilot_binding,
+            build_shadow_pilot_acceptance,
+        )
+
+        for function in (build_shadow_pilot_acceptance, _build_shadow_pilot_binding):
+            assert "journal_path" in inspect.signature(function).parameters
+
+    def test_the_report_passes_its_path_through(self):
+        import inspect
+
+        from pr_agent.algo import checkpoint_evaluation_report as report
+
+        source = inspect.getsource(report.build_checkpoint_pilot_report)
+        assert "journal_path=shadow_journal_path" in source
+
+
+class TestCacheHitsAreRecorded:
+    def test_a_cached_review_still_produces_an_entry(self):
+        import inspect
+
+        from pr_agent import cli
+
+        source = inspect.getsource(cli._run_review_snapshot_impl)
+        cached_return = source.index("return cached_result")
+        recorded = source.rindex("_record_shadow_journal_entry", 0, cached_return)
+        # The recorder must run before the cache-hit early return, or normal
+        # cache-hit activity never reaches the journal at all.
+        assert recorded < cached_return
+
+    def test_a_cached_entry_reports_itself_as_cached(self):
+        snapshot = _snapshot()
+        entry = shadow_entry_from_snapshot_result(
+            snapshot, _result(snapshot, cached=True)
+        )
+
+        assert entry.cached is True

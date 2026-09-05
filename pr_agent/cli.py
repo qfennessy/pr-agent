@@ -1051,6 +1051,10 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     ):
         cached_result = cache.read(snapshot.snapshot_id, snapshot=snapshot)
         if cached_result is not None:
+            # A cache hit is still a review the developer asked for and received.
+            # Skipping it would understate event counts and shorten the observed
+            # span; the entry carries `cached` so the difference stays visible.
+            _record_shadow_journal_entry(snapshot, cached_result)
             _emit_snapshot_result(
                 cached_result,
                 json_output,

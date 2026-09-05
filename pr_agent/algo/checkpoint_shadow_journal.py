@@ -446,7 +446,6 @@ def record_shadow_journal_drop(path: str | Path, reason: str) -> None:
     subset. The marker is deliberately outside the journal, since the journal is
     exactly what could not be written.
     """
-    marker = shadow_journal_drop_marker_path(path)
     payload = json.dumps(
         {
             "schema_version": SHADOW_JOURNAL_RECORD_SCHEMA_VERSION,
@@ -458,10 +457,13 @@ def record_shadow_journal_drop(path: str | Path, reason: str) -> None:
         sort_keys=True,
         separators=(",", ":"),
     )
-    marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with open(marker, "a", encoding="utf-8") as handle:
-        handle.write(payload + "\n")
-    os.chmod(marker, 0o600)
+    # The same private-parent, ownership, regular-file and O_NOFOLLOW protections
+    # the journal itself uses. A repository-local .pr_agent.toml can choose
+    # shadow_journal_path, so a planted symlink at <path>.dropped must not be
+    # followed and written through.
+    _append_private_line(
+        shadow_journal_drop_marker_path(path), (payload + "\n").encode("utf-8")
+    )
 
 
 def shadow_journal_inventory_complete(
