@@ -279,6 +279,19 @@ identity hash, and each priced-cost model key against the same frozen arm.
 
 ## Privacy-safe live shadow journal
 
+Entries come from local snapshot reviews. `pr-agent review-snapshot` records one
+entry per completed review when `checkpoint_evaluation.shadow_journal_enabled` is
+true and `shadow_journal_path` names a file; with either unset, no writer is
+opened and no file is created, which is the shipped default. Nothing else
+produces entries: hosted pull-request review does not, and neither does the
+production evaluation runner.
+
+The recorder is observational. It cannot change routing, findings, or output, and
+a failure to record is logged and dropped rather than raised, so a review is never
+delayed or failed by telemetry. Only what the snapshot and its result already hold
+is written; absent token, cost, or latency data stays unavailable rather than
+becoming a false zero.
+
 `ShadowJournalWriter` is disabled unless explicitly opted in. When enabled, checkpoint
 code calls only bounded `put_nowait`; a daemon worker appends source-free NDJSON in the
 background. A full queue or write failure drops telemetry rather than delaying or failing
