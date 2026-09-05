@@ -795,8 +795,10 @@ def _is_hard_linked_to_repository(candidate: Path, *roots: Path) -> bool:
 # Opened lazily on the first record so command-line setting overrides are already
 # applied, and closed by _run_review_snapshot. None means recording is off, which
 # is the shipped default and the state in which no file is ever created.
-_shadow_journal_writer = None
-_shadow_journal_opened = False
+# Distinguishes "not opened yet" from "opened, and recording is off". Two
+# booleans tracking one state invited them to disagree.
+_SHADOW_JOURNAL_UNOPENED = object()
+_shadow_journal_writer = _SHADOW_JOURNAL_UNOPENED
 
 
 def _record_shadow_journal_entry(snapshot, result) -> None:
@@ -807,10 +809,9 @@ def _record_shadow_journal_entry(snapshot, result) -> None:
     ``writer_failed`` so the reader can see that a session was incomplete rather
     than silently short.
     """
-    global _shadow_journal_writer, _shadow_journal_opened
+    global _shadow_journal_writer
     try:
-        if not _shadow_journal_opened:
-            _shadow_journal_opened = True
+        if _shadow_journal_writer is _SHADOW_JOURNAL_UNOPENED:
             _shadow_journal_writer = shadow_journal_writer_from_settings(get_settings())
         if _shadow_journal_writer is None:
             return
@@ -820,11 +821,10 @@ def _record_shadow_journal_entry(snapshot, result) -> None:
 
 
 def _close_shadow_journal() -> None:
-    global _shadow_journal_writer, _shadow_journal_opened
+    global _shadow_journal_writer
     writer = _shadow_journal_writer
-    _shadow_journal_writer = None
-    _shadow_journal_opened = False
-    if writer is None:
+    _shadow_journal_writer = _SHADOW_JOURNAL_UNOPENED
+    if writer is None or writer is _SHADOW_JOURNAL_UNOPENED:
         return
     try:
         writer.close()

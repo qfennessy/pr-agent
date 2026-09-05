@@ -129,7 +129,10 @@ class TestRoundTrip:
         assert writer is not None
 
         writer.submit(shadow_entry_from_snapshot_result(snapshot, _result(snapshot)))
-        assert writer.close() is True
+        # Never inside an assert: python -O strips those, and the writer would
+        # then never flush or close.
+        closed = writer.close()
+        assert closed is True
 
         records = load_shadow_journal(target)
         assert len(records) == 1
@@ -146,7 +149,8 @@ class TestRoundTrip:
         writer = shadow_journal_writer_from_settings(_settings(path=str(target)))
         writer.submit(shadow_entry_from_snapshot_result(parent, _result(parent)))
         writer.submit(shadow_entry_from_snapshot_result(child, _result(child)))
-        assert writer.close() is True
+        closed = writer.close()
+        assert closed is True
 
         records = load_shadow_journal(target)
         assert [record.entry.parent_snapshot_id for record in records] == [
@@ -159,8 +163,9 @@ class TestRecordingNeverBreaksTheReview:
     def test_a_failing_writer_does_not_raise_into_the_review(self, monkeypatch, tmp_path):
         from pr_agent import cli
 
-        monkeypatch.setattr(cli, "_shadow_journal_writer", None, raising=False)
-        monkeypatch.setattr(cli, "_shadow_journal_opened", False, raising=False)
+        monkeypatch.setattr(
+            cli, "_shadow_journal_writer", cli._SHADOW_JOURNAL_UNOPENED, raising=False
+        )
         monkeypatch.setattr(
             cli,
             "shadow_journal_writer_from_settings",
@@ -175,7 +180,8 @@ class TestRecordingNeverBreaksTheReview:
     def test_a_malformed_result_does_not_raise_into_the_review(self, monkeypatch):
         from pr_agent import cli
 
-        monkeypatch.setattr(cli, "_shadow_journal_writer", None, raising=False)
-        monkeypatch.setattr(cli, "_shadow_journal_opened", False, raising=False)
+        monkeypatch.setattr(
+            cli, "_shadow_journal_writer", cli._SHADOW_JOURNAL_UNOPENED, raising=False
+        )
         cli._record_shadow_journal_entry(object(), object())
         cli._close_shadow_journal()
