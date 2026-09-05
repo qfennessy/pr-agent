@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 from pr_agent.algo.checkpoint_evaluation import (
@@ -737,3 +738,83 @@ class ShadowJournalWriter:
                 and not self._failed.is_set()
                 and self._dropped_entry_count == 0
             )
+
+
+_RESULT_STATE_BY_REVIEW_STATE = MappingProxyType({
+    "findings": EvaluationRunState.COMPLETED,
+    "no_findings": EvaluationRunState.COMPLETED,
+    "coverage_unavailable": EvaluationRunState.COVERAGE_UNAVAILABLE,
+    "cancelled": EvaluationRunState.CANCELLED,
+    "stale": EvaluationRunState.STALE,
+})
+
+# A snapshot taken before any frozen review configuration existed still has an
+# identity; it just has no configuration to name. A fixed sentinel says that
+# honestly rather than inventing a hash that looks like a real one.
+_UNCONFIGURED_REVIEW_CONFIGURATION = content_hash({"review_configuration": None})
+
+
+def _measurement(value: object) -> NumericMeasurement:
+    """Wrap a number, keeping absent data absent instead of turning it into zero."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+    if not math.isfinite(value):
+        return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+    return NumericMeasurement(MeasurementStatus.COMPLETE, float(value))
+
+
+def shadow_entry_from_snapshot_result(snapshot: Any, result: Any) -> ShadowJournalEntry:
+    """Build one source-free journal entry from a completed local review.
+
+    Reads only what the snapshot and its result already carry. Nothing here
+    reaches for source text, diffs, prompts, or provider request identifiers, and
+    the entry type could not hold them if it did.
+    """
+    review_state = getattr(getattr(result, "state", None), "value", None)
+    result_state = _RESULT_STATE_BY_REVIEW_STATE.get(
+        review_state, EvaluationRunState.COVERAGE_UNAVAILABLE
+    )
+    coverage_status = (
+        MeasurementStatus.COMPLETE
+        if result_state is EvaluationRunState.COMPLETED and not result.coverage_issues
+        else MeasurementStatus.PARTIAL
+        if result.coverage_issues
+        else MeasurementStatus.UNAVAILABLE
+    )
+    usage = result.usage if isinstance(result.usage, Mapping) else {}
+    cost = result.cost if isinstance(result.cost, Mapping) else {}
+    return ShadowJournalEntry(
+        snapshot_id=snapshot.snapshot_id,
+        event=snapshot.event,
+        policy_hash=content_hash({"policy_version": snapshot.policy_version}),
+        configuration_hash=(
+            snapshot.review_configuration_hash or _UNCONFIGURED_REVIEW_CONFIGURATION
+        ),
+        result_state=result_state,
+        parent_snapshot_id=snapshot.parent_snapshot_id,
+        coverage_status=coverage_status,
+        latency_seconds=_measurement(result.latency_seconds),
+        tokens=_measurement(usage.get("total_tokens")),
+        cost_usd=_measurement(cost.get("total_usd")),
+        cached=bool(result.cached),
+    )
+
+
+def shadow_journal_writer_from_settings(settings: Any) -> Optional[ShadowJournalWriter]:
+    """Open the journal only when an operator has explicitly asked for it.
+
+    Returns None when recording is off or no path is configured, so the caller
+    does nothing and no file is created. That is the shipped default.
+    """
+    section = getattr(settings, "checkpoint_evaluation", None)
+    if section is None:
+        return None
+    if getattr(section, "shadow_journal_enabled", False) is not True:
+        return None
+    path = str(getattr(section, "shadow_journal_path", "") or "").strip()
+    if not path:
+        return None
+    max_entries = getattr(section, "shadow_journal_max_queue_entries", 256)
+    if not isinstance(max_entries, int) or isinstance(max_entries, bool) or max_entries < 1:
+        max_entries = 256
+    return ShadowJournalWriter(path, enabled=True, max_queue_entries=max_entries)

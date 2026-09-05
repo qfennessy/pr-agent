@@ -12,9 +12,9 @@ from pr_agent.algo.candidate_verification import (
     parse_candidate_verification_config,
 )
 from pr_agent.algo.checkpoint_cost_authority import (
+    CheckpointCostAuthorityError,
     FrozenCostAuthority,
     ProviderMaximumCharge,
-    CheckpointCostAuthorityError,
     gateway_api_base_identity_hash,
 )
 from pr_agent.algo.checkpoint_evaluation import (
