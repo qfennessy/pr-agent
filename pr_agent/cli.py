@@ -19,6 +19,11 @@ from pr_agent.algo.ai_handlers.litellm_helpers import (
     litellm_callbacks_registered,
 )
 from pr_agent.algo.checkpoint_evaluation_cli import run_evaluation_plan
+from pr_agent.algo.checkpoint_shadow_journal import (
+    record_shadow_journal_drop,
+    shadow_entry_from_snapshot_result,
+    shadow_journal_writer_from_settings,
+)
 from pr_agent.algo.review_configuration import snapshot_review_configuration_hash as _snapshot_review_configuration_hash
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, snapshot_review_instructions
 from pr_agent.algo.review_specialists import use_specialist_snapshot_context
@@ -788,11 +793,69 @@ def _is_hard_linked_to_repository(candidate: Path, *roots: Path) -> bool:
     return False
 
 
+# Opened lazily on the first record so command-line setting overrides are already
+# applied, and closed by _run_review_snapshot. None means recording is off, which
+# is the shipped default and the state in which no file is ever created.
+# Distinguishes "not opened yet" from "opened, and recording is off". Two
+# booleans tracking one state invited them to disagree.
+_SHADOW_JOURNAL_UNOPENED = object()
+_shadow_journal_writer = _SHADOW_JOURNAL_UNOPENED
+
+
+def _record_shadow_journal_entry(snapshot, result) -> None:
+    """Record one completed local review, if an operator asked for recording.
+
+    Observational only. A recording failure must never change, delay, or fail a
+    review, so everything here is contained. The writer marks its own session
+    ``writer_failed`` so the reader can see that a session was incomplete rather
+    than silently short.
+    """
+    global _shadow_journal_writer
+    try:
+        if _shadow_journal_writer is _SHADOW_JOURNAL_UNOPENED:
+            _shadow_journal_writer = shadow_journal_writer_from_settings(get_settings())
+        if _shadow_journal_writer is None:
+            return
+        _shadow_journal_writer.submit(shadow_entry_from_snapshot_result(snapshot, result))
+    except Exception as exc:
+        get_logger().debug("shadow journal entry was not recorded", exc_info=True)
+        # Recording was asked for and did not happen, most often because another
+        # review holds the journal's exclusive session boundary. Say so beside the
+        # journal, or this review disappears while the inventory still looks
+        # complete for the reviews that did get through.
+        _mark_shadow_journal_drop(exc)
+
+
+def _mark_shadow_journal_drop(exc: BaseException) -> None:
+    try:
+        section = getattr(get_settings(), "checkpoint_evaluation", None)
+        if getattr(section, "shadow_journal_enabled", False) is not True:
+            return
+        path = str(getattr(section, "shadow_journal_path", "") or "").strip()
+        if path:
+            record_shadow_journal_drop(path, type(exc).__name__)
+    except Exception:
+        get_logger().debug("shadow journal drop was not marked", exc_info=True)
+
+
+def _close_shadow_journal() -> None:
+    global _shadow_journal_writer
+    writer = _shadow_journal_writer
+    _shadow_journal_writer = _SHADOW_JOURNAL_UNOPENED
+    if writer is None or writer is _SHADOW_JOURNAL_UNOPENED:
+        return
+    try:
+        writer.close()
+    except Exception:
+        get_logger().debug("shadow journal did not close cleanly", exc_info=True)
+
+
 def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
     original_settings = _snapshot_all_settings()
     try:
         return _run_review_snapshot_impl(args, outer_parser)
     finally:
+        _close_shadow_journal()
         _restore_all_settings(original_settings)
 
 
@@ -969,6 +1032,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             structured_review=None,
             started_at=monotonic(),
         )
+        _record_shadow_journal_entry(snapshot, stale_result)
         _emit_snapshot_result(
             stale_result,
             json_output,
@@ -987,6 +1051,10 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     ):
         cached_result = cache.read(snapshot.snapshot_id, snapshot=snapshot)
         if cached_result is not None:
+            # A cache hit is still a review the developer asked for and received.
+            # Skipping it would understate event counts and shorten the observed
+            # span; the entry carries `cached` so the difference stays visible.
+            _record_shadow_journal_entry(snapshot, cached_result)
             _emit_snapshot_result(
                 cached_result,
                 json_output,
@@ -1094,6 +1162,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         started_at=started_at,
         error=review_error,
     )
+    _record_shadow_journal_entry(snapshot, result)
     if markdown_output and pending_markdown is None and result.state is ReviewResultState.NO_FINDINGS:
         pending_markdown = b"## PR Review\n\nNo findings.\n"
     if pending_markdown is not None and not pending_markdown.startswith(_SNAPSHOT_MARKDOWN_MARKER):

@@ -12,8 +12,10 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 from pr_agent.algo.checkpoint_evaluation import (
@@ -429,8 +431,53 @@ class ShadowJournalRecord:
         return record
 
 
-def shadow_journal_inventory_complete(records: tuple[ShadowJournalRecord, ...]) -> bool:
-    """Validate writer-session boundaries and report whether every submission was retained."""
+def shadow_journal_drop_marker_path(path: str | Path) -> Path:
+    """Where a review that could not be recorded at all is remembered."""
+    target = Path(path)
+    return target.with_name(target.name + ".dropped")
+
+
+def record_shadow_journal_drop(path: str | Path, reason: str) -> None:
+    """Remember a review whose telemetry was lost before it reached the journal.
+
+    A second concurrent writer cannot open the journal, because the first holds an
+    exclusive session boundary. Without this, that review vanishes silently: the
+    first process seals normally and the inventory looks complete for a biased
+    subset. The marker is deliberately outside the journal, since the journal is
+    exactly what could not be written.
+    """
+    payload = json.dumps(
+        {
+            "schema_version": SHADOW_JOURNAL_RECORD_SCHEMA_VERSION,
+            "dropped_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "reason": str(reason)[:200],
+        },
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    # The same private-parent, ownership, regular-file and O_NOFOLLOW protections
+    # the journal itself uses. A repository-local .pr_agent.toml can choose
+    # shadow_journal_path, so a planted symlink at <path>.dropped must not be
+    # followed and written through.
+    _append_private_line(
+        shadow_journal_drop_marker_path(path), (payload + "\n").encode("utf-8")
+    )
+
+
+def shadow_journal_inventory_complete(
+    records: tuple[ShadowJournalRecord, ...],
+    journal_path: Optional[str | Path] = None,
+) -> bool:
+    """Validate writer-session boundaries and report whether every submission was retained.
+
+    Pass ``journal_path`` to also honour reviews that never reached the journal at
+    all. Those are recorded beside it, because the journal was unwritable when
+    they happened.
+    """
+    if journal_path is not None and shadow_journal_drop_marker_path(journal_path).exists():
+        return False
     session_entry_count = 0
     inventory_complete = bool(records)
     for record in records:
@@ -737,3 +784,112 @@ class ShadowJournalWriter:
                 and not self._failed.is_set()
                 and self._dropped_entry_count == 0
             )
+
+
+_RESULT_STATE_BY_REVIEW_STATE = MappingProxyType({
+    "findings": EvaluationRunState.COMPLETED,
+    "no_findings": EvaluationRunState.COMPLETED,
+    "coverage_unavailable": EvaluationRunState.COVERAGE_UNAVAILABLE,
+    "cancelled": EvaluationRunState.CANCELLED,
+    "stale": EvaluationRunState.STALE,
+})
+
+# A snapshot taken before any frozen review configuration existed still has an
+# identity; it just has no configuration to name. A fixed sentinel says that
+# honestly rather than inventing a hash that looks like a real one.
+_UNCONFIGURED_REVIEW_CONFIGURATION = content_hash({"review_configuration": None})
+
+
+_REPORTED_STATUS = MappingProxyType({
+    "complete": MeasurementStatus.COMPLETE,
+    "partial": MeasurementStatus.PARTIAL,
+    "unavailable": MeasurementStatus.UNAVAILABLE,
+})
+
+
+def _measurement(value: object, reported_status: object = None) -> NumericMeasurement:
+    """Wrap a number, keeping absent data absent instead of turning it into zero.
+
+    Accepts an exact decimal string as well as a number: the CLI deliberately
+    serializes cost as a string to avoid binary floating point, and rejecting it
+    would journal every priced run as having unknown cost.
+
+    ``reported_status`` carries the producer's own verdict. A run that priced some
+    calls but not others reports ``partial`` with a subtotal; calling that
+    complete would let an underestimate satisfy a cost gate. The producer's
+    verdict can only lower confidence here, never raise it.
+    """
+    if isinstance(value, bool):
+        return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+    if isinstance(value, str):
+        try:
+            value = float(Decimal(value.strip()))
+        except (ArithmeticError, InvalidOperation, ValueError):
+            return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+    status = MeasurementStatus.COMPLETE
+    if reported_status is not None:
+        reported = _REPORTED_STATUS.get(str(reported_status).strip().casefold())
+        # An unrecognised verdict is not a reason for confidence.
+        status = reported if reported is not None else MeasurementStatus.PARTIAL
+    if status is MeasurementStatus.UNAVAILABLE:
+        return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+    return NumericMeasurement(status, float(value))
+
+
+def shadow_entry_from_snapshot_result(snapshot: Any, result: Any) -> ShadowJournalEntry:
+    """Build one source-free journal entry from a completed local review.
+
+    Reads only what the snapshot and its result already carry. Nothing here
+    reaches for source text, diffs, prompts, or provider request identifiers, and
+    the entry type could not hold them if it did.
+    """
+    review_state = getattr(getattr(result, "state", None), "value", None)
+    result_state = _RESULT_STATE_BY_REVIEW_STATE.get(
+        review_state, EvaluationRunState.COVERAGE_UNAVAILABLE
+    )
+    coverage_status = (
+        MeasurementStatus.COMPLETE
+        if result_state is EvaluationRunState.COMPLETED and not result.coverage_issues
+        else MeasurementStatus.PARTIAL
+        if result.coverage_issues
+        else MeasurementStatus.UNAVAILABLE
+    )
+    usage = result.usage if isinstance(result.usage, Mapping) else {}
+    cost = result.cost if isinstance(result.cost, Mapping) else {}
+    return ShadowJournalEntry(
+        snapshot_id=snapshot.snapshot_id,
+        event=snapshot.event,
+        policy_hash=content_hash({"policy_version": snapshot.policy_version}),
+        configuration_hash=(
+            snapshot.review_configuration_hash or _UNCONFIGURED_REVIEW_CONFIGURATION
+        ),
+        result_state=result_state,
+        parent_snapshot_id=snapshot.parent_snapshot_id,
+        coverage_status=coverage_status,
+        latency_seconds=_measurement(result.latency_seconds),
+        tokens=_measurement(usage.get("total_tokens"), usage.get("status")),
+        cost_usd=_measurement(cost.get("total_usd"), cost.get("status")),
+        cached=bool(result.cached),
+    )
+
+
+def shadow_journal_writer_from_settings(settings: Any) -> Optional[ShadowJournalWriter]:
+    """Open the journal only when an operator has explicitly asked for it.
+
+    Returns None when recording is off or no path is configured, so the caller
+    does nothing and no file is created. That is the shipped default.
+    """
+    section = getattr(settings, "checkpoint_evaluation", None)
+    if section is None:
+        return None
+    if getattr(section, "shadow_journal_enabled", False) is not True:
+        return None
+    path = str(getattr(section, "shadow_journal_path", "") or "").strip()
+    if not path:
+        return None
+    max_entries = getattr(section, "shadow_journal_max_queue_entries", 256)
+    if not isinstance(max_entries, int) or isinstance(max_entries, bool) or max_entries < 1:
+        max_entries = 256
+    return ShadowJournalWriter(path, enabled=True, max_queue_entries=max_entries)

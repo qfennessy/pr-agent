@@ -585,6 +585,7 @@ def build_shadow_pilot_acceptance(
     *,
     manifest: EvaluationManifest,
     target_arm_id: str,
+    journal_path: Optional[str | Path] = None,
 ) -> ShadowPilotAcceptance:
     """Generate exact journal identities for separate review; this does not accept them."""
     if not isinstance(manifest, EvaluationManifest):
@@ -592,7 +593,9 @@ def build_shadow_pilot_acceptance(
     records = tuple(records)
     if not records or any(not isinstance(record, ShadowJournalRecord) for record in records):
         raise EvaluationValidationError("shadow pilot acceptance requires journal records")
-    shadow_journal_inventory_complete(records)
+    # Reviews lost before they reached the journal are recorded beside it. Without
+    # the path they are invisible here, and a biased subset looks complete.
+    shadow_journal_inventory_complete(records, journal_path)
     observed_at_utc = tuple(record.ingested_at_utc for record in records)
     if any(
         later < earlier
@@ -831,6 +834,7 @@ def _build_shadow_pilot_binding(
     *,
     manifest: EvaluationManifest,
     target_arm_id: str,
+    journal_path: Optional[str | Path] = None,
 ) -> Optional[ShadowPilotBinding]:
     records = tuple(records)
     if not records or acceptance is None or CANONICAL_SHADOW_PILOT_ACCEPTANCE_ID is None:
@@ -843,6 +847,7 @@ def _build_shadow_pilot_binding(
         records,
         manifest=manifest,
         target_arm_id=target_arm_id,
+        journal_path=journal_path,
     )
     if actual_acceptance != acceptance:
         raise EvaluationValidationError("shadow records do not exactly match the accepted journal inventory")
@@ -852,7 +857,7 @@ def _build_shadow_pilot_binding(
         for record in records
         if record.developer_time_basis is DeveloperTimeBasis.WRITER_MONOTONIC
     )
-    inventory_complete = shadow_journal_inventory_complete(records)
+    inventory_complete = shadow_journal_inventory_complete(records, journal_path)
     return ShadowPilotBinding(
         acceptance_id=acceptance.acceptance_id,
         journal_hash=acceptance.journal_hash,
@@ -1831,6 +1836,7 @@ def build_checkpoint_pilot_report(
         shadow_acceptance,
         manifest=manifest,
         target_arm_id=target_arm_id,
+        journal_path=shadow_journal_path,
     )
     settled_binding = _build_settled_pilot_binding(
         settled_candidate_records,
