@@ -12,6 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -755,10 +756,20 @@ _UNCONFIGURED_REVIEW_CONFIGURATION = content_hash({"review_configuration": None}
 
 
 def _measurement(value: object) -> NumericMeasurement:
-    """Wrap a number, keeping absent data absent instead of turning it into zero."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    """Wrap a number, keeping absent data absent instead of turning it into zero.
+
+    Accepts an exact decimal string as well as a number: the CLI deliberately
+    serializes cost as a string to avoid binary floating point, and rejecting it
+    would journal every priced run as having unknown cost.
+    """
+    if isinstance(value, bool):
         return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
-    if not math.isfinite(value):
+    if isinstance(value, str):
+        try:
+            value = float(Decimal(value.strip()))
+        except (ArithmeticError, InvalidOperation, ValueError):
+            return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
         return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
     return NumericMeasurement(MeasurementStatus.COMPLETE, float(value))
 

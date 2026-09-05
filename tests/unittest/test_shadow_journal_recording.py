@@ -92,6 +92,27 @@ class TestEntryContents:
         assert entry.tokens.value == pytest.approx(1200)
         assert entry.cost_usd.value == pytest.approx(0.004)
 
+    def test_a_cost_serialized_as_a_string_is_still_a_measurement(self):
+        """The CLI serializes cost as an exact decimal string, not a float.
+
+        Rejecting strings journals every priced run as having unknown cost, which
+        makes the live-shadow cost metric unobtainable.
+        """
+        snapshot = _snapshot()
+        result = _result(snapshot, cost={"total_usd": "0.0042", "status": "complete"})
+        entry = shadow_entry_from_snapshot_result(snapshot, result)
+
+        assert entry.cost_usd.status is MeasurementStatus.COMPLETE
+        assert entry.cost_usd.value == pytest.approx(0.0042)
+
+    def test_an_unparseable_cost_stays_unavailable(self):
+        snapshot = _snapshot()
+        result = _result(snapshot, cost={"total_usd": "not-a-number"})
+        entry = shadow_entry_from_snapshot_result(snapshot, result)
+
+        assert entry.cost_usd.status is MeasurementStatus.UNAVAILABLE
+        assert entry.cost_usd.value is None
+
     def test_missing_telemetry_stays_unavailable_and_never_becomes_zero(self):
         snapshot = _snapshot()
         result = _result(snapshot, usage={}, cost={})
