@@ -20,6 +20,7 @@ from pr_agent.algo.ai_handlers.litellm_helpers import (
 )
 from pr_agent.algo.checkpoint_evaluation_cli import run_evaluation_plan
 from pr_agent.algo.checkpoint_shadow_journal import (
+    record_shadow_journal_drop,
     shadow_entry_from_snapshot_result,
     shadow_journal_writer_from_settings,
 )
@@ -816,8 +817,25 @@ def _record_shadow_journal_entry(snapshot, result) -> None:
         if _shadow_journal_writer is None:
             return
         _shadow_journal_writer.submit(shadow_entry_from_snapshot_result(snapshot, result))
-    except Exception:
+    except Exception as exc:
         get_logger().debug("shadow journal entry was not recorded", exc_info=True)
+        # Recording was asked for and did not happen, most often because another
+        # review holds the journal's exclusive session boundary. Say so beside the
+        # journal, or this review disappears while the inventory still looks
+        # complete for the reviews that did get through.
+        _mark_shadow_journal_drop(exc)
+
+
+def _mark_shadow_journal_drop(exc: BaseException) -> None:
+    try:
+        section = getattr(get_settings(), "checkpoint_evaluation", None)
+        if getattr(section, "shadow_journal_enabled", False) is not True:
+            return
+        path = str(getattr(section, "shadow_journal_path", "") or "").strip()
+        if path:
+            record_shadow_journal_drop(path, type(exc).__name__)
+    except Exception:
+        get_logger().debug("shadow journal drop was not marked", exc_info=True)
 
 
 def _close_shadow_journal() -> None:

@@ -12,7 +12,9 @@ import pytest
 from pr_agent.algo.checkpoint_evaluation import EvaluationRunState, MeasurementStatus
 from pr_agent.algo.checkpoint_shadow_journal import (
     load_shadow_journal,
+    record_shadow_journal_drop,
     shadow_entry_from_snapshot_result,
+    shadow_journal_drop_marker_path,
     shadow_journal_inventory_complete,
     shadow_journal_writer_from_settings,
 )
@@ -206,3 +208,71 @@ class TestRecordingNeverBreaksTheReview:
         )
         cli._record_shadow_journal_entry(object(), object())
         cli._close_shadow_journal()
+
+
+class TestPartialCostIsNotCalledComplete:
+    """An underestimate that claims completeness makes a cost gate easier to pass."""
+
+    def test_a_partial_cost_stays_partial(self):
+        snapshot = _snapshot()
+        result = _result(snapshot, cost={"total_usd": "0.0042", "status": "partial"})
+        entry = shadow_entry_from_snapshot_result(snapshot, result)
+
+        assert entry.cost_usd.status is MeasurementStatus.PARTIAL
+        assert entry.cost_usd.value == pytest.approx(0.0042)
+
+    def test_a_cost_reported_unavailable_keeps_no_value(self):
+        snapshot = _snapshot()
+        result = _result(snapshot, cost={"total_usd": "0.0042", "status": "unavailable"})
+        entry = shadow_entry_from_snapshot_result(snapshot, result)
+
+        assert entry.cost_usd.status is MeasurementStatus.UNAVAILABLE
+        assert entry.cost_usd.value is None
+
+    def test_an_unrecognised_verdict_is_not_a_reason_for_confidence(self):
+        snapshot = _snapshot()
+        result = _result(snapshot, cost={"total_usd": "0.0042", "status": "who knows"})
+        entry = shadow_entry_from_snapshot_result(snapshot, result)
+
+        assert entry.cost_usd.status is MeasurementStatus.PARTIAL
+
+
+class TestALostReviewIsVisible:
+    """A review that never reached the journal must not leave it looking complete."""
+
+    def test_a_concurrent_writer_cannot_open_the_same_journal(self, tmp_path):
+        target = tmp_path / "shadow.ndjson"
+        first = shadow_journal_writer_from_settings(_settings(path=str(target)))
+        assert first is not None
+
+        with pytest.raises(Exception):
+            shadow_journal_writer_from_settings(_settings(path=str(target)))
+
+        first.close()
+
+    def test_a_drop_marker_makes_the_inventory_incomplete(self, tmp_path):
+        target = tmp_path / "shadow.ndjson"
+        snapshot = _snapshot()
+        writer = shadow_journal_writer_from_settings(_settings(path=str(target)))
+        writer.submit(shadow_entry_from_snapshot_result(snapshot, _result(snapshot)))
+        closed = writer.close()
+        assert closed is True
+
+        records = load_shadow_journal(target)
+        # The surviving session seals cleanly and looks complete on its own.
+        assert shadow_journal_inventory_complete(records) is True
+
+        record_shadow_journal_drop(target, "SessionBoundaryHeld")
+
+        # Once the lost review is known, the same records are no longer a
+        # complete inventory.
+        assert shadow_journal_inventory_complete(records, target) is False
+        assert shadow_journal_drop_marker_path(target).exists()
+
+    def test_the_marker_is_private_and_records_a_reason(self, tmp_path):
+        target = tmp_path / "shadow.ndjson"
+        record_shadow_journal_drop(target, "SessionBoundaryHeld")
+        marker = shadow_journal_drop_marker_path(target)
+
+        assert oct(marker.stat().st_mode)[-3:] == "600"
+        assert "SessionBoundaryHeld" in marker.read_text(encoding="utf-8")

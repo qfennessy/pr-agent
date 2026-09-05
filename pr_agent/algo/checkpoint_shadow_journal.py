@@ -431,8 +431,51 @@ class ShadowJournalRecord:
         return record
 
 
-def shadow_journal_inventory_complete(records: tuple[ShadowJournalRecord, ...]) -> bool:
-    """Validate writer-session boundaries and report whether every submission was retained."""
+def shadow_journal_drop_marker_path(path: str | Path) -> Path:
+    """Where a review that could not be recorded at all is remembered."""
+    target = Path(path)
+    return target.with_name(target.name + ".dropped")
+
+
+def record_shadow_journal_drop(path: str | Path, reason: str) -> None:
+    """Remember a review whose telemetry was lost before it reached the journal.
+
+    A second concurrent writer cannot open the journal, because the first holds an
+    exclusive session boundary. Without this, that review vanishes silently: the
+    first process seals normally and the inventory looks complete for a biased
+    subset. The marker is deliberately outside the journal, since the journal is
+    exactly what could not be written.
+    """
+    marker = shadow_journal_drop_marker_path(path)
+    payload = json.dumps(
+        {
+            "schema_version": SHADOW_JOURNAL_RECORD_SCHEMA_VERSION,
+            "dropped_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "reason": str(reason)[:200],
+        },
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(marker, "a", encoding="utf-8") as handle:
+        handle.write(payload + "\n")
+    os.chmod(marker, 0o600)
+
+
+def shadow_journal_inventory_complete(
+    records: tuple[ShadowJournalRecord, ...],
+    journal_path: Optional[str | Path] = None,
+) -> bool:
+    """Validate writer-session boundaries and report whether every submission was retained.
+
+    Pass ``journal_path`` to also honour reviews that never reached the journal at
+    all. Those are recorded beside it, because the journal was unwritable when
+    they happened.
+    """
+    if journal_path is not None and shadow_journal_drop_marker_path(journal_path).exists():
+        return False
     session_entry_count = 0
     inventory_complete = bool(records)
     for record in records:
@@ -755,12 +798,24 @@ _RESULT_STATE_BY_REVIEW_STATE = MappingProxyType({
 _UNCONFIGURED_REVIEW_CONFIGURATION = content_hash({"review_configuration": None})
 
 
-def _measurement(value: object) -> NumericMeasurement:
+_REPORTED_STATUS = MappingProxyType({
+    "complete": MeasurementStatus.COMPLETE,
+    "partial": MeasurementStatus.PARTIAL,
+    "unavailable": MeasurementStatus.UNAVAILABLE,
+})
+
+
+def _measurement(value: object, reported_status: object = None) -> NumericMeasurement:
     """Wrap a number, keeping absent data absent instead of turning it into zero.
 
     Accepts an exact decimal string as well as a number: the CLI deliberately
     serializes cost as a string to avoid binary floating point, and rejecting it
     would journal every priced run as having unknown cost.
+
+    ``reported_status`` carries the producer's own verdict. A run that priced some
+    calls but not others reports ``partial`` with a subtotal; calling that
+    complete would let an underestimate satisfy a cost gate. The producer's
+    verdict can only lower confidence here, never raise it.
     """
     if isinstance(value, bool):
         return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
@@ -771,7 +826,14 @@ def _measurement(value: object) -> NumericMeasurement:
             return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
     if not isinstance(value, (int, float)) or not math.isfinite(value):
         return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
-    return NumericMeasurement(MeasurementStatus.COMPLETE, float(value))
+    status = MeasurementStatus.COMPLETE
+    if reported_status is not None:
+        reported = _REPORTED_STATUS.get(str(reported_status).strip().casefold())
+        # An unrecognised verdict is not a reason for confidence.
+        status = reported if reported is not None else MeasurementStatus.PARTIAL
+    if status is MeasurementStatus.UNAVAILABLE:
+        return NumericMeasurement(MeasurementStatus.UNAVAILABLE, None)
+    return NumericMeasurement(status, float(value))
 
 
 def shadow_entry_from_snapshot_result(snapshot: Any, result: Any) -> ShadowJournalEntry:
@@ -805,8 +867,8 @@ def shadow_entry_from_snapshot_result(snapshot: Any, result: Any) -> ShadowJourn
         parent_snapshot_id=snapshot.parent_snapshot_id,
         coverage_status=coverage_status,
         latency_seconds=_measurement(result.latency_seconds),
-        tokens=_measurement(usage.get("total_tokens")),
-        cost_usd=_measurement(cost.get("total_usd")),
+        tokens=_measurement(usage.get("total_tokens"), usage.get("status")),
+        cost_usd=_measurement(cost.get("total_usd"), cost.get("status")),
         cached=bool(result.cached),
     )
 
