@@ -379,18 +379,27 @@ class TestCacheHitsReportTheirOwnEvent:
 
         assert entry.latency_seconds.value == pytest.approx(0.01)
 
-    def test_two_cache_hits_of_one_snapshot_get_distinct_identities(self):
-        """entry_id is a content hash, and acceptance rejects duplicate ids.
+    def test_two_identical_cache_hits_are_both_retained(self, tmp_path):
+        """Two hits can measure the same lookup time and hash alike.
 
-        Identical entries would make a journal containing an ordinary second
-        cache hit ineligible, even though both events were genuinely retained.
+        entry_id is a content hash, so identical events share one. The writer's
+        record_id carries the sequence number and stays distinct, which is what
+        the reader and the acceptance check key on. Keying on entry_id instead
+        would throw away an ordinary second cache hit.
         """
+        target = tmp_path / "shadow.ndjson"
         snapshot = _snapshot()
         result = _result(snapshot, cached=True)
-        first = shadow_entry_from_snapshot_result(snapshot, result, lookup_seconds=0.011)
-        second = shadow_entry_from_snapshot_result(snapshot, result, lookup_seconds=0.013)
+        writer = shadow_journal_writer_from_settings(_settings(path=str(target)))
+        writer.submit(shadow_entry_from_snapshot_result(snapshot, result, lookup_seconds=0.01))
+        writer.submit(shadow_entry_from_snapshot_result(snapshot, result, lookup_seconds=0.01))
+        closed = writer.close()
+        assert closed is True
 
-        assert first.entry_id != second.entry_id
+        records = load_shadow_journal(target)
+        assert len(records) == 2
+        assert records[0].entry.entry_id == records[1].entry.entry_id
+        assert records[0].record_id != records[1].record_id
 
     def test_a_fresh_review_still_reports_its_real_telemetry(self):
         snapshot = _snapshot()

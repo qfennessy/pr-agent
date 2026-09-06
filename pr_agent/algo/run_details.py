@@ -262,6 +262,10 @@ class RunDetails:
     total_tokens: int = 0
     # Successful LLM invocations, counted even when their token usage is unavailable.
     num_ai_calls: int = 0
+    # Successful calls that reported prompt, completion and total tokens. Compared
+    # against num_ai_calls it separates a full token count from a subtotal, the same
+    # way known_cost_call_count does for pricing.
+    known_usage_call_count: int = 0
     # Accumulate costs only when cost output is enabled and LiteLLM can synchronously
     # price a successful response with a positive amount. Use the known-call count to
     # distinguish priced calls from missing pricing data. Retain per-model totals to
@@ -306,6 +310,15 @@ class RunDetails:
         if self.known_cost_call_count == 0:
             return "unavailable"
         if self.known_cost_call_count == self.num_ai_calls:
+            return "complete"
+        return "partial"
+
+    @property
+    def usage_status(self) -> str:
+        """Return whether every, some, or none of the successful calls reported usage."""
+        if self.num_ai_calls == 0:
+            return "unavailable"
+        if self.known_usage_call_count == self.num_ai_calls:
             return "complete"
         return "partial"
 
@@ -918,7 +931,7 @@ def record_ai_call(
     target.num_ai_calls += 1
     if usage is not None:
         _add_token_usage(target, usage)
-        if isinstance(target, AdjudicationRunDetails) and _has_complete_token_usage(usage):
+        if isinstance(target, (AdjudicationRunDetails, RunDetails)) and _has_complete_token_usage(usage):
             target.known_usage_call_count += 1
     cost = _as_decimal_cost(cost_usd)
     if cost is not None:

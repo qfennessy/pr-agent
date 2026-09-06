@@ -318,6 +318,30 @@ def test_record_ai_call_marks_partial_and_unavailable_cost_without_fabricating_z
     assert details.model_costs_usd == {}
 
 
+def test_record_ai_call_marks_partial_token_usage_without_claiming_a_full_count():
+    """Publishing a subtotal with no verdict lets a consumer read it as the whole run."""
+    init_run_details()
+
+    record_ai_call(_Usage(30, 12, 42), model="known")
+    record_ai_call(None, model="unreported")
+
+    details = get_run_details()
+    assert details.total_tokens == 42
+    assert details.known_usage_call_count == 1
+    assert details.usage_status == "partial"
+
+    init_run_details()
+    record_ai_call(_Usage(30, 12, 42), model="known")
+    record_ai_call(_Usage(5, 1, 6), model="known")
+
+    details = get_run_details()
+    assert details.known_usage_call_count == 2
+    assert details.usage_status == "complete"
+
+    init_run_details()
+    assert get_run_details().usage_status == "unavailable"
+
+
 def test_specialist_usage_is_attributed_without_changing_primary_totals():
     init_run_details()
     record_model_used("main-model", is_fallback=False)

@@ -7476,10 +7476,8 @@ def test_prepare_review_publishes_provider_neutral_structured_data(monkeypatch):
         lambda *args, **kwargs: "## Review",
     )
 
-    from pr_agent.algo.run_details import add_token_usage, init_run_details
-
     init_run_details()
-    add_token_usage({"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42})
+    record_ai_call({"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42}, model="model-a")
 
     reviewer._prepare_pr_review()
 
@@ -7488,7 +7486,12 @@ def test_prepare_review_publishes_provider_neutral_structured_data(monkeypatch):
             "key_issues_to_review": [],
             "security_concerns": False,
         },
-        "usage": {"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42},
+        "usage": {
+            "prompt_tokens": 30,
+            "completion_tokens": 12,
+            "total_tokens": 42,
+            "status": "complete",
+        },
         "metadata": {"review_profile": "full", "omitted_files": [], "deleted_files": []},
     })
     # Assert key order to prove the snapshot is isolated: _prepare_pr_review moves
@@ -7497,6 +7500,43 @@ def test_prepare_review_publishes_provider_neutral_structured_data(monkeypatch):
     # (assert_called_once_with cannot catch this: dict equality ignores key order.)
     published = git_provider.publish_structured_review.call_args[0][0]
     assert list(published["review"].keys()) == ["key_issues_to_review", "security_concerns"]
+
+
+def test_structured_snapshot_marks_token_usage_partial_when_a_call_reports_none(monkeypatch):
+    """A subtotal published without a verdict reads as a full count downstream.
+
+    The shadow journal turns this dict into a measurement and treats a missing
+    status as complete, so a run where only some calls reported usage would be
+    recorded as the whole token cost.
+    """
+    git_provider = MagicMock()
+    git_provider.is_supported.return_value = False
+    git_provider.get_diff_files.return_value = []
+    reviewer = _make_prediction_reviewer(git_provider)
+    reviewer.prediction = """review:
+  key_issues_to_review: []
+  security_concerns: no
+"""
+    reviewer.incremental = SimpleNamespace(is_incremental=False)
+    reviewer.set_review_labels = MagicMock()
+    monkeypatch.setattr(
+        "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+        lambda *args, **kwargs: "## Review",
+    )
+
+    init_run_details()
+    record_ai_call({"prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42}, model="model-a")
+    record_ai_call(None, model="model-b")
+
+    reviewer._prepare_pr_review()
+
+    published = git_provider.publish_structured_review.call_args[0][0]
+    assert published["usage"] == {
+        "prompt_tokens": 30,
+        "completion_tokens": 12,
+        "total_tokens": 42,
+        "status": "partial",
+    }
 
 
 def test_prepare_review_sanitizes_candidate_verification_structured_data(monkeypatch):

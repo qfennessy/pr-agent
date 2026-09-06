@@ -854,8 +854,9 @@ def shadow_entry_from_snapshot_result(
     from cache. A cache hit makes no model request, so it carries the cached
     result's findings but must not carry the original request's cost, tokens or
     latency: repeating those would charge a historical call again on every hit
-    and distort the latency the gate reads. It also gives each hit distinct
-    content, so two hits of one snapshot do not collide on ``entry_id``.
+    and distort the latency the gate reads. Two hits of one snapshot may end up
+    with the same ``entry_id``; that is correct for a content hash, and the
+    writer's ``record_id`` is what keeps each record distinct.
     """
     review_state = getattr(getattr(result, "state", None), "value", None)
     result_state = _RESULT_STATE_BY_REVIEW_STATE.get(

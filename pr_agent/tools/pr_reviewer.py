@@ -2918,6 +2918,11 @@ class PRReviewer:
                 "prompt_tokens": details.prompt_tokens,
                 "completion_tokens": details.completion_tokens,
                 "total_tokens": details.total_tokens,
+                # RunDetails already knows whether every call reported usage.
+                # Without this the consumer sees a subtotal and no verdict, and
+                # has to guess that it is complete — the same mistake the cost
+                # field avoids by carrying its own status.
+                "status": details.usage_status,
             }
         structured_data["usage"] = usage
         structured_data["metadata"] = {

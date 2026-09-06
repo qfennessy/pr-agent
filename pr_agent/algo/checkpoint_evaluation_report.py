@@ -557,8 +557,13 @@ class ShadowPilotAcceptance:
         )
         for identity in (*record_ids, *entry_ids):
             _validate_hash("shadow pilot record identity", identity)
-        if len(record_ids) != len(set(record_ids)) or len(entry_ids) != len(set(entry_ids)):
-            raise EvaluationValidationError("shadow pilot record and entry identities must be unique")
+        # Only record_id has to be unique. It is stamped by the writer and includes the
+        # sequence number, so no two records can share one. entry_id is a content hash,
+        # and two reviews that genuinely produced the same content share it by design —
+        # two cache hits of one snapshot inside a single clock tick, for instance.
+        # Demanding distinct entry_ids would reject a correct journal.
+        if len(record_ids) != len(set(record_ids)):
+            raise EvaluationValidationError("shadow pilot record identities must be unique")
         object.__setattr__(self, "record_inventory", tuple(_freeze_json(item) for item in inventory))
         object.__setattr__(self, "journal_hash", content_hash({
             "record_inventory": inventory,
@@ -603,9 +608,8 @@ def build_shadow_pilot_acceptance(
     ):
         raise EvaluationValidationError("shadow journal records must remain in observed UTC order")
     record_ids = tuple(record.record_id for record in records)
-    entry_ids = tuple(record.entry.entry_id for record in records)
-    if len(record_ids) != len(set(record_ids)) or len(entry_ids) != len(set(entry_ids)):
-        raise EvaluationValidationError("shadow journal records and entries must be unique")
+    if len(record_ids) != len(set(record_ids)):
+        raise EvaluationValidationError("shadow journal records must be unique")
     target_arm = next(
         (arm for arm in manifest.arms if arm.arm_id == target_arm_id and arm.enabled),
         None,
