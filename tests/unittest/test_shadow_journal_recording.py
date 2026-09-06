@@ -398,3 +398,48 @@ class TestCacheHitsReportTheirOwnEvent:
 
         assert entry.tokens.value == pytest.approx(1200)
         assert entry.latency_seconds.value == pytest.approx(1.25)
+
+
+class TestARepositoryCannotChooseTheJournalDestination:
+    """shadow_journal_path names a host file the recorder creates and appends to."""
+
+    def test_the_section_is_host_only(self):
+        from pr_agent.config_security import REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION
+
+        assert "checkpoint_evaluation" in REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION
+        # Empty allowlist means every key in the section is dropped from
+        # repository settings, the same treatment push_outputs and otel get.
+        assert REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION["checkpoint_evaluation"] == frozenset()
+
+    def test_repo_settings_cannot_enable_recording_or_pick_a_path(self, tmp_path):
+        from pr_agent.config_security import REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION
+
+        allowed = REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION["checkpoint_evaluation"]
+        for key in (
+            "shadow_journal_enabled",
+            "shadow_journal_path",
+            "shadow_journal_max_queue_entries",
+            "allow_paid_execution",
+            "paid_cost_cap_usd",
+        ):
+            assert key not in allowed
+
+
+class TestRecordingDoesNotDelayTheResult:
+    """Opening the writer reads the whole journal and fsyncs a boundary."""
+
+    def test_every_record_call_follows_its_emit(self):
+        import inspect
+
+        from pr_agent import cli
+
+        source = inspect.getsource(cli._run_review_snapshot_impl)
+        emits = [i for i in range(len(source)) if source.startswith("_emit_snapshot_result(", i)]
+        records = [
+            i for i in range(len(source)) if source.startswith("_record_shadow_journal_entry(", i)
+        ]
+        assert emits and records
+        # Each recording happens after some emit, so a week-old journal never
+        # sits between the review finishing and the developer seeing it.
+        for record_at in records:
+            assert any(emit_at < record_at for emit_at in emits)

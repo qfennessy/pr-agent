@@ -1036,7 +1036,6 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             structured_review=None,
             started_at=monotonic(),
         )
-        _record_shadow_journal_entry(snapshot, stale_result)
         _emit_snapshot_result(
             stale_result,
             json_output,
@@ -1044,6 +1043,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             output_target_identities.get(json_output),
             repository_root,
         )
+        _record_shadow_journal_entry(snapshot, stale_result)
         return stale_result
     # Cached structured results cannot reproduce the exact Markdown rendering.
     # Bypass the cache when the caller explicitly requests that artifact.
@@ -1062,15 +1062,16 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             # It reports this lookup's own latency and zero spend, because no
             # model request was made — repeating the cached result's cost would
             # charge a historical call again on every hit.
-            _record_shadow_journal_entry(
-                snapshot, cached_result, lookup_seconds=monotonic() - lookup_started
-            )
+            lookup_seconds = monotonic() - lookup_started
             _emit_snapshot_result(
                 cached_result,
                 json_output,
                 output_parent_identities.get(json_output),
                 output_target_identities.get(json_output),
                 repository_root,
+            )
+            _record_shadow_journal_entry(
+                snapshot, cached_result, lookup_seconds=lookup_seconds
             )
             return cached_result
 
@@ -1172,7 +1173,6 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         started_at=started_at,
         error=review_error,
     )
-    _record_shadow_journal_entry(snapshot, result)
     if markdown_output and pending_markdown is None and result.state is ReviewResultState.NO_FINDINGS:
         pending_markdown = b"## PR Review\n\nNo findings.\n"
     if pending_markdown is not None and not pending_markdown.startswith(_SNAPSHOT_MARKDOWN_MARKER):
@@ -1202,6 +1202,11 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         output_target_identities.get(json_output),
         repository_root,
     )
+    # After the result is out. Opening the writer reads and validates the whole
+    # accumulated journal and fsyncs a session boundary, which is O(journal size)
+    # of blocking disk work. A week-old journal must not sit between the review
+    # finishing and the developer seeing it.
+    _record_shadow_journal_entry(snapshot, result)
     return result
 
 
