@@ -23,13 +23,14 @@ updates:
         update-types:
           - minor
           - patch
-    ignore:
-      # These are pinned deliberately and a bump needs a decision, not a merge.
-      # litellm is pinned exactly because two tests assert against the installed
-      # version, and the Docker image resolves its transitive tree from this pin.
-      - dependency-name: litellm
-      - dependency-name: openai
-      - dependency-name: anthropic
+    # No ignore list. An `ignore` entry suppresses security updates as well as
+    # version updates, so ignoring litellm, openai or anthropic here would hide
+    # advisories for the three most security-sensitive dependencies we have.
+    #
+    # litellm is pinned exactly, and two tests assert against the installed
+    # version, so a bump needs those tests updated in the same pull request. That
+    # is a reason to read the pull request carefully, not a reason to never see
+    # one. Close it if the bump is unwanted.
     labels:
       - dependencies
     commit-message:
