@@ -438,7 +438,11 @@ def _emit_snapshot_result(
     payload_data = result.to_dict()
     payload_data["artifact_type"] = _SNAPSHOT_ARTIFACT_TYPE
     payload = json.dumps(payload_data, ensure_ascii=True, sort_keys=True, indent=2) + "\n"
-    print(payload, end="")
+    # flush is not cosmetic here: a redirected or piped stdout is block-buffered,
+    # so without it the result would sit in the buffer while the recorder reads
+    # and fsyncs the journal, and a downstream consumer would wait on I/O the
+    # review is supposed to be independent of.
+    print(payload, end="", flush=True)
     if output_path:
         try:
             destination = Path(output_path)
@@ -802,6 +806,32 @@ _SHADOW_JOURNAL_UNOPENED = object()
 _shadow_journal_writer = _SHADOW_JOURNAL_UNOPENED
 
 
+def _shadow_recording_requested(settings) -> bool:
+    """Report the exact condition under which a journal writer would be opened."""
+    section = getattr(settings, "checkpoint_evaluation", None)
+    if section is None:
+        return False
+    if getattr(section, "shadow_journal_enabled", False) is not True:
+        return False
+    return bool(str(getattr(section, "shadow_journal_path", "") or "").strip())
+
+
+def _collect_cost_for_shadow_recording() -> None:
+    """Price model calls whenever their telemetry is going to be recorded.
+
+    LiteLLM computes a response cost only when config.output_run_cost or the
+    request's collect_cost is set, and both ship off. The live-shadow gate reads
+    cost per developer hour, so recording without pricing yields seven days of
+    entries whose cost is permanently unavailable -- collected, and then unusable.
+    Tying it to recording keeps that from depending on an operator finding a third
+    setting. Only collection is enabled; output_run_details stays as configured, so
+    this does not add a cost footer to a review that was not already rendering one.
+    """
+    if not _shadow_recording_requested(get_settings()):
+        return
+    get_settings().set("config.output_run_cost", True)
+
+
 def _record_shadow_journal_entry(snapshot, result, *, lookup_seconds=None) -> None:
     """Record one completed local review, if an operator asked for recording.
 
@@ -832,12 +862,12 @@ def _record_shadow_journal_entry(snapshot, result, *, lookup_seconds=None) -> No
 
 def _mark_shadow_journal_drop(exc: BaseException) -> None:
     try:
-        section = getattr(get_settings(), "checkpoint_evaluation", None)
-        if getattr(section, "shadow_journal_enabled", False) is not True:
+        settings = get_settings()
+        if not _shadow_recording_requested(settings):
             return
+        section = getattr(settings, "checkpoint_evaluation", None)
         path = str(getattr(section, "shadow_journal_path", "") or "").strip()
-        if path:
-            record_shadow_journal_drop(path, type(exc).__name__)
+        record_shadow_journal_drop(path, type(exc).__name__)
     except Exception:
         get_logger().debug("shadow journal drop was not marked", exc_info=True)
 
@@ -893,6 +923,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         outer_parser.error(str(exc))
     except Exception as exc:
         outer_parser.error(f"could not apply repository settings: {type(exc).__name__}")
+    _collect_cost_for_shadow_recording()
     settings = get_settings().get("local_pair_review", {}) or {}
     try:
         validated_limits = validate_local_pair_review_limits(settings)

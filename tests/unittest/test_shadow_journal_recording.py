@@ -452,3 +452,91 @@ class TestRecordingDoesNotDelayTheResult:
         # sits between the review finishing and the developer seeing it.
         for record_at in records:
             assert any(emit_at < record_at for emit_at in emits)
+
+    def test_the_result_is_flushed_before_the_recorder_can_run(self):
+        """Ordering alone is not enough when stdout is a pipe.
+
+        A redirected stdout is block-buffered, so an unflushed print would still
+        be sitting in the buffer while the recorder reads and fsyncs the journal.
+        """
+        import contextlib
+
+        from pr_agent import cli
+
+        flushed = []
+
+        class _BlockBufferedStdout:
+            def write(self, text):
+                return len(text)
+
+            def flush(self):
+                flushed.append(True)
+
+        result = SimpleNamespace(to_dict=lambda: {"state": "no_findings"})
+        with contextlib.redirect_stdout(_BlockBufferedStdout()):
+            cli._emit_snapshot_result(result, None)
+
+        assert flushed, "the snapshot result must be flushed, not left in the buffer"
+
+
+class TestRecordingImpliesPricing:
+    """The live-shadow gate reads cost per developer hour, so entries need a cost."""
+
+    def test_recording_turns_on_cost_collection(self, tmp_path):
+        from pr_agent import cli
+        from pr_agent.config_loader import get_settings
+
+        settings = get_settings()
+        original = settings.get("config.output_run_cost", False)
+        original_section = dict(settings.get("checkpoint_evaluation", {}) or {})
+        try:
+            settings.set("config.output_run_cost", False)
+            settings.set("checkpoint_evaluation.shadow_journal_enabled", True)
+            settings.set("checkpoint_evaluation.shadow_journal_path", str(tmp_path / "shadow.ndjson"))
+
+            cli._collect_cost_for_shadow_recording()
+
+            # Without this the journal records seven days of entries whose cost is
+            # permanently unavailable, and the gate can never read a cost per hour.
+            assert settings.get("config.output_run_cost") is True
+        finally:
+            settings.set("config.output_run_cost", original)
+            settings.set("checkpoint_evaluation", original_section, merge=False)
+
+    def test_pricing_stays_off_when_recording_is_off(self, tmp_path):
+        from pr_agent import cli
+        from pr_agent.config_loader import get_settings
+
+        settings = get_settings()
+        original = settings.get("config.output_run_cost", False)
+        original_section = dict(settings.get("checkpoint_evaluation", {}) or {})
+        try:
+            settings.set("config.output_run_cost", False)
+            settings.set("checkpoint_evaluation.shadow_journal_enabled", False)
+            settings.set("checkpoint_evaluation.shadow_journal_path", str(tmp_path / "shadow.ndjson"))
+            cli._collect_cost_for_shadow_recording()
+            assert settings.get("config.output_run_cost") is False
+
+            # Enabled but with no path opens no writer, so it must not price either.
+            settings.set("checkpoint_evaluation.shadow_journal_enabled", True)
+            settings.set("checkpoint_evaluation.shadow_journal_path", "")
+            cli._collect_cost_for_shadow_recording()
+            assert settings.get("config.output_run_cost") is False
+        finally:
+            settings.set("config.output_run_cost", original)
+            settings.set("checkpoint_evaluation", original_section, merge=False)
+
+    def test_the_predicate_matches_the_writer_it_stands_in_for(self, tmp_path):
+        """Two copies of this condition would eventually disagree."""
+
+        from pr_agent import cli
+
+        for enabled, path, expected in (
+            (True, str(tmp_path / "shadow.ndjson"), True),
+            (True, "", False),
+            (False, str(tmp_path / "shadow.ndjson"), False),
+            ("true", str(tmp_path / "shadow.ndjson"), False),
+        ):
+            settings = _settings(enabled=enabled, path=path)
+            assert cli._shadow_recording_requested(settings) is expected
+            assert (shadow_journal_writer_from_settings(settings) is not None) is expected
