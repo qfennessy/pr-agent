@@ -1079,14 +1079,22 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             structured_review=None,
             started_at=monotonic(),
         )
-        _emit_snapshot_result(
-            stale_result,
-            json_output,
-            output_parent_identities.get(json_output),
-            output_target_identities.get(json_output),
-            repository_root,
-        )
-        _record_shadow_journal_entry(snapshot, stale_result)
+        try:
+            _emit_snapshot_result(
+                stale_result,
+                json_output,
+                output_parent_identities.get(json_output),
+                output_target_identities.get(json_output),
+                repository_root,
+            )
+        finally:
+        # In a finally: the review is over, and for a model-backed run it is already
+        # paid for. A failure to publish must not also erase it, or the journal omits
+        # the event and its cost while still reporting a complete inventory.
+        # _record_shadow_journal_entry never raises, so this cannot mask the
+        # publication error, and on the success path recording still happens after
+        # the result is out.
+            _record_shadow_journal_entry(snapshot, stale_result)
         return stale_result
     # Cached structured results cannot reproduce the exact Markdown rendering.
     # Bypass the cache when the caller explicitly requests that artifact.
@@ -1106,16 +1114,24 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             # model request was made — repeating the cached result's cost would
             # charge a historical call again on every hit.
             lookup_seconds = monotonic() - lookup_started
-            _emit_snapshot_result(
-                cached_result,
-                json_output,
-                output_parent_identities.get(json_output),
-                output_target_identities.get(json_output),
-                repository_root,
-            )
-            _record_shadow_journal_entry(
-                snapshot, cached_result, lookup_seconds=lookup_seconds
-            )
+            try:
+                _emit_snapshot_result(
+                    cached_result,
+                    json_output,
+                    output_parent_identities.get(json_output),
+                    output_target_identities.get(json_output),
+                    repository_root,
+                )
+            finally:
+            # In a finally: the review is over, and for a model-backed run it is already
+            # paid for. A failure to publish must not also erase it, or the journal omits
+            # the event and its cost while still reporting a complete inventory.
+            # _record_shadow_journal_entry never raises, so this cannot mask the
+            # publication error, and on the success path recording still happens after
+            # the result is out.
+                _record_shadow_journal_entry(
+                    snapshot, cached_result, lookup_seconds=lookup_seconds
+                )
             return cached_result
 
     started_at = monotonic()
@@ -1222,34 +1238,42 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         pending_markdown = _SNAPSHOT_MARKDOWN_MARKER + pending_markdown
     if cache_enabled and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}:
         cache.write(result)
-    if (
-        markdown_output
-        and pending_markdown is not None
-        and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
-    ):
-        output_path = Path(markdown_output)
-        try:
-            _atomic_replace_bytes(
-                output_path,
-                pending_markdown,
-                output_parent_identities[markdown_output],
-                output_target_identities[markdown_output],
-                repository_root,
-            )
-        except (OSError, SnapshotCaptureError) as exc:
-            raise SnapshotCaptureError(f"could not publish --output '{markdown_output}': {exc}") from exc
-    _emit_snapshot_result(
-        result,
-        json_output,
-        output_parent_identities.get(json_output),
-        output_target_identities.get(json_output),
-        repository_root,
-    )
-    # After the result is out. Opening the writer reads and validates the whole
-    # accumulated journal and fsyncs a session boundary, which is O(journal size)
-    # of blocking disk work. A week-old journal must not sit between the review
-    # finishing and the developer seeing it.
-    _record_shadow_journal_entry(snapshot, result)
+    try:
+        if (
+            markdown_output
+            and pending_markdown is not None
+            and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
+        ):
+            output_path = Path(markdown_output)
+            try:
+                _atomic_replace_bytes(
+                    output_path,
+                    pending_markdown,
+                    output_parent_identities[markdown_output],
+                    output_target_identities[markdown_output],
+                    repository_root,
+                )
+            except (OSError, SnapshotCaptureError) as exc:
+                raise SnapshotCaptureError(f"could not publish --output '{markdown_output}': {exc}") from exc
+        _emit_snapshot_result(
+            result,
+            json_output,
+            output_parent_identities.get(json_output),
+            output_target_identities.get(json_output),
+            repository_root,
+        )
+    finally:
+        # Recording is last on the success path. Opening the writer reads and
+        # validates the whole accumulated journal and fsyncs a session boundary,
+        # which is O(journal size) of blocking disk work, and a week-old journal
+        # must not sit between the review finishing and the developer seeing it.
+        # In a finally: the review is over, and for a model-backed run it is already
+        # paid for. A failure to publish must not also erase it, or the journal omits
+        # the event and its cost while still reporting a complete inventory.
+        # _record_shadow_journal_entry never raises, so this cannot mask the
+        # publication error, and on the success path recording still happens after
+        # the result is out.
+        _record_shadow_journal_entry(snapshot, result)
     return result
 
 

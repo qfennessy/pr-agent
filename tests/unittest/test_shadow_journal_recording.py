@@ -479,6 +479,45 @@ class TestRecordingDoesNotDelayTheResult:
         assert flushed, "the snapshot result must be flushed, not left in the buffer"
 
 
+class TestAPaidReviewIsNeverLostToAFailedPublication:
+    """A review that ran and cost money must reach the journal or a drop marker."""
+
+    def test_every_emit_records_through_a_finally(self):
+        """Publication can raise between the review finishing and the recorder.
+
+        --output writes to a caller-supplied path and _emit_snapshot_result()
+        writes --json-output, so either can fail after the model was paid. Without
+        a finally the event has neither an entry nor a drop marker, and the
+        remaining journal still reports a complete inventory.
+        """
+        import inspect
+
+        from pr_agent import cli
+
+        lines = inspect.getsource(cli._run_review_snapshot_impl).splitlines()
+        emits = [i for i, line in enumerate(lines) if "_emit_snapshot_result(" in line]
+        records = [i for i, line in enumerate(lines) if "_record_shadow_journal_entry(" in line]
+        assert len(emits) == len(records) == 3
+
+        for emit_at, record_at in zip(emits, records, strict=True):
+            assert emit_at < record_at
+            between = lines[emit_at:record_at]
+            assert any(line.strip() == "finally:" for line in between), (
+                f"the emit at line {emit_at} does not record through a finally"
+            )
+
+    def test_the_recorder_cannot_mask_the_publication_error(self):
+        """A finally that raised would replace the real failure with its own."""
+        import inspect
+
+        from pr_agent import cli
+
+        source = inspect.getsource(cli._record_shadow_journal_entry)
+        assert "except Exception" in source
+        # Belt and braces: the behaviour itself is covered by
+        # TestRecordingNeverBreaksTheReview.
+
+
 class TestRecordingImpliesPricing:
     """The live-shadow gate reads cost per developer hour, so entries need a cost."""
 
