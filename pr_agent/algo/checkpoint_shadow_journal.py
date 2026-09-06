@@ -843,6 +843,7 @@ def shadow_entry_from_snapshot_result(
     result: Any,
     *,
     lookup_seconds: Optional[float] = None,
+    model_calls: Optional[int] = None,
 ) -> ShadowJournalEntry:
     """Build one source-free journal entry from a completed local review.
 
@@ -850,14 +851,30 @@ def shadow_entry_from_snapshot_result(
     reaches for source text, diffs, prompts, or provider request identifiers, and
     the entry type could not hold them if it did.
 
+    ``model_calls`` is how many provider requests this invocation actually made.
+    Zero means the cost and token counts are exactly zero rather than unknown --
+    a cache hit, a stale snapshot, or a diff with nothing to review. Recording
+    those as unavailable would make the gate's cost metric partial for an
+    ordinary invocation whose cost is precisely known. ``None`` means the caller
+    cannot say, and the reported mappings are used as-is.
+
     ``lookup_seconds`` is the wall time of *this* invocation when the review came
-    from cache. A cache hit makes no model request, so it carries the cached
-    result's findings but must not carry the original request's cost, tokens or
-    latency: repeating those would charge a historical call again on every hit
-    and distort the latency the gate reads. Two hits of one snapshot may end up
-    with the same ``entry_id``; that is correct for a content hash, and the
-    writer's ``record_id`` is what keeps each record distinct.
+    from cache, which is the latency the gate should read rather than the cached
+    result's original latency. Two hits of one snapshot may end up with the same
+    ``entry_id``; that is correct for a content hash, and the writer's
+    ``record_id`` is what keeps each record distinct.
     """
+    if model_calls is not None and (
+        isinstance(model_calls, bool) or not isinstance(model_calls, int) or model_calls < 0
+    ):
+        raise EvaluationValidationError("shadow model_calls must be a non-negative integer or None")
+    # Separate from lookup_seconds on purpose. Overloading one parameter with
+    # "this was a cache hit" and "nothing was spent" made every stale and
+    # empty-diff review record an unavailable cost it knew exactly.
+    #
+    # result.cached is included so this cannot regress if a caller passes only
+    # lookup_seconds: a served cache hit made no request whatever it was told.
+    no_provider_request = model_calls == 0 or bool(getattr(result, "cached", False))
     review_state = getattr(getattr(result, "state", None), "value", None)
     result_state = _RESULT_STATE_BY_REVIEW_STATE.get(
         review_state, EvaluationRunState.COVERAGE_UNAVAILABLE
@@ -886,17 +903,17 @@ def shadow_entry_from_snapshot_result(
             if lookup_seconds is None
             else _measurement(lookup_seconds)
         ),
-        # A cache hit consumed nothing from the provider. Zero is the measured
-        # truth for this invocation, not missing data.
+        # An invocation that made no provider request consumed nothing. Zero is
+        # the measured truth here, not missing data.
         tokens=(
-            _measurement(usage.get("total_tokens"), usage.get("status"))
-            if lookup_seconds is None
-            else NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+            NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+            if no_provider_request
+            else _measurement(usage.get("total_tokens"), usage.get("status"))
         ),
         cost_usd=(
-            _measurement(cost.get("total_usd"), cost.get("status"))
-            if lookup_seconds is None
-            else NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+            NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+            if no_provider_request
+            else _measurement(cost.get("total_usd"), cost.get("status"))
         ),
         cached=bool(result.cached),
     )

@@ -9,7 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from pr_agent.algo.checkpoint_evaluation import EvaluationRunState, MeasurementStatus
+from pr_agent.algo.checkpoint_evaluation import (
+    EvaluationRunState,
+    EvaluationValidationError,
+    MeasurementStatus,
+)
 from pr_agent.algo.checkpoint_shadow_journal import (
     load_shadow_journal,
     record_shadow_journal_drop,
@@ -477,6 +481,78 @@ class TestRecordingDoesNotDelayTheResult:
             cli._emit_snapshot_result(result, None)
 
         assert flushed, "the snapshot result must be flushed, not left in the buffer"
+
+
+class TestAReviewThatSpentNothingSaysSoExactly:
+    """The gate needs a complete cost on every record to compute cost per hour."""
+
+    def test_a_model_free_review_records_a_complete_zero(self):
+        """A stale snapshot or an empty diff makes no request, so its cost is zero.
+
+        Recording that as unavailable would make the gate's cost metric partial
+        for an ordinary invocation whose cost is precisely known.
+        """
+        snapshot = _snapshot()
+        result = _result(snapshot, usage={}, cost={})
+        entry = shadow_entry_from_snapshot_result(snapshot, result, model_calls=0)
+
+        assert entry.cost_usd.status is MeasurementStatus.COMPLETE
+        assert entry.cost_usd.value == 0.0
+        assert entry.tokens.status is MeasurementStatus.COMPLETE
+        assert entry.tokens.value == 0.0
+
+    def test_an_unknown_call_count_still_reports_what_was_measured(self):
+        """None means the caller cannot say, which is not the same as zero."""
+        snapshot = _snapshot()
+        entry = shadow_entry_from_snapshot_result(snapshot, _result(snapshot))
+
+        assert entry.tokens.value == pytest.approx(1200)
+
+    def test_a_cache_hit_reports_zero_even_without_the_count(self):
+        """result.cached is authoritative, so a caller cannot reintroduce the bug."""
+        snapshot = _snapshot()
+        result = _result(
+            snapshot,
+            cached=True,
+            usage={"total_tokens": 1200},
+            cost={"total_usd": "0.0042", "status": "complete"},
+        )
+        entry = shadow_entry_from_snapshot_result(snapshot, result, lookup_seconds=0.01)
+
+        assert entry.cost_usd.value == 0.0
+        assert entry.tokens.value == 0.0
+
+    def test_a_nonsense_call_count_is_refused(self):
+        snapshot = _snapshot()
+        for bad in (-1, True, 1.5, "0"):
+            with pytest.raises(EvaluationValidationError):
+                shadow_entry_from_snapshot_result(snapshot, _result(snapshot), model_calls=bad)
+
+    def test_the_review_path_reports_the_count_it_measured(self):
+        """num_ai_calls is the only thing that knows an empty diff made no request."""
+        import inspect
+
+        from pr_agent import cli
+
+        source = inspect.getsource(cli._run_review_snapshot_impl)
+        assert "model_calls=None if details is None else details.num_ai_calls" in source
+        # The two short-circuits never reach a provider at all.
+        assert source.count("model_calls=0") == 2
+
+
+class TestStagingFailureIsVisible:
+    """Staging happens after the model runs and before a result exists."""
+
+    def test_a_failed_staging_read_marks_a_drop(self):
+        """There is no result to record, so the marker is the only record of it."""
+        import inspect
+
+        from pr_agent import cli
+
+        lines = inspect.getsource(cli._run_review_snapshot_impl).splitlines()
+        staging = next(i for i, line in enumerate(lines) if "could not stage --output" in line)
+        window = "\n".join(lines[max(0, staging - 8):staging])
+        assert "_mark_shadow_journal_drop(exc)" in window
 
 
 class TestAPaidReviewIsNeverLostToAFailedPublication:

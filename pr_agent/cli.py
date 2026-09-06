@@ -845,7 +845,7 @@ def _collect_cost_for_shadow_recording() -> None:
     get_settings().set("config.output_run_cost", True)
 
 
-def _record_shadow_journal_entry(snapshot, result, *, lookup_seconds=None) -> None:
+def _record_shadow_journal_entry(snapshot, result, *, lookup_seconds=None, model_calls=None) -> None:
     """Record one completed local review, if an operator asked for recording.
 
     Observational only. A recording failure must never change, delay, or fail a
@@ -861,7 +861,7 @@ def _record_shadow_journal_entry(snapshot, result, *, lookup_seconds=None) -> No
             return
         _shadow_journal_writer.submit(
             shadow_entry_from_snapshot_result(
-                snapshot, result, lookup_seconds=lookup_seconds
+                snapshot, result, lookup_seconds=lookup_seconds, model_calls=model_calls
             )
         )
     except Exception as exc:
@@ -1094,7 +1094,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         # _record_shadow_journal_entry never raises, so this cannot mask the
         # publication error, and on the success path recording still happens after
         # the result is out.
-            _record_shadow_journal_entry(snapshot, stale_result)
+            _record_shadow_journal_entry(snapshot, stale_result, model_calls=0)
         return stale_result
     # Cached structured results cannot reproduce the exact Markdown rendering.
     # Bypass the cache when the caller explicitly requests that artifact.
@@ -1130,7 +1130,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             # publication error, and on the success path recording still happens after
             # the result is out.
                 _record_shadow_journal_entry(
-                    snapshot, cached_result, lookup_seconds=lookup_seconds
+                    snapshot, cached_result, lookup_seconds=lookup_seconds, model_calls=0
                 )
             return cached_result
 
@@ -1211,6 +1211,11 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
                 try:
                     pending_markdown = markdown_path.read_bytes()
                 except OSError as exc:
+                    # The model has already run. There is no result to record yet,
+                    # so a drop marker is the only thing that keeps this review
+                    # visible; without it the journal reads as a complete
+                    # inventory that silently omits a paid event.
+                    _mark_shadow_journal_drop(exc)
                     raise SnapshotCaptureError(
                         f"could not stage --output '{markdown_output}': {exc}"
                     ) from exc
@@ -1278,7 +1283,11 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         # _record_shadow_journal_entry never raises, so this cannot mask the
         # publication error, and on the success path recording still happens after
         # the result is out.
-        _record_shadow_journal_entry(snapshot, result)
+        _record_shadow_journal_entry(
+            snapshot,
+            result,
+            model_calls=None if details is None else details.num_ai_calls,
+        )
     return result
 
 
