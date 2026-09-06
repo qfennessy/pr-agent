@@ -816,6 +816,19 @@ def _shadow_recording_requested(settings) -> bool:
     return bool(str(getattr(section, "shadow_journal_path", "") or "").strip())
 
 
+def _apply_snapshot_repository_settings(repository_root) -> None:
+    """Rebuild the repository settings layer, then reapply what recording implies.
+
+    Both the initial configuration capture and every recapture go through here.
+    A recapture restores the invocation baseline first, and that baseline predates
+    anything recording switches on, so applying those at only one of the two sites
+    makes the two hashes disagree -- every recorded review would then look stale
+    and return without calling the model.
+    """
+    apply_local_repo_settings(repository_root)
+    _collect_cost_for_shadow_recording()
+
+
 def _collect_cost_for_shadow_recording() -> None:
     """Price model calls whenever their telemetry is going to be recorded.
 
@@ -918,12 +931,11 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     invocation_extra_config = get_settings().get("CONFIG.EXTRA_CONFIG_URL", None)
     try:
         repository_root = find_repository_root()
-        apply_local_repo_settings(repository_root)
+        _apply_snapshot_repository_settings(repository_root)
     except SnapshotCaptureError as exc:
         outer_parser.error(str(exc))
     except Exception as exc:
         outer_parser.error(f"could not apply repository settings: {type(exc).__name__}")
-    _collect_cost_for_shadow_recording()
     settings = get_settings().get("local_pair_review", {}) or {}
     try:
         validated_limits = validate_local_pair_review_limits(settings)
@@ -1030,7 +1042,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             # from the start of the review. The invocation baseline retains CLI/env
             # precedence, including the original extra-config source.
             _restore_all_settings(configuration_baseline)
-            apply_local_repo_settings(repository_root)
+            _apply_snapshot_repository_settings(repository_root)
             current_exclusions = _configured_snapshot_exclusions(
                 get_settings().get("local_pair_review", {}) or {}
             )

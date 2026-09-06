@@ -540,3 +540,53 @@ class TestRecordingImpliesPricing:
             settings = _settings(enabled=enabled, path=path)
             assert cli._shadow_recording_requested(settings) is expected
             assert (shadow_journal_writer_from_settings(settings) is not None) is expected
+
+    def test_the_pricing_flag_is_part_of_the_configuration_identity(self, tmp_path):
+        """This is why the flag has to be reapplied, not just applied once.
+
+        output_run_cost is not among the hash's transient config keys, so turning
+        it on changes the snapshot's configuration identity.
+        """
+        from pr_agent import cli
+        from pr_agent.algo.review_configuration import snapshot_review_configuration_hash
+        from pr_agent.config_loader import get_settings
+
+        entry_state = cli._snapshot_all_settings()
+        try:
+            get_settings().set("config.output_run_cost", False)
+            without = snapshot_review_configuration_hash("skills", {})
+            get_settings().set("config.output_run_cost", True)
+            with_pricing = snapshot_review_configuration_hash("skills", {})
+
+            assert without != with_pricing
+        finally:
+            cli._restore_all_settings(entry_state)
+
+    def test_every_repository_settings_rebuild_reapplies_it(self):
+        """A recapture restores the invocation baseline, which predates the flag.
+
+        current_configuration_hash() rebuilds the repository layer on every
+        staleness check. If that path calls apply_local_repo_settings() directly,
+        pricing is not reapplied, the recapture hashes a different configuration
+        than the initial capture, and the review is judged stale and returns
+        without ever calling the model.
+        """
+        import inspect
+
+        from pr_agent import cli
+
+        source = inspect.getsource(cli._run_review_snapshot_impl)
+        assert "_apply_snapshot_repository_settings(" in source
+        bare_calls = [
+            line.strip()
+            for line in source.splitlines()
+            if "apply_local_repo_settings(" in line
+            and "_apply_snapshot_repository_settings(" not in line
+        ]
+        assert bare_calls == [], f"these bypass the shared helper: {bare_calls}"
+
+        # The helper is the only thing allowed to rebuild that layer, so it must
+        # be the thing that reapplies what recording implies.
+        helper = inspect.getsource(cli._apply_snapshot_repository_settings)
+        assert "apply_local_repo_settings(" in helper
+        assert "_collect_cost_for_shadow_recording()" in helper
