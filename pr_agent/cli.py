@@ -802,7 +802,7 @@ _SHADOW_JOURNAL_UNOPENED = object()
 _shadow_journal_writer = _SHADOW_JOURNAL_UNOPENED
 
 
-def _record_shadow_journal_entry(snapshot, result) -> None:
+def _record_shadow_journal_entry(snapshot, result, *, lookup_seconds=None) -> None:
     """Record one completed local review, if an operator asked for recording.
 
     Observational only. A recording failure must never change, delay, or fail a
@@ -816,7 +816,11 @@ def _record_shadow_journal_entry(snapshot, result) -> None:
             _shadow_journal_writer = shadow_journal_writer_from_settings(get_settings())
         if _shadow_journal_writer is None:
             return
-        _shadow_journal_writer.submit(shadow_entry_from_snapshot_result(snapshot, result))
+        _shadow_journal_writer.submit(
+            shadow_entry_from_snapshot_result(
+                snapshot, result, lookup_seconds=lookup_seconds
+            )
+        )
     except Exception as exc:
         get_logger().debug("shadow journal entry was not recorded", exc_info=True)
         # Recording was asked for and did not happen, most often because another
@@ -1049,12 +1053,18 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         and current is not None
         and current.snapshot_id == snapshot.snapshot_id
     ):
+        lookup_started = monotonic()
         cached_result = cache.read(snapshot.snapshot_id, snapshot=snapshot)
         if cached_result is not None:
             # A cache hit is still a review the developer asked for and received.
             # Skipping it would understate event counts and shorten the observed
             # span; the entry carries `cached` so the difference stays visible.
-            _record_shadow_journal_entry(snapshot, cached_result)
+            # It reports this lookup's own latency and zero spend, because no
+            # model request was made — repeating the cached result's cost would
+            # charge a historical call again on every hit.
+            _record_shadow_journal_entry(
+                snapshot, cached_result, lookup_seconds=monotonic() - lookup_started
+            )
             _emit_snapshot_result(
                 cached_result,
                 json_output,

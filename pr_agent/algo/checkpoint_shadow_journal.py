@@ -838,12 +838,24 @@ def _measurement(value: object, reported_status: object = None) -> NumericMeasur
     return NumericMeasurement(status, float(value))
 
 
-def shadow_entry_from_snapshot_result(snapshot: Any, result: Any) -> ShadowJournalEntry:
+def shadow_entry_from_snapshot_result(
+    snapshot: Any,
+    result: Any,
+    *,
+    lookup_seconds: Optional[float] = None,
+) -> ShadowJournalEntry:
     """Build one source-free journal entry from a completed local review.
 
     Reads only what the snapshot and its result already carry. Nothing here
     reaches for source text, diffs, prompts, or provider request identifiers, and
     the entry type could not hold them if it did.
+
+    ``lookup_seconds`` is the wall time of *this* invocation when the review came
+    from cache. A cache hit makes no model request, so it carries the cached
+    result's findings but must not carry the original request's cost, tokens or
+    latency: repeating those would charge a historical call again on every hit
+    and distort the latency the gate reads. It also gives each hit distinct
+    content, so two hits of one snapshot do not collide on ``entry_id``.
     """
     review_state = getattr(getattr(result, "state", None), "value", None)
     result_state = _RESULT_STATE_BY_REVIEW_STATE.get(
@@ -868,9 +880,23 @@ def shadow_entry_from_snapshot_result(snapshot: Any, result: Any) -> ShadowJourn
         result_state=result_state,
         parent_snapshot_id=snapshot.parent_snapshot_id,
         coverage_status=coverage_status,
-        latency_seconds=_measurement(result.latency_seconds),
-        tokens=_measurement(usage.get("total_tokens"), usage.get("status")),
-        cost_usd=_measurement(cost.get("total_usd"), cost.get("status")),
+        latency_seconds=(
+            _measurement(result.latency_seconds)
+            if lookup_seconds is None
+            else _measurement(lookup_seconds)
+        ),
+        # A cache hit consumed nothing from the provider. Zero is the measured
+        # truth for this invocation, not missing data.
+        tokens=(
+            _measurement(usage.get("total_tokens"), usage.get("status"))
+            if lookup_seconds is None
+            else NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+        ),
+        cost_usd=(
+            _measurement(cost.get("total_usd"), cost.get("status"))
+            if lookup_seconds is None
+            else NumericMeasurement(MeasurementStatus.COMPLETE, 0.0)
+        ),
         cached=bool(result.cached),
     )
 

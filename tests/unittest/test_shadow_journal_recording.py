@@ -348,3 +348,53 @@ class TestCacheHitsAreRecorded:
         )
 
         assert entry.cached is True
+
+
+class TestCacheHitsReportTheirOwnEvent:
+    """A cache hit made no model request, and is a distinct event from the last."""
+
+    def test_a_cache_hit_reports_zero_spend_not_the_cached_cost(self):
+        snapshot = _snapshot()
+        result = _result(
+            snapshot,
+            cached=True,
+            usage={"total_tokens": 1200},
+            cost={"total_usd": "0.0042", "status": "complete"},
+            latency_seconds=42.0,
+        )
+        entry = shadow_entry_from_snapshot_result(snapshot, result, lookup_seconds=0.01)
+
+        # Zero is measured truth here, not missing data: this invocation spent
+        # nothing. Repeating the cached cost would charge a historical call again
+        # on every hit and inflate cost per developer hour.
+        assert entry.tokens.status is MeasurementStatus.COMPLETE
+        assert entry.tokens.value == 0.0
+        assert entry.cost_usd.status is MeasurementStatus.COMPLETE
+        assert entry.cost_usd.value == 0.0
+
+    def test_a_cache_hit_reports_this_lookup_not_the_original_latency(self):
+        snapshot = _snapshot()
+        result = _result(snapshot, cached=True, latency_seconds=42.0)
+        entry = shadow_entry_from_snapshot_result(snapshot, result, lookup_seconds=0.01)
+
+        assert entry.latency_seconds.value == pytest.approx(0.01)
+
+    def test_two_cache_hits_of_one_snapshot_get_distinct_identities(self):
+        """entry_id is a content hash, and acceptance rejects duplicate ids.
+
+        Identical entries would make a journal containing an ordinary second
+        cache hit ineligible, even though both events were genuinely retained.
+        """
+        snapshot = _snapshot()
+        result = _result(snapshot, cached=True)
+        first = shadow_entry_from_snapshot_result(snapshot, result, lookup_seconds=0.011)
+        second = shadow_entry_from_snapshot_result(snapshot, result, lookup_seconds=0.013)
+
+        assert first.entry_id != second.entry_id
+
+    def test_a_fresh_review_still_reports_its_real_telemetry(self):
+        snapshot = _snapshot()
+        entry = shadow_entry_from_snapshot_result(snapshot, _result(snapshot))
+
+        assert entry.tokens.value == pytest.approx(1200)
+        assert entry.latency_seconds.value == pytest.approx(1.25)
