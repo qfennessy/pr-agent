@@ -286,6 +286,14 @@ opened and no file is created, which is the shipped default. Nothing else
 produces entries: hosted pull-request review does not, and neither does the
 production evaluation runner.
 
+Enabling recording also enables `config.output_run_cost` for that run. LiteLLM
+prices a call only when that setting is on, and it ships off, so recording
+without it would produce entries whose cost is permanently unavailable — while
+the live-shadow gate reads cost per developer hour. This is applied after
+repository settings, so a repository cannot switch pricing off for a run the
+host asked to record. Only collection is enabled; `output_run_details` is left
+as configured, so no review gains a cost footer it was not already rendering.
+
 The recorder is observational. It cannot change routing, findings, or output, and
 a failure to record is logged and dropped rather than raised, so a review is never
 delayed or failed by telemetry. Only what the snapshot and its result already hold
