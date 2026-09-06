@@ -1232,13 +1232,18 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         started_at=started_at,
         error=review_error,
     )
-    if markdown_output and pending_markdown is None and result.state is ReviewResultState.NO_FINDINGS:
-        pending_markdown = b"## PR Review\n\nNo findings.\n"
-    if pending_markdown is not None and not pending_markdown.startswith(_SNAPSHOT_MARKDOWN_MARKER):
-        pending_markdown = _SNAPSHOT_MARKDOWN_MARKER + pending_markdown
-    if cache_enabled and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}:
-        cache.write(result)
+    # Everything from here to the finally can raise after the model has been paid:
+    # cache.write() touches .git/pr-agent, --output writes a caller-supplied path,
+    # and _emit_snapshot_result() writes --json-output. The review exists from this
+    # point on, so it has to reach the journal or a drop marker whichever of them
+    # fails.
     try:
+        if markdown_output and pending_markdown is None and result.state is ReviewResultState.NO_FINDINGS:
+            pending_markdown = b"## PR Review\n\nNo findings.\n"
+        if pending_markdown is not None and not pending_markdown.startswith(_SNAPSHOT_MARKDOWN_MARKER):
+            pending_markdown = _SNAPSHOT_MARKDOWN_MARKER + pending_markdown
+        if cache_enabled and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}:
+            cache.write(result)
         if (
             markdown_output
             and pending_markdown is not None

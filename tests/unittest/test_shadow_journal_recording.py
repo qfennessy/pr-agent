@@ -495,16 +495,40 @@ class TestAPaidReviewIsNeverLostToAFailedPublication:
         from pr_agent import cli
 
         lines = inspect.getsource(cli._run_review_snapshot_impl).splitlines()
-        emits = [i for i, line in enumerate(lines) if "_emit_snapshot_result(" in line]
-        records = [i for i, line in enumerate(lines) if "_record_shadow_journal_entry(" in line]
+        # Comments name these functions too, and a mention is not a call site.
+        code = [line for line in lines if not line.strip().startswith("#")]
+        emits = [i for i, line in enumerate(code) if "_emit_snapshot_result(" in line]
+        records = [i for i, line in enumerate(code) if "_record_shadow_journal_entry(" in line]
         assert len(emits) == len(records) == 3
 
         for emit_at, record_at in zip(emits, records, strict=True):
             assert emit_at < record_at
-            between = lines[emit_at:record_at]
+            between = code[emit_at:record_at]
             assert any(line.strip() == "finally:" for line in between), (
                 f"the emit at line {emit_at} does not record through a finally"
             )
+
+    def test_everything_after_the_model_call_is_inside_the_protected_region(self):
+        """The paid review exists from build_snapshot_result() onward.
+
+        Three things between there and the recorder write to disk and can fail:
+        cache.write() into .git/pr-agent, --output through _atomic_replace_bytes(),
+        and --json-output through _emit_snapshot_result(). Any one of them raising
+        outside the try loses the event and its cost while an older surviving
+        journal still reads as a complete inventory.
+        """
+        import inspect
+
+        from pr_agent import cli
+
+        lines = inspect.getsource(cli._run_review_snapshot_impl).splitlines()
+        opens = [i for i, line in enumerate(lines) if line == "    try:"]
+        closes = [i for i, line in enumerate(lines) if line == "    finally:"]
+        assert opens and closes
+        protected = "\n".join(lines[opens[-1]:closes[-1]])
+
+        for statement in ("cache.write(", "_atomic_replace_bytes(", "_emit_snapshot_result("):
+            assert statement in protected, f"{statement} can lose a paid review"
 
     def test_the_recorder_cannot_mask_the_publication_error(self):
         """A finally that raised would replace the real failure with its own."""
