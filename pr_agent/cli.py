@@ -1138,6 +1138,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     details = None
     pending_markdown = None
     review_attempted = False
+    review_recorded = False
     # One guard for the whole span between the provider call and the recorder.
     # Publication, cache persistence and markdown staging were each fixed
     # individually and each time something one step earlier was still exposed:
@@ -1283,20 +1284,24 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             # validates the whole accumulated journal and fsyncs a session boundary,
             # which is O(journal size) of blocking disk work, and a week-old journal
             # must not sit between the review finishing and the developer seeing it.
-            # In a finally: the review is over, and for a model-backed run it is already
-            # paid for. A failure to publish must not also erase it, or the journal omits
-            # the event and its cost while still reporting a complete inventory.
+            # In a finally: the review is over, and for a model-backed run it is
+            # already paid for. A failure to publish must not also erase it, or the
+            # journal omits the event while still reporting a complete inventory.
             # _record_shadow_journal_entry never raises, so this cannot mask the
-            # publication error, and on the success path recording still happens after
-            # the result is out.
+            # publication error.
             _record_shadow_journal_entry(
                 snapshot,
                 result,
                 model_calls=None if details is None else details.num_ai_calls,
             )
+            # Reached only because the recorder cannot raise. It handles and marks
+            # its own failures, so past this point the outer guard has nothing to
+            # add -- and a marker written on top of a retained entry would seal a
+            # complete journal that reports itself incomplete forever.
+            review_recorded = True
         return result
     except BaseException as exc:
-        if review_attempted:
+        if review_attempted and not review_recorded:
             # Marking is contained and never raises, so it cannot replace the
             # real failure with one of its own.
             _mark_shadow_journal_drop(exc)

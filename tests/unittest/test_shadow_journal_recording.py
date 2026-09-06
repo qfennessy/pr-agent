@@ -586,7 +586,28 @@ class TestNothingBetweenTheModelAndTheRecorderIsUnguarded:
         source = inspect.getsource(cli._run_review_snapshot_impl)
         assert "review_attempted = False" in source
         assert "review_attempted = True" in source
-        assert "if review_attempted:" in source
+        assert "if review_attempted and not review_recorded:" in source
+
+    def test_a_retained_entry_is_never_also_marked_as_dropped(self):
+        """The marker is a file, so a false one poisons the journal permanently.
+
+        Publication failing after the inner finally has already queued the entry
+        would otherwise seal a journal that holds the event and reports itself
+        incomplete for good.
+        """
+        import inspect
+
+        from pr_agent import cli
+
+        lines = inspect.getsource(cli._run_review_snapshot_impl).splitlines()
+        record_at = max(i for i, line in enumerate(lines) if "_record_shadow_journal_entry(" in line)
+        after = [line.strip() for line in lines[record_at:] if line.strip()]
+        assert "review_recorded = True" in after, "recording success is not tracked"
+
+        guard = next(i for i, line in enumerate(lines) if line.strip() == "except BaseException as exc:")
+        condition = lines[guard + 1].strip()
+        assert condition == "if review_attempted and not review_recorded:", condition
+        assert "review_recorded = False" in "\n".join(lines[:guard])
 
     def test_marking_a_drop_cannot_replace_the_real_failure(self):
         import inspect
