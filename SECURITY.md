@@ -75,7 +75,12 @@ gh attestation verify \
 
 We take the security of PR-Agent seriously. If you discover a security vulnerability, please report it privately through GitHub's private vulnerability reporting, which is enabled on this repository:
 
-[**Report a vulnerability**](https://github.com/The-PR-Agent/pr-agent/security/advisories/new)
+[**Report a vulnerability in this fork**](https://github.com/qfennessy/pr-agent/security/advisories/new)
+
+This fork carries substantial code that upstream does not have, so a vulnerability
+in fork-only code cannot be fixed by reporting it upstream. If the vulnerability is
+in code inherited from upstream and present there too, please also report it to
+[The-PR-Agent/pr-agent](https://github.com/The-PR-Agent/pr-agent/security/advisories/new).
 
 Please include a description of the vulnerability, steps to reproduce, and the affected PR-Agent version.
 

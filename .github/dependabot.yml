@@ -1,0 +1,67 @@
+# Scheduled dependency updates. Security updates are separate and are enabled in
+# the repository settings; they open pull requests as soon as an advisory lands,
+# regardless of this schedule.
+#
+# Everything here is grouped. Ungrouped updates open one pull request per package,
+# which on a repository with this many dependencies buries real review work under
+# version bumps.
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      # One pull request for routine bumps. Anything that changes a major version
+      # is excluded so it arrives on its own and gets read properly.
+      python-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # No ignore list. An `ignore` entry suppresses security updates as well as
+    # version updates, so ignoring litellm, openai or anthropic here would hide
+    # advisories for the three most security-sensitive dependencies we have.
+    #
+    # litellm is pinned exactly, and two tests assert against the installed
+    # version, so a bump needs those tests updated in the same pull request. That
+    # is a reason to read the pull request carefully, not a reason to never see
+    # one. Close it if the bump is unwanted.
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore(deps)
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore(deps)
+
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      docker:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore(deps)
