@@ -1123,12 +1123,10 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
                     repository_root,
                 )
             finally:
-            # In a finally: the review is over, and for a model-backed run it is already
-            # paid for. A failure to publish must not also erase it, or the journal omits
-            # the event and its cost while still reporting a complete inventory.
-            # _record_shadow_journal_entry never raises, so this cannot mask the
-            # publication error, and on the success path recording still happens after
-            # the result is out.
+                # The review is over. A failure to publish must not also erase it,
+                # or the journal omits the event while still reporting a complete
+                # inventory. _record_shadow_journal_entry never raises, so this
+                # cannot mask the publication error.
                 _record_shadow_journal_entry(
                     snapshot, cached_result, lookup_seconds=lookup_seconds, model_calls=0
                 )
@@ -1139,156 +1137,170 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     review_error = None
     details = None
     pending_markdown = None
-    if snapshot.diff.strip():
-        with tempfile.TemporaryDirectory(prefix="pr-agent-snapshot-") as temp_dir:
-            structured_path = Path(temp_dir) / "review.json"
-            markdown_path = Path(temp_dir) / "review.md" if markdown_output else None
-            original_provider_settings = _snapshot_settings(_SNAPSHOT_PROVIDER_SETTINGS)
-            get_settings().set("config.git_provider", "plain-diff")
-            get_settings().set("plain_diff.content", snapshot.diff)
-            get_settings().set("plain_diff.output_path", str(markdown_path) if markdown_path else None)
-            get_settings().set("plain_diff.json_output_path", str(structured_path))
-            get_settings().set("plain_diff.suppress_stdout", True)
-            get_settings().set("plain_diff.disable_working_tree_enrichment", True)
-            get_settings().set("plain_diff.repo_context_files", repo_context_files)
-            get_settings().set("config.publish_output", True)
-            get_settings().set("config.propagate_tool_errors", True)
-            get_settings().set("pr_reviewer.extra_instructions", _snapshot_review_instructions(snapshot))
+    review_attempted = False
+    # One guard for the whole span between the provider call and the recorder.
+    # Publication, cache persistence and markdown staging were each fixed
+    # individually and each time something one step earlier was still exposed:
+    # temporary-directory cleanup, a recapture raising other than
+    # SnapshotCaptureError, a structured review that is valid JSON but not an
+    # object, build_snapshot_result() itself. Any of them escaping loses the
+    # review, and an older surviving journal then reads as a complete inventory
+    # that silently omits it.
+    try:
+        if snapshot.diff.strip():
+            with tempfile.TemporaryDirectory(prefix="pr-agent-snapshot-") as temp_dir:
+                structured_path = Path(temp_dir) / "review.json"
+                markdown_path = Path(temp_dir) / "review.md" if markdown_output else None
+                original_provider_settings = _snapshot_settings(_SNAPSHOT_PROVIDER_SETTINGS)
+                get_settings().set("config.git_provider", "plain-diff")
+                get_settings().set("plain_diff.content", snapshot.diff)
+                get_settings().set("plain_diff.output_path", str(markdown_path) if markdown_path else None)
+                get_settings().set("plain_diff.json_output_path", str(structured_path))
+                get_settings().set("plain_diff.suppress_stdout", True)
+                get_settings().set("plain_diff.disable_working_tree_enrichment", True)
+                get_settings().set("plain_diff.repo_context_files", repo_context_files)
+                get_settings().set("config.publish_output", True)
+                get_settings().set("config.propagate_tool_errors", True)
+                get_settings().set("pr_reviewer.extra_instructions", _snapshot_review_instructions(snapshot))
 
-            async def inner():
-                try:
-                    await PRAgent()._handle_request("local_snapshot", ["review"])
-                finally:
-                    if litellm_callbacks_registered():
-                        await drain_litellm_callbacks(
-                            get_settings().litellm.get(
-                                "callback_timeout_seconds", DEFAULT_CALLBACK_TIMEOUT_SECONDS
+                async def inner():
+                    try:
+                        await PRAgent()._handle_request("local_snapshot", ["review"])
+                    finally:
+                        if litellm_callbacks_registered():
+                            await drain_litellm_callbacks(
+                                get_settings().litellm.get(
+                                    "callback_timeout_seconds", DEFAULT_CALLBACK_TIMEOUT_SECONDS
+                                )
                             )
-                        )
-                return get_run_details()
+                    return get_run_details()
 
-            try:
                 try:
-                    def current_specialist_snapshot_id():
-                        try:
-                            return reviewer.recapture(snapshot).snapshot_id
-                        except SnapshotCaptureError:
-                            return None
+                    try:
+                        def current_specialist_snapshot_id():
+                            try:
+                                return reviewer.recapture(snapshot).snapshot_id
+                            except SnapshotCaptureError:
+                                return None
 
-                    with (
-                        pin_skills_context(skills_context),
-                        use_specialist_snapshot_context(snapshot, current_specialist_snapshot_id),
-                    ):
-                        details = asyncio.run(inner())
-                except Exception as exc:
-                    # The result exposes the error class, not provider text that may
-                    # contain credential-shaped values or source excerpts.
-                    review_error = type(exc).__name__
-            finally:
-                _restore_settings(original_provider_settings)
-            if structured_path.exists():
+                        with (
+                            pin_skills_context(skills_context),
+                            use_specialist_snapshot_context(snapshot, current_specialist_snapshot_id),
+                        ):
+                            # From here on a provider request may have been made, so losing the
+                            # review would hide a paid event from the journal's inventory.
+                            review_attempted = True
+                            details = asyncio.run(inner())
+                    except Exception as exc:
+                        # The result exposes the error class, not provider text that may
+                        # contain credential-shaped values or source excerpts.
+                        review_error = type(exc).__name__
+                finally:
+                    _restore_settings(original_provider_settings)
+                if structured_path.exists():
+                    try:
+                        structured_review = json.loads(structured_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        review_error = review_error or "InvalidStructuredReview"
+
                 try:
-                    structured_review = json.loads(structured_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    review_error = review_error or "InvalidStructuredReview"
+                    current = reviewer.recapture(
+                        snapshot,
+                        review_configuration_hash_factory=current_configuration_hash,
+                    )
+                except SnapshotCaptureError:
+                    current = None
+                if (
+                    markdown_output
+                    and markdown_path is not None
+                    and markdown_path.exists()
+                    and structured_review is not None
+                    and review_error is None
+                    and current is not None
+                    and current.snapshot_id == snapshot.snapshot_id
+                ):
+                    try:
+                        pending_markdown = markdown_path.read_bytes()
+                    except OSError as exc:
+                        raise SnapshotCaptureError(
+                            f"could not stage --output '{markdown_output}': {exc}"
+                        ) from exc
 
-            try:
-                current = reviewer.recapture(
-                    snapshot,
-                    review_configuration_hash_factory=current_configuration_hash,
-                )
-            except SnapshotCaptureError:
-                current = None
+        if structured_review is not None and details is not None:
+            metadata = dict(structured_review.get("metadata", {}))
+            metadata["model"] = details.model_used
+            metadata["cost"] = {
+                "status": details.cost_status,
+                "total_usd": str(details.total_cost_usd) if details.known_cost_call_count else None,
+                "by_model_usd": {model: str(cost) for model, cost in details.model_costs_usd.items()},
+            }
+            structured_review["metadata"] = metadata
+
+        result = build_snapshot_result(
+            snapshot,
+            current_snapshot=current,
+            structured_review=structured_review,
+            started_at=started_at,
+            error=review_error,
+        )
+        # Everything from here to the finally can raise after the model has been paid:
+        # cache.write() touches .git/pr-agent, --output writes a caller-supplied path,
+        # and _emit_snapshot_result() writes --json-output. The review exists from this
+        # point on, so it has to reach the journal or a drop marker whichever of them
+        # fails.
+        try:
+            if markdown_output and pending_markdown is None and result.state is ReviewResultState.NO_FINDINGS:
+                pending_markdown = b"## PR Review\n\nNo findings.\n"
+            if pending_markdown is not None and not pending_markdown.startswith(_SNAPSHOT_MARKDOWN_MARKER):
+                pending_markdown = _SNAPSHOT_MARKDOWN_MARKER + pending_markdown
+            if cache_enabled and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}:
+                cache.write(result)
             if (
                 markdown_output
-                and markdown_path is not None
-                and markdown_path.exists()
-                and structured_review is not None
-                and review_error is None
-                and current is not None
-                and current.snapshot_id == snapshot.snapshot_id
+                and pending_markdown is not None
+                and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
             ):
+                output_path = Path(markdown_output)
                 try:
-                    pending_markdown = markdown_path.read_bytes()
-                except OSError as exc:
-                    # The model has already run. There is no result to record yet,
-                    # so a drop marker is the only thing that keeps this review
-                    # visible; without it the journal reads as a complete
-                    # inventory that silently omits a paid event.
-                    _mark_shadow_journal_drop(exc)
-                    raise SnapshotCaptureError(
-                        f"could not stage --output '{markdown_output}': {exc}"
-                    ) from exc
-
-    if structured_review is not None and details is not None:
-        metadata = dict(structured_review.get("metadata", {}))
-        metadata["model"] = details.model_used
-        metadata["cost"] = {
-            "status": details.cost_status,
-            "total_usd": str(details.total_cost_usd) if details.known_cost_call_count else None,
-            "by_model_usd": {model: str(cost) for model, cost in details.model_costs_usd.items()},
-        }
-        structured_review["metadata"] = metadata
-
-    result = build_snapshot_result(
-        snapshot,
-        current_snapshot=current,
-        structured_review=structured_review,
-        started_at=started_at,
-        error=review_error,
-    )
-    # Everything from here to the finally can raise after the model has been paid:
-    # cache.write() touches .git/pr-agent, --output writes a caller-supplied path,
-    # and _emit_snapshot_result() writes --json-output. The review exists from this
-    # point on, so it has to reach the journal or a drop marker whichever of them
-    # fails.
-    try:
-        if markdown_output and pending_markdown is None and result.state is ReviewResultState.NO_FINDINGS:
-            pending_markdown = b"## PR Review\n\nNo findings.\n"
-        if pending_markdown is not None and not pending_markdown.startswith(_SNAPSHOT_MARKDOWN_MARKER):
-            pending_markdown = _SNAPSHOT_MARKDOWN_MARKER + pending_markdown
-        if cache_enabled and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}:
-            cache.write(result)
-        if (
-            markdown_output
-            and pending_markdown is not None
-            and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
-        ):
-            output_path = Path(markdown_output)
-            try:
-                _atomic_replace_bytes(
-                    output_path,
-                    pending_markdown,
-                    output_parent_identities[markdown_output],
-                    output_target_identities[markdown_output],
-                    repository_root,
-                )
-            except (OSError, SnapshotCaptureError) as exc:
-                raise SnapshotCaptureError(f"could not publish --output '{markdown_output}': {exc}") from exc
-        _emit_snapshot_result(
-            result,
-            json_output,
-            output_parent_identities.get(json_output),
-            output_target_identities.get(json_output),
-            repository_root,
-        )
-    finally:
-        # Recording is last on the success path. Opening the writer reads and
-        # validates the whole accumulated journal and fsyncs a session boundary,
-        # which is O(journal size) of blocking disk work, and a week-old journal
-        # must not sit between the review finishing and the developer seeing it.
-        # In a finally: the review is over, and for a model-backed run it is already
-        # paid for. A failure to publish must not also erase it, or the journal omits
-        # the event and its cost while still reporting a complete inventory.
-        # _record_shadow_journal_entry never raises, so this cannot mask the
-        # publication error, and on the success path recording still happens after
-        # the result is out.
-        _record_shadow_journal_entry(
-            snapshot,
-            result,
-            model_calls=None if details is None else details.num_ai_calls,
-        )
-    return result
+                    _atomic_replace_bytes(
+                        output_path,
+                        pending_markdown,
+                        output_parent_identities[markdown_output],
+                        output_target_identities[markdown_output],
+                        repository_root,
+                    )
+                except (OSError, SnapshotCaptureError) as exc:
+                    raise SnapshotCaptureError(f"could not publish --output '{markdown_output}': {exc}") from exc
+            _emit_snapshot_result(
+                result,
+                json_output,
+                output_parent_identities.get(json_output),
+                output_target_identities.get(json_output),
+                repository_root,
+            )
+        finally:
+            # Recording is last on the success path. Opening the writer reads and
+            # validates the whole accumulated journal and fsyncs a session boundary,
+            # which is O(journal size) of blocking disk work, and a week-old journal
+            # must not sit between the review finishing and the developer seeing it.
+            # In a finally: the review is over, and for a model-backed run it is already
+            # paid for. A failure to publish must not also erase it, or the journal omits
+            # the event and its cost while still reporting a complete inventory.
+            # _record_shadow_journal_entry never raises, so this cannot mask the
+            # publication error, and on the success path recording still happens after
+            # the result is out.
+            _record_shadow_journal_entry(
+                snapshot,
+                result,
+                model_calls=None if details is None else details.num_ai_calls,
+            )
+        return result
+    except BaseException as exc:
+        if review_attempted:
+            # Marking is contained and never raises, so it cannot replace the
+            # real failure with one of its own.
+            _mark_shadow_journal_drop(exc)
+        raise
 
 
 def run(inargs=None, args=None):

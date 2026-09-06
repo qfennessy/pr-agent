@@ -540,19 +540,60 @@ class TestAReviewThatSpentNothingSaysSoExactly:
         assert source.count("model_calls=0") == 2
 
 
-class TestStagingFailureIsVisible:
-    """Staging happens after the model runs and before a result exists."""
+class TestNothingBetweenTheModelAndTheRecorderIsUnguarded:
+    """Three rounds of review found three separate steps in this span exposed.
 
-    def test_a_failed_staging_read_marks_a_drop(self):
-        """There is no result to record, so the marker is the only record of it."""
+    Publication, then cache.write(), then markdown staging. Guarding them one at
+    a time left the next one up still exposed, so the span is guarded as a whole.
+    """
+
+    def test_one_guard_covers_the_whole_span(self):
         import inspect
 
         from pr_agent import cli
 
         lines = inspect.getsource(cli._run_review_snapshot_impl).splitlines()
-        staging = next(i for i, line in enumerate(lines) if "could not stage --output" in line)
-        window = "\n".join(lines[max(0, staging - 8):staging])
-        assert "_mark_shadow_journal_drop(exc)" in window
+        guard = next(i for i, line in enumerate(lines) if line.strip() == "except BaseException as exc:")
+        opens = [i for i, line in enumerate(lines) if line == "    try:" and i < guard]
+        assert opens, "the guard has no function-level try"
+        protected = "\n".join(lines[opens[0]:guard])
+
+        # Every step that can fail after the review has started must be inside it.
+        for statement in (
+            "asyncio.run(inner())",
+            "tempfile.TemporaryDirectory(",
+            "reviewer.recapture(",
+            "markdown_path.read_bytes()",
+            "structured_review.get(",
+            "build_snapshot_result(",
+            "cache.write(",
+            "_atomic_replace_bytes(",
+            "_emit_snapshot_result(",
+            "_record_shadow_journal_entry(",
+        ):
+            assert statement in protected, f"{statement} sits outside the recording guard"
+
+        handler = "\n".join(lines[guard:guard + 6])
+        assert "_mark_shadow_journal_drop(exc)" in handler
+        assert "raise" in handler
+
+    def test_the_guard_only_marks_when_a_review_was_attempted(self):
+        """Marking a drop for an argument error would falsely spoil the inventory."""
+        import inspect
+
+        from pr_agent import cli
+
+        source = inspect.getsource(cli._run_review_snapshot_impl)
+        assert "review_attempted = False" in source
+        assert "review_attempted = True" in source
+        assert "if review_attempted:" in source
+
+    def test_marking_a_drop_cannot_replace_the_real_failure(self):
+        import inspect
+
+        from pr_agent import cli
+
+        assert "except Exception" in inspect.getsource(cli._mark_shadow_journal_drop)
 
 
 class TestAPaidReviewIsNeverLostToAFailedPublication:
@@ -598,10 +639,15 @@ class TestAPaidReviewIsNeverLostToAFailedPublication:
         from pr_agent import cli
 
         lines = inspect.getsource(cli._run_review_snapshot_impl).splitlines()
-        opens = [i for i, line in enumerate(lines) if line == "    try:"]
-        closes = [i for i, line in enumerate(lines) if line == "    finally:"]
-        assert opens and closes
-        protected = "\n".join(lines[opens[-1]:closes[-1]])
+        record_at = max(i for i, line in enumerate(lines) if "_record_shadow_journal_entry(" in line)
+        # Walk back to the finally that reaches the recorder, then to its try.
+        close = max(i for i in range(record_at) if lines[i].strip() == "finally:")
+        depth = len(lines[close]) - len(lines[close].lstrip())
+        open_at = max(
+            i for i in range(close)
+            if lines[i].strip() == "try:" and len(lines[i]) - len(lines[i].lstrip()) == depth
+        )
+        protected = "\n".join(lines[open_at:close])
 
         for statement in ("cache.write(", "_atomic_replace_bytes(", "_emit_snapshot_result("):
             assert statement in protected, f"{statement} can lose a paid review"
