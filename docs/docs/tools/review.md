@@ -56,7 +56,7 @@ to keep supported inline publication behavior.
 PR-Agent contains an opt-in GitHub lifecycle for keeping one independently verified finding in one review thread across
 pushes. It defines versioned finding identities, paginated thread inventory, explicit create/update/resolve operations,
 and a fail-closed action plan tied to one pull-request head commit. It remains disabled by default until issue #27's
-offline-replay and PR-publication gates are complete. Existing persistent inline comments continue to
+offline-replay, opt-in-pair-review, and PR-publication gates are complete. Existing persistent inline comments continue to
 use the simpler duplicate-suppression behavior described in the [improve tool](./improve.md#persistent-inline-comments).
 
 The `/review` integration consumes the `root_cause_id`, `trusted_stable_key`, and `relevant_file` emitted by the issue #9
