@@ -157,9 +157,11 @@ jobs:
                 "$BRANCH" "$BRANCH"
               echo '```'
               echo
-              echo "If \`main\` moves and the PR conflicts again, rebuild the same two-parent candidate on the"
-              echo "new baseline and update the single \`Fork integration baseline\` line in this body. The"
-              echo "remote-head lookup makes the lease bind to the current candidate rather than the original pin."
+              echo "If \`main\` moves afterwards, merge the current fork \`main\` into this candidate (GitHub's"
+              echo "\"Update branch\" or \`git merge\` in the worktree); each refresh must be one two-parent merge that"
+              echo "brings in a newer base, and the \`Fork integration baseline\` line stays as it is. Rebuilding the"
+              echo "candidate on the new baseline and updating that line is also accepted. The remote-head lookup"
+              echo "makes the lease bind to the current candidate rather than the original pin."
               echo
               echo "After GitHub shows the PR merged, return to the trusted checkout, confirm"
               echo "\`git -C \"\$WORKTREE_PATH\" status --short\` is empty, then run:"

@@ -1,6 +1,6 @@
 # Fork Maintenance
 
-Created: 2026-08-07. Last edited: 2026-09-02.
+Created: 2026-08-07. Last edited: 2026-09-07.
 
 This repository (`qfennessy/pr-agent`) is a deliberately conservative fork of
 [`The-PR-Agent/pr-agent`](https://github.com/The-PR-Agent/pr-agent). PR-Agent
@@ -44,12 +44,26 @@ not the original upstream SHA.
 
 Existing raw-pin PRs, including PR #35, can use the same protocol: add exactly
 one canonical `Fork integration baseline` line to the body, create the
-two-parent merge on that baseline, and replace the PR head. If `main` advances
-and the candidate then conflicts, rebuild the candidate directly on the new
-baseline and update that body line; do not merge `main` into the existing
-candidate because that would add an unverified commit layer. Retire the
-resolution worktree only after GitHub confirms the PR merged and its status is
-clean. The generated cleanup recipe checks the PR state with `gh`, fails on an
+two-parent merge on that baseline, and replace the PR head.
+
+### Keeping a resolved candidate current with `main`
+
+If `main` advances after the resolution, either of two shapes is accepted:
+
+- **Refresh.** Merge the current fork `main` commit into the existing candidate
+  (GitHub's "Update branch", or `git merge` in the resolution worktree). Each
+  refresh is one merge with exactly two parents, the previous candidate and the
+  fork commit being brought in, in either order. Repeat as often as `main`
+  moves. Every refresh must bring in a base newer than the last one; the
+  `Fork integration baseline` line in the body stays the original resolution
+  point and is not updated. Provenance identifies the immutable upstream pin;
+  the PR head is a reviewed chain of merges above it.
+- **Rebuild.** Create a fresh two-parent resolution on the new baseline and
+  update the body line. Use this when the refresh merge would itself conflict
+  badly enough that a clean resolution is easier to review.
+
+Retire the resolution worktree only after GitHub confirms the PR merged and its
+status is clean. The generated cleanup recipe checks the PR state with `gh`, fails on an
 unmerged PR or dirty worktree, and runs `git worktree remove <path>` from the
 trusted checkout without `--force`. If Git refuses, preserve the worktree and
 investigate.
@@ -86,15 +100,21 @@ and update only the deploy key and environment secret, never this workflow.
    - branch, title, and body identify one canonical upstream pin;
    - that pin belongs to upstream `main`;
    - the declared fork baseline is an ancestor of the current PR base; and
-   - the PR head is either the raw pin or one merge commit whose two parents
-     are exactly the pin and baseline.
+   - the PR head is the raw pin, or one merge commit whose two parents are
+     exactly the pin and baseline, or that merge followed by base-refresh
+     merges each of whose two parents are the previous candidate and a newer
+     fork `main` commit. A plain commit anywhere above the pin, a parent that
+     is not on the fork base, or a refresh that brings in an older base fails.
 4. Merge with a merge commit. The `main` ruleset rejects squash and rebase
    merges so the reviewed PR candidate remains an immutable parent.
 5. After merging, inspect the repository merge commit's second parent (the PR
    candidate) with `git log -1 --format=%P <merge-commit>`. For a raw pin it
    equals the reviewed upstream SHA. For a resolved candidate, inspect that
    commit with `git log -1 --format=%P <candidate>` and confirm its only
-   parents are the reviewed fork baseline and upstream pin.
+   parents are the reviewed fork baseline and upstream pin. For a refreshed
+   candidate, `git log --first-parent --format=%P <candidate>` shows one
+   two-parent line per refresh down to the resolution; every second parent
+   must be a fork `main` commit.
 
 ## CI posture
 
