@@ -211,9 +211,7 @@ def test_rejects_arbitrary_commits_inside_a_refresh_chain(
 def test_rejects_a_chain_longer_than_the_allowed_refresh_count(
     provenance_graph: dict[str, str | Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import pr_agent.upstream_provenance as module
-
-    monkeypatch.setattr(module, "MAX_BASE_REFRESH_MERGES", 1)
+    monkeypatch.setattr("pr_agent.upstream_provenance.MAX_BASE_REFRESH_MERGES", 1)
     metadata = replace(
         _metadata(provenance_graph, head=str(provenance_graph["refreshed"])),
         base_sha=str(provenance_graph["newer_base"]),

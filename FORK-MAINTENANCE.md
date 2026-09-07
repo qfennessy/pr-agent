@@ -112,9 +112,22 @@ and update only the deploy key and environment secret, never this workflow.
    equals the reviewed upstream SHA. For a resolved candidate, inspect that
    commit with `git log -1 --format=%P <candidate>` and confirm its only
    parents are the reviewed fork baseline and upstream pin. For a refreshed
-   candidate, `git log --first-parent --format=%P <candidate>` shows one
-   two-parent line per refresh down to the resolution; every second parent
-   must be a fork `main` commit.
+   candidate, walk the chain the way the verifier does. `--first-parent` will
+   not do it: either parent order is accepted, so the first parent may be the
+   fork side. At each merge, the parent that is *not* on `main` is the link
+   below; follow it until you reach the pin:
+
+   ```bash
+   c=<candidate>
+   until [ "$c" = "<pin>" ]; do
+     git log -1 --format=%P "$c"            # exactly two parents
+     c=$(for p in $(git log -1 --format=%P "$c"); do
+           git merge-base --is-ancestor "$p" main || echo "$p"; done)
+   done
+   ```
+
+   Every parent the loop skipped must be a fork `main` commit, and the last
+   line printed must be the resolution whose parents are the baseline and pin.
 
 ## CI posture
 
