@@ -19,6 +19,11 @@ from pr_agent.algo.ai_handlers.litellm_helpers import (
     litellm_callbacks_registered,
 )
 from pr_agent.algo.checkpoint_evaluation_cli import run_evaluation_plan
+from pr_agent.algo.checkpoint_shadow_journal import (
+    record_shadow_journal_drop,
+    shadow_entry_from_snapshot_result,
+    shadow_journal_writer_from_settings,
+)
 from pr_agent.algo.review_configuration import snapshot_review_configuration_hash as _snapshot_review_configuration_hash
 from pr_agent.algo.review_snapshot import ReviewEvent, ReviewResultState, snapshot_review_instructions
 from pr_agent.algo.review_specialists import use_specialist_snapshot_context
@@ -433,7 +438,11 @@ def _emit_snapshot_result(
     payload_data = result.to_dict()
     payload_data["artifact_type"] = _SNAPSHOT_ARTIFACT_TYPE
     payload = json.dumps(payload_data, ensure_ascii=True, sort_keys=True, indent=2) + "\n"
-    print(payload, end="")
+    # flush is not cosmetic here: a redirected or piped stdout is block-buffered,
+    # so without it the result would sit in the buffer while the recorder reads
+    # and fsyncs the journal, and a downstream consumer would wait on I/O the
+    # review is supposed to be independent of.
+    print(payload, end="", flush=True)
     if output_path:
         try:
             destination = Path(output_path)
@@ -788,11 +797,118 @@ def _is_hard_linked_to_repository(candidate: Path, *roots: Path) -> bool:
     return False
 
 
+# Opened lazily on the first record so command-line setting overrides are already
+# applied, and closed by _run_review_snapshot. None means recording is off, which
+# is the shipped default and the state in which no file is ever created.
+# Distinguishes "not opened yet" from "opened, and recording is off". Two
+# booleans tracking one state invited them to disagree.
+_SHADOW_JOURNAL_UNOPENED = object()
+_shadow_journal_writer = _SHADOW_JOURNAL_UNOPENED
+
+
+def _shadow_recording_requested(settings) -> bool:
+    """Report the exact condition under which a journal writer would be opened."""
+    section = getattr(settings, "checkpoint_evaluation", None)
+    if section is None:
+        return False
+    if getattr(section, "shadow_journal_enabled", False) is not True:
+        return False
+    return bool(str(getattr(section, "shadow_journal_path", "") or "").strip())
+
+
+def _apply_snapshot_repository_settings(repository_root) -> None:
+    """Rebuild the repository settings layer, then reapply what recording implies.
+
+    Both the initial configuration capture and every recapture go through here.
+    A recapture restores the invocation baseline first, and that baseline predates
+    anything recording switches on, so applying those at only one of the two sites
+    makes the two hashes disagree -- every recorded review would then look stale
+    and return without calling the model.
+    """
+    apply_local_repo_settings(repository_root)
+    _collect_cost_for_shadow_recording()
+
+
+def _collect_cost_for_shadow_recording() -> None:
+    """Price model calls whenever their telemetry is going to be recorded.
+
+    LiteLLM computes a response cost only when config.output_run_cost or the
+    request's collect_cost is set, and both ship off. The live-shadow gate reads
+    cost per developer hour, so recording without pricing yields seven days of
+    entries whose cost is permanently unavailable -- collected, and then unusable.
+    Tying it to recording keeps that from depending on an operator finding a third
+    setting. Only collection is enabled; output_run_details stays as configured, so
+    this does not add a cost footer to a review that was not already rendering one.
+    """
+    if not _shadow_recording_requested(get_settings()):
+        return
+    get_settings().set("config.output_run_cost", True)
+
+
+def _record_shadow_journal_entry(
+    snapshot, result, *, lookup_seconds=None, model_calls=None, run_details=None
+) -> None:
+    """Record one completed local review, if an operator asked for recording.
+
+    Observational only. A recording failure must never change, delay, or fail a
+    review, so everything here is contained. The writer marks its own session
+    ``writer_failed`` so the reader can see that a session was incomplete rather
+    than silently short.
+    """
+    global _shadow_journal_writer
+    try:
+        if _shadow_journal_writer is _SHADOW_JOURNAL_UNOPENED:
+            _shadow_journal_writer = shadow_journal_writer_from_settings(get_settings())
+        if _shadow_journal_writer is None:
+            return
+        _shadow_journal_writer.submit(
+            shadow_entry_from_snapshot_result(
+                snapshot,
+                result,
+                lookup_seconds=lookup_seconds,
+                model_calls=model_calls,
+                run_details=run_details,
+            )
+        )
+    except Exception as exc:
+        get_logger().debug("shadow journal entry was not recorded", exc_info=True)
+        # Recording was asked for and did not happen, most often because another
+        # review holds the journal's exclusive session boundary. Say so beside the
+        # journal, or this review disappears while the inventory still looks
+        # complete for the reviews that did get through.
+        _mark_shadow_journal_drop(exc)
+
+
+def _mark_shadow_journal_drop(exc: BaseException) -> None:
+    try:
+        settings = get_settings()
+        if not _shadow_recording_requested(settings):
+            return
+        section = getattr(settings, "checkpoint_evaluation", None)
+        path = str(getattr(section, "shadow_journal_path", "") or "").strip()
+        record_shadow_journal_drop(path, type(exc).__name__)
+    except Exception:
+        get_logger().debug("shadow journal drop was not marked", exc_info=True)
+
+
+def _close_shadow_journal() -> None:
+    global _shadow_journal_writer
+    writer = _shadow_journal_writer
+    _shadow_journal_writer = _SHADOW_JOURNAL_UNOPENED
+    if writer is None or writer is _SHADOW_JOURNAL_UNOPENED:
+        return
+    try:
+        writer.close()
+    except Exception:
+        get_logger().debug("shadow journal did not close cleanly", exc_info=True)
+
+
 def _run_review_snapshot(args, outer_parser: argparse.ArgumentParser):
     original_settings = _snapshot_all_settings()
     try:
         return _run_review_snapshot_impl(args, outer_parser)
     finally:
+        _close_shadow_journal()
         _restore_all_settings(original_settings)
 
 
@@ -821,7 +937,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     invocation_extra_config = get_settings().get("CONFIG.EXTRA_CONFIG_URL", None)
     try:
         repository_root = find_repository_root()
-        apply_local_repo_settings(repository_root)
+        _apply_snapshot_repository_settings(repository_root)
     except SnapshotCaptureError as exc:
         outer_parser.error(str(exc))
     except Exception as exc:
@@ -932,7 +1048,7 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             # from the start of the review. The invocation baseline retains CLI/env
             # precedence, including the original extra-config source.
             _restore_all_settings(configuration_baseline)
-            apply_local_repo_settings(repository_root)
+            _apply_snapshot_repository_settings(repository_root)
             current_exclusions = _configured_snapshot_exclusions(
                 get_settings().get("local_pair_review", {}) or {}
             )
@@ -969,13 +1085,22 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             structured_review=None,
             started_at=monotonic(),
         )
-        _emit_snapshot_result(
-            stale_result,
-            json_output,
-            output_parent_identities.get(json_output),
-            output_target_identities.get(json_output),
-            repository_root,
-        )
+        try:
+            _emit_snapshot_result(
+                stale_result,
+                json_output,
+                output_parent_identities.get(json_output),
+                output_target_identities.get(json_output),
+                repository_root,
+            )
+        finally:
+        # In a finally: the review is over, and for a model-backed run it is already
+        # paid for. A failure to publish must not also erase it, or the journal omits
+        # the event and its cost while still reporting a complete inventory.
+        # _record_shadow_journal_entry never raises, so this cannot mask the
+        # publication error, and on the success path recording still happens after
+        # the result is out.
+            _record_shadow_journal_entry(snapshot, stale_result, model_calls=0)
         return stale_result
     # Cached structured results cannot reproduce the exact Markdown rendering.
     # Bypass the cache when the caller explicitly requests that artifact.
@@ -985,15 +1110,32 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
         and current is not None
         and current.snapshot_id == snapshot.snapshot_id
     ):
+        lookup_started = monotonic()
         cached_result = cache.read(snapshot.snapshot_id, snapshot=snapshot)
         if cached_result is not None:
-            _emit_snapshot_result(
-                cached_result,
-                json_output,
-                output_parent_identities.get(json_output),
-                output_target_identities.get(json_output),
-                repository_root,
-            )
+            # A cache hit is still a review the developer asked for and received.
+            # Skipping it would understate event counts and shorten the observed
+            # span; the entry carries `cached` so the difference stays visible.
+            # It reports this lookup's own latency and zero spend, because no
+            # model request was made — repeating the cached result's cost would
+            # charge a historical call again on every hit.
+            lookup_seconds = monotonic() - lookup_started
+            try:
+                _emit_snapshot_result(
+                    cached_result,
+                    json_output,
+                    output_parent_identities.get(json_output),
+                    output_target_identities.get(json_output),
+                    repository_root,
+                )
+            finally:
+                # The review is over. A failure to publish must not also erase it,
+                # or the journal omits the event while still reporting a complete
+                # inventory. _record_shadow_journal_entry never raises, so this
+                # cannot mask the publication error.
+                _record_shadow_journal_entry(
+                    snapshot, cached_result, lookup_seconds=lookup_seconds, model_calls=0
+                )
             return cached_result
 
     started_at = monotonic()
@@ -1001,129 +1143,182 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
     review_error = None
     details = None
     pending_markdown = None
-    if snapshot.diff.strip():
-        with tempfile.TemporaryDirectory(prefix="pr-agent-snapshot-") as temp_dir:
-            structured_path = Path(temp_dir) / "review.json"
-            markdown_path = Path(temp_dir) / "review.md" if markdown_output else None
-            original_provider_settings = _snapshot_settings(_SNAPSHOT_PROVIDER_SETTINGS)
-            get_settings().set("config.git_provider", "plain-diff")
-            get_settings().set("plain_diff.content", snapshot.diff)
-            get_settings().set("plain_diff.output_path", str(markdown_path) if markdown_path else None)
-            get_settings().set("plain_diff.json_output_path", str(structured_path))
-            get_settings().set("plain_diff.suppress_stdout", True)
-            get_settings().set("plain_diff.disable_working_tree_enrichment", True)
-            get_settings().set("plain_diff.repo_context_files", repo_context_files)
-            get_settings().set("config.publish_output", True)
-            get_settings().set("config.propagate_tool_errors", True)
-            get_settings().set("pr_reviewer.extra_instructions", _snapshot_review_instructions(snapshot))
+    review_attempted = False
+    review_recorded = False
+    # One guard for the whole span between the provider call and the recorder.
+    # Publication, cache persistence and markdown staging were each fixed
+    # individually and each time something one step earlier was still exposed:
+    # temporary-directory cleanup, a recapture raising other than
+    # SnapshotCaptureError, a structured review that is valid JSON but not an
+    # object, build_snapshot_result() itself. Any of them escaping loses the
+    # review, and an older surviving journal then reads as a complete inventory
+    # that silently omits it.
+    try:
+        if snapshot.diff.strip():
+            with tempfile.TemporaryDirectory(prefix="pr-agent-snapshot-") as temp_dir:
+                structured_path = Path(temp_dir) / "review.json"
+                markdown_path = Path(temp_dir) / "review.md" if markdown_output else None
+                original_provider_settings = _snapshot_settings(_SNAPSHOT_PROVIDER_SETTINGS)
+                get_settings().set("config.git_provider", "plain-diff")
+                get_settings().set("plain_diff.content", snapshot.diff)
+                get_settings().set("plain_diff.output_path", str(markdown_path) if markdown_path else None)
+                get_settings().set("plain_diff.json_output_path", str(structured_path))
+                get_settings().set("plain_diff.suppress_stdout", True)
+                get_settings().set("plain_diff.disable_working_tree_enrichment", True)
+                get_settings().set("plain_diff.repo_context_files", repo_context_files)
+                get_settings().set("config.publish_output", True)
+                get_settings().set("config.propagate_tool_errors", True)
+                get_settings().set("pr_reviewer.extra_instructions", _snapshot_review_instructions(snapshot))
 
-            async def inner():
-                try:
-                    await PRAgent()._handle_request("local_snapshot", ["review"])
-                finally:
-                    if litellm_callbacks_registered():
-                        await drain_litellm_callbacks(
-                            get_settings().litellm.get(
-                                "callback_timeout_seconds", DEFAULT_CALLBACK_TIMEOUT_SECONDS
+                async def inner():
+                    try:
+                        await PRAgent()._handle_request("local_snapshot", ["review"])
+                    finally:
+                        if litellm_callbacks_registered():
+                            await drain_litellm_callbacks(
+                                get_settings().litellm.get(
+                                    "callback_timeout_seconds", DEFAULT_CALLBACK_TIMEOUT_SECONDS
+                                )
                             )
-                        )
-                return get_run_details()
+                    return get_run_details()
 
-            try:
                 try:
-                    def current_specialist_snapshot_id():
-                        try:
-                            return reviewer.recapture(snapshot).snapshot_id
-                        except SnapshotCaptureError:
-                            return None
+                    try:
+                        def current_specialist_snapshot_id():
+                            try:
+                                return reviewer.recapture(snapshot).snapshot_id
+                            except SnapshotCaptureError:
+                                return None
 
-                    with (
-                        pin_skills_context(skills_context),
-                        use_specialist_snapshot_context(snapshot, current_specialist_snapshot_id),
-                    ):
-                        details = asyncio.run(inner())
-                except Exception as exc:
-                    # The result exposes the error class, not provider text that may
-                    # contain credential-shaped values or source excerpts.
-                    review_error = type(exc).__name__
-            finally:
-                _restore_settings(original_provider_settings)
-            if structured_path.exists():
+                        with (
+                            pin_skills_context(skills_context),
+                            use_specialist_snapshot_context(snapshot, current_specialist_snapshot_id),
+                        ):
+                            # From here on a provider request may have been made, so losing the
+                            # review would hide a paid event from the journal's inventory.
+                            review_attempted = True
+                            details = asyncio.run(inner())
+                    except Exception as exc:
+                        # The result exposes the error class, not provider text that may
+                        # contain credential-shaped values or source excerpts.
+                        review_error = type(exc).__name__
+                finally:
+                    _restore_settings(original_provider_settings)
+                if structured_path.exists():
+                    try:
+                        structured_review = json.loads(structured_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        review_error = review_error or "InvalidStructuredReview"
+
                 try:
-                    structured_review = json.loads(structured_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    review_error = review_error or "InvalidStructuredReview"
+                    current = reviewer.recapture(
+                        snapshot,
+                        review_configuration_hash_factory=current_configuration_hash,
+                    )
+                except SnapshotCaptureError:
+                    current = None
+                if (
+                    markdown_output
+                    and markdown_path is not None
+                    and markdown_path.exists()
+                    and structured_review is not None
+                    and review_error is None
+                    and current is not None
+                    and current.snapshot_id == snapshot.snapshot_id
+                ):
+                    try:
+                        pending_markdown = markdown_path.read_bytes()
+                    except OSError as exc:
+                        raise SnapshotCaptureError(
+                            f"could not stage --output '{markdown_output}': {exc}"
+                        ) from exc
 
-            try:
-                current = reviewer.recapture(
-                    snapshot,
-                    review_configuration_hash_factory=current_configuration_hash,
-                )
-            except SnapshotCaptureError:
-                current = None
+        if structured_review is not None and details is not None:
+            metadata = dict(structured_review.get("metadata", {}))
+            metadata["model"] = details.model_used
+            metadata["cost"] = {
+                "status": details.cost_status,
+                "total_usd": str(details.total_cost_usd) if details.known_cost_call_count else None,
+                "by_model_usd": {model: str(cost) for model, cost in details.model_costs_usd.items()},
+            }
+            structured_review["metadata"] = metadata
+
+        result = build_snapshot_result(
+            snapshot,
+            current_snapshot=current,
+            structured_review=structured_review,
+            started_at=started_at,
+            error=review_error,
+        )
+        # Everything from here to the finally can raise after the model has been paid:
+        # cache.write() touches .git/pr-agent, --output writes a caller-supplied path,
+        # and _emit_snapshot_result() writes --json-output. The review exists from this
+        # point on, so it has to reach the journal or a drop marker whichever of them
+        # fails.
+        try:
+            if markdown_output and pending_markdown is None and result.state is ReviewResultState.NO_FINDINGS:
+                pending_markdown = b"## PR Review\n\nNo findings.\n"
+            if pending_markdown is not None and not pending_markdown.startswith(_SNAPSHOT_MARKDOWN_MARKER):
+                pending_markdown = _SNAPSHOT_MARKDOWN_MARKER + pending_markdown
+            if cache_enabled and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}:
+                cache.write(result)
             if (
                 markdown_output
-                and markdown_path is not None
-                and markdown_path.exists()
-                and structured_review is not None
-                and review_error is None
-                and current is not None
-                and current.snapshot_id == snapshot.snapshot_id
+                and pending_markdown is not None
+                and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
             ):
+                output_path = Path(markdown_output)
                 try:
-                    pending_markdown = markdown_path.read_bytes()
-                except OSError as exc:
-                    raise SnapshotCaptureError(
-                        f"could not stage --output '{markdown_output}': {exc}"
-                    ) from exc
-
-    if structured_review is not None and details is not None:
-        metadata = dict(structured_review.get("metadata", {}))
-        metadata["model"] = details.model_used
-        metadata["cost"] = {
-            "status": details.cost_status,
-            "total_usd": str(details.total_cost_usd) if details.known_cost_call_count else None,
-            "by_model_usd": {model: str(cost) for model, cost in details.model_costs_usd.items()},
-        }
-        structured_review["metadata"] = metadata
-
-    result = build_snapshot_result(
-        snapshot,
-        current_snapshot=current,
-        structured_review=structured_review,
-        started_at=started_at,
-        error=review_error,
-    )
-    if markdown_output and pending_markdown is None and result.state is ReviewResultState.NO_FINDINGS:
-        pending_markdown = b"## PR Review\n\nNo findings.\n"
-    if pending_markdown is not None and not pending_markdown.startswith(_SNAPSHOT_MARKDOWN_MARKER):
-        pending_markdown = _SNAPSHOT_MARKDOWN_MARKER + pending_markdown
-    if cache_enabled and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}:
-        cache.write(result)
-    if (
-        markdown_output
-        and pending_markdown is not None
-        and result.state in {ReviewResultState.FINDINGS, ReviewResultState.NO_FINDINGS}
-    ):
-        output_path = Path(markdown_output)
-        try:
-            _atomic_replace_bytes(
-                output_path,
-                pending_markdown,
-                output_parent_identities[markdown_output],
-                output_target_identities[markdown_output],
+                    _atomic_replace_bytes(
+                        output_path,
+                        pending_markdown,
+                        output_parent_identities[markdown_output],
+                        output_target_identities[markdown_output],
+                        repository_root,
+                    )
+                except (OSError, SnapshotCaptureError) as exc:
+                    raise SnapshotCaptureError(f"could not publish --output '{markdown_output}': {exc}") from exc
+            _emit_snapshot_result(
+                result,
+                json_output,
+                output_parent_identities.get(json_output),
+                output_target_identities.get(json_output),
                 repository_root,
             )
-        except (OSError, SnapshotCaptureError) as exc:
-            raise SnapshotCaptureError(f"could not publish --output '{markdown_output}': {exc}") from exc
-    _emit_snapshot_result(
-        result,
-        json_output,
-        output_parent_identities.get(json_output),
-        output_target_identities.get(json_output),
-        repository_root,
-    )
-    return result
+        finally:
+            # Recording is last on the success path. Opening the writer reads and
+            # validates the whole accumulated journal and fsyncs a session boundary,
+            # which is O(journal size) of blocking disk work, and a week-old journal
+            # must not sit between the review finishing and the developer seeing it.
+            # In a finally: the review is over, and for a model-backed run it is
+            # already paid for. A failure to publish must not also erase it, or the
+            # journal omits the event while still reporting a complete inventory.
+            # _record_shadow_journal_entry never raises, so this cannot mask the
+            # publication error.
+            # The run's own accounting, not the result's mappings: those are empty
+            # whenever no structured review came back, and a priced call whose
+            # response failed to parse would otherwise be journaled as unpriced.
+            # An empty diff never enters the review block, so it made no request
+            # and its spend is exactly zero; a block that was entered and raised
+            # before returning its accounting is genuinely unknown.
+            _record_shadow_journal_entry(
+                snapshot,
+                result,
+                model_calls=0 if not review_attempted else None,
+                run_details=details,
+            )
+            # Reached only because the recorder cannot raise. It handles and marks
+            # its own failures, so past this point the outer guard has nothing to
+            # add -- and a marker written on top of a retained entry would seal a
+            # complete journal that reports itself incomplete forever.
+            review_recorded = True
+        return result
+    except BaseException as exc:
+        if review_attempted and not review_recorded:
+            # Marking is contained and never raises, so it cannot replace the
+            # real failure with one of its own.
+            _mark_shadow_journal_drop(exc)
+        raise
 
 
 def run(inargs=None, args=None):

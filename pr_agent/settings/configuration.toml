@@ -554,6 +554,10 @@ publish_output = false
 paid_cost_cap_usd = 0.0
 # Empty means no shadow artifact may be opened. When explicitly enabled, use a
 # private path outside the source tree (normally below the Git common directory).
+# Enabling recording also turns on config.output_run_cost for that run: LiteLLM
+# prices a call only when it is set, and the live-shadow gate reads cost per
+# developer hour, so recording without it collects entries whose cost can never
+# be known.
 shadow_journal_path = ""
 shadow_journal_max_queue_entries = 256
 

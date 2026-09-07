@@ -557,8 +557,13 @@ class ShadowPilotAcceptance:
         )
         for identity in (*record_ids, *entry_ids):
             _validate_hash("shadow pilot record identity", identity)
-        if len(record_ids) != len(set(record_ids)) or len(entry_ids) != len(set(entry_ids)):
-            raise EvaluationValidationError("shadow pilot record and entry identities must be unique")
+        # Only record_id has to be unique. It is stamped by the writer and includes the
+        # sequence number, so no two records can share one. entry_id is a content hash,
+        # and two reviews that genuinely produced the same content share it by design —
+        # two cache hits of one snapshot inside a single clock tick, for instance.
+        # Demanding distinct entry_ids would reject a correct journal.
+        if len(record_ids) != len(set(record_ids)):
+            raise EvaluationValidationError("shadow pilot record identities must be unique")
         object.__setattr__(self, "record_inventory", tuple(_freeze_json(item) for item in inventory))
         object.__setattr__(self, "journal_hash", content_hash({
             "record_inventory": inventory,
@@ -585,6 +590,7 @@ def build_shadow_pilot_acceptance(
     *,
     manifest: EvaluationManifest,
     target_arm_id: str,
+    journal_path: Optional[str | Path] = None,
 ) -> ShadowPilotAcceptance:
     """Generate exact journal identities for separate review; this does not accept them."""
     if not isinstance(manifest, EvaluationManifest):
@@ -592,7 +598,9 @@ def build_shadow_pilot_acceptance(
     records = tuple(records)
     if not records or any(not isinstance(record, ShadowJournalRecord) for record in records):
         raise EvaluationValidationError("shadow pilot acceptance requires journal records")
-    shadow_journal_inventory_complete(records)
+    # Reviews lost before they reached the journal are recorded beside it. Without
+    # the path they are invisible here, and a biased subset looks complete.
+    shadow_journal_inventory_complete(records, journal_path)
     observed_at_utc = tuple(record.ingested_at_utc for record in records)
     if any(
         later < earlier
@@ -600,9 +608,8 @@ def build_shadow_pilot_acceptance(
     ):
         raise EvaluationValidationError("shadow journal records must remain in observed UTC order")
     record_ids = tuple(record.record_id for record in records)
-    entry_ids = tuple(record.entry.entry_id for record in records)
-    if len(record_ids) != len(set(record_ids)) or len(entry_ids) != len(set(entry_ids)):
-        raise EvaluationValidationError("shadow journal records and entries must be unique")
+    if len(record_ids) != len(set(record_ids)):
+        raise EvaluationValidationError("shadow journal records must be unique")
     target_arm = next(
         (arm for arm in manifest.arms if arm.arm_id == target_arm_id and arm.enabled),
         None,
@@ -831,6 +838,7 @@ def _build_shadow_pilot_binding(
     *,
     manifest: EvaluationManifest,
     target_arm_id: str,
+    journal_path: Optional[str | Path] = None,
 ) -> Optional[ShadowPilotBinding]:
     records = tuple(records)
     if not records or acceptance is None or CANONICAL_SHADOW_PILOT_ACCEPTANCE_ID is None:
@@ -843,6 +851,7 @@ def _build_shadow_pilot_binding(
         records,
         manifest=manifest,
         target_arm_id=target_arm_id,
+        journal_path=journal_path,
     )
     if actual_acceptance != acceptance:
         raise EvaluationValidationError("shadow records do not exactly match the accepted journal inventory")
@@ -852,7 +861,7 @@ def _build_shadow_pilot_binding(
         for record in records
         if record.developer_time_basis is DeveloperTimeBasis.WRITER_MONOTONIC
     )
-    inventory_complete = shadow_journal_inventory_complete(records)
+    inventory_complete = shadow_journal_inventory_complete(records, journal_path)
     return ShadowPilotBinding(
         acceptance_id=acceptance.acceptance_id,
         journal_hash=acceptance.journal_hash,
@@ -1831,6 +1840,7 @@ def build_checkpoint_pilot_report(
         shadow_acceptance,
         manifest=manifest,
         target_arm_id=target_arm_id,
+        journal_path=shadow_journal_path,
     )
     settled_binding = _build_settled_pilot_binding(
         settled_candidate_records,
