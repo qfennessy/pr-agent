@@ -1,4 +1,22 @@
-"""Verify that an upstream-sync pull request has an allowed immutable topology."""
+"""Verify that an upstream-sync pull request has an allowed immutable topology.
+
+Three shapes are accepted, from a fixed upstream ``pin`` that the branch name,
+title and body all identify:
+
+* ``raw-pin``: the PR head is the pin itself.
+* ``resolved-merge``: one merge whose parents are exactly the pin and the
+  declared fork integration baseline, i.e. a reviewed conflict resolution.
+* ``base-refreshed-merge``: that resolution followed by one or more merges of a
+  newer fork ``main`` commit, each with exactly two parents -- the previous
+  candidate and the fork commit being brought in. This is what "update branch"
+  produces when ``main`` advances after the resolution, and it keeps the pin
+  immutable while letting the PR stay current with its base.
+
+Anything else -- a plain commit on top, a merge with a parent that is not on
+the fork base, a refresh that brings in an older base than the last one -- is
+rejected. Topology is all this can check; the content of a resolution is what
+the human review is for.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +29,9 @@ from pathlib import Path
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 BRANCH_PATTERN = re.compile(r"^sync/upstream-[0-9]{8}-([0-9a-f]{8})$")
 PIN_PATTERN = re.compile(r"^Pinned upstream sync: `The-PR-Agent/pr-agent@([0-9a-f]{40})`$", re.MULTILINE)
+# Each refresh merge costs a few git calls. A sync PR that has been updated more
+# times than this is not a legitimate shape and is refused before walking further.
+MAX_BASE_REFRESH_MERGES = 32
 
 
 class ProvenanceError(ValueError):
@@ -58,8 +79,39 @@ def _is_ancestor(repository: Path, ancestor: str, descendant: str) -> bool:
     return _git(repository, "merge-base", "--is-ancestor", ancestor, descendant, check=False).returncode == 0
 
 
+def _parents(repository: Path, sha: str) -> list[str]:
+    return _git(repository, "show", "-s", "--format=%P", sha).stdout.strip().split()
+
+
+def _fork_parents_from_head_to_pin(
+    repository: Path, head: str, pin: str, base_sha: str
+) -> list[str]:
+    """Walk merge links from ``head`` down to ``pin``; return each link's fork-side parent.
+
+    Every link must be a two-parent merge. Exactly one parent must be a fork commit
+    (an ancestor of the PR base); the other is the link below. A chain link can
+    never itself be an ancestor of the base, because it contains the pin and the
+    pin is verified not to be in the base, so the two parents are distinguishable.
+    Returned head-most first.
+    """
+    fork_parents: list[str] = []
+    current = head
+    while current != pin:
+        if len(fork_parents) >= MAX_BASE_REFRESH_MERGES:
+            raise ProvenanceError("Sync candidate has more base refresh merges than are allowed")
+        parents = _parents(repository, current)
+        if len(parents) != 2 or len(set(parents)) != 2:
+            raise ProvenanceError("Resolved sync candidate must have exactly two parents")
+        on_fork_base = [parent for parent in parents if _is_ancestor(repository, parent, base_sha)]
+        if len(on_fork_base) != 1:
+            raise ProvenanceError("Sync candidate merge must have exactly one parent on the fork base")
+        fork_parents.append(on_fork_base[0])
+        (current,) = (parent for parent in parents if parent != on_fork_base[0])
+    return fork_parents
+
+
 def verify_upstream_provenance(metadata: PullRequestMetadata, repository: Path) -> str:
-    """Validate PR metadata and return ``raw-pin`` or ``resolved-merge``."""
+    """Validate PR metadata and return ``raw-pin``, ``resolved-merge`` or ``base-refreshed-merge``."""
 
     _require_sha(metadata.head_sha, "Pull request head")
     _require_sha(metadata.base_sha, "Pull request base")
@@ -112,12 +164,16 @@ def verify_upstream_provenance(metadata: PullRequestMetadata, repository: Path) 
     if metadata.head_sha == pin:
         return "raw-pin"
 
-    parents = _git(repository, "show", "-s", "--format=%P", metadata.head_sha).stdout.strip().split()
-    if len(parents) != 2:
-        raise ProvenanceError("Resolved sync candidate must have exactly two parents")
-    if len(set(parents)) != 2 or set(parents) != {pin, baseline}:
+    # Chronological order: the resolution merge first, then each base refresh.
+    fork_parents = list(reversed(_fork_parents_from_head_to_pin(repository, metadata.head_sha, pin, metadata.base_sha)))
+    if fork_parents[0] != baseline:
         raise ProvenanceError("Resolved sync parents must be exactly the pinned upstream commit and fork baseline")
-    return "resolved-merge"
+    for previous, refreshed in zip(fork_parents, fork_parents[1:], strict=False):
+        # Each refresh must move forward along the fork base. The same commit
+        # again, or an older one, is not a base update and has no reason to exist.
+        if refreshed == previous or not _is_ancestor(repository, previous, refreshed):
+            raise ProvenanceError("Base refresh merge must bring in a newer fork base than the previous merge")
+    return "resolved-merge" if len(fork_parents) == 1 else "base-refreshed-merge"
 
 
 def _parse_args() -> argparse.Namespace:

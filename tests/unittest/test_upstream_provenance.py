@@ -63,6 +63,12 @@ def provenance_graph(tmp_path: Path) -> dict[str, str | Path]:
     stale_baseline = _commit(repository, tree, "stale fork-like history", root)
     resolved = _commit(repository, tree, "resolved merge", baseline, pin)
     reversed_resolved = _commit(repository, tree, "reversed resolved merge", pin, baseline)
+    # main advanced twice after the resolution; each refresh merges the newer base
+    # into the existing candidate, which is what GitHub's "update branch" does.
+    newer_base = _commit(repository, tree, "newer fork base", base)
+    newest_base = _commit(repository, tree, "newest fork base", newer_base)
+    refreshed = _commit(repository, tree, "refresh with newer base", resolved, newer_base)
+    refreshed_twice = _commit(repository, tree, "refresh with newest base", newest_base, refreshed)
 
     return {
         "repository": repository,
@@ -76,6 +82,10 @@ def provenance_graph(tmp_path: Path) -> dict[str, str | Path]:
         "stale_baseline": stale_baseline,
         "resolved": resolved,
         "reversed_resolved": reversed_resolved,
+        "newer_base": newer_base,
+        "newest_base": newest_base,
+        "refreshed": refreshed,
+        "refreshed_twice": refreshed_twice,
     }
 
 
@@ -115,6 +125,99 @@ def test_accepts_resolved_merge_with_either_parent_order(
     assert verify_upstream_provenance(
         _metadata(provenance_graph, head=str(provenance_graph[head_key])), Path(provenance_graph["repository"])
     ) == "resolved-merge"
+
+
+@pytest.mark.parametrize(
+    ("head_key", "base_key"),
+    [("refreshed", "newer_base"), ("refreshed", "newest_base"), ("refreshed_twice", "newest_base")],
+)
+def test_accepts_repeated_base_refresh_merges(
+    provenance_graph: dict[str, str | Path], head_key: str, base_key: str
+) -> None:
+    """Issue #6: main advancing after a resolution must not make the PR unverifiable.
+
+    The pin stays immutable and the body baseline stays the original integration
+    point; each refresh adds one two-parent merge in either parent order. The base
+    may also have moved on again since the last refresh, so the newest fork parent
+    need not equal the current base.
+    """
+    metadata = replace(
+        _metadata(provenance_graph, head=str(provenance_graph[head_key])),
+        base_sha=str(provenance_graph[base_key]),
+    )
+    assert verify_upstream_provenance(metadata, Path(provenance_graph["repository"])) == "base-refreshed-merge"
+
+
+@pytest.mark.parametrize(
+    ("fork_parent_key", "message"),
+    [
+        ("foreign", "exactly one parent on the fork base"),
+        ("stale_baseline", "exactly one parent on the fork base"),
+        ("baseline", "newer fork base than the previous merge"),
+        ("base", "newer fork base than the previous merge"),
+    ],
+)
+def test_rejects_refresh_with_unexpected_or_stale_fork_parent(
+    provenance_graph: dict[str, str | Path], fork_parent_key: str, message: str
+) -> None:
+    """A refresh may only bring in a fork base commit newer than the last one.
+
+    Anything off the fork base is an unexpected parent. The same commit again, or
+    an older one, is not a base update and would let an arbitrary merge ride in.
+    """
+    repository = Path(provenance_graph["repository"])
+    # "refreshed" already brought in newer_base, so baseline and base are both stale here.
+    candidate = _commit(
+        repository, str(provenance_graph["tree"]), "bad refresh",
+        str(provenance_graph["refreshed"]), str(provenance_graph[fork_parent_key]),
+    )
+    metadata = replace(
+        _metadata(provenance_graph, head=candidate), base_sha=str(provenance_graph["newest_base"])
+    )
+    with pytest.raises(ProvenanceError, match=message):
+        verify_upstream_provenance(metadata, repository)
+
+
+def test_rejects_chain_whose_resolution_is_not_on_the_declared_baseline(
+    provenance_graph: dict[str, str | Path],
+) -> None:
+    """The body's baseline line must still name the resolution's fork parent."""
+    repository = Path(provenance_graph["repository"])
+    tree = str(provenance_graph["tree"])
+    resolved_on_base = _commit(repository, tree, "resolved on base", str(provenance_graph["base"]), str(provenance_graph["pin"]))
+    candidate = _commit(repository, tree, "refresh", resolved_on_base, str(provenance_graph["newer_base"]))
+    metadata = replace(_metadata(provenance_graph, head=candidate), base_sha=str(provenance_graph["newer_base"]))
+    with pytest.raises(ProvenanceError, match="exactly the pinned upstream commit and fork baseline"):
+        verify_upstream_provenance(metadata, repository)
+
+
+@pytest.mark.parametrize("extra", ["plain-commit-on-top", "three-parent-refresh"])
+def test_rejects_arbitrary_commits_inside_a_refresh_chain(
+    provenance_graph: dict[str, str | Path], extra: str
+) -> None:
+    repository = Path(provenance_graph["repository"])
+    tree = str(provenance_graph["tree"])
+    refreshed = str(provenance_graph["refreshed"])
+    parents = {
+        "plain-commit-on-top": (refreshed,),
+        "three-parent-refresh": (refreshed, str(provenance_graph["newest_base"]), str(provenance_graph["root"])),
+    }[extra]
+    candidate = _commit(repository, tree, extra, *parents)
+    metadata = replace(_metadata(provenance_graph, head=candidate), base_sha=str(provenance_graph["newest_base"]))
+    with pytest.raises(ProvenanceError, match="exactly two parents"):
+        verify_upstream_provenance(metadata, repository)
+
+
+def test_rejects_a_chain_longer_than_the_allowed_refresh_count(
+    provenance_graph: dict[str, str | Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("pr_agent.upstream_provenance.MAX_BASE_REFRESH_MERGES", 1)
+    metadata = replace(
+        _metadata(provenance_graph, head=str(provenance_graph["refreshed"])),
+        base_sha=str(provenance_graph["newer_base"]),
+    )
+    with pytest.raises(ProvenanceError, match="more base refresh merges than are allowed"):
+        verify_upstream_provenance(metadata, Path(provenance_graph["repository"]))
 
 
 def test_rejects_pin_outside_upstream_main(provenance_graph: dict[str, str | Path]) -> None:
