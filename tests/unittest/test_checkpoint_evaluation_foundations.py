@@ -1290,11 +1290,11 @@ def test_scorer_reports_lineage_lifecycle_events_stages_cohorts_and_paired_uncer
     all_gate_spec_hashes = {
         decision.gate_name: decision.gate_spec_hash for decision in prerequisite_gates
     }
-    # PR publication is gated by offline replay and its own gate only; the
-    # editor gates are not prerequisites and the pinned set must not name them.
-    required_gate_spec_hashes = {
-        gate: all_gate_spec_hashes[gate] for gate in ("offline-replay", "pr-publication")
-    }
+    # PR publication is gated by offline replay, the replay-based precision floor
+    # (opt-in-pair-review) and its own gate. The two shadow-evidence gates are not
+    # prerequisites and the pinned set must not name them.
+    publication_chain = ("offline-replay", "opt-in-pair-review", "pr-publication")
+    required_gate_spec_hashes = {gate: all_gate_spec_hashes[gate] for gate in publication_chain}
     permission = evaluate_output_permission(
         OutputCapability.PR_PUBLICATION,
         prerequisite_gates,
@@ -1387,6 +1387,31 @@ def test_scorer_reports_lineage_lifecycle_events_stages_cohorts_and_paired_uncer
     assert editor_blocked.status is GateStatus.FAILED
     with pytest.raises(EvaluationValidationError, match="not permitted"):
         editor_blocked.require_permitted()
+
+    # The precision floor is the one gate that must survive the trim: without it a
+    # noisy candidate that merely beats a weak incumbent could publish.
+    failed_floor_gate = evaluate_rollout_gate(
+        "opt-in-pair-review",
+        scorecard,
+        "deterministic",
+        (GateRule("verified_precision", GateComparator.AT_LEAST, 1.1),),
+    )
+    floor_blocked = evaluate_output_permission(
+        OutputCapability.PR_PUBLICATION,
+        tuple(
+            failed_floor_gate if decision.gate_name == "opt-in-pair-review" else decision
+            for decision in prerequisite_gates
+        ),
+        arm_id="deterministic",
+        scorecard_id=scorecard.scorecard_id,
+        required_gate_spec_hashes={
+            **required_gate_spec_hashes,
+            "opt-in-pair-review": failed_floor_gate.gate_spec_hash,
+        },
+    )
+    assert floor_blocked.status is GateStatus.FAILED
+    with pytest.raises(EvaluationValidationError, match="not permitted"):
+        floor_blocked.require_permitted()
 
     paired_gate = evaluate_rollout_gate(
         "pr-publication",

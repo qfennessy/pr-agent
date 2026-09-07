@@ -52,11 +52,16 @@ class OutputCapability(str, Enum):
 #
 # PR publication is a different thing. It runs on demand and in CI, never in an
 # editor, so there is no developer to interrupt and nothing for the live-shadow
-# gate to measure. Its own gate carries the quality bar -- a strictly positive
-# quality advantage on the frozen holdout, within an accepted cost ceiling -- on
-# top of the offline replay gate that proves the reviewer finds real bugs at all.
-# Requiring the editor gates as well would make publication wait on seven days
-# of evidence that on-demand and CI runs can never produce (issue #60).
+# gate to measure. Requiring it, or default-pair-review (which also needs shadow
+# evidence), would make publication wait on seven days of evidence that
+# on-demand and CI runs can never produce (issue #60).
+#
+# opt-in-pair-review stays on the publication path despite its name. Its rules
+# are replay-based -- verified precision of at least 80% and no high-severity
+# recall regression on the temporal cohort -- and it is the only gate that sets
+# an absolute quality floor. The pr-publication gate checks a *relative*
+# advantage over the incumbent plus cost; without the floor, a noisy candidate
+# that beats a weak incumbent would be authorized to comment on pull requests.
 _OUTPUT_GATES_BY_CAPABILITY = {
     OutputCapability.OPT_IN_PAIR_REVIEW: (
         "offline-replay", "live-shadow", "opt-in-pair-review",
@@ -65,7 +70,7 @@ _OUTPUT_GATES_BY_CAPABILITY = {
         "offline-replay", "live-shadow", "opt-in-pair-review", "default-pair-review",
     ),
     OutputCapability.PR_PUBLICATION: (
-        "offline-replay", "pr-publication",
+        "offline-replay", "opt-in-pair-review", "pr-publication",
     ),
 }
 _MUTABLE_MODEL_REVISIONS = {"default", "latest", "main", "stable"}
