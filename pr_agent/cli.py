@@ -845,7 +845,9 @@ def _collect_cost_for_shadow_recording() -> None:
     get_settings().set("config.output_run_cost", True)
 
 
-def _record_shadow_journal_entry(snapshot, result, *, lookup_seconds=None, model_calls=None) -> None:
+def _record_shadow_journal_entry(
+    snapshot, result, *, lookup_seconds=None, model_calls=None, run_details=None
+) -> None:
     """Record one completed local review, if an operator asked for recording.
 
     Observational only. A recording failure must never change, delay, or fail a
@@ -861,7 +863,11 @@ def _record_shadow_journal_entry(snapshot, result, *, lookup_seconds=None, model
             return
         _shadow_journal_writer.submit(
             shadow_entry_from_snapshot_result(
-                snapshot, result, lookup_seconds=lookup_seconds, model_calls=model_calls
+                snapshot,
+                result,
+                lookup_seconds=lookup_seconds,
+                model_calls=model_calls,
+                run_details=run_details,
             )
         )
     except Exception as exc:
@@ -1289,10 +1295,17 @@ def _run_review_snapshot_impl(args, outer_parser: argparse.ArgumentParser):
             # journal omits the event while still reporting a complete inventory.
             # _record_shadow_journal_entry never raises, so this cannot mask the
             # publication error.
+            # The run's own accounting, not the result's mappings: those are empty
+            # whenever no structured review came back, and a priced call whose
+            # response failed to parse would otherwise be journaled as unpriced.
+            # An empty diff never enters the review block, so it made no request
+            # and its spend is exactly zero; a block that was entered and raised
+            # before returning its accounting is genuinely unknown.
             _record_shadow_journal_entry(
                 snapshot,
                 result,
-                model_calls=None if details is None else details.num_ai_calls,
+                model_calls=0 if not review_attempted else None,
+                run_details=details,
             )
             # Reached only because the recorder cannot raise. It handles and marks
             # its own failures, so past this point the outer guard has nothing to

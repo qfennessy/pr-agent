@@ -844,6 +844,7 @@ def shadow_entry_from_snapshot_result(
     *,
     lookup_seconds: Optional[float] = None,
     model_calls: Optional[int] = None,
+    run_details: Any = None,
 ) -> ShadowJournalEntry:
     """Build one source-free journal entry from a completed local review.
 
@@ -858,12 +859,21 @@ def shadow_entry_from_snapshot_result(
     ordinary invocation whose cost is precisely known. ``None`` means the caller
     cannot say, and the reported mappings are used as-is.
 
+    ``run_details`` is the run's own accounting when the caller has it. It is
+    preferred over the result's usage and cost mappings, because those are
+    filled only when a structured review was produced: a priced call whose
+    response failed to parse yields a result with empty mappings, and the paid
+    event would otherwise be journaled with an unavailable cost. When given, it
+    also supplies ``model_calls``.
+
     ``lookup_seconds`` is the wall time of *this* invocation when the review came
     from cache, which is the latency the gate should read rather than the cached
     result's original latency. Two hits of one snapshot may end up with the same
     ``entry_id``; that is correct for a content hash, and the writer's
     ``record_id`` is what keeps each record distinct.
     """
+    if run_details is not None and model_calls is None:
+        model_calls = getattr(run_details, "num_ai_calls", None)
     if model_calls is not None and (
         isinstance(model_calls, bool) or not isinstance(model_calls, int) or model_calls < 0
     ):
@@ -886,8 +896,15 @@ def shadow_entry_from_snapshot_result(
         if result.coverage_issues
         else MeasurementStatus.UNAVAILABLE
     )
-    usage = result.usage if isinstance(result.usage, Mapping) else {}
-    cost = result.cost if isinstance(result.cost, Mapping) else {}
+    if run_details is not None:
+        # The accounting knows what was spent whether or not a review came back.
+        usage = {"total_tokens": getattr(run_details, "total_tokens", None),
+                 "status": getattr(run_details, "usage_status", None)}
+        cost = {"total_usd": str(getattr(run_details, "total_cost_usd", "")),
+                "status": getattr(run_details, "cost_status", None)}
+    else:
+        usage = result.usage if isinstance(result.usage, Mapping) else {}
+        cost = result.cost if isinstance(result.cost, Mapping) else {}
     return ShadowJournalEntry(
         snapshot_id=snapshot.snapshot_id,
         event=snapshot.event,

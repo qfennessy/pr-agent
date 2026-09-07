@@ -522,6 +522,47 @@ class TestAReviewThatSpentNothingSaysSoExactly:
         assert entry.cost_usd.value == 0.0
         assert entry.tokens.value == 0.0
 
+    def test_a_priced_call_with_no_parseable_review_keeps_its_cost(self):
+        """The result's mappings are empty whenever no structured review came back.
+
+        A malformed model response is still a paid call. Reading cost from the
+        result would journal it as unpriced and make the gate's metric partial.
+        """
+        snapshot = _snapshot()
+        failed = _result(snapshot, usage={}, cost={})
+        accounting = SimpleNamespace(
+            num_ai_calls=1, total_tokens=1659, usage_status="complete",
+            total_cost_usd="0.010047", cost_status="complete",
+        )
+        entry = shadow_entry_from_snapshot_result(snapshot, failed, run_details=accounting)
+
+        assert entry.cost_usd.status is MeasurementStatus.COMPLETE
+        assert entry.cost_usd.value == pytest.approx(0.010047)
+        assert entry.tokens.status is MeasurementStatus.COMPLETE
+        assert entry.tokens.value == pytest.approx(1659)
+
+    def test_run_accounting_that_made_no_call_records_zero(self):
+        snapshot = _snapshot()
+        accounting = SimpleNamespace(
+            num_ai_calls=0, total_tokens=0, usage_status="unavailable",
+            total_cost_usd="0", cost_status="unavailable",
+        )
+        entry = shadow_entry_from_snapshot_result(snapshot, _result(snapshot), run_details=accounting)
+
+        assert entry.cost_usd.status is MeasurementStatus.COMPLETE
+        assert entry.cost_usd.value == 0.0
+
+    def test_run_accounting_with_partial_pricing_stays_partial(self):
+        snapshot = _snapshot()
+        accounting = SimpleNamespace(
+            num_ai_calls=2, total_tokens=3000, usage_status="complete",
+            total_cost_usd="0.01", cost_status="partial",
+        )
+        entry = shadow_entry_from_snapshot_result(snapshot, _result(snapshot), run_details=accounting)
+
+        assert entry.cost_usd.status is MeasurementStatus.PARTIAL
+        assert entry.tokens.status is MeasurementStatus.COMPLETE
+
     def test_a_nonsense_call_count_is_refused(self):
         snapshot = _snapshot()
         for bad in (-1, True, 1.5, "0"):
@@ -535,9 +576,14 @@ class TestAReviewThatSpentNothingSaysSoExactly:
         from pr_agent import cli
 
         source = inspect.getsource(cli._run_review_snapshot_impl)
-        assert "model_calls=None if details is None else details.num_ai_calls" in source
+        # The review path hands over the run's own accounting, which carries the
+        # call count, and says "zero" outright when the review block never ran.
+        assert "run_details=details" in source
+        assert "model_calls=0 if not review_attempted else None" in source
         # The two short-circuits never reach a provider at all.
-        assert source.count("model_calls=0") == 2
+        import re
+
+        assert len(re.findall(r"model_calls=0(?! if)", source)) == 2
 
 
 class TestNothingBetweenTheModelAndTheRecorderIsUnguarded:
