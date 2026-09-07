@@ -44,6 +44,24 @@ class OutputCapability(str, Enum):
     PR_PUBLICATION = "pr_publication"
 
 
+# Which gates a capability must have passed before it may produce output.
+#
+# The two pair-review capabilities are local editor modes, so they sit behind the
+# live-shadow gate: it measures how often a reviewer would interrupt a developer
+# mid-edit, and that risk only exists when the reviewer runs on file save.
+#
+# PR publication is a different thing. It runs on demand and in CI, never in an
+# editor, so there is no developer to interrupt and nothing for the live-shadow
+# gate to measure. Requiring it, or default-pair-review (which also needs shadow
+# evidence), would make publication wait on seven days of evidence that
+# on-demand and CI runs can never produce (issue #60).
+#
+# opt-in-pair-review stays on the publication path despite its name. Its rules
+# are replay-based -- verified precision of at least 80% and no high-severity
+# recall regression on the temporal cohort -- and it is the only gate that sets
+# an absolute quality floor. The pr-publication gate checks a *relative*
+# advantage over the incumbent plus cost; without the floor, a noisy candidate
+# that beats a weak incumbent would be authorized to comment on pull requests.
 _OUTPUT_GATES_BY_CAPABILITY = {
     OutputCapability.OPT_IN_PAIR_REVIEW: (
         "offline-replay", "live-shadow", "opt-in-pair-review",
@@ -52,7 +70,7 @@ _OUTPUT_GATES_BY_CAPABILITY = {
         "offline-replay", "live-shadow", "opt-in-pair-review", "default-pair-review",
     ),
     OutputCapability.PR_PUBLICATION: (
-        "offline-replay", "live-shadow", "opt-in-pair-review", "default-pair-review", "pr-publication",
+        "offline-replay", "opt-in-pair-review", "pr-publication",
     ),
 }
 _MUTABLE_MODEL_REVISIONS = {"default", "latest", "main", "stable"}
