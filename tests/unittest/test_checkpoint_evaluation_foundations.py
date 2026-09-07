@@ -1287,8 +1287,13 @@ def test_scorer_reports_lineage_lifecycle_events_stages_cohorts_and_paired_uncer
             "pr-publication",
         )
     )
-    required_gate_spec_hashes = {
+    all_gate_spec_hashes = {
         decision.gate_name: decision.gate_spec_hash for decision in prerequisite_gates
+    }
+    # PR publication is gated by offline replay and its own gate only; the
+    # editor gates are not prerequisites and the pinned set must not name them.
+    required_gate_spec_hashes = {
+        gate: all_gate_spec_hashes[gate] for gate in ("offline-replay", "pr-publication")
     }
     permission = evaluate_output_permission(
         OutputCapability.PR_PUBLICATION,
@@ -1298,6 +1303,14 @@ def test_scorer_reports_lineage_lifecycle_events_stages_cohorts_and_paired_uncer
         required_gate_spec_hashes=required_gate_spec_hashes,
     )
     permission.require_permitted()
+    with pytest.raises(EvaluationValidationError, match="pin every approved prerequisite gate"):
+        evaluate_output_permission(
+            OutputCapability.PR_PUBLICATION,
+            prerequisite_gates,
+            arm_id="deterministic",
+            scorecard_id=scorecard.scorecard_id,
+            required_gate_spec_hashes=all_gate_spec_hashes,
+        )
     stale_permission = evaluate_output_permission(
         OutputCapability.PR_PUBLICATION,
         prerequisite_gates,
@@ -1338,6 +1351,42 @@ def test_scorer_reports_lineage_lifecycle_events_stages_cohorts_and_paired_uncer
     )
     with pytest.raises(EvaluationValidationError, match="not permitted"):
         blocked_by_prerequisite.require_permitted()
+
+    # Issue #60: the live-shadow and default-pair-review gates measure interrupting
+    # a developer mid-edit. PR publication runs on demand and in CI, with no
+    # developer to interrupt, so a failed editor gate must not block it -- while
+    # the pair-review capabilities still wait on it.
+    failed_shadow_gate = evaluate_rollout_gate(
+        "live-shadow",
+        scorecard,
+        "deterministic",
+        (GateRule("verified_precision", GateComparator.AT_LEAST, 1.1),),
+    )
+    assert failed_shadow_gate.status is GateStatus.FAILED
+    with_failed_shadow = tuple(
+        failed_shadow_gate if decision.gate_name == "live-shadow" else decision
+        for decision in prerequisite_gates
+    )
+    evaluate_output_permission(
+        OutputCapability.PR_PUBLICATION,
+        with_failed_shadow,
+        arm_id="deterministic",
+        scorecard_id=scorecard.scorecard_id,
+        required_gate_spec_hashes=required_gate_spec_hashes,
+    ).require_permitted()
+    editor_blocked = evaluate_output_permission(
+        OutputCapability.OPT_IN_PAIR_REVIEW,
+        with_failed_shadow,
+        arm_id="deterministic",
+        scorecard_id=scorecard.scorecard_id,
+        required_gate_spec_hashes={
+            **{gate: all_gate_spec_hashes[gate] for gate in ("offline-replay", "opt-in-pair-review")},
+            "live-shadow": failed_shadow_gate.gate_spec_hash,
+        },
+    )
+    assert editor_blocked.status is GateStatus.FAILED
+    with pytest.raises(EvaluationValidationError, match="not permitted"):
+        editor_blocked.require_permitted()
 
     paired_gate = evaluate_rollout_gate(
         "pr-publication",
