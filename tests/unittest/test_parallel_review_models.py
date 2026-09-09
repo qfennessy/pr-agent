@@ -179,3 +179,21 @@ async def test_unknown_model_and_publication_failure_are_isolated(monkeypatch, s
     await reviewer.run()
     assert len(provider.edited) == 1
     assert "provider/b" in settings.data.reviews
+
+
+async def test_all_unknown_models_publish_failures_without_preparing_input(monkeypatch, settings):
+    reviewer, provider = make_reviewer(monkeypatch, MagicMock)
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.get_max_tokens", MagicMock(side_effect=ValueError))
+    await reviewer.run()
+    reviewer._prepare_review_diff.assert_not_called()
+    assert len(provider.existing) == 2
+    assert all("model context window unavailable" in comment.body for comment in provider.existing)
+
+
+def test_plain_text_prompt_preserves_code_characters(settings):
+    reviewer = PRReviewer.__new__(PRReviewer)
+    reviewer.vars = {"title": "Check <tag> & condition"}
+    reviewer.patches_diff = 'if x < 2 and y > 1: print("hello")'
+    settings.set("pr_review_prompt.system", "{{ title }}")
+    settings.set("pr_review_prompt.user", "{{ diff }}")
+    assert reviewer._render_review_prompts() == (reviewer.vars["title"], reviewer.patches_diff)

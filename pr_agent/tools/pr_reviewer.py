@@ -633,16 +633,18 @@ class PRReviewer:
             except Exception:
                 # An unknown model must not stop otherwise valid review slots.
                 pass
-        budget_model = min(model_budgets, key=model_budgets.get) if model_budgets else get_settings().config.model
-        self.token_handler = TokenHandler(
-            self.git_provider.pr, self.vars,
-            get_settings().pr_review_prompt.system, get_settings().pr_review_prompt.user,
-            model=budget_model,
-        )
-        self._prepare_review_diff(budget_model)
-        if not self.patches_diff:
-            return
-        prompts = self._render_review_prompts()
+        prompts = None
+        if model_budgets:
+            budget_model = min(model_budgets, key=model_budgets.get)
+            self.token_handler = TokenHandler(
+                self.git_provider.pr, self.vars,
+                get_settings().pr_review_prompt.system, get_settings().pr_review_prompt.user,
+                model=budget_model,
+            )
+            self._prepare_review_diff(budget_model)
+            if not self.patches_diff:
+                return
+            prompts = self._render_review_prompts()
         settings = copy.deepcopy(get_settings())
 
         async def review_model(model):
@@ -679,7 +681,7 @@ class PRReviewer:
                 except Exception as exc:
                     # Provider exception strings can contain credentials or prompt data.
                     reason = (
-                        "model context window unavailable" if isinstance(exc, LookupError)
+                        "model context window unavailable" if model not in model_budgets
                         else "invalid or empty review output" if isinstance(exc, ValueError)
                         else type(exc).__name__
                     )
@@ -1715,7 +1717,10 @@ class PRReviewer:
     def _render_review_prompts(self) -> tuple[str, str]:
         variables = copy.deepcopy(self.vars)
         variables["diff"] = self.patches_diff
-        environment = Environment(undefined=StrictUndefined)
+        # These are plain-text model inputs; preserve source code characters literally.
+        environment = Environment(
+            undefined=StrictUndefined, autoescape=select_autoescape(default_for_string=False),
+        )
         return (
             environment.from_string(get_settings().pr_review_prompt.system).render(variables),
             environment.from_string(get_settings().pr_review_prompt.user).render(variables),
