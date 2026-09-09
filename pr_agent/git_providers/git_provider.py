@@ -204,7 +204,7 @@ def _persistent_comment_attribution(comment_id: str) -> str:
     except AttributeError:
         model_used = comment_id
     # Model ids carry a provider prefix ("openai/kimi-k3") that reviewer ids do not.
-    is_own_model = str(model_used).rsplit("/", 1)[-1] == comment_id
+    is_own_model = model_used == comment_id or str(model_used).rsplit("/", 1)[-1] == comment_id
     if is_own_model:
         return f"{PERSISTENT_COMMENT_ATTRIBUTION_PREFIX} `{comment_id}`"
     return (

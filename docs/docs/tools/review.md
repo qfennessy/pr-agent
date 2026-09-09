@@ -641,3 +641,28 @@ no other review behavior needs to change.
     """
     ```
     Use triple quotes to write multi-line instructions. Use bullet points to make the instructions more readable.
+
+### Independent reviews from multiple models
+
+Set `pr_reviewer.review_models` to run multiple models concurrently from one `/review`:
+
+```toml
+[pr_reviewer]
+review_models = ["openrouter/deepseek/deepseek-v4-flash", "openrouter/z-ai/glm-5.3-flash"]
+```
+
+Each model receives the same rendered prompts and diff, prepared once using the smallest
+configured model context window. Each produces its own persistent summary comment, with
+its full model ID in the heading and `Reviewed by` attribution. Subsequent runs update
+that model's comment in place; changing the list order does not change ownership. Duplicate
+model IDs run once. A timeout, provider failure, or invalid output produces a failure
+summary for that model while the others finish normally. Each call uses `config.ai_timeout`.
+Failure summaries report the error category without exposing provider response bodies.
+
+This mode produces independent summary comments only: it does not combine findings or run
+specialist, verification, adjudication, inline-comment, or label stages. With
+`config.publish_output=false`, the summaries are available in the local result artifact.
+The full model ID becomes `config.persistent_comment_id` for that comment.
+`/describe`, `/improve`, and `/ask` are unaffected. An empty list (the default) preserves
+the existing review flow, including `config.model` and `config.fallback_models`; those
+fallbacks are not used to substitute a different model in an independent review slot.

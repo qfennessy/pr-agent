@@ -9,6 +9,7 @@ from functools import partial
 from typing import Any, List, Mapping, Optional, Tuple
 
 from jinja2 import Environment, StrictUndefined, select_autoescape
+from starlette_context import request_cycle_context
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import (
@@ -242,6 +243,7 @@ class PRReviewer:
 
         if self.is_answer and not self.git_provider.is_supported("get_issue_comments"):
             raise Exception(f"Answer mode is not supported for {get_settings().config.git_provider} for now")
+        self._ai_handler_factory = ai_handler
         self.ai_handler = ai_handler()
         self.ai_handler.main_pr_language = self.main_language
         self.patches_diff = None
@@ -373,6 +375,10 @@ class PRReviewer:
         return incremental
 
     async def run(self) -> None:
+        review_models = get_settings().pr_reviewer.get("review_models", [])
+        if review_models and not review_execution_is_isolated():
+            await self._run_review_models(review_models)
+            return
         self._review_execution_started = True
         init_run_details()
         record_review_profile(self._review_profile())
@@ -606,6 +612,99 @@ class PRReviewer:
                     self.git_provider.publish_comment("Failed to review PR")
                 except Exception as e:
                     get_logger().exception(f"Failed to publish review failure result, error: {e}")
+
+    async def _run_review_models(self, models) -> None:
+        """Fan out one prepared input and publish an independent summary per model."""
+        if not isinstance(models, (list, tuple)) or any(
+            not isinstance(model, str) or not model.strip() for model in models
+        ):
+            raise ValueError("pr_reviewer.review_models must be a list of non-empty model ids")
+        models = list(dict.fromkeys(model.strip() for model in models))
+        if not self.git_provider.get_files():
+            return
+        if self._review_profile() != "bugs_only":
+            await extract_and_cache_pr_tickets(self.git_provider, self.vars)
+
+        # Build once against the smallest model window. No model can select its own diff.
+        model_budgets = {}
+        for model in models:
+            try:
+                model_budgets[model] = get_max_tokens(model)
+            except Exception:
+                # An unknown model must not stop otherwise valid review slots.
+                pass
+        budget_model = min(model_budgets, key=model_budgets.get) if model_budgets else get_settings().config.model
+        self.token_handler = TokenHandler(
+            self.git_provider.pr, self.vars,
+            get_settings().pr_review_prompt.system, get_settings().pr_review_prompt.user,
+            model=budget_model,
+        )
+        self._prepare_review_diff(budget_model)
+        if not self.patches_diff:
+            return
+        prompts = self._render_review_prompts()
+        settings = copy.deepcopy(get_settings())
+
+        async def review_model(model):
+            # A new context dictionary is essential: inherited request dictionaries
+            # and Dynaconf objects would otherwise be shared by asyncio tasks.
+            with request_cycle_context({"settings": copy.deepcopy(settings)}), isolate_run_details():
+                get_settings().set("config.model", model)
+                get_settings().set("config.persistent_comment_id", model)
+                get_settings().set("config.last_used_model", model)
+                init_run_details()
+                record_review_profile(self._review_profile())
+                reviewer = copy.copy(self)
+                # Provider access is read-only during rendering; only the final
+                # publication uses the shared provider. Copy all model-owned state.
+                for key, value in self.__dict__.items():
+                    if key not in {"git_provider", "ai_handler", "_ai_handler_factory", "token_handler"}:
+                        setattr(reviewer, key, copy.deepcopy(value))
+                reviewer._force_no_publish = True
+                heading = f"## PR Reviewer Guide ({model}) 🔍"
+                try:
+                    if model not in model_budgets:
+                        raise LookupError("model context window unavailable")
+                    reviewer.ai_handler = self._ai_handler_factory()
+                    reviewer.ai_handler.main_pr_language = self.main_language
+                    reviewer.prediction = await asyncio.wait_for(
+                        reviewer._get_prediction(model, prompts=prompts), timeout=settings.config.ai_timeout,
+                    )
+                    reviewer._reject_unparsable_prediction(model)
+                    body = reviewer._prepare_pr_review()
+                    if body:
+                        body = heading + "\n" + body.partition("\n")[2]
+                    else:
+                        body = heading + "\n\nNo major issues detected."
+                except Exception as exc:
+                    # Provider exception strings can contain credentials or prompt data.
+                    reason = (
+                        "model context window unavailable" if isinstance(exc, LookupError)
+                        else "invalid or empty review output" if isinstance(exc, ValueError)
+                        else type(exc).__name__
+                    )
+                    body = f"{heading}\n\nReview failed: {reason}."
+                    get_logger().warning("Independent review failed", artifact={"model": model, "reason": reason})
+                if settings.config.publish_output:
+                    self.git_provider.publish_persistent_comment(
+                        body,
+                        initial_header=heading,
+                        update_header=True,
+                        final_update_message=False,
+                        name="review",
+                    )
+                return body
+
+        results = await asyncio.gather(*(review_model(model) for model in models), return_exceptions=True)
+        artifacts = {}
+        for model, result in zip(models, results):
+            if isinstance(result, BaseException):
+                get_logger().error("Could not publish independent review", artifact={"model": model,
+                                                                                     "error": type(result).__name__})
+            else:
+                artifacts[model] = result
+        if self._local_artifact_mutations_allowed():
+            get_settings().data = {"artifact": "\n\n".join(artifacts.values()), "reviews": artifacts}
 
     async def _run_structured_no_publish_once(self) -> StructuredReviewExecution:
         """Run one already-isolated reviewer while forcing review output sinks closed."""
@@ -1415,7 +1514,7 @@ class PRReviewer:
             name="bugs-only review",
         )
 
-    async def _prepare_prediction(self, model: str) -> None:
+    def _prepare_review_diff(self, model: str) -> None:
         decision = getattr(self, "review_route_decision", None)
         if (decision is not None and decision.routing_enabled) or review_execution_is_isolated():
             # Model-specific tokenization matters when the selected profile uses a
@@ -1474,6 +1573,8 @@ class PRReviewer:
             self.remaining_files_list = []
             self.deleted_files_list = []
 
+    async def _prepare_prediction(self, model: str) -> None:
+        self._prepare_review_diff(model)
         if self.patches_diff:
             get_logger().debug("PR diff", diff=self.patches_diff)
             if specialists_enabled() and not getattr(self, "_specialists_started", False):
@@ -1611,7 +1712,16 @@ class PRReviewer:
         if not isinstance(data, dict) or not isinstance(data.get('review'), dict) or not data['review']:
             raise ValueError(f"Model {model} returned output without a non-empty 'review' mapping")
 
-    async def _get_prediction(self, model: str) -> str:
+    def _render_review_prompts(self) -> tuple[str, str]:
+        variables = copy.deepcopy(self.vars)
+        variables["diff"] = self.patches_diff
+        environment = Environment(undefined=StrictUndefined)
+        return (
+            environment.from_string(get_settings().pr_review_prompt.system).render(variables),
+            environment.from_string(get_settings().pr_review_prompt.user).render(variables),
+        )
+
+    async def _get_prediction(self, model: str, *, prompts: Optional[tuple[str, str]] = None) -> str:
         """
         Generate an AI prediction for the pull request review.
 
@@ -1621,12 +1731,7 @@ class PRReviewer:
         Returns:
             A string representing the AI prediction for the pull request review.
         """
-        variables = copy.deepcopy(self.vars)
-        variables["diff"] = self.patches_diff  # update diff
-
-        environment = Environment(undefined=StrictUndefined)
-        system_prompt = environment.from_string(get_settings().pr_review_prompt.system).render(variables)
-        user_prompt = environment.from_string(get_settings().pr_review_prompt.user).render(variables)
+        system_prompt, user_prompt = prompts if prompts is not None else self._render_review_prompts()
 
         self._review_prediction_finish_reason = None
         response, finish_reason = await self.ai_handler.chat_completion(
