@@ -117,6 +117,10 @@ branch_issue_regex = ""
 # Independent concurrent reviews with identical inputs and one persistent comment per model.
 # Empty preserves config.model and config.fallback_models behavior.
 review_models = []
+# Disabled by default. A repository may opt in to one delayed retry after a provider
+# reports a 429; the delay is capped by the reviewer so an untrusted header cannot
+# extend a CI job indefinitely. Other failures never retry here.
+rate_limit_retry_delay_seconds = 0
 # enable/disable features
 review_profile="full" # "full" preserves the standard review; "bugs_only" emits only qualifying defects.
 # Opt in to a bounded second pass that verifies review candidates against repository evidence.
