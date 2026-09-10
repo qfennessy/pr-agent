@@ -5,7 +5,8 @@ import re
 from functools import partial
 from typing import List, Optional, Tuple
 
-from jinja2 import Environment, StrictUndefined
+from jinja2 import Environment, StrictUndefined, select_autoescape
+from starlette_context import request_cycle_context
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
@@ -31,7 +32,7 @@ from pr_agent.algo.review_finding_state import (
     reconcile_review_findings,
 )
 from pr_agent.algo.review_merge import merge_review_chunks
-from pr_agent.algo.run_details import get_run_details, init_run_details
+from pr_agent.algo.run_details import get_run_details, init_run_details, isolate_run_details
 from pr_agent.algo.skills_loader import get_skills_context
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import (
@@ -40,6 +41,7 @@ from pr_agent.algo.utils import (
     PRReviewIdentity,
     add_pr_review_identity,
     convert_to_markdown_v2,
+    get_max_tokens,
     get_pr_review_comment_identifiers,
     github_action_output,
     load_yaml,
@@ -180,6 +182,7 @@ class PRReviewer:
 
         if self.is_answer and not self.git_provider.is_supported("get_issue_comments"):
             raise Exception(f"Answer mode is not supported for {get_settings().config.git_provider} for now")
+        self._ai_handler_factory = ai_handler
         self.ai_handler = ai_handler()
         self.ai_handler.main_pr_language = self.main_language
         self.patches_diff = None
@@ -255,6 +258,10 @@ class PRReviewer:
         return incremental
 
     async def run(self) -> None:
+        review_models = get_settings().pr_reviewer.get("review_models", [])
+        if review_models:
+            await self._run_review_models(review_models)
+            return
         init_run_details()
         progress_response = None
         review_error = None
@@ -450,6 +457,113 @@ class PRReviewer:
                     self.git_provider.publish_comment(_review_failure_comment(review_error))
                 except Exception as e:
                     get_logger().exception(f"Failed to publish review failure result, error: {e}")
+
+    async def _run_review_models(self, models) -> None:
+        """Run configured review models concurrently with one prepared prompt and diff."""
+        if not isinstance(models, (list, tuple)) or any(
+            not isinstance(model, str) or not model.strip() for model in models
+        ):
+            raise ValueError("pr_reviewer.review_models must be a list of non-empty model ids")
+        models = list(dict.fromkeys(model.strip() for model in models))
+        if not self.git_provider.get_files():
+            get_logger().info(f"PR has no files: {self.pr_url}, skipping review")
+            return
+
+        await extract_and_cache_pr_tickets(self.git_provider, self.vars)
+        raw_prompt_vars = copy.deepcopy(self.vars)
+        model_budgets = {}
+        for model in models:
+            try:
+                model_budgets[model] = get_max_tokens(model)
+            except Exception:
+                get_logger().warning("Independent review model has no known context window", artifact={"model": model})
+
+        prompts = None
+        if model_budgets:
+            budget_model = min(model_budgets, key=model_budgets.get)
+            self.vars, self.token_handler = fit_related_tickets_to_prompt_budget(
+                self.git_provider.pr,
+                raw_prompt_vars,
+                get_settings().pr_review_prompt.system,
+                get_settings().pr_review_prompt.user,
+                budget_model,
+            )
+            output = get_pr_diff(
+                self.git_provider,
+                self.token_handler,
+                budget_model,
+                add_line_numbers_to_hunks=True,
+                disable_extra_lines=False,
+                return_remaining_files=True,
+            )
+            self.patches_diff, self.remaining_files_list = output if isinstance(output, tuple) else (output, [])
+            if not self.patches_diff:
+                get_logger().warning(f"Empty diff for PR: {self.pr_url}")
+                return
+            prompts = self._render_review_prompts(self.patches_diff)
+
+        settings = copy.deepcopy(get_settings())
+
+        async def review_model(model):
+            heading = f"## PR Reviewer Guide ({model}) 🔍"
+            with request_cycle_context({"settings": copy.deepcopy(settings)}), isolate_run_details():
+                get_settings().set("config.model", model)
+                get_settings().set("config.last_used_model", model)
+                get_settings().set("config.persistent_comment_id", model)
+                init_run_details()
+                try:
+                    if model not in model_budgets:
+                        raise LookupError("model context window unavailable")
+                    handler = self._ai_handler_factory()
+                    handler.main_pr_language = self.main_language
+                    response, _finish_reason = await asyncio.wait_for(
+                        handler.chat_completion(
+                            model=model,
+                            temperature=get_settings().config.temperature,
+                            system=prompts[0],
+                            user=prompts[1],
+                        ),
+                        timeout=get_settings().config.ai_timeout,
+                    )
+                    data = self._load_review_yaml(response)
+                    if not isinstance(data, dict) or not isinstance(data.get("review"), dict) or not data["review"]:
+                        raise ValueError("invalid or empty review output")
+                    markdown = convert_to_markdown_v2(
+                        data,
+                        self.git_provider.is_supported("gfm_markdown"),
+                        git_provider=self.git_provider,
+                        files=self.git_provider.get_diff_files(),
+                    )
+                    body = heading + "\n" + markdown.partition("\n")[2]
+                except Exception as error:
+                    reason = (
+                        "model context window unavailable" if isinstance(error, LookupError)
+                        else "invalid or empty review output" if isinstance(error, ValueError)
+                        else type(error).__name__
+                    )
+                    body = f"{heading}\n\nReview failed: {reason}."
+                    get_logger().warning("Independent review failed", artifact={"model": model, "reason": reason})
+
+                if settings.config.publish_output:
+                    self.git_provider.publish_persistent_comment(
+                        body,
+                        initial_header=heading,
+                        update_header=True,
+                        final_update_message=False,
+                        name="review",
+                        identity_marker=PRReviewIdentity.REGULAR.value,
+                    )
+                return body
+
+        results = await asyncio.gather(*(review_model(model) for model in models), return_exceptions=True)
+        artifacts = {}
+        for model, result in zip(models, results, strict=True):
+            if isinstance(result, BaseException):
+                get_logger().error("Could not publish independent review", artifact={"model": model,
+                                                                                     "error": type(result).__name__})
+            else:
+                artifacts[model] = result
+        get_settings().data = {"artifact": "\n\n".join(artifacts.values()), "reviews": artifacts}
 
     def _review_finding_state_enabled(self) -> bool:
         settings = get_settings()
@@ -839,6 +953,18 @@ class PRReviewer:
         self.remaining_files_list = remaining_files_list
         return True
 
+    def _render_review_prompts(self, patches_diff: Optional[str] = None) -> tuple[str, str]:
+        variables = copy.deepcopy(self.vars)
+        variables["diff"] = self.patches_diff if patches_diff is None else patches_diff
+        environment = Environment(
+            undefined=StrictUndefined,
+            autoescape=select_autoescape(default_for_string=False),
+        )
+        return (
+            environment.from_string(get_settings().pr_review_prompt.system).render(variables),
+            environment.from_string(get_settings().pr_review_prompt.user).render(variables),
+        )
+
     async def _get_prediction(self, model: str, patches_diff: Optional[str] = None) -> str:
         """
         Generate an AI prediction for the pull request review.
@@ -851,12 +977,7 @@ class PRReviewer:
         Returns:
             A string representing the AI prediction for the pull request review.
         """
-        variables = copy.deepcopy(self.vars)
-        variables["diff"] = self.patches_diff if patches_diff is None else patches_diff  # update diff
-
-        environment = Environment(undefined=StrictUndefined)
-        system_prompt = environment.from_string(get_settings().pr_review_prompt.system).render(variables)
-        user_prompt = environment.from_string(get_settings().pr_review_prompt.user).render(variables)
+        system_prompt, user_prompt = self._render_review_prompts(patches_diff)
 
         response, finish_reason = await self.ai_handler.chat_completion(
             model=model,

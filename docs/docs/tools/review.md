@@ -696,3 +696,18 @@ no other review behavior needs to change.
 
     The merged verdict is deliberately never less alarming than the worst chunk: a clean chunk
     cannot raise a score, clear a security concern, or soften a risk level set by another chunk.
+
+### Independent reviews from multiple models
+
+Set `pr_reviewer.review_models` to run several models concurrently from one `/review`:
+
+```toml
+[pr_reviewer]
+review_models = ["openrouter/deepseek/deepseek-v4-flash", "openrouter/z-ai/glm-5.3-flash"]
+```
+
+PR-Agent prepares one prompt and diff using the smallest configured model context window, then sends
+that exact input to every model. Each result has its own persistent comment headed with the full model
+ID, so reruns update the same model's comment without overwriting another result. A timeout, provider
+failure, or malformed response writes a safe failure summary for that model while the other reviews
+continue. An empty list preserves the existing `config.model` and `config.fallback_models` flow.

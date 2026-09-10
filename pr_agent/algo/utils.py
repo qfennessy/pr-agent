@@ -89,7 +89,10 @@ class PRReviewHeader(str, Enum):
 
 class PRReviewIdentity(str, Enum):
     REGULAR = "<!-- pr-agent:review:full -->"
+    BUGS_ONLY = "<!-- pr-agent:review:bugs-only -->"
+    FULL_INCREMENTAL = "<!-- pr-agent:review:full:incremental -->"
     INCREMENTAL = "<!-- pr-agent:review:incremental -->"
+    BUGS_ONLY_INCREMENTAL = "<!-- pr-agent:review:bugs-only:incremental -->"
 
 
 class PRCodeSuggestionsHeader(str, Enum):
@@ -103,8 +106,7 @@ class PRCodeSuggestionsIdentity(str, Enum):
 
 
 _ALL_COMMENT_IDENTITIES = (
-    PRReviewIdentity.REGULAR.value,
-    PRReviewIdentity.INCREMENTAL.value,
+    *(identity.value for identity in PRReviewIdentity),
     PRCodeSuggestionsIdentity.SUMMARY.value,
     PRCodeSuggestionsIdentity.NO_SUGGESTIONS.value,
     PRCodeSuggestionsIdentity.UNANCHORED.value,
@@ -176,6 +178,17 @@ def comment_matches_any_identity(body: str, identities: Iterable[str]) -> bool:
     return any(comment_matches_identity(body, identity) for identity in identities)
 
 
+def comment_matches_pr_review_identity(
+        body: str, identities: Iterable[str], review_profile: str = "full") -> bool:
+    """Match a review anchor without letting legacy headings override an explicit profile."""
+    if review_profile == "full" and comment_matches_any_identity(body, (
+        PRReviewIdentity.BUGS_ONLY.value,
+        PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value,
+    )):
+        return False
+    return comment_matches_any_identity(body, identities)
+
+
 def comment_carries_other_identity(body: str, identity_marker: str | None) -> bool:
     """Return whether the comment carries a different hidden identity."""
     return comment_matches_any_identity(
@@ -184,13 +197,23 @@ def comment_carries_other_identity(body: str, identity_marker: str | None) -> bo
     )
 
 
-def get_pr_review_comment_identifiers(*, full: bool, incremental: bool) -> tuple[str, ...]:
+def get_pr_review_comment_identifiers(
+        *, full: bool, incremental: bool, review_profile: str = "full") -> tuple[str, ...]:
     """Return stable markers followed by legacy visible prefixes for migration."""
     identifiers = []
     if full:
         identifiers.extend((PRReviewIdentity.REGULAR.value, PRReviewHeader.REGULAR.value))
     if incremental:
-        identifiers.extend((PRReviewIdentity.INCREMENTAL.value, PRReviewHeader.INCREMENTAL.value))
+        if review_profile == "bugs_only":
+            identifiers.extend((
+                PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value,
+                PRReviewIdentity.BUGS_ONLY.value,
+                PRReviewIdentity.FULL_INCREMENTAL.value,
+                PRReviewIdentity.INCREMENTAL.value,
+                PRReviewHeader.INCREMENTAL.value,
+            ))
+        else:
+            identifiers.append(PRReviewIdentity.FULL_INCREMENTAL.value)
     return tuple(identifiers)
 
 

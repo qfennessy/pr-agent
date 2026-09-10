@@ -11,18 +11,43 @@ from starlette_context import context
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 from ..algo.file_filter import filter_ignored
+from ..algo.git_patch_processing import iter_git_patch_lines, strip_git_line_ending
 from ..algo.language_handler import is_valid_file
-from ..algo.utils import add_pr_review_identity, comment_matches_identity, find_line_number_of_relevant_line_in_file
+from ..algo.utils import add_pr_review_identity, find_line_number_of_relevant_line_in_file
 from ..config_loader import get_settings, get_verbosity_level
 from ..log import get_logger
 from .diff_parsing import to_hunk_only_patch
-from .git_provider import MAX_FILES_ALLOWED_FULL, GitProvider, get_cached_global_settings, redact_credentials
+from .git_provider import (
+    MAX_FILES_ALLOWED_FULL,
+    GitProvider,
+    attach_persistent_comment_id,
+    get_cached_global_settings,
+    is_own_persistent_comment_for_identities,
+    redact_credentials,
+)
 
 
 def _gef_filename(diff):
     if diff.new.path:
         return diff.new.path
     return diff.old.path
+
+
+def _split_git_diff_sections(patch: str) -> list[str]:
+    """Split a raw Git diff only at LF-delimited file headers."""
+    sections = []
+    current = []
+    for record in iter_git_patch_lines(patch):
+        line = strip_git_line_ending(record)
+        if line.startswith("diff --git "):
+            if current:
+                sections.append("".join(current))
+            current = [record]
+        elif current:
+            current.append(record)
+    if current:
+        sections.append("".join(current))
+    return sections
 
 
 class BitbucketProvider(GitProvider):
@@ -292,7 +317,7 @@ class BitbucketProvider(GitProvider):
             if pr_patches is None:
                 raise ValueError(f"Failed to decode PR patch with encodings {encodings_to_try}")
 
-        diff_split = ["diff --git" + x for x in pr_patches.split("diff --git") if x.strip()]
+        diff_split = _split_git_diff_sections(pr_patches)
         # filter all elements of 'diff_split' that are of indices in 'diffs_original' that are not in 'diffs'
         if len(diff_split) > len(diffs) and len(diffs_original) == len(diff_split):
             diff_split = [diff_split[i] for i in range(len(diff_split)) if diffs_original[i] in diffs]
@@ -387,6 +412,7 @@ class BitbucketProvider(GitProvider):
                                    identity_marker: str | None = None,
                                    legacy_initial_header: str | None = None):
         try:
+            pr_comment = attach_persistent_comment_id(pr_comment)
             pr_comment = add_pr_review_identity(pr_comment, identity_marker)
             comments = list(self.pr.comments())
             if identity_marker:
@@ -394,19 +420,21 @@ class BitbucketProvider(GitProvider):
                     (
                         comment
                         for comment in comments
-                        if comment_matches_identity(comment.raw, identity_marker)
+                        if is_own_persistent_comment_for_identities(comment.raw, (identity_marker,))
                     ),
                     None,
                 )
                 if comment_to_update is None and legacy_initial_header:
                     comment_to_update = next(
                         (
-                            comment
-                            for comment in comments
-                            if comment_matches_identity(comment.raw, legacy_initial_header)
-                        ),
-                        None,
-                    )
+                        comment
+                        for comment in comments
+                        if is_own_persistent_comment_for_identities(
+                            comment.raw, (legacy_initial_header,)
+                        )
+                    ),
+                    None,
+                )
             else:
                 # Preserve Bitbucket's existing behavior for non-review persistent comments.
                 comment_to_update = next(

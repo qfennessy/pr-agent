@@ -386,6 +386,26 @@ The canonical rules are:
 | Default pair review | Actionable precision at least 90% derived from the exact accepted inventory of at least 100 settled candidates, observed false interruptions no greater than an explicitly accepted non-negative threshold, and complete shadow artifacts |
 | PR publication | A strictly positive lower 95% bound for the cascade's quality advantage across all 18 cases in the locked Cocos Story holdout, complete holdout cost within an explicitly accepted positive ceiling, and complete replay artifacts |
 
+Each output capability must have passed a fixed chain of gates before it may
+produce anything. The two pair-review capabilities are local editor modes, so
+they wait on the live-shadow gate, which measures how often a reviewer would
+interrupt a developer mid-edit. PR publication runs on demand and in CI, where
+there is no developer to interrupt, so it skips the two gates that need shadow
+evidence. It keeps the opt-in pair review gate despite the name: that gate's
+rules are replay-based and it is the only one that sets an absolute quality
+floor (verified precision of at least 80%, no high-severity recall regression),
+whereas the PR publication gate checks a relative advantage over the incumbent.
+
+| Capability | Gates that must have passed |
+| --- | --- |
+| Opt-in pair review | Offline replay, live shadow, opt-in pair review |
+| Default pair review | Offline replay, live shadow, opt-in pair review, default pair review |
+| PR publication | Offline replay, opt-in pair review, PR publication |
+
+`evaluate_output_permission` requires the caller to pin exactly that set of
+gate-spec hashes; pinning a gate outside the chain is rejected rather than
+ignored.
+
 Create `PilotRolloutBudgets` only from thresholds a maintainer has actually accepted.
 `PilotRolloutEvidence` carries only separately bound replay declarations and a content-bound
 leakage-check artifact; a bare leakage boolean cannot satisfy a gate. The checker revision and
@@ -460,8 +480,8 @@ the report. Keep the report JSON publishable and keep the manifest, source-beari
 truth ledger, raw attempt files, and shadow journals in their existing private stores.
 
 `evaluate_output_permission()` separately binds opt-in advice, default advice, or PR
-publication to its exact passed gate plus every preceding offline-replay and rollout gate
-for the same arm and scorecard id. Missing decisions, stale
+publication to the exact passed gates in that capability's chain (the table above) for
+the same arm and scorecard id. Missing decisions, stale
 scorecards, duplicate decisions, failed gates, and `not_evaluable` gates deny output.
 Gate rules may target a cohort explicitly with names such as
 `cohort.temporal.verified_recall`, so a healthy aggregate cannot hide a temporal regression.

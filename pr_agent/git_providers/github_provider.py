@@ -30,7 +30,7 @@ from ..algo.types import EDIT_TYPE
 from ..algo.utils import (
     Range,
     clip_tokens,
-    comment_matches_any_identity,
+    comment_matches_pr_review_identity,
     find_line_number_of_relevant_line_in_file,
     get_pr_review_comment_identifiers,
     load_large_diff,
@@ -45,6 +45,7 @@ from .git_provider import (
     GitProvider,
     IncrementalPR,
     get_cached_global_settings,
+    is_own_persistent_comment_for_identities,
     redact_credentials,
 )
 
@@ -219,14 +220,21 @@ class GithubProvider(GitProvider):
                 break
         return self.pr_commits[first_new_commit_index:] if first_new_commit_index is not None else []
 
-    def get_previous_review(self, *, full: bool, incremental: bool):
+    def get_previous_review(self, *, full: bool, incremental: bool, review_profile: str = "full"):
         if not (full or incremental):
             raise ValueError("At least one of full or incremental must be True")
         if not getattr(self, "comments", None):
             self.comments = list(self.pr.get_issue_comments())
-        identifiers = get_pr_review_comment_identifiers(full=full, incremental=incremental)
+        identifiers = get_pr_review_comment_identifiers(
+            full=full,
+            incremental=incremental,
+            review_profile=review_profile,
+        )
         for index in range(len(self.comments) - 1, -1, -1):
-            if comment_matches_any_identity(self.comments[index].body, identifiers):
+            body = self.comments[index].body
+            if not comment_matches_pr_review_identity(body, identifiers, review_profile):
+                continue
+            if is_own_persistent_comment_for_identities(body, identifiers):
                 return self.comments[index]
         return None
 

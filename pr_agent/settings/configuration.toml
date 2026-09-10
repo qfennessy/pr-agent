@@ -124,6 +124,9 @@ branch_issue_regex = ""
 
 
 [pr_reviewer] # /review #
+# Independent concurrent reviews with identical inputs and one persistent comment per model.
+# Empty preserves config.model and config.fallback_models behavior.
+review_models = []
 # enable/disable features
 review_profile="full" # "full" preserves the standard review; "bugs_only" emits only qualifying defects.
 # Opt in to a bounded second pass that verifies review candidates against repository evidence.

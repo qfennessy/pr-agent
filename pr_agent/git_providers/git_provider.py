@@ -20,6 +20,8 @@ from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 
 MAX_FILES_ALLOWED_FULL = 50
+PERSISTENT_COMMENT_ID_MARKER = "<!-- pr-agent-persistent-id:"
+PERSISTENT_COMMENT_ATTRIBUTION_PREFIX = "> Reviewed by"
 
 _URL_USERINFO_RE = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]{0,30}://)[^/@\s]+@")
 _AUTH_HEADER_RE = re.compile(r"(?i)(authorization\s*:\s*(?:bearer|basic|token)\s+)\S+")
@@ -146,6 +148,82 @@ def get_git_ssl_env() -> dict[str, str]:
     if chosen_cert_file:
         returned_env.update({"GIT_SSL_CAINFO": chosen_cert_file, "REQUESTS_CA_BUNDLE": chosen_cert_file})
     return returned_env
+
+
+def get_persistent_comment_id() -> str:
+    """Return the configured identifier for one persistent review stream."""
+    try:
+        value = get_settings().config.get("persistent_comment_id", "")
+    except AttributeError:
+        return ""
+    return str(value).strip() if value else ""
+
+
+def _persistent_comment_marker(comment_id: str) -> str:
+    return f"{PERSISTENT_COMMENT_ID_MARKER} {comment_id} -->"
+
+
+def _last_line(text: str) -> str:
+    stripped = (text or "").rstrip()
+    return stripped.rsplit("\n", 1)[-1].strip() if stripped else ""
+
+
+def _persistent_comment_attribution(comment_id: str) -> str:
+    try:
+        model_used = get_settings().config.get("last_used_model", "") or comment_id
+    except AttributeError:
+        model_used = comment_id
+    if model_used == comment_id or str(model_used).rsplit("/", 1)[-1] == comment_id:
+        return f"{PERSISTENT_COMMENT_ATTRIBUTION_PREFIX} `{comment_id}`"
+    return (
+        f"{PERSISTENT_COMMENT_ATTRIBUTION_PREFIX} `{comment_id}` - "
+        f"fallback model `{model_used}` answered"
+    )
+
+
+def attach_persistent_comment_id(pr_comment: str) -> str:
+    """Add a visible attribution and terminal ownership marker when configured."""
+    comment_id = get_persistent_comment_id()
+    if not comment_id:
+        return pr_comment
+    marker = _persistent_comment_marker(comment_id)
+    if _last_line(pr_comment) == marker:
+        return pr_comment
+    attribution = _persistent_comment_attribution(comment_id)
+    body = (pr_comment or "").rstrip()
+    heading, _, rest = body.partition("\n")
+    if heading.strip():
+        rest = rest.lstrip("\n")
+        first_rest_line, _, remainder = rest.partition("\n")
+        if first_rest_line.startswith(PERSISTENT_COMMENT_ATTRIBUTION_PREFIX):
+            rest = remainder.lstrip("\n")
+        body = f"{heading}\n\n{attribution}\n\n{rest}".rstrip() if rest else f"{heading}\n\n{attribution}"
+    else:
+        body = attribution
+    return f"{body}\n{marker}"
+
+
+def is_own_persistent_comment(comment_body: str, initial_header: str) -> bool:
+    return is_own_persistent_comment_for_identities(comment_body, (initial_header,))
+
+
+def is_own_persistent_comment_for_identities(comment_body: str, identities: Iterable[str]) -> bool:
+    body = comment_body or ""
+    if not any(comment_matches_identity(body, identity) for identity in identities if identity):
+        return False
+    comment_id = get_persistent_comment_id()
+    if comment_id:
+        return _last_line(body) == _persistent_comment_marker(comment_id)
+    return not (
+        _last_line(body).startswith(PERSISTENT_COMMENT_ID_MARKER)
+        and _last_line(body).endswith("-->")
+    )
+
+
+def _comment_body(comment) -> str:
+    if isinstance(comment, dict):
+        return str(comment.get("body") or comment.get("comment") or "")
+    return str(getattr(comment, "body", "") or "")
 
 
 class GitProvider(ABC):
@@ -530,6 +608,7 @@ class GitProvider(ABC):
                                    legacy_initial_header: str | None = None,
                                    require_agent_authorship: bool = False,
                                    fallback_on_error: bool = True):
+        pr_comment = attach_persistent_comment_id(pr_comment)
         try:
             pr_comment = add_pr_review_identity(pr_comment, identity_marker)
             identifiers = (
@@ -538,14 +617,19 @@ class GitProvider(ABC):
                 else [initial_header]
             )
             comment_to_update = None
-            for comment, _body in GitProvider._iter_persistent_comments(
-                self,
-                identifiers,
-                identity_marker=identity_marker,
-                require_agent_authorship=require_agent_authorship,
-            ):
-                comment_to_update = comment
-                break
+            for identifier in identifiers:
+                for comment in reversed(list(self.get_issue_comments())):
+                    body = _comment_body(comment)
+                    if not is_own_persistent_comment_for_identities(body, (identifier,)):
+                        continue
+                    if comment_carries_other_identity(body, identity_marker):
+                        continue
+                    if require_agent_authorship and not self.is_comment_authored_by_pr_agent(comment):
+                        continue
+                    comment_to_update = comment
+                    break
+                if comment_to_update is not None:
+                    break
             if comment_to_update is not None:
                 comment = comment_to_update
                 latest_commit_url = self.get_latest_commit_url()

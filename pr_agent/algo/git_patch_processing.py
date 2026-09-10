@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import traceback
+from typing import Iterator
 
 from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.config_loader import get_settings, get_verbosity_level
@@ -11,6 +12,32 @@ from pr_agent.log import get_logger
 # in performance-critical patch processing functions.
 RE_HUNK_HEADER = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[ ]?(.*)")
+
+
+def iter_git_patch_lines(patch: str) -> Iterator[str]:
+    """Yield LF-delimited patch records while preserving all other bytes."""
+    start = 0
+    while start < len(patch):
+        end = patch.find("\n", start)
+        if end < 0:
+            yield patch[start:]
+            return
+        yield patch[start:end + 1]
+        start = end + 1
+
+
+def strip_git_line_ending(line: str) -> str:
+    """Remove one Git record terminator without consuming content CR bytes."""
+    if line.endswith("\r\n"):
+        return line[:-2]
+    if line.endswith("\n"):
+        return line[:-1]
+    return line
+
+
+def split_git_file_lines(content: str) -> list[str]:
+    """Split Git source content without stripping meaningful carriage returns."""
+    return [strip_git_line_ending(line) for line in iter_git_patch_lines(content)]
 
 
 def to_hunk_only_patch(patch_str: str) -> str:
