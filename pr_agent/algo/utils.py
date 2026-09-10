@@ -12,7 +12,6 @@ import sys
 import textwrap
 import time
 import traceback
-from collections.abc import Hashable
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
@@ -30,11 +29,8 @@ from pr_agent.algo import MAX_TOKENS
 from pr_agent.algo.git_patch_processing import (
     extract_hunk_headers,
     extract_hunk_lines_from_patch,
-    iter_git_patch_lines,
-    split_git_file_lines,
-    strip_git_line_ending,
+    to_hunk_only_patch,
 )
-from pr_agent.algo.review_execution_context import review_execution_is_isolated
 from pr_agent.algo.run_details import get_run_details
 from pr_agent.algo.token_handler import TokenEncoder
 from pr_agent.algo.types import FilePatchInfo
@@ -93,10 +89,7 @@ class PRReviewHeader(str, Enum):
 
 class PRReviewIdentity(str, Enum):
     REGULAR = "<!-- pr-agent:review:full -->"
-    BUGS_ONLY = "<!-- pr-agent:review:bugs-only -->"
-    FULL_INCREMENTAL = "<!-- pr-agent:review:full:incremental -->"
     INCREMENTAL = "<!-- pr-agent:review:incremental -->"
-    BUGS_ONLY_INCREMENTAL = "<!-- pr-agent:review:bugs-only:incremental -->"
 
 
 class PRCodeSuggestionsHeader(str, Enum):
@@ -110,7 +103,8 @@ class PRCodeSuggestionsIdentity(str, Enum):
 
 
 _ALL_COMMENT_IDENTITIES = (
-    *(identity.value for identity in PRReviewIdentity),
+    PRReviewIdentity.REGULAR.value,
+    PRReviewIdentity.INCREMENTAL.value,
     PRCodeSuggestionsIdentity.SUMMARY.value,
     PRCodeSuggestionsIdentity.NO_SUGGESTIONS.value,
     PRCodeSuggestionsIdentity.UNANCHORED.value,
@@ -182,17 +176,6 @@ def comment_matches_any_identity(body: str, identities: Iterable[str]) -> bool:
     return any(comment_matches_identity(body, identity) for identity in identities)
 
 
-def comment_matches_pr_review_identity(
-        body: str, identities: Iterable[str], review_profile: str = "full") -> bool:
-    """Match a review anchor without letting legacy headings override an explicit profile."""
-    if review_profile == "full" and comment_matches_any_identity(body, (
-        PRReviewIdentity.BUGS_ONLY.value,
-        PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value,
-    )):
-        return False
-    return comment_matches_any_identity(body, identities)
-
-
 def comment_carries_other_identity(body: str, identity_marker: str | None) -> bool:
     """Return whether the comment carries a different hidden identity."""
     return comment_matches_any_identity(
@@ -201,23 +184,13 @@ def comment_carries_other_identity(body: str, identity_marker: str | None) -> bo
     )
 
 
-def get_pr_review_comment_identifiers(
-        *, full: bool, incremental: bool, review_profile: str = "full") -> tuple[str, ...]:
+def get_pr_review_comment_identifiers(*, full: bool, incremental: bool) -> tuple[str, ...]:
     """Return stable markers followed by legacy visible prefixes for migration."""
     identifiers = []
     if full:
         identifiers.extend((PRReviewIdentity.REGULAR.value, PRReviewHeader.REGULAR.value))
     if incremental:
-        if review_profile == "bugs_only":
-            identifiers.extend((
-                PRReviewIdentity.BUGS_ONLY_INCREMENTAL.value,
-                PRReviewIdentity.BUGS_ONLY.value,
-                PRReviewIdentity.FULL_INCREMENTAL.value,
-                PRReviewIdentity.INCREMENTAL.value,
-                PRReviewHeader.INCREMENTAL.value,
-            ))
-        else:
-            identifiers.append(PRReviewIdentity.FULL_INCREMENTAL.value)
+        identifiers.extend((PRReviewIdentity.INCREMENTAL.value, PRReviewHeader.INCREMENTAL.value))
     return tuple(identifiers)
 
 
@@ -256,6 +229,22 @@ def get_setting(key: str) -> Any:
         return context.get("settings", global_settings).get(key, global_settings.get(key, None))
     except Exception:
         return global_settings.get(key, None)
+
+
+def as_review_text(value) -> str:
+    """Flatten a review field the model returned as a list or mapping into readable text.
+
+    The prompt asks for a single string, but a model enumerating several findings commonly
+    answers with a list or a mapping. Rendering those is preferable to losing the review.
+    """
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        value = [f"{key}: {item}" for key, item in value.items()]
+    if isinstance(value, (list, tuple, set)):
+        entries = [as_review_text(item) for item in value]
+        return "\n".join(f"- {entry}" for entry in entries if entry)
+    return str(value).strip()
 
 
 def emphasize_header(text: str, only_markdown=False, reference_link=None) -> str:
@@ -312,8 +301,7 @@ def convert_to_markdown_v2(output_data: dict,
                            gfm_supported: bool = True,
                            incremental_review=None,
                            git_provider=None,
-                           files=None,
-                           review_profile: str = "full") -> str:
+                           files=None) -> str:
     """
     Convert a dictionary of data into markdown format.
     Args:
@@ -348,7 +336,7 @@ def convert_to_markdown_v2(output_data: dict,
     if not output_data or not output_data.get('review', {}):
         return ""
 
-    if review_profile != "bugs_only" and get_settings().get("pr_reviewer.enable_intro_text", False):
+    if get_settings().get("pr_reviewer.enable_intro_text", False):
         markdown_text += "Here are some key observations to aid the review process:\n\n"
 
     if gfm_supported:
@@ -424,7 +412,7 @@ def convert_to_markdown_v2(output_data: dict,
                     markdown_text += f"{emoji}&nbsp;<strong>No security concerns identified</strong>"
                 else:
                     markdown_text += f"{emoji}&nbsp;<strong>Security concerns</strong><br><br>\n\n"
-                    value = emphasize_header(value.strip())
+                    value = emphasize_header(value.strip()) if isinstance(value, str) else as_review_text(value)
                     markdown_text += f"{value}"
                 markdown_text += "</td></tr>\n"
             else:
@@ -432,7 +420,7 @@ def convert_to_markdown_v2(output_data: dict,
                     markdown_text += f'### {emoji} No security concerns identified\n\n'
                 else:
                     markdown_text += f"### {emoji} Security concerns\n\n"
-                    value = emphasize_header(value.strip(), only_markdown=True)
+                    value = emphasize_header(value.strip(), only_markdown=True) if isinstance(value, str) else as_review_text(value)
                     markdown_text += f"{value}\n\n"
         elif 'risk level' in key_nice.lower():
             risk_value = str(value).strip().lower().replace("_", " ")
@@ -511,15 +499,9 @@ def convert_to_markdown_v2(output_data: dict,
                 if gfm_supported:
                     markdown_text += "<tr><td>"
                     # markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong><br><br>\n\n"
-                    section_title = (
-                        "Introduced defects" if review_profile == "bugs_only" else "Recommended focus areas for review"
-                    )
-                    markdown_text += f"{emoji}&nbsp;<strong>{section_title}</strong><br><br>\n\n"
+                    markdown_text += f"{emoji}&nbsp;<strong>Recommended focus areas for review</strong><br><br>\n\n"
                 else:
-                    section_title = (
-                        "Introduced defects" if review_profile == "bugs_only" else "Recommended focus areas for review"
-                    )
-                    markdown_text += f"### {emoji} {section_title}\n\n#### \n"
+                    markdown_text += f"### {emoji} Recommended focus areas for review\n\n#### \n"
                 for i, issue in enumerate(issues):
                     try:
                         if not issue or not isinstance(issue, dict):
@@ -531,24 +513,12 @@ def convert_to_markdown_v2(output_data: dict,
                         issue_content = issue.get('issue_content', '').strip()
                         start_line = int(str(issue.get('start_line', 0)).strip())
                         end_line = int(str(issue.get('end_line', 0)).strip())
-                        if issue.get('side') == 'old':
-                            relevant_lines_str = ""
-                            reference_link = None
-                            escaped_file = html.escape(relevant_file)
-                            line_label = (
-                                f"line {start_line}" if start_line == end_line
-                                else f"lines {start_line}-{end_line}"
-                            )
-                            issue_content += (
-                                f"\n\n<em>Deleted location: <code>{escaped_file}</code>, {line_label}.</em>"
-                            )
-                        else:
-                            relevant_lines_str = extract_relevant_lines_str(
-                                end_line, files, relevant_file, start_line, dedent=True
-                            )
-                            reference_link = None
-                        if git_provider and issue.get('side') != 'old':
+
+                        relevant_lines_str = extract_relevant_lines_str(end_line, files, relevant_file, start_line, dedent=True)
+                        if git_provider:
                             reference_link = git_provider.get_line_link(relevant_file, start_line, end_line)
+                        else:
+                            reference_link = None
 
                         if gfm_supported:
                             if reference_link is not None and len(reference_link) > 0:
@@ -602,13 +572,12 @@ def extract_relevant_lines_str(end_line, files, relevant_file, start_line, deden
                             return ""
                         # filter out '-' lines
                         relevant_lines_str = ""
-                        for line in (strip_git_line_ending(record)
-                                     for record in iter_git_patch_lines(selected_lines)):
+                        for line in selected_lines.splitlines():
                             if line.startswith('-'):
                                 continue
                             relevant_lines_str += line[1:] + '\n'
                     else:
-                        relevant_file_lines = split_git_file_lines(file.head_file)
+                        relevant_file_lines = file.head_file.splitlines()
                         relevant_lines_str = "\n".join(relevant_file_lines[start_line - 1:end_line])
 
                     if dedent and relevant_lines_str:
@@ -709,8 +678,7 @@ def ticket_markdown_logic(emoji, markdown_text, value, gfm_supported) -> str:
                 compliance_emoji = '✅'
 
             # Set extra statistics outside the ticket loop
-            if not review_execution_is_isolated():
-                get_settings().set('config.extra_statistics', {'compliance_level': compliance_level})
+            get_settings().set('config.extra_statistics', {'compliance_level': compliance_level})
 
         # editing table row for ticket compliance analysis
         if gfm_supported:
@@ -947,20 +915,19 @@ def convert_str_to_datetime(date_str):
 def load_large_diff(filename, new_file_content_str: str, original_file_content_str: str, show_warning: bool = True) -> str:
     """
     Generate a patch for a modified file by comparing the original content of the file with the new content provided as
-    input.
+    input. The returned patch starts at its first hunk and excludes unified-diff file metadata.
     """
     if not original_file_content_str and not new_file_content_str:
         return ""
 
     try:
-        original_file_content_str = (original_file_content_str or "").rstrip(" \t\n") + "\n"
-        new_file_content_str = (new_file_content_str or "").rstrip(" \t\n") + "\n"
-        diff = difflib.unified_diff(list(iter_git_patch_lines(original_file_content_str)),
-                                    list(iter_git_patch_lines(new_file_content_str)))
+        original_file_content_str = (original_file_content_str or "").rstrip() + "\n"
+        new_file_content_str = (new_file_content_str or "").rstrip() + "\n"
+        diff = difflib.unified_diff(original_file_content_str.splitlines(keepends=True),
+                                    new_file_content_str.splitlines(keepends=True))
         if get_verbosity_level() >= 2 and show_warning:
             get_logger().info(f"File was modified, but no patch was found. Manually creating patch: {filename}.")
-        patch = ''.join(diff)
-        return patch
+        return to_hunk_only_patch(''.join(diff))
     except Exception as e:
         get_logger().exception(f"Failed to generate patch for file: {filename}")
         return ""
@@ -1040,79 +1007,7 @@ def sanitize_yaml_control_chars(text: str, log: bool = True) -> str:
     return sanitized
 
 
-class DuplicateYamlKeyError(ValueError):
-    """Raised when strict AI-response parsing encounters an ambiguous mapping."""
-
-
-class _UniqueKeySafeLoader(yaml.SafeLoader):
-    """SafeLoader variant that rejects duplicate mapping keys."""
-
-
-def _construct_unique_yaml_mapping(loader, node, deep=False):
-    loader.flatten_mapping(node)
-    mapping = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
-        if not isinstance(key, Hashable):
-            raise yaml.constructor.ConstructorError(
-                "while constructing a mapping",
-                node.start_mark,
-                "found unhashable key",
-                key_node.start_mark,
-            )
-        if key in mapping:
-            raise DuplicateYamlKeyError(f"duplicate YAML key: {key!r}")
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
-
-
-_UniqueKeySafeLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
-    _construct_unique_yaml_mapping,
-)
-
-
-def _safe_load_yaml(response_text: str, *, reject_duplicate_keys: bool):
-    if reject_duplicate_keys:
-        return yaml.load(response_text, Loader=_UniqueKeySafeLoader)
-    return yaml.safe_load(response_text)
-
-
-def _find_yaml_key_start(response_text: str, first_key: str) -> int:
-    index_start = response_text.find(f"\n{first_key}:")
-    if index_start == -1:
-        index_start = response_text.find(f"{first_key}:")
-    return index_start
-
-
-def _extract_yaml_document(response_text: str, index_start: int, first_key: str) -> str:
-    """Extract one root-keyed YAML document without truncating internal blank lines."""
-    response_tail = response_text[index_start:].strip()
-    response_lines = response_tail.splitlines()
-    if not response_lines:
-        return ""
-
-    root_indent = len(response_lines[0]) - len(response_lines[0].lstrip())
-    index_end = len(response_lines)
-    for index, line in enumerate(response_lines[1:], start=1):
-        stripped_line = line.strip()
-        if not stripped_line or stripped_line.startswith("#"):
-            continue
-        line_indent = len(line) - len(line.lstrip())
-        if line_indent <= root_indent and not stripped_line.startswith(f"{first_key}:"):
-            index_end = index
-            break
-    return "\n".join(response_lines[:index_end]).strip()
-
-
-def load_yaml(
-    response_text: str,
-    keys_fix_yaml: List[str] = [],
-    first_key="",
-    last_key="",
-    *,
-    reject_duplicate_keys: bool = False,
-) -> dict:
+def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", last_key="") -> dict:
     response_text_original = copy.deepcopy(response_text)
     response_text = response_text.strip('\n')
     # strip the fence label only when it is a complete info string, so a key such as
@@ -1120,14 +1015,11 @@ def load_yaml(
     unfenced = re.sub(r'^```[ \t]*(?:(?i:yaml|yml))?[ \t]*(?=\r?\n)', '', response_text)
     if unfenced == response_text:
         unfenced = response_text.removeprefix('yaml')
-    response_text = unfenced.rstrip().removesuffix('```')
+    response_text = unfenced.rstrip()
+    if response_text.split('\n')[-1] == '```':
+        response_text = response_text.removesuffix('```')
     response_text = sanitize_yaml_control_chars(response_text)
     response_text_original_sanitized = sanitize_yaml_control_chars(response_text_original, log=False)
-    if reject_duplicate_keys and first_key and last_key:
-        index_start = _find_yaml_key_start(response_text, first_key)
-        if index_start != -1:
-            response_text = _extract_yaml_document(response_text, index_start, first_key)
-            response_text_original_sanitized = response_text
     try:
         # yaml.safe_load('') / yaml.safe_load(' ') returns None without raising, so a response that was
         # non-empty before preprocessing/sanitization but is blank afterwards (e.g. it consisted entirely of
@@ -1136,14 +1028,11 @@ def load_yaml(
         # through the same exception handling as a normal parse failure instead.
         if response_text_original.strip() and not response_text.strip():
             raise ValueError("Preprocessing/sanitization removed all content from a non-empty AI prediction")
-        data = _safe_load_yaml(response_text, reject_duplicate_keys=reject_duplicate_keys)
-    except DuplicateYamlKeyError:
-        raise
+        data = yaml.safe_load(response_text)
     except Exception as e:
         get_logger().warning(f"Initial failure to parse AI prediction: {e}")
         data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key,
-                            response_text_original=response_text_original_sanitized,
-                            reject_duplicate_keys=reject_duplicate_keys)
+                            response_text_original=response_text_original_sanitized)
         if not data:
             get_logger().error("Failed to parse AI prediction after fallbacks",
                                artifact={'response_text': response_text})
@@ -1160,9 +1049,7 @@ def try_fix_yaml(response_text: str,
                  keys_fix_yaml: List[str] = [],
                  first_key="",
                  last_key="",
-                 response_text_original="",
-                 *,
-                 reject_duplicate_keys: bool = False) -> dict:
+                 response_text_original="") -> dict:
     response_text_lines = response_text.split('\n')
 
     keys_yaml = ['relevant line:', 'suggestion content:', 'relevant file:', 'existing code:',
@@ -1173,19 +1060,14 @@ def try_fix_yaml(response_text: str,
     response_text_lines_copy = response_text_lines.copy()
     for i in range(0, len(response_text_lines_copy)):
         for key in keys_yaml:
-            if key in response_text_lines_copy[i] and not '|' in response_text_lines_copy[i]:
+            if key in response_text_lines_copy[i] and "|" not in response_text_lines_copy[i]:
                 response_text_lines_copy[i] = response_text_lines_copy[i].replace(f'{key}',
                                                                                   f'{key} |\n        ')
     try:
-        data = _safe_load_yaml(
-            '\n'.join(response_text_lines_copy),
-            reject_duplicate_keys=reject_duplicate_keys,
-        )
+        data = yaml.safe_load('\n'.join(response_text_lines_copy))
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after adding |-\n")
             return data
-    except DuplicateYamlKeyError:
-        raise
     except:
         pass
 
@@ -1193,12 +1075,10 @@ def try_fix_yaml(response_text: str,
     response_text_copy = copy.deepcopy(response_text)
     response_text_copy = response_text_copy.replace('|\n', '|2\n')
     try:
-        data = _safe_load_yaml(response_text_copy, reject_duplicate_keys=reject_duplicate_keys)
+        data = yaml.safe_load(response_text_copy)
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after replacing | with |2")
             return data
-    except DuplicateYamlKeyError:
-        raise
     except:
         pass
     # try to add spaces to lines that are not indented properly, and contain '}'.
@@ -1207,17 +1087,32 @@ def try_fix_yaml(response_text: str,
     for i in range(0, len(response_text_lines_copy)):
         initial_space = len(response_text_lines_copy[i]) - len(response_text_lines_copy[i].lstrip())
         if initial_space == 2 and '|2' not in response_text_lines_copy[i] and '}' in response_text_lines_copy[i]:
+            if response_text_lines_copy[i].strip() == '}':
+                # Only move a standalone brace into the block scalar when it closes an earlier opening brace.
+                block_scalar_lines = []
+                should_indent = False
+                for previous_line in reversed(response_text_lines_copy[:i]):
+                    if not previous_line.strip():
+                        block_scalar_lines.append(previous_line)
+                        continue
+                    previous_space = len(previous_line) - len(previous_line.lstrip())
+                    if previous_space < initial_space:
+                        break
+                    if previous_space == initial_space:
+                        if re.search(r':\s*\|[0-9+-]*\s*$', previous_line):
+                            block_scalar = '\n'.join(reversed(block_scalar_lines))
+                            should_indent = '{' in block_scalar or '}' in block_scalar
+                        break
+                    block_scalar_lines.append(previous_line)
+                if not should_indent:
+                    response_text_lines_copy[i] = ''
+                    continue
             response_text_lines_copy[i] = '    ' + response_text_lines_copy[i].lstrip()
     try:
-        data = _safe_load_yaml(
-            '\n'.join(response_text_lines_copy),
-            reject_duplicate_keys=reject_duplicate_keys,
-        )
+        data = yaml.safe_load('\n'.join(response_text_lines_copy))
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after replacing | with |2 and adding spaces")
             return data
-    except DuplicateYamlKeyError:
-        raise
     except:
         pass
 
@@ -1230,12 +1125,10 @@ def try_fix_yaml(response_text: str,
         # group(1) is the snippet body, without the ``` fences or the optional yaml/yml language identifier
         snippet_text = snippet.group(1)
         try:
-            data = _safe_load_yaml(snippet_text, reject_duplicate_keys=reject_duplicate_keys)
+            data = yaml.safe_load(snippet_text)
             if data is not None:
                 get_logger().info("Successfully parsed AI prediction after extracting yaml snippet")
                 return data
-        except DuplicateYamlKeyError:
-            raise
         except Exception as e:
             get_logger().debug(f"Failed to parse AI prediction after extracting yaml snippet: {e}")
 
@@ -1243,12 +1136,10 @@ def try_fix_yaml(response_text: str,
     # third fallback - try to remove leading and trailing curly brackets
     response_text_copy = response_text.strip().rstrip().removeprefix('{').removesuffix('}').rstrip(':\n')
     try:
-        data = _safe_load_yaml(response_text_copy, reject_duplicate_keys=reject_duplicate_keys)
+        data = yaml.safe_load(response_text_copy)
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after removing curly brackets")
             return data
-    except DuplicateYamlKeyError:
-        raise
     except:
         pass
 
@@ -1257,15 +1148,14 @@ def try_fix_yaml(response_text: str,
     # note that 'last_key' can be in practice a key that is not the last key in the yaml snippet.
     # it just needs to be some inner key, so we can look for newlines after it
     if first_key and last_key:
-        index_start = _find_yaml_key_start(response_text, first_key)
+        index_start = response_text.find(f"\n{first_key}:")
+        if index_start == -1:
+            index_start = response_text.find(f"{first_key}:")
         index_last_code = response_text.rfind(f"{last_key}:")
-        if reject_duplicate_keys:
-            response_text_copy = _extract_yaml_document(response_text, index_start, first_key)
-        else:
-            index_end = response_text.find("\n\n", index_last_code)  # look for newlines after last_key
-            if index_end == -1:
-                index_end = len(response_text)
-            response_text_copy = response_text[index_start:index_end].strip()
+        index_end = response_text.find("\n\n", index_last_code) # look for newlines after last_key
+        if index_end == -1:
+            index_end = len(response_text)
+        response_text_copy = response_text[index_start:index_end].strip()
         for fence in ("\n```yaml", "\n```yml"):
             if response_text_copy[-len(fence):].lower() == fence:
                 response_text_copy = response_text_copy[: -len(fence)]
@@ -1273,12 +1163,10 @@ def try_fix_yaml(response_text: str,
         response_text_copy = response_text_copy.strip("`").strip()
         if response_text_copy:
             try:
-                data = _safe_load_yaml(response_text_copy, reject_duplicate_keys=reject_duplicate_keys)
+                data = yaml.safe_load(response_text_copy)
                 if data is not None:
                     get_logger().info("Successfully parsed AI prediction after extracting yaml snippet")
                     return data
-            except DuplicateYamlKeyError:
-                raise
             except:
                 pass
 
@@ -1288,15 +1176,10 @@ def try_fix_yaml(response_text: str,
         if response_text_lines_copy[i].startswith('+'):
             response_text_lines_copy[i] = ' ' + response_text_lines_copy[i][1:]
     try:
-        data = _safe_load_yaml(
-            '\n'.join(response_text_lines_copy),
-            reject_duplicate_keys=reject_duplicate_keys,
-        )
+        data = yaml.safe_load('\n'.join(response_text_lines_copy))
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after removing leading '+'")
             return data
-    except DuplicateYamlKeyError:
-        raise
     except:
         pass
 
@@ -1331,15 +1214,10 @@ def try_fix_yaml(response_text: str,
             modified = True
     if modified:
         try:
-            data = _safe_load_yaml(
-                '\n'.join(response_text_lines_copy),
-                reject_duplicate_keys=reject_duplicate_keys,
-            )
+            data = yaml.safe_load('\n'.join(response_text_lines_copy))
             if data is not None:
                 get_logger().info("Successfully parsed AI prediction after normalizing diff removal markers")
                 return data
-        except DuplicateYamlKeyError:
-            raise
         except Exception:
             pass
 
@@ -1349,12 +1227,10 @@ def try_fix_yaml(response_text: str,
         response_text_copy = copy.deepcopy(response_text)
         response_text_copy = response_text_copy.replace('\t', '    ')
         try:
-            data = _safe_load_yaml(response_text_copy, reject_duplicate_keys=reject_duplicate_keys)
+            data = yaml.safe_load(response_text_copy)
             if data is not None:
                 get_logger().info("Successfully parsed AI prediction after replacing tabs with spaces")
                 return data
-        except DuplicateYamlKeyError:
-            raise
         except:
             pass
 
@@ -1375,12 +1251,10 @@ def try_fix_yaml(response_text: str,
     response_text_copy = '\n'.join(response_text_copy_lines)
     response_text_copy = response_text_copy.replace(' |\n', ' |2\n')
     try:
-        data = _safe_load_yaml(response_text_copy, reject_duplicate_keys=reject_duplicate_keys)
+        data = yaml.safe_load(response_text_copy)
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after adding indent for sections of code blocks")
             return data
-    except DuplicateYamlKeyError:
-        raise
     except:
         pass
 
@@ -1388,12 +1262,10 @@ def try_fix_yaml(response_text: str,
     response_text_copy = copy.deepcopy(response_text)
     response_text_copy = response_text_copy.lstrip('|\n')
     try:
-        data = _safe_load_yaml(response_text_copy, reject_duplicate_keys=reject_duplicate_keys)
+        data = yaml.safe_load(response_text_copy)
         if data is not None:
             get_logger().info("Successfully parsed AI prediction after removing pipe chars")
             return data
-    except DuplicateYamlKeyError:
-        raise
     except:
         pass
 
@@ -1401,15 +1273,10 @@ def try_fix_yaml(response_text: str,
     encodings_to_try = ['latin-1', 'utf-16']
     for encoding in encodings_to_try:
         try:
-            data = _safe_load_yaml(
-                response_text.encode(encoding).decode("utf-8"),
-                reject_duplicate_keys=reject_duplicate_keys,
-            )
+            data = yaml.safe_load(response_text.encode(encoding).decode("utf-8"))
             if data:
                 get_logger().info(f"Successfully parsed AI prediction after decoding with {encoding} encoding")
                 return data
-        except DuplicateYamlKeyError:
-            raise
         except:
             pass
 
@@ -1499,6 +1366,13 @@ def get_max_tokens(model):
     """
     settings = get_settings()
     custom_max_tokens = _as_int(settings.config.custom_model_max_tokens)
+    # Resolve GPT-6 Astra aliases before diff token accounting, just as the handler does.
+    # Preserve explicit custom limits for provider aliases that were not in the registry.
+    model_base = model
+    while model_base.startswith(('openai/', 'azure/')):
+        model_base = model_base.removeprefix('openai/').removeprefix('azure/')
+    if custom_max_tokens <= 0 and model_base.removesuffix('_thinking') == 'gpt-6-astra':
+        model = 'gpt-6-astra'
     if model in MAX_TOKENS:
         max_tokens_model = MAX_TOKENS[model]
     elif custom_max_tokens > 0:
@@ -1667,10 +1541,7 @@ def find_line_number_of_relevant_line_in_file(diff_files: List[FilePatchInfo],
     for file in diff_files:
         if file.filename and (file.filename.strip() == relevant_file):
             patch = file.patch
-            patch_lines = [
-                strip_git_line_ending(line)
-                for line in iter_git_patch_lines(patch)
-            ]
+            patch_lines = patch.splitlines()
             delta = 0
             start1, size1, start2, size2 = 0, 0, 0, 0
             if absolute_position != -1: # matching absolute to relative
@@ -1856,43 +1727,34 @@ def push_outputs(message_type: str, payload: dict | None = None, markdown: str |
         }
         if markdown is not None:
             record["markdown"] = markdown
-    except Exception as e:
-        get_logger().warning(f"push_outputs setup failed: {type(e).__name__}")
-        return
 
-    # Keep local channels first and isolate every sink so one failed delivery cannot prevent the
-    # remaining configured channels. Log only the channel and exception type: requests errors can
-    # embed a secret-bearing URL in their text.
-    for channel in ("stdout", "file", "webhook", "slack"):
-        if channel not in channels:
-            continue
-        try:
-            if channel == "stdout":
-                print(json.dumps(record, ensure_ascii=False))
-            elif channel == "file":
-                file_path = cfg.get('file_path', 'pr-agent-outputs/reviews.jsonl')
-                folder = os.path.dirname(file_path)
-                if folder:
-                    os.makedirs(folder, exist_ok=True)
-                with open(file_path, 'a', encoding='utf-8') as fh:
-                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-            elif channel == "webhook":
-                webhook_url = _push_outputs_sink_url(cfg, 'webhook_url')
-                if webhook_url:
-                    # Never follow a redirect from a configured sink to another host.
-                    response = requests.post(webhook_url, json=record, timeout=5, allow_redirects=False)
-                    response.raise_for_status()
-            else:
-                # Slack Incoming Webhooks accept {"text": ...} directly, no relay service needed.
-                slack_webhook_url = _push_outputs_sink_url(cfg, 'slack_webhook_url')
-                if slack_webhook_url:
-                    text = markdown if markdown is not None else json.dumps(payload or {}, ensure_ascii=False)
-                    response = requests.post(
-                        slack_webhook_url, json={"text": text}, timeout=5, allow_redirects=False
-                    )
-                    response.raise_for_status()
-        except Exception as e:
-            get_logger().warning(f"push_outputs {channel} failed: {type(e).__name__}")
+        if "stdout" in channels:
+            print(json.dumps(record, ensure_ascii=False))
+
+        if "file" in channels:
+            file_path = cfg.get('file_path', 'pr-agent-outputs/reviews.jsonl')
+            folder = os.path.dirname(file_path)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(file_path, 'a', encoding='utf-8') as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # Local channels first, network last, so a failed POST can't lose a file write.
+        # allow_redirects=False: never follow a redirect from a configured sink to another host.
+        if "webhook" in channels:
+            webhook_url = _push_outputs_sink_url(cfg, 'webhook_url')
+            if webhook_url:
+                requests.post(webhook_url, json=record, timeout=5, allow_redirects=False)
+
+        # Slack Incoming Webhooks accept {"text": ...} directly, no relay service needed.
+        if "slack" in channels:
+            slack_webhook_url = _push_outputs_sink_url(cfg, 'slack_webhook_url')
+            if slack_webhook_url:
+                text = markdown if markdown is not None else json.dumps(payload or {}, ensure_ascii=False)
+                requests.post(slack_webhook_url, json={"text": text}, timeout=5, allow_redirects=False)
+    except Exception as e:
+        # Log only the exception type: requests errors embed the (secret-bearing) URL in their text.
+        get_logger().warning(f"push_outputs failed: {type(e).__name__}")
 
 
 def _render_setting_value(value) -> str:
@@ -1961,12 +1823,6 @@ def show_run_details(gfm_supported: bool) -> str:
 
     title = "⚙️ Agent run details"
     lines = [f"- Model: {details.model_used}{' (fallback)' if details.fallback_used else ''}"]
-    if details.review_profile:
-        lines.append(f"- Review profile: {details.review_profile}")
-    if details.review_route:
-        applied_depth = details.review_route.get("applied_depth")
-        if applied_depth:
-            lines.append(f"- Review depth: {applied_depth}")
     if details.has_token_usage:
         # A counter still at zero after a successful call means the provider never
         # reported that component, so drop it instead of claiming it was zero.
@@ -2126,15 +1982,22 @@ def process_description(description_full: str) -> Tuple[str, List]:
     return base_description_str, files
 
 def get_version() -> str:
-    # First check pyproject.toml if running directly out of repository
+    # First check pyproject.toml if running directly out of the pr-agent repository
     if os.path.exists("pyproject.toml"):
         if sys.version_info >= (3, 11):
             import tomllib
-            with open("pyproject.toml", "rb") as f:
-                data = tomllib.load(f)
-                if "project" in data and "version" in data["project"]:
-                    return data["project"]["version"]
-                else:
+            try:
+                with open("pyproject.toml", "rb") as f:
+                    data = tomllib.load(f)
+            except (OSError, ValueError) as e:  # tomllib raises TOMLDecodeError, or UnicodeDecodeError on non-UTF-8
+                get_logger().warning(f"Unable to read pyproject.toml, falling back to package metadata: {e}")
+            else:
+                # only trust this file when it is pr-agent's own pyproject.toml, otherwise an
+                # unrelated project in the current working directory would dictate our version
+                project = data.get("project", {})
+                if project.get("name") == "pr-agent":
+                    if "version" in project:
+                        return project["version"]
                     get_logger().warning("Version not found in pyproject.toml")
         else:
             get_logger().warning("Unable to determine local version from pyproject.toml")
@@ -2170,10 +2033,19 @@ def set_file_languages(diff_files) -> List[FilePatchInfo]:
 
     return diff_files
 
-def format_todo_item(todo_item: TodoItem, git_provider, gfm_supported) -> str:
-    relevant_file = todo_item.get('relevant_file', '').strip()
+def format_todo_item(todo_item: TodoItem | str, git_provider, gfm_supported) -> str:
+    """Render one TODO entry, tolerating the free-text form the schema also allows.
+
+    todo_sections is declared as Union[List[TodoSection], str], so a model may summarise the
+    TODOs in prose instead of locating each one. Such an entry has no file to link to.
+    """
+    if not isinstance(todo_item, dict):
+        return str(todo_item).strip() if todo_item is not None else ""
+    relevant_file = str(todo_item.get('relevant_file', '') or '').strip()
     line_number = todo_item.get('line_number', '')
-    content = todo_item.get('content', '')
+    content = str(todo_item.get('content', '') or '')
+    if not relevant_file:
+        return content.strip()
     reference_link = git_provider.get_line_link(relevant_file, line_number, line_number)
     file_ref = f"{relevant_file} [{line_number}]"
     if reference_link:
@@ -2189,27 +2061,26 @@ def format_todo_item(todo_item: TodoItem, git_provider, gfm_supported) -> str:
         return file_ref
 
 
-def format_todo_items(value: list[TodoItem] | TodoItem, git_provider, gfm_supported) -> str:
+def format_todo_items(value: list[TodoItem] | TodoItem | str, git_provider, gfm_supported) -> str:
     markdown_text = ""
     MAX_ITEMS = 5 # limit the number of items to display
+    is_list = isinstance(value, list)
+    items = value if is_list else [value]
+    if len(items) > MAX_ITEMS:
+        get_logger().debug(f"Truncating todo items to {MAX_ITEMS} items")
+        items = items[:MAX_ITEMS]
+    entries = [format_todo_item(todo_item, git_provider, gfm_supported) for todo_item in items]
+    entries = [entry for entry in entries if entry]
+    if not entries:
+        return markdown_text
     if gfm_supported:
-        if isinstance(value, list):
-            markdown_text += "<ul>\n"
-            if len(value) > MAX_ITEMS:
-                get_logger().debug(f"Truncating todo items to {MAX_ITEMS} items")
-                value = value[:MAX_ITEMS]
-            for todo_item in value:
-                markdown_text += f"<li>{format_todo_item(todo_item, git_provider, gfm_supported)}</li>\n"
-            markdown_text += "</ul>\n"
-        else:
-            markdown_text += f"<p>{format_todo_item(value, git_provider, gfm_supported)}</p>\n"
+        if not is_list:
+            return f"<p>{entries[0]}</p>\n"
+        markdown_text += "<ul>\n"
+        for entry in entries:
+            markdown_text += f"<li>{entry}</li>\n"
+        markdown_text += "</ul>\n"
     else:
-        if isinstance(value, list):
-            if len(value) > MAX_ITEMS:
-                get_logger().debug(f"Truncating todo items to {MAX_ITEMS} items")
-                value = value[:MAX_ITEMS]
-            for todo_item in value:
-                markdown_text += f"- {format_todo_item(todo_item, git_provider, gfm_supported)}\n"
-        else:
-            markdown_text += f"- {format_todo_item(value, git_provider, gfm_supported)}\n"
+        for entry in entries:
+            markdown_text += f"- {entry}\n"
     return markdown_text

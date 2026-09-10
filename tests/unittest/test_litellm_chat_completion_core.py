@@ -1,5 +1,8 @@
+import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import openai
 import pytest
 
@@ -59,6 +62,38 @@ async def test_chat_completion_passes_seed_when_temperature_is_zero(monkeypatch)
         await handler.chat_completion(model="gpt-4o", system="sys", user="usr", temperature=0)
 
     assert mock_call.call_args.kwargs["seed"] == 123
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_probes_images_off_loop_with_timeout(monkeypatch):
+    monkeypatch.setattr(litellm_handler, "get_settings", FakeSettings)
+    loop_thread = threading.get_ident()
+    observed = {}
+
+    def fake_head(url, **kwargs):
+        observed.update(url=url, kwargs=kwargs, thread=threading.get_ident())
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(litellm_handler.requests, "head", fake_head)
+
+    with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion", new_callable=AsyncMock) as mock_call:
+        mock_call.return_value = _mock_response()
+        handler = litellm_handler.LiteLLMAIHandler()
+
+        await handler.chat_completion(
+            model="gpt-4o",
+            system="sys",
+            user="usr",
+            img_path="https://example.test/image.png",
+        )
+
+    assert observed["url"] == "https://example.test/image.png"
+    assert observed["kwargs"] == {"allow_redirects": True, "timeout": 5}
+    assert observed["thread"] != loop_thread
+    assert mock_call.call_args.kwargs["messages"][1]["content"][1] == {
+        "type": "image_url",
+        "image_url": {"url": "https://example.test/image.png"},
+    }
 
 
 @pytest.mark.asyncio
@@ -212,6 +247,30 @@ async def test_chat_completion_strips_temperature_for_claude_sonnet_5(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model",
+    [
+        "anthropic/claude-fable-5-1",
+        "claude-fable-5-1",
+        "vertex_ai/claude-fable-5-1",
+        "bedrock/anthropic.claude-fable-5-1",
+        "bedrock/global.anthropic.claude-fable-5-1",
+        "bedrock/us.anthropic.claude-fable-5-1",
+    ],
+)
+async def test_chat_completion_strips_temperature_for_claude_fable_5_1(monkeypatch, model):
+    monkeypatch.setattr(litellm_handler, "get_settings", FakeSettings)
+
+    with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion", new_callable=AsyncMock) as mock_call:
+        mock_call.return_value = _mock_response()
+        handler = litellm_handler.LiteLLMAIHandler()
+
+        await handler.chat_completion(model=model, system="sys", user="usr", temperature=0.2)
+
+    assert "temperature" not in mock_call.call_args.kwargs
+
+
+@pytest.mark.asyncio
 async def test_chat_completion_does_not_use_extended_thinking_for_claude_opus_4_8(monkeypatch):
     monkeypatch.setattr(
         litellm_handler,
@@ -283,6 +342,36 @@ async def test_chat_completion_does_not_use_extended_thinking_for_claude_sonnet_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model",
+    [
+        "anthropic/claude-fable-5-1",
+        "claude-fable-5-1",
+        "vertex_ai/claude-fable-5-1",
+        "bedrock/anthropic.claude-fable-5-1",
+        "bedrock/global.anthropic.claude-fable-5-1",
+        "bedrock/us.anthropic.claude-fable-5-1",
+    ],
+)
+async def test_chat_completion_does_not_use_extended_thinking_for_claude_fable_5_1(monkeypatch, model):
+    monkeypatch.setattr(
+        litellm_handler,
+        "get_settings",
+        lambda: FakeSettings(config_values={"enable_claude_extended_thinking": True}),
+    )
+
+    with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion", new_callable=AsyncMock) as mock_call:
+        mock_call.return_value = _mock_response()
+        handler = litellm_handler.LiteLLMAIHandler()
+
+        await handler.chat_completion(model=model, system="sys", user="usr", temperature=0.2)
+
+    assert "thinking" not in mock_call.call_args.kwargs
+    assert "max_tokens" not in mock_call.call_args.kwargs
+    assert "temperature" not in mock_call.call_args.kwargs
+
+
+@pytest.mark.asyncio
 async def test_chat_completion_combines_prompts_for_user_message_only_models(monkeypatch):
     monkeypatch.setattr(litellm_handler, "get_settings", FakeSettings)
 
@@ -295,6 +384,79 @@ async def test_chat_completion_combines_prompts_for_user_message_only_models(mon
 
     messages = mock_call.call_args.kwargs["messages"]
     assert messages == [{"role": "user", "content": "sys\n\n\nusr"}]
+
+
+# Wiring tests for the retry knobs: the helpers (_should_retry_same_model,
+# _configured_client_retries) are unit-tested in test_litellm_retry_config.py, but those
+# tests keep passing when the @retry predicate or the kwargs pass-through in
+# chat_completion is reverted. The four tests below drive chat_completion itself, so a
+# regression in the wiring — not just the helpers — fails a test.
+
+
+def _timeout_error():
+    return openai.APITimeoutError(request=httpx.Request("POST", "http://model.invalid"))
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_passes_configured_retries_to_completion_call(monkeypatch):
+    monkeypatch.setattr(litellm_handler, "get_settings", lambda: FakeSettings(config_values={"num_retries": 0}))
+
+    with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion", new_callable=AsyncMock) as mock_call:
+        mock_call.return_value = _mock_response()
+        handler = litellm_handler.LiteLLMAIHandler()
+
+        await handler.chat_completion(model="gpt-4o", system="sys", user="usr")
+
+    assert mock_call.call_args.kwargs["num_retries"] == 0
+    assert mock_call.call_args.kwargs["max_retries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_unset_num_retries_keeps_client_defaults(monkeypatch):
+    monkeypatch.setattr(litellm_handler, "get_settings", FakeSettings)
+
+    with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion", new_callable=AsyncMock) as mock_call:
+        mock_call.return_value = _mock_response()
+        handler = litellm_handler.LiteLLMAIHandler()
+
+        await handler.chat_completion(model="gpt-4o", system="sys", user="usr")
+
+    assert "num_retries" not in mock_call.call_args.kwargs
+    assert "max_retries" not in mock_call.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_timeout_retries_same_model_by_default(monkeypatch):
+    monkeypatch.setattr(litellm_handler, "get_settings", FakeSettings)
+
+    with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion", new_callable=AsyncMock) as mock_call:
+        mock_call.side_effect = _timeout_error()
+        handler = litellm_handler.LiteLLMAIHandler()
+
+        with pytest.raises(openai.APITimeoutError):
+            await handler.chat_completion(model="gpt-4o", system="sys", user="usr")
+
+    assert mock_call.call_count == litellm_handler.MODEL_RETRIES
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_timeout_not_retried_same_model_when_disabled(monkeypatch):
+    monkeypatch.setattr(
+        litellm_handler,
+        "get_settings",
+        lambda: FakeSettings(config_values={"retry_same_model_on_timeout": False}),
+    )
+
+    with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion", new_callable=AsyncMock) as mock_call:
+        mock_call.side_effect = _timeout_error()
+        handler = litellm_handler.LiteLLMAIHandler()
+
+        # The timeout must surface to the caller's fallback-models loop after a single
+        # attempt, instead of being replayed on the model that just missed the deadline.
+        with pytest.raises(openai.APITimeoutError):
+            await handler.chat_completion(model="gpt-4o", system="sys", user="usr")
+
+    assert mock_call.call_count == 1
 
 
 @pytest.mark.asyncio

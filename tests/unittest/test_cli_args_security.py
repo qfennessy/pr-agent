@@ -24,6 +24,9 @@ FORBIDDEN_ARGS = [
     "--litellm.api_type=azure",
     "--litellm.api_version=2024-01-01",
     "--jira.jira_base_url=https://evil.example",
+    # gitea.web_url is resolved on first use, so a comment could otherwise redirect published links
+    "--gitea.web_url=https://evil.example",
+    "--gitea__web_url=https://evil.example",
     "--config.url=https://evil.example",
     "--config.uri=https://evil.example",
     # provider / auth selection and skip lists
@@ -46,9 +49,6 @@ FORBIDDEN_ARGS = [
     "--config.shared_secret=xxx",
     "--config.app_name=evil",
     "--config.analytics_folder=/tmp",
-    "--config.extra_config_url=https://evil.example/shared.toml",
-    '--config={"extra_config_url": "https://evil.example/shared.toml"}',
-    r'--config={"extra_config\u005furl": "https://evil.example/shared.toml"}',
     # double-underscore variants of the above
     "--github__webhook_secret=secret",
     "--github_app__private_key=xxx",
@@ -64,14 +64,10 @@ FORBIDDEN_ARGS = [
     "--push_outputs__webhook_url=https://evil.example/collect",
     # whole-section form: the dotted entries above do not cover it
     '--push_outputs={"enable": true, "channels": ["webhook"], "webhook_url": "https://evil.example"}',
-    # OTEL exporter selection, endpoints, and headers are host-only. PR commands
-    # must not redirect telemetry or inject collector credentials.
-    "--otel.is_enabled=true",
-    "--otel.exporter_type=otlp_http",
-    "--otel.otlp_endpoint=https://evil.example/v1/traces",
-    "--otel.otlp_headers=authorization=secret",
-    "--OTEL__OTLP_ENDPOINT=https://evil.example/v1/traces",
-    '--otel={"is_enabled": true, "otlp_endpoint": "https://evil.example"}',
+    # publish_error_details can expose service-side failure state, so it is host-only.
+    "--pr_reviewer.publish_error_details=true",
+    "--pr_reviewer__publish_error_details=true",
+    '--pr_reviewer={"publish_error_details": true}',
 ]
 
 
@@ -95,6 +91,9 @@ HOST_ONLY_ARGS = [
     "--skills__paths=/etc",
     "--skills.unknown=value",
     "--skills={paths:[/etc]}",
+    "--prompt_fragments.diff_hunk_format={{ cycler.__init__.__globals__ }}",
+    "--prompt_fragments__diff_hunk_format=unsafe",
+    '--prompt_fragments={"diff_hunk_format": "unsafe"}',
 ]
 
 
@@ -154,7 +153,7 @@ async def test_handle_request_uses_real_validator_to_block_forbidden(monkeypatch
 
     notify = Mock()
 
-    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url, **kwargs: None)
+    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url: None)
 
     def _fail_update_settings(args):
         raise AssertionError(

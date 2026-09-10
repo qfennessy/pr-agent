@@ -9,16 +9,10 @@ from urllib.parse import urlparse
 import gitlab
 from gitlab import GitlabAuthenticationError, GitlabCreateError, GitlabGetError, GitlabUpdateError
 
-from pr_agent.algo.config_utils import parse_env_bool
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 
 from ..algo.file_filter import filter_ignored
-from ..algo.git_patch_processing import (
-    decode_if_bytes,
-    iter_git_patch_lines,
-    split_git_file_lines,
-    strip_git_line_ending,
-)
+from ..algo.git_patch_processing import decode_if_bytes
 from ..algo.inline_comment_dedup import (
     body_fingerprint,
     body_with_markers,
@@ -33,7 +27,6 @@ from ..algo.utils import (
     PRCodeSuggestionsIdentity,
     clip_tokens,
     comment_matches_any_identity,
-    comment_matches_pr_review_identity,
     find_line_number_of_relevant_line_in_file,
     get_pr_review_comment_identifiers,
     load_large_diff,
@@ -430,7 +423,7 @@ class GitLabProvider(GitProvider):
         return True
 
     def supports_incremental_kind(self, kind: str) -> bool:
-        return kind == "review" or kind in self._INCREMENTAL_ANCHOR_PREFIXES
+        return kind in self._INCREMENTAL_ANCHOR_PREFIXES
 
     def _get_project_path_from_pr_or_issue_url(self, pr_or_issue_url: str) -> str:
         repo_project_path = None
@@ -498,6 +491,7 @@ class GitLabProvider(GitProvider):
     )
     _SUGGESTIONS_LEGACY_ANCHORS = (PRCodeSuggestionsHeader.SUMMARY.value,)
     _INCREMENTAL_ANCHOR_PREFIXES = {
+        "review": get_pr_review_comment_identifiers(full=True, incremental=True),
         "suggestions": _SUGGESTIONS_STABLE_ANCHORS + _SUGGESTIONS_LEGACY_ANCHORS,
     }
 
@@ -512,7 +506,6 @@ class GitLabProvider(GitProvider):
         if incremental is None:
             incremental = IncrementalPR(False)
         self.incremental = incremental
-        self._incremental_scope_complete = None
         # Provider instances are cached per PR URL in server mode, so `diff_files` may hold
         # a diff computed under a different incremental scope (or none). Invalidate it so the
         # next get_diff_files() call reflects the scope configured here.
@@ -529,21 +522,9 @@ class GitLabProvider(GitProvider):
             self.mr_commits = list(self.mr.commits())[::-1]
 
         kind = getattr(self, '_incremental_kind', 'review')
-        prefixes = (
-            get_pr_review_comment_identifiers(
-                full=True,
-                incremental=True,
-                review_profile=self.incremental.review_profile,
-            )
-            if kind == "review"
-            else self._INCREMENTAL_ANCHOR_PREFIXES.get(kind, ())
-        )
+        prefixes = self._INCREMENTAL_ANCHOR_PREFIXES.get(kind, ())
         self.previous_review = (
-            self._find_anchor_note(
-                prefixes,
-                prefer_latest_activity=kind == "suggestions",
-                review_profile=self.incremental.review_profile if kind == "review" else None,
-            )
+            self._find_anchor_note(prefixes, prefer_latest_activity=kind == "suggestions")
             if prefixes
             else None
         )
@@ -570,8 +551,6 @@ class GitLabProvider(GitProvider):
                     "(missing/unparseable timestamps); falling back to a full review"
                 )
                 self.incremental.is_incremental = False
-            else:
-                self._incremental_scope_complete = True
             return
 
         last_seen_sha = self.incremental.last_seen_commit_sha
@@ -615,28 +594,13 @@ class GitLabProvider(GitProvider):
         # `mr.changes()` is anchored on the MR's merge-base with target, so it correctly excludes
         # target-side changes. Intersect file paths to drop "phantom" files brought in via merge.
         mr_change_paths = None
-        incremental_scope_complete = True
         try:
-            mr_changes = self._get_merge_request_changes().get('changes', [])
-            candidate_paths = set()
-            malformed_filter = not isinstance(mr_changes, (list, tuple))
-            if not malformed_filter:
-                for change in mr_changes:
-                    new_path = change.get('new_path') if isinstance(change, dict) else None
-                    if not isinstance(new_path, str) or not new_path.strip():
-                        malformed_filter = True
-                        break
-                    candidate_paths.add(new_path)
-            if malformed_filter:
-                incremental_scope_complete = False
-                get_logger().warning(
-                    "Could not validate every mr.changes() path; preserving compare "
-                    "evidence and marking incremental scope incomplete."
-                )
-            else:
-                mr_change_paths = candidate_paths
+            mr_change_paths = {
+                c.get('new_path')
+                for c in self._get_merge_request_changes().get('changes', [])
+                if c.get('new_path')
+            }
         except Exception as e:
-            incremental_scope_complete = False
             get_logger().warning(
                 f"Could not fetch mr.changes() to filter incremental scope; "
                 f"merge-from-target changes may leak into the review: {e}"
@@ -654,7 +618,6 @@ class GitLabProvider(GitProvider):
                                     'new_file', 'deleted_file', 'renamed_file')}
             new_path = diff.get('new_path')
             if not new_path:
-                incremental_scope_complete = False
                 continue
             if mr_change_paths is not None and new_path not in mr_change_paths:
                 get_logger().debug(
@@ -663,7 +626,6 @@ class GitLabProvider(GitProvider):
                 )
                 continue
             self.unreviewed_files_map[new_path] = diff
-        self._incremental_scope_complete = incremental_scope_complete
 
     def get_commit_range(self):
         last_review_time = getattr(self.previous_review, 'anchor_time', None)
@@ -689,18 +651,13 @@ class GitLabProvider(GitProvider):
                 break
         return self.mr_commits[first_new_commit_index:] if first_new_commit_index is not None else []
 
-    def get_previous_review(self, *, full: bool, incremental: bool, review_profile: str = "full"):
+    def get_previous_review(self, *, full: bool, incremental: bool):
         if not (full or incremental):
             raise ValueError("At least one of full or incremental must be True")
-        identifiers = get_pr_review_comment_identifiers(
-            full=full,
-            incremental=incremental,
-            review_profile=review_profile,
-        )
-        return self._find_anchor_note(identifiers, review_profile=review_profile)
+        identifiers = get_pr_review_comment_identifiers(full=full, incremental=incremental)
+        return self._find_anchor_note(identifiers)
 
-    def _find_anchor_note(
-            self, identities, *, prefer_latest_activity: bool = False, review_profile: str | None = None):
+    def _find_anchor_note(self, identities, *, prefer_latest_activity: bool = False):
         """Return the most recent MR note whose body matches any supplied identity.
 
         Used by incremental flows (`/review -i`, `/improve -i`) to find the timestamp
@@ -737,12 +694,7 @@ class GitLabProvider(GitProvider):
             body = getattr(note, 'body', None)
             if not isinstance(body, str):
                 continue
-            matches_identity = (
-                comment_matches_pr_review_identity(body, identities, review_profile)
-                if review_profile
-                else comment_matches_any_identity(body, identities)
-            )
-            if not matches_identity:
+            if not comment_matches_any_identity(body, identities):
                 continue
             if own_user_id is not None:
                 author = getattr(note, 'author', None)
@@ -910,7 +862,7 @@ class GitLabProvider(GitProvider):
 
 
             # count number of lines added and removed
-            patch_lines = list(iter_git_patch_lines(patch))
+            patch_lines = patch.splitlines(keepends=True)
             num_plus_lines = len([line for line in patch_lines if line.startswith('+')])
             num_minus_lines = len([line for line in patch_lines if line.startswith('-')])
             diff_files.append(
@@ -938,34 +890,7 @@ class GitLabProvider(GitProvider):
             self.git_files = [c.get('new_path') for c in raw_changes if c.get('new_path')]
         return self.git_files
 
-    def get_files_for_routing(self) -> list[dict]:
-        """Return GitLab's unfiltered changed-file records for safety routing.
-
-        The regular file list intentionally exposes only destination paths, while
-        ``get_diff_files()`` filters ignored or unsupported destinations. Routing
-        needs GitLab's original old/new path pair so a rename cannot hide a
-        sensitive source path behind an ignored destination.
-        """
-        incremental_active = bool(
-            getattr(self, 'incremental', None)
-            and getattr(self.incremental, 'is_incremental', False)
-        )
-        if incremental_active:
-            inventory = getattr(self, 'unreviewed_files_map', None)
-            raw_changes = list(inventory.values()) if isinstance(inventory, dict) else []
-            if getattr(self, '_incremental_scope_complete', None) is not True:
-                raw_changes.append({})
-        else:
-            raw_changes = self._get_merge_request_changes().get('changes', [])
-        return list(self._expand_submodule_changes(raw_changes))
-
-    def is_incremental_scope_empty(self) -> bool | None:
-        empty = super().is_incremental_scope_empty()
-        if empty is True and getattr(self, '_incremental_scope_complete', None) is not True:
-            return None
-        return empty
-
-    def publish_description(self, pr_title: str, pr_body: str):
+    def publish_description(self, pr_title: str, pr_body: str) -> None:
         try:
             if pr_title is not None:
                 self.mr.title = pr_title
@@ -973,6 +898,7 @@ class GitLabProvider(GitProvider):
             self.mr.save()
         except Exception as e:
             get_logger().exception(f"Could not update merge request {self.id_mr} description: {e}")
+            raise
 
     def get_latest_commit_url(self):
         try:
@@ -987,20 +913,32 @@ class GitLabProvider(GitProvider):
         return f"{self.mr.web_url}#note_{comment.id}"
 
     def should_publish_review_as_thread(self) -> bool:
-        return parse_env_bool(get_settings().get("GITLAB.PUBLISH_REVIEW_AS_THREAD", False)) is True
+        return bool(get_settings().get("GITLAB.PUBLISH_REVIEW_AS_THREAD", False))
 
     def should_publish_improve_as_thread(self) -> bool:
-        return parse_env_bool(get_settings().get("GITLAB.PUBLISH_IMPROVE_AS_THREAD", False)) is True
-
-    def is_comment_thread(self, comment) -> bool:
-        resolvable = getattr(comment, "resolvable", None)
-        attributes = getattr(comment, "attributes", None)
-        if not isinstance(resolvable, bool) and isinstance(attributes, dict):
-            resolvable = attributes.get("resolvable")
-        return resolvable is True
+        return bool(get_settings().get("GITLAB.PUBLISH_IMPROVE_AS_THREAD", False))
 
     def supports_review_comment_identity(self) -> bool:
         return True
+
+    def supports_review_finding_state(self) -> bool:
+        return True
+
+    def is_comment_authored_by_pr_agent(self, comment) -> bool:
+        if isinstance(comment, dict):
+            author = comment.get("author") or comment.get("user")
+        else:
+            author = getattr(comment, "author", None) or getattr(comment, "user", None)
+        if isinstance(author, dict):
+            author_id = author.get("id")
+        else:
+            author_id = getattr(author, "id", None)
+        if author_id is None:
+            raise RuntimeError("GitLab comment author cannot be verified")
+        own_user_id = self._get_own_user_id()
+        if own_user_id is None:
+            raise RuntimeError("GitLab authenticated user cannot be verified")
+        return str(author_id) == str(own_user_id)
 
     def publish_persistent_comment(self, pr_comment: str,
                                    initial_header: str,
@@ -1259,10 +1197,7 @@ class GitLabProvider(GitProvider):
                 diff_patch = difflib.unified_diff(old_code_snippet.split('\n'),
                                             new_code_snippet.split('\n'), n=999)
                 patch_orig = "\n".join(diff_patch)
-                patch = "\n".join(
-                    strip_git_line_ending(line)
-                    for line in list(iter_git_patch_lines(patch_orig))[5:]
-                ).strip('\n')
+                patch = "\n".join(patch_orig.splitlines()[5:]).strip('\n')
                 diff_code = f"\n\n```diff\n{patch.rstrip()}\n```"
                 body_fallback += diff_code
 
@@ -1338,7 +1273,13 @@ class GitLabProvider(GitProvider):
                     continue
                 range = relevant_lines_end - relevant_lines_start # no need to add 1
                 body = body.replace('```suggestion', f'```suggestion:-0+{range}')
-                lines = split_git_file_lines(target_file.head_file)
+                lines = target_file.head_file.splitlines() if target_file.head_file else []
+                if not 0 < relevant_lines_start <= len(lines):
+                    get_logger().warning(
+                        f"Skipping suggestion: line {relevant_lines_start} out of range "
+                        f"for '{relevant_file}' (head content has {len(lines)} lines)"
+                    )
+                    continue
                 relevant_line_in_file = lines[relevant_lines_start - 1]
 
                 # edit_type, found, source_line_no, target_file, target_line_no = self.find_in_file(target_file,
@@ -1407,10 +1348,7 @@ class GitLabProvider(GitProvider):
         found = False
         target_file = file
         patch = file.patch
-        patch_lines = [
-            strip_git_line_ending(line)
-            for line in iter_git_patch_lines(patch)
-        ]
+        patch_lines = patch.splitlines()
         for line in patch_lines:
             if line.startswith('@@'):
                 match = self.RE_HUNK_HEADER.match(line)
@@ -1470,10 +1408,6 @@ class GitLabProvider(GitProvider):
     def get_pr_branch(self):
         return self.mr.source_branch
 
-    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
-        merge_request = self._get_merge_request() if refresh else self.mr
-        return (getattr(merge_request, "diff_refs", None) or {}).get("head_sha")
-
     def get_pr_owner_id(self) -> str | None:
         if not self.gitlab_url or 'gitlab.com' in self.gitlab_url:
             if not self.id_project:
@@ -1498,6 +1432,9 @@ class GitLabProvider(GitProvider):
 
     def get_issue_comments(self):
         return self.mr.notes.list(get_all=True)[::-1]
+
+    def get_issue_comments_newest_first(self):
+        return list(reversed(self.get_issue_comments()))
 
     def get_repo_settings(self):
         settings_files = []
@@ -1562,12 +1499,10 @@ class GitLabProvider(GitProvider):
     def get_workspace_name(self):
         return self.id_project.split('/')[0]
 
-    def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> Optional[int]:
-        if disable_eyes:
-            return None
+    def add_reaction(self, issue_comment_id: int, reaction: str) -> Optional[int]:
         try:
             if not self.id_mr:
-                get_logger().warning("Cannot add eyes reaction: merge request ID is not set.")
+                get_logger().warning("Cannot add a reaction: merge request ID is not set.")
                 return None
 
             mr = self.gl.projects.get(self.id_project).mergerequests.get(self.id_mr)
@@ -1578,11 +1513,11 @@ class GitLabProvider(GitProvider):
                 return None
 
             award_emoji = comment.awardemojis.create({
-                'name': 'eyes'
+                'name': reaction
             })
             return award_emoji.id
         except Exception as e:
-            get_logger().warning(f"Failed to add eyes reaction, error: {e}")
+            get_logger().warning(f"Failed to add the {reaction} reaction, error: {e}")
             return None
 
     def remove_reaction(self, issue_comment_id: int, reaction_id: str) -> bool:
@@ -1738,7 +1673,7 @@ class GitLabProvider(GitProvider):
     def get_repo_labels(self):
         return self.gl.projects.get(self.id_project).labels.list()
 
-    def get_commit_messages(self):
+    def get_commit_messages(self) -> str:
         """
         Retrieves the commit messages of a pull request.
 

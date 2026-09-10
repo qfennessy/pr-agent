@@ -10,9 +10,8 @@ from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.cli_args import CliArgs
 from pr_agent.algo.utils import update_settings_from_args
 from pr_agent.config_loader import get_settings
-from pr_agent.git_providers.utils import apply_extra_config_settings, apply_repo_settings
+from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import get_logger
-from pr_agent.telemetry.config import parse_otel_bool
 from pr_agent.telemetry.meter import get_commands_counter
 from pr_agent.telemetry.shutdown import flush_telemetry
 from pr_agent.telemetry.tracer import get_tracer
@@ -159,11 +158,20 @@ def prepare_command(command: str) -> list[str]:
             key, value = argument.split("=", 1)
             argument = f"{key}={json.dumps(value, ensure_ascii=False)}"
         args.append(argument)
-
-    is_valid, arg = CliArgs.validate_user_args(args)
-    if not is_valid:
-        raise ValueError(f"CLI argument for param '{arg}' is forbidden. Use instead a configuration file.")
-
+    kept, rejected = [], []
+    for argument in args:
+        # Validate the key only. The value is free text - a review instruction may legitimately
+        # mention openai.key or config.url - and only the key can actually set a setting.
+        is_allowed, offending_param = CliArgs.validate_user_args([argument.split("=", 1)[0]])
+        if is_allowed:
+            kept.append(argument)
+        else:
+            rejected.append(offending_param)
+    if rejected:
+        get_logger().error(
+            "Dropping auto-command argument(s) targeting forbidden param(s): "
+            + ", ".join(f"'{param}'" for param in rejected))
+        args = kept
     other_args = update_settings_from_args(args)
     return [action] + other_args
 
@@ -173,20 +181,16 @@ class PRAgent:
         self.ai_handler = ai_handler  # will be initialized in run_action
 
     async def _handle_request(self, pr_url, request, notify=None) -> bool:
-        # Shared extra configuration is host-owned and must be available before
-        # telemetry caches decide whether this process exports spans and metrics.
-        apply_extra_config_settings()
-
         # Exceptions raised inside are caught below, but a BaseException (e.g. the
         # CancelledError a webhook timeout raises) still escapes the span, and the SDK
         # would auto-record its message and stacktrace — request content, so opt-in.
-        record_details = parse_otel_bool(get_settings().get("OTEL.INCLUDE_ERROR_DETAILS", False))
+        record_details = bool(get_settings().get("OTEL.INCLUDE_ERROR_DETAILS", False))
         with get_tracer().start_as_current_span(
             "pr_agent.command",
             record_exception=record_details,
             set_status_on_exception=record_details,
         ) as span:
-            if parse_otel_bool(get_settings().get("OTEL.INCLUDE_PR_URL", False)):
+            if get_settings().get("OTEL.INCLUDE_PR_URL", False):
                 span.set_attribute("pr_agent.pr_url", pr_url)
             try:
                 return await self._run_command(pr_url, request, notify, span)
@@ -202,9 +206,8 @@ class PRAgent:
                 return False
 
     async def _run_command(self, pr_url, request, notify, span) -> bool:
-        # Shared host settings were loaded before telemetry initialization. Apply
-        # only repository settings here, inside the request span/provider context.
-        apply_repo_settings(pr_url, include_extra_config=False)
+        # First, apply repo specific settings if exists
+        apply_repo_settings(pr_url)
 
         # Then, apply user specific settings if exists
         if isinstance(request, str):
@@ -263,7 +266,7 @@ class PRAgent:
             get_logger().warning(f"Unknown command: {action}")
             span.set_status(StatusCode.ERROR)
             span.set_attribute("error.type", "unknown_command")
-            if parse_otel_bool(get_settings().get("OTEL.INCLUDE_ERROR_DETAILS", False)):
+            if get_settings().get("OTEL.INCLUDE_ERROR_DETAILS", False):
                 span.set_attribute("error.message", f"Unknown command: {action}")
             return False
 

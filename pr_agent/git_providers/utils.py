@@ -19,8 +19,6 @@ from pr_agent.log import get_logger
 
 _MAX_EXTRA_CONFIG_BYTES = 1 * 1024 * 1024  # 1 MB cap for a remote .toml
 _FETCH_TIMEOUT_SECONDS = 10
-_EXTRA_CONFIG_CONTEXT_KEY = "pr_agent_extra_config_source"
-_EXTRA_CONFIG_SOURCE_UNSET = object()
 # Bare Windows drive-letter paths (e.g. "C:\\shared.toml", "D:/cfg.toml").
 # urlparse() would otherwise interpret the drive letter as a URL scheme.
 _WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -40,28 +38,6 @@ def _safe_url_for_log(url: str) -> str:
         return f"{parsed.scheme}://{netloc}{parsed.path}"
     except Exception:
         return "<extra config URL redacted>"
-
-
-def get_local_extra_config_path(source) -> str | None:
-    """Return the local path represented by a bare path or file URL."""
-    if not isinstance(source, str):
-        return None
-    source = source.strip()
-    if not source:
-        return None
-    if _WINDOWS_DRIVE_PATH_RE.match(source):
-        return source
-    parsed = urlparse(source)
-    scheme = (parsed.scheme or "").lower()
-    if scheme not in ("", "file"):
-        return None
-    if scheme == "":
-        return source
-    netloc = parsed.netloc or ""
-    raw = parsed.path
-    if netloc and netloc.lower() != "localhost":
-        raw = f"//{netloc}{raw}"
-    return url2pathname(raw)
 
 
 def _resolve_extra_config_to_file(source):
@@ -90,15 +66,34 @@ def _resolve_extra_config_to_file(source):
     if not source:
         return None, False
 
-    local_path = get_local_extra_config_path(source)
-    if local_path is not None:
+    # Bare Windows drive-letter paths must be handled before urlparse() — it
+    # would otherwise treat the drive letter as a URL scheme.
+    if _WINDOWS_DRIVE_PATH_RE.match(source):
+        if os.path.isfile(source):
+            return source, False
+        get_logger().warning(f"Extra config not found at local path: {source}")
+        return None, False
+
+    parsed = urlparse(source)
+    scheme = (parsed.scheme or "").lower()
+
+    # Local path (bare or file://)
+    if scheme in ("", "file"):
+        if scheme == "file":
+            # Preserve any non-localhost netloc (UNC-style file://host/share/...)
+            # and URL-decode percent-encoded path components via url2pathname.
+            netloc = parsed.netloc or ""
+            raw = parsed.path
+            if netloc and netloc.lower() != "localhost":
+                raw = f"//{netloc}{raw}"
+            local_path = url2pathname(raw)
+        else:
+            local_path = source
         if os.path.isfile(local_path):
             return local_path, False
         get_logger().warning(f"Extra config not found at local path: {local_path}")
         return None, False
 
-    parsed = urlparse(source)
-    scheme = (parsed.scheme or "").lower()
     if scheme not in ("http", "https"):
         get_logger().warning(f"Unsupported scheme for extra config: {scheme}")
         return None, False
@@ -228,54 +223,36 @@ def _apply_settings_from_file(path: str, label: str):
         get_logger().warning(f"Failed to apply {label} settings from {path}: {e}")
 
 
-def apply_extra_config_settings():
-    """Apply the configured shared settings layer before repository settings."""
+def apply_repo_settings(pr_url):
     os.environ["AUTO_CAST_FOR_DYNACONF"] = "false"
+
+    # Apply external/shared config FIRST, before constructing the git provider:
+    # provider initialisers (e.g. GitLabProvider reads GITLAB.PERSONAL_ACCESS_TOKEN
+    # at __init__) need to see any provider-critical settings that come from the
+    # extra file. Repo-local .pr_agent.toml is still applied later and overrides
+    # the extra file on conflicting keys.
     extra_source = get_settings().get("CONFIG.EXTRA_CONFIG_URL", None)
-    try:
-        if context.get(_EXTRA_CONFIG_CONTEXT_KEY, _EXTRA_CONFIG_SOURCE_UNSET) == extra_source:
-            return
-    except Exception:
-        # CLI and direct-library callers run without Starlette request context.
-        pass
-
-    try:
-        if isinstance(extra_source, str) and extra_source.strip():
-            extra_path, extra_is_temp = _resolve_extra_config_to_file(extra_source)
-            if extra_path:
-                try:
-                    # _apply_settings_from_file() re-applies env-var overrides
-                    # itself, so env precedence is restored before the provider
-                    # is constructed below.
-                    _apply_settings_from_file(extra_path, label="extra")
-                finally:
-                    if extra_is_temp:
-                        try:
-                            os.remove(extra_path)
-                        except Exception as e:
-                            get_logger().error(
-                                f"Failed to remove temp extra config {extra_path}: {e}"
-                            )
-        elif extra_source is not None and not isinstance(extra_source, str):
-            get_logger().warning(
-                "Ignoring CONFIG.EXTRA_CONFIG_URL: expected str, got "
-                f"{type(extra_source).__name__}"
-            )
-    finally:
-        try:
-            context[_EXTRA_CONFIG_CONTEXT_KEY] = extra_source
-        except Exception:
-            # No request context for CLI/direct callers; intentionally leave uncached.
-            pass
-
-
-def apply_repo_settings(pr_url, *, include_extra_config=True):
-    os.environ["AUTO_CAST_FOR_DYNACONF"] = "false"
-
-    # Provider initialisers need external provider settings before construction.
-    # Hosted repository settings are applied afterwards and retain precedence.
-    if include_extra_config:
-        apply_extra_config_settings()
+    if isinstance(extra_source, str) and extra_source.strip():
+        extra_path, extra_is_temp = _resolve_extra_config_to_file(extra_source)
+        if extra_path:
+            try:
+                # _apply_settings_from_file() re-applies env-var overrides
+                # itself, so env precedence is restored before the provider
+                # is constructed below.
+                _apply_settings_from_file(extra_path, label="extra")
+            finally:
+                if extra_is_temp:
+                    try:
+                        os.remove(extra_path)
+                    except Exception as e:
+                        get_logger().error(
+                            f"Failed to remove temp extra config {extra_path}: {e}"
+                        )
+    elif extra_source is not None and not isinstance(extra_source, str):
+        get_logger().warning(
+            "Ignoring CONFIG.EXTRA_CONFIG_URL: expected str, got "
+            f"{type(extra_source).__name__}"
+        )
 
     git_provider = get_git_provider_with_context(pr_url)
 
@@ -331,17 +308,6 @@ def apply_repo_settings(pr_url, *, include_extra_config=True):
         set_claude_model()
 
 
-def apply_local_repo_settings(repository_root):
-    """Apply shared then worktree settings through the normal security gates."""
-    apply_extra_config_settings()
-    settings_path = os.path.join(str(repository_root), ".pr_agent.toml")
-    if get_settings().config.use_repo_settings_file and os.path.isfile(settings_path):
-        _apply_repo_settings_file(settings_path)
-    # The local and shared layers are now fully materialized. Prevent the later
-    # plain-diff provider setup from reapplying shared settings after local ones.
-    get_settings().set("CONFIG.EXTRA_CONFIG_URL", None)
-
-
 def _apply_repo_settings_file(repo_settings_file):
     """Load a single repo settings file and merge its allowed keys into the global settings.
 
@@ -373,7 +339,6 @@ def _apply_repo_settings_file(repo_settings_file):
             get_logger().debug(f"Skipping non-table or empty section: {section}")
             continue
         allowed_keys = REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION.get(section.lower())
-        host_only_keys = REPO_HOST_ONLY_KEYS_BY_SECTION.get(section.lower(), ())
         if allowed_keys is not None:
             rejected = [k for k in contents if k.lower() not in allowed_keys]
             if rejected:
@@ -384,15 +349,16 @@ def _apply_repo_settings_file(repo_settings_file):
             contents = {k: v for k, v in contents.items() if k.lower() in allowed_keys}
             if not contents:
                 continue
-        elif host_only_keys:
+        else:
+            host_only_keys = REPO_HOST_ONLY_KEYS_BY_SECTION.get(section.lower(), frozenset())
             rejected = [k for k in contents if k.lower() in host_only_keys]
             if rejected:
                 get_logger().warning(
                     f"Ignoring host-only key(s) {rejected} in section [{section}] from repo settings"
                 )
-            contents = {k: v for k, v in contents.items() if k.lower() not in host_only_keys}
-            if not contents:
-                continue
+                contents = {k: v for k, v in contents.items() if k.lower() not in host_only_keys}
+                if not contents:
+                    continue
         section_dict = copy.deepcopy(get_settings().as_dict().get(section.upper(), {}))
         for key, value in contents.items():
             section_dict[key] = value
