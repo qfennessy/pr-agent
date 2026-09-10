@@ -193,6 +193,92 @@ _GENERIC_CI_EVIDENCE_TERMS = {
     "assert", "assertion", "build", "check", "error", "errors", "fail", "failed", "failure", "failures",
     "job", "test", "tests", "unit",
 }
+_MAX_RATE_LIMIT_RETRY_DELAY_SECONDS = 30
+_SAFE_PROVIDER_EVIDENCE = re.compile(r"[^A-Za-z0-9._:/=+\- ]")
+_RETRY_AFTER_HEADERS = (
+    "retry-after",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+)
+_REQUEST_ID_HEADERS = ("x-request-id", "request-id", "openai-request-id")
+
+
+def _safe_provider_evidence(value: Any) -> str | None:
+    """Return a bounded header or error-code value that is safe to publish."""
+    if value is None:
+        return None
+    sanitized = _SAFE_PROVIDER_EVIDENCE.sub("?", str(value)).strip()
+    return sanitized[:120] or None
+
+
+def _provider_failure_evidence(error: BaseException) -> dict[str, str]:
+    """Classify a provider failure without copying its message or response body."""
+    response = getattr(error, "response", None)
+    status = getattr(error, "status_code", None) or getattr(response, "status_code", None)
+    headers = getattr(error, "headers", None) or getattr(response, "headers", None) or {}
+    error_code = _safe_provider_evidence(getattr(error, "code", None))
+    error_name = type(error).__name__
+    normalized_name = error_name.casefold()
+    if status == 429 or "ratelimit" in normalized_name or error_code in {
+        "insufficient_quota", "rate_limit_exceeded", "billing_hard_limit_reached",
+    }:
+        error_class = "rate_limited"
+    elif status in {401, 403} or "authentication" in normalized_name or "permission" in normalized_name:
+        error_class = "authentication_or_permission"
+    elif status in {400, 404, 422}:
+        error_class = "configuration_or_model"
+    elif isinstance(error, TimeoutError) or "timeout" in normalized_name:
+        error_class = "timeout"
+    else:
+        error_class = "provider_error"
+
+    evidence = {"error_class": error_class, "exception": error_name}
+    if status is not None:
+        evidence["http_status"] = str(status)
+    if error_code:
+        evidence["provider_code"] = error_code
+    for name in _REQUEST_ID_HEADERS:
+        value = _safe_provider_evidence(getattr(headers, "get", lambda *_: None)(name))
+        if value:
+            evidence["request_id"] = value
+            break
+    for name in _RETRY_AFTER_HEADERS:
+        value = _safe_provider_evidence(getattr(headers, "get", lambda *_: None)(name))
+        if value:
+            evidence["retry_after"] = value
+            break
+    return evidence
+
+
+def _rate_limit_retry_delay_seconds() -> int:
+    """Read a bounded repository opt-in for one 429 retry."""
+    value = get_settings().pr_reviewer.get("rate_limit_retry_delay_seconds", 0)
+    try:
+        return min(max(int(value), 0), _MAX_RATE_LIMIT_RETRY_DELAY_SECONDS)
+    except (TypeError, ValueError):
+        get_logger().warning("Invalid pr_reviewer.rate_limit_retry_delay_seconds; disabling retry")
+        return 0
+
+
+def _review_failure_body(heading: str, evidence: Mapping[str, str], retry_note: str | None) -> str:
+    """Render a compact failure note from whitelisted provider metadata only."""
+    lines = [f"{heading}\n\nReview failed: {evidence['error_class']}."]
+    details = [f"exception `{evidence['exception']}`"]
+    if evidence.get("http_status"):
+        details.append(f"HTTP `{evidence['http_status']}`")
+    if evidence.get("provider_code"):
+        details.append(f"provider code `{evidence['provider_code']}`")
+    if evidence.get("request_id"):
+        details.append(f"request ID `{evidence['request_id']}`")
+    if evidence.get("retry_after"):
+        details.append(f"retry-after/reset `{evidence['retry_after']}`")
+    if evidence.get("detail"):
+        details.append(evidence["detail"])
+    lines.append("\n- ".join(["", *details]))
+    if retry_note:
+        lines.append(f"\nRetry: {retry_note}.")
+    lines.append("\nNo provider response body or credential value is shown.")
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -664,29 +750,54 @@ class PRReviewer:
                         setattr(reviewer, key, copy.deepcopy(value))
                 reviewer._force_no_publish = True
                 heading = f"## PR Reviewer Guide ({model}) 🔍"
-                try:
-                    if model not in model_budgets:
-                        raise LookupError("model context window unavailable")
-                    reviewer.ai_handler = self._ai_handler_factory()
-                    reviewer.ai_handler.main_pr_language = self.main_language
-                    reviewer.prediction = await asyncio.wait_for(
-                        reviewer._get_prediction(model, prompts=prompts), timeout=settings.config.ai_timeout,
-                    )
-                    reviewer._reject_unparsable_prediction(model)
-                    body = reviewer._prepare_pr_review()
-                    if body:
-                        body = heading + "\n" + body.partition("\n")[2]
-                    else:
-                        body = heading + "\n\nNo major issues detected."
-                except Exception as exc:
-                    # Provider exception strings can contain credentials or prompt data.
-                    reason = (
-                        "model context window unavailable" if model not in model_budgets
-                        else "invalid or empty review output" if isinstance(exc, ValueError)
-                        else type(exc).__name__
-                    )
-                    body = f"{heading}\n\nReview failed: {reason}."
-                    get_logger().warning("Independent review failed", artifact={"model": model, "reason": reason})
+                retry_delay = _rate_limit_retry_delay_seconds()
+                rate_limit_retry_attempted = False
+                for attempt in range(2):
+                    try:
+                        if model not in model_budgets:
+                            raise LookupError("model context window unavailable")
+                        reviewer.ai_handler = self._ai_handler_factory()
+                        reviewer.ai_handler.main_pr_language = self.main_language
+                        reviewer.prediction = await asyncio.wait_for(
+                            reviewer._get_prediction(model, prompts=prompts), timeout=settings.config.ai_timeout,
+                        )
+                        reviewer._reject_unparsable_prediction(model)
+                        body = reviewer._prepare_pr_review()
+                        if body:
+                            body = heading + "\n" + body.partition("\n")[2]
+                        else:
+                            body = heading + "\n\nNo major issues detected."
+                        break
+                    except Exception as exc:
+                        # Provider exception strings can contain credentials or prompt data.
+                        if model not in model_budgets:
+                            evidence = {
+                                "error_class": "configuration_or_model",
+                                "exception": "LookupError",
+                                "detail": "model context window unavailable",
+                            }
+                        elif isinstance(exc, ValueError):
+                            evidence = {"error_class": "invalid_or_empty_output", "exception": type(exc).__name__}
+                        else:
+                            evidence = _provider_failure_evidence(exc)
+                        if attempt == 0 and evidence["error_class"] == "rate_limited" and retry_delay:
+                            rate_limit_retry_attempted = True
+                            get_logger().warning(
+                                "Independent reviewer received a rate limit; retrying once",
+                                artifact={"model": model, "delay_seconds": retry_delay, **evidence},
+                            )
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        retry_note = (
+                            f"one rate-limit retry after {retry_delay}s also failed ({evidence['error_class']})"
+                            if rate_limit_retry_attempted else None
+                        )
+                        body = _review_failure_body(heading, evidence, retry_note)
+                        get_logger().warning(
+                            "Independent review failed",
+                            artifact={"model": model, "attempt": attempt + 1, **evidence},
+                        )
+                        break
                 if settings.config.publish_output:
                     self.git_provider.publish_persistent_comment(
                         body,

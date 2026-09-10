@@ -125,6 +125,49 @@ async def test_one_failure_does_not_cancel_other_model(monkeypatch, settings, fa
     assert "secret provider response" not in "".join(bodies.values())
 
 
+async def test_rate_limit_retries_once_and_publishes_safe_failure_evidence(monkeypatch, settings):
+    class Response:
+        status_code = 429
+        headers = {
+            "x-request-id": "req_123",
+            "retry-after": "90",
+        }
+
+    class RateLimitError(Exception):
+        response = Response()
+        code = "insufficient_quota"
+
+    calls = []
+
+    class Handler:
+        async def chat_completion(self, model, **kwargs):
+            if model == "provider/a":
+                calls.append(model)
+                raise RateLimitError("api_key=sk-this-must-not-appear")
+            return "review:\n  estimated_effort_to_review_[1-5]: 2\n", "stop"
+
+    sleep = AsyncMock()
+    monkeypatch.setattr("pr_agent.tools.pr_reviewer.asyncio.sleep", sleep)
+    settings.set("pr_reviewer.rate_limit_retry_delay_seconds", 7)
+    settings.set("pr_review_prompt.system", "review")
+    settings.set("pr_review_prompt.user", "{{ diff }}")
+    reviewer, provider = make_reviewer(monkeypatch, Handler)
+    await reviewer.run()
+
+    bodies = {comment.body.split("\n")[0]: comment.body for comment in provider.existing}
+    failed = bodies["## PR Reviewer Guide (provider/a) 🔍"]
+    assert calls == ["provider/a", "provider/a"]
+    sleep.assert_awaited_once_with(7)
+    assert "Review failed: rate_limited." in failed
+    assert "HTTP `429`" in failed
+    assert "provider code `insufficient_quota`" in failed
+    assert "request ID `req_123`" in failed
+    assert "retry-after/reset `90`" in failed
+    assert "one rate-limit retry after 7s also failed" in failed
+    assert "sk-this-must-not-appear" not in failed
+    assert "Review failed" not in bodies["## PR Reviewer Guide (provider/b) 🔍"]
+
+
 async def test_no_publish_duplicate_models_and_bugs_only_empty_result(monkeypatch, settings):
     handler = MagicMock()
     handler.chat_completion = AsyncMock(return_value=("review:\n  key_issues_to_review: []\n", "stop"))
