@@ -2,6 +2,7 @@ import asyncio
 import copy
 import datetime
 import json
+import math
 import re
 import time
 from dataclasses import dataclass, field, replace
@@ -69,6 +70,7 @@ from pr_agent.algo.pr_processing import (
     PRDiffCoverage,
     add_ai_metadata_to_diff_files,
     get_pr_diff,
+    publish_model_failure_summary,
     retry_with_fallback_models,
 )
 from pr_agent.algo.repo_context import build_repo_context
@@ -647,6 +649,22 @@ class PRReviewer:
             prompts = self._render_review_prompts()
         settings = copy.deepcopy(get_settings())
 
+        def retry_after_seconds(exc: BaseException) -> float | None:
+            """Return numeric provider retry advice without exposing response headers."""
+            response = getattr(exc, "response", None)
+            headers = getattr(response, "headers", None)
+            if not hasattr(headers, "items"):
+                return None
+            for key, value in headers.items():
+                if str(key).lower() != "retry-after":
+                    continue
+                try:
+                    seconds = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                return max(0.0, seconds) if math.isfinite(seconds) else None
+            return None
+
         async def review_model(model):
             # A new context dictionary is essential: inherited request dictionaries
             # and Dynaconf objects would otherwise be shared by asyncio tasks.
@@ -664,6 +682,9 @@ class PRReviewer:
                         setattr(reviewer, key, copy.deepcopy(value))
                 reviewer._force_no_publish = True
                 heading = f"## PR Reviewer Guide ({model}) 🔍"
+                failure_attempt = None
+                failure_message = ""
+                started_at = time.monotonic()
                 try:
                     if model not in model_budgets:
                         raise LookupError("model context window unavailable")
@@ -686,6 +707,15 @@ class PRReviewer:
                         else type(exc).__name__
                     )
                     body = f"{heading}\n\nReview failed: {reason}."
+                    failure_attempt = {
+                        "attempt": "1/1",
+                        "model": model,
+                        "ai_timeout": settings.config.ai_timeout,
+                        "error_class": type(exc).__name__,
+                        "elapsed_seconds": round(time.monotonic() - started_at, 1),
+                        "retry_after_seconds": retry_after_seconds(exc),
+                    }
+                    failure_message = str(exc)
                     get_logger().warning("Independent review failed", artifact={"model": model, "reason": reason})
                 if settings.config.publish_output:
                     self.git_provider.publish_persistent_comment(
@@ -695,16 +725,26 @@ class PRReviewer:
                         final_update_message=False,
                         name="review",
                     )
-                return body
+                return body, failure_attempt, failure_message
 
         results = await asyncio.gather(*(review_model(model) for model in models), return_exceptions=True)
         artifacts = {}
+        failures = []
         for model, result in zip(models, results):
             if isinstance(result, BaseException):
                 get_logger().error("Could not publish independent review", artifact={"model": model,
                                                                                      "error": type(result).__name__})
             else:
-                artifacts[model] = result
+                body, failure_attempt, failure_message = result
+                artifacts[model] = body
+                if failure_attempt is not None:
+                    failures.append((failure_attempt, failure_message))
+        if failures:
+            publish_model_failure_summary(
+                [attempt for attempt, _ in failures],
+                failures[-1][1],
+                heading="PR-Agent: independent review slot failures",
+            )
         if self._local_artifact_mutations_allowed():
             get_settings().data = {"artifact": "\n\n".join(artifacts.values()), "reviews": artifacts}
 
