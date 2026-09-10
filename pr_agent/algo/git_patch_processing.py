@@ -15,7 +15,7 @@ RE_HUNK_HEADER = re.compile(
 
 
 def iter_git_patch_lines(patch: str) -> Iterator[str]:
-    """Yield Git's LF-delimited patch records while preserving every other byte."""
+    """Yield LF-delimited patch records while preserving all other bytes."""
     start = 0
     while start < len(patch):
         end = patch.find("\n", start)
@@ -36,12 +36,22 @@ def strip_git_line_ending(line: str) -> str:
 
 
 def split_git_file_lines(content: str) -> list[str]:
-    """Split source content using the same LF line boundaries used by Git."""
+    """Split Git source content without stripping meaningful carriage returns."""
     return [strip_git_line_ending(line) for line in iter_git_patch_lines(content)]
 
 
-def _split_file_content_lines(content: str) -> list[str]:
-    return split_git_file_lines(content)
+def to_hunk_only_patch(patch_str: str) -> str:
+    """Drop unified-diff file metadata before the first hunk.
+
+    ``FilePatchInfo.patch`` consumers expect hunk-only patches and may otherwise
+    treat ``---``/``+++`` file headers as changed source lines. Returns an empty
+    string when the diff has no textual hunk, for example a rename-only change.
+    """
+    lines = patch_str.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.startswith("@@"):
+            return "".join(lines[i:])
+    return ""
 
 
 def extend_patch(original_file_str, patch_str, patch_extra_lines_before=0,
@@ -93,10 +103,10 @@ def process_patch_lines(patch_str, original_file_str, patch_extra_lines_before, 
     allow_dynamic_context = get_settings().config.allow_dynamic_context
     patch_extra_lines_before_dynamic = get_settings().config.max_extra_lines_before_dynamic_context
 
-    file_original_lines = _split_file_content_lines(original_file_str)
-    file_new_lines = _split_file_content_lines(new_file_str) if new_file_str else []
+    file_original_lines = original_file_str.splitlines()
+    file_new_lines = new_file_str.splitlines() if new_file_str else []
     len_original_lines = len(file_original_lines)
-    patch_lines = [line.removesuffix("\n") for line in iter_git_patch_lines(patch_str)]
+    patch_lines = patch_str.splitlines()
     extended_patch_lines = []
 
     is_valid_hunk = True
@@ -319,7 +329,7 @@ def handle_patch_deletions(patch: str, original_file_content_str: str,
             get_logger().info(f"Processing file: {file_name}, minimizing deletion file")
         patch = None # file was deleted
     else:
-        patch_lines = [line.removesuffix("\n") for line in iter_git_patch_lines(patch)]
+        patch_lines = patch.splitlines()
         patch_new = omit_deletion_hunks(patch_lines)
         if patch != patch_new:
             if get_verbosity_level() > 0:
@@ -371,7 +381,7 @@ __old hunk__
     else:
         patch_with_lines_str = ""
 
-    patch_lines = [strip_git_line_ending(line) for line in iter_git_patch_lines(patch)]
+    patch_lines = patch.splitlines()
     new_content_lines = []
     old_content_lines = []
     match = None
@@ -402,11 +412,11 @@ __old hunk__
                 if old_content_lines:
                     is_minus_lines = any([line.startswith('-') for line in old_content_lines])
                 if is_plus_lines or is_minus_lines: # notice 'True' here - we always present __new hunk__ for section, otherwise LLM gets confused
-                    patch_with_lines_str = patch_with_lines_str.rstrip("\n") + '\n__new hunk__\n'
+                    patch_with_lines_str = patch_with_lines_str.rstrip() + '\n__new hunk__\n'
                     for i, line_new in enumerate(new_content_lines):
                         patch_with_lines_str += f"{start2 + i} {line_new}\n"
                 if is_minus_lines:
-                    patch_with_lines_str = patch_with_lines_str.rstrip("\n") + '\n__old hunk__\n'
+                    patch_with_lines_str = patch_with_lines_str.rstrip() + '\n__old hunk__\n'
                     for line_old in old_content_lines:
                         patch_with_lines_str += f"{line_old}\n"
                 new_content_lines = []
@@ -417,6 +427,9 @@ __old hunk__
             section_header, size1, size2, start1, start2 = extract_hunk_headers(match)
 
         elif skip_hunk:
+            continue
+        elif match is None:
+            # Ignore unified-diff file metadata before the first valid hunk.
             continue
         elif line.startswith('+'):
             new_content_lines.append(line)
@@ -440,15 +453,15 @@ __old hunk__
         if old_content_lines:
             is_minus_lines = any([line.startswith('-') for line in old_content_lines])
         if is_plus_lines or is_minus_lines:  # notice 'True' here - we always present __new hunk__ for section, otherwise LLM gets confused
-            patch_with_lines_str = patch_with_lines_str.rstrip("\n") + '\n__new hunk__\n'
+            patch_with_lines_str = patch_with_lines_str.rstrip() + '\n__new hunk__\n'
             for i, line_new in enumerate(new_content_lines):
                 patch_with_lines_str += f"{start2 + i} {line_new}\n"
         if is_minus_lines:
-            patch_with_lines_str = patch_with_lines_str.rstrip("\n") + '\n__old hunk__\n'
+            patch_with_lines_str = patch_with_lines_str.rstrip() + '\n__old hunk__\n'
             for line_old in old_content_lines:
                 patch_with_lines_str += f"{line_old}\n"
 
-    return patch_with_lines_str.rstrip("\n")
+    return patch_with_lines_str.rstrip()
 
 
 def extract_hunk_lines_from_patch(patch: str, file_name, line_start, line_end, side, remove_trailing_chars: bool = True) -> tuple[str, str]:
@@ -465,7 +478,7 @@ def extract_hunk_lines_from_patch(patch: str, file_name, line_start, line_end, s
             line_end = -1
         patch_with_lines_str = f"\n\n## File: '{file_name.strip()}'\n\n"
         selected_lines = ""
-        patch_lines = [strip_git_line_ending(line) for line in iter_git_patch_lines(patch)]
+        patch_lines = patch.splitlines()
         match = None
         start1, size1, start2, size2 = -1, -1, -1, -1
         skip_hunk = False
@@ -516,7 +529,7 @@ def extract_hunk_lines_from_patch(patch: str, file_name, line_start, line_end, s
         return "", ""
 
     if remove_trailing_chars:
-        patch_with_lines_str = patch_with_lines_str.rstrip("\n")
-        selected_lines = selected_lines.rstrip("\n")
+        patch_with_lines_str = patch_with_lines_str.rstrip()
+        selected_lines = selected_lines.rstrip()
 
     return patch_with_lines_str, selected_lines

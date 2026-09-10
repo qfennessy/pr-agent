@@ -2,8 +2,11 @@ import asyncio
 import inspect
 import json
 import sys
+from math import isfinite
 
+import httpx
 import litellm
+import openai
 
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
@@ -59,14 +62,6 @@ def _stream_usage(chunk):
     return None
 
 
-class _IncompleteStreamingResponseError(RuntimeError):
-    """Carry a completed but unusable stream response into retry accounting."""
-
-    def __init__(self, message, completed_response):
-        super().__init__(message)
-        self.completed_response = completed_response
-
-
 async def _handle_streaming_response(response, model=None):
     """
     Handle streaming response from acompletion and collect the full response.
@@ -80,22 +75,12 @@ async def _handle_streaming_response(response, model=None):
     full_response = ""
     finish_reason = None
     finalized_usage = None
-    completion_model = None
-    completion_provider = None
 
     try:
         async for chunk in response:
             usage = _stream_usage(chunk)
             if usage is not None:
                 finalized_usage = usage
-            chunk_model = _response_field(chunk, "model")
-            if chunk_model:
-                completion_model = str(chunk_model).strip() or None
-            hidden_params = _response_field(chunk, "_hidden_params")
-            if isinstance(hidden_params, dict):
-                provider = hidden_params.get("custom_llm_provider") or hidden_params.get("provider")
-                if provider:
-                    completion_provider = str(provider).strip().casefold() or None
             if chunk.choices and len(chunk.choices) > 0:
                 choice = chunk.choices[0]
                 delta = choice.delta
@@ -108,37 +93,23 @@ async def _handle_streaming_response(response, model=None):
         get_logger().error(f"Error handling streaming response: {e}")
         raise
 
-    completed_response = MockResponse(
-        full_response,
-        finish_reason,
-        finalized_usage,
-        model=completion_model,
-        provider=completion_provider,
-    )
     if not full_response and finish_reason is None:
         get_logger().warning("Streaming response resulted in empty content with no finish reason")
-        raise _IncompleteStreamingResponseError(
-            "Empty streaming response received without proper completion",
-            completed_response,
-        )
+        raise openai.APIError("Empty streaming response received without proper completion",
+                              request=httpx.Request("POST", model or ""), body=None)
     elif not full_response and finish_reason:
-        get_logger().debug(
-            f"Streaming response resulted in empty content but completed with finish_reason: {finish_reason}"
-        )
-        raise _IncompleteStreamingResponseError(
+        get_logger().debug(f"Streaming response resulted in empty content but completed with finish_reason: {finish_reason}")
+        raise openai.APIError(
             f"Streaming response completed with finish_reason '{finish_reason}' but no content received",
-            completed_response,
-        )
-    return full_response, finish_reason, completed_response
+            request=httpx.Request("POST", model or ""), body=None)
+    return full_response, finish_reason, MockResponse(full_response, finish_reason, finalized_usage, model)
 
 
 class MockResponse:
     """Represent a completed streaming response while retaining LiteLLM's finalized usage object."""
 
-    def __init__(self, resp, finish_reason, usage=None, model=None, provider=None):
+    def __init__(self, resp, finish_reason, usage=None, model=None):
         self.usage = usage
-        self.model = model
-        self._hidden_params = {"custom_llm_provider": provider} if provider else {}
         self._data = {
             "choices": [
                 {
@@ -160,6 +131,25 @@ class MockResponse:
             else:
                 data["usage"] = vars(self.usage).copy()
         return data
+
+
+def get_repetition_penalty():
+    """Return huggingface.repetition_penalty as a float, or None when it is unusable.
+
+    The value is read in LiteLLMAIHandler.__init__, before any handler exists to turn a bad
+    setting into a readable error, so an unreadable value must not raise there.
+    """
+    value = get_settings().get("HUGGINGFACE.REPETITION_PENALTY", None)
+    if value is None:
+        return None
+    try:
+        penalty = float(value)
+    except (TypeError, ValueError, OverflowError):
+        penalty = None
+    if penalty is None or not isfinite(penalty):
+        get_logger().warning(f"huggingface.repetition_penalty is not a usable number ({value!r}); ignoring it")
+        return None
+    return penalty
 
 
 def _get_azure_ad_token():

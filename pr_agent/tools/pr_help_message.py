@@ -11,6 +11,7 @@ from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.pr_processing import retry_with_fallback_models
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import ModelType, clip_tokens, get_max_tokens, load_yaml
+from pr_agent.command_descriptions import COMMAND_DESCRIPTIONS
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import BitbucketServerProvider, GithubProvider, get_git_provider_with_context
 from pr_agent.log import get_logger
@@ -208,17 +209,15 @@ class PRHelpMessage:
                 tool_names.append(f"[REVIEW]({base_path}/review/)")
                 tool_names.append(f"[IMPROVE]({base_path}/improve/)")
                 tool_names.append(f"[UPDATE CHANGELOG]({base_path}/update_changelog/)")
-                tool_names.append(f"[HELP DOCS]({base_path}/help_docs/)")
                 tool_names.append(f"[ADD DOCS]({base_path}/add_docs/)")
                 tool_names.append(f"[ASK]({base_path}/ask/)")
                 tool_names.append(f"[GENERATE CUSTOM LABELS]({base_path}/generate_labels/)")
 
                 descriptions = []
-                descriptions.append("Generates PR description - title, type, summary, code walkthrough and labels")
-                descriptions.append("Adjustable feedback about the PR, possible issues, security concerns, review effort and more")
-                descriptions.append("Code suggestions for improving the PR")
+                descriptions.append(COMMAND_DESCRIPTIONS["describe"])
+                descriptions.append(COMMAND_DESCRIPTIONS["review"])
+                descriptions.append(COMMAND_DESCRIPTIONS["improve"])
                 descriptions.append("Automatically updates the changelog")
-                descriptions.append("Answers a question regarding this repository, or a given one, based on given documentation path")
                 descriptions.append("Generates documentation to methods/functions/classes that changed in the PR")
                 descriptions.append("Answering free-text questions about the PR")
                 descriptions.append("Generates custom labels for the PR, based on specific guidelines defined by the user")
@@ -228,7 +227,6 @@ class PRHelpMessage:
                 commands.append("`/review`")
                 commands.append("`/improve`")
                 commands.append("`/update_changelog`")
-                commands.append("`/help_docs`")
                 commands.append("`/add_docs`")
                 commands.append("`/ask`")
                 commands.append("`/generate_labels`")
@@ -238,9 +236,7 @@ class PRHelpMessage:
                 checkbox_list.append(" - [ ] Run <!-- /review -->")
                 checkbox_list.append(" - [ ] Run <!-- /improve -->")
                 checkbox_list.append(" - [ ] Run <!-- /update_changelog -->")
-                checkbox_list.append(" - [ ] Run <!-- /help_docs -->")
                 checkbox_list.append(" - [ ] Run <!-- /add_docs -->")
-                checkbox_list.append("[*]")
                 checkbox_list.append("[*]")
                 checkbox_list.append("[*]")
                 checkbox_list.append("[*]")

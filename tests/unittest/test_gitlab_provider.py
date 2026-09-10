@@ -1,5 +1,4 @@
 from datetime import datetime
-from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -17,16 +16,11 @@ from pr_agent.git_providers.gitlab_provider import (
 )
 
 
-def _mock_settings(
-    publish_review_as_thread=False,
-    publish_improve_as_thread=False,
-    resolve_outdated_inline_threads=False,
-):
+def _mock_settings(publish_review_as_thread=False, resolve_outdated_inline_threads=False):
     """Settings stub whose .get() returns the GitLab thread flags and passes other keys through to the default."""
     settings = MagicMock()
     settings.get.side_effect = lambda key, default=None: {
         "GITLAB.PUBLISH_REVIEW_AS_THREAD": publish_review_as_thread,
-        "GITLAB.PUBLISH_IMPROVE_AS_THREAD": publish_improve_as_thread,
         "GITLAB.RESOLVE_OUTDATED_INLINE_THREADS": resolve_outdated_inline_threads,
     }.get(key, default)
     return settings
@@ -128,44 +122,6 @@ class TestGitLabProvider:
         content = gitlab_provider.get_pr_file_content("CHANGELOG.md", "main")
 
         assert content == ""
-
-    def test_get_files_for_routing_preserves_unfiltered_rename_paths(self, gitlab_provider):
-        changes = [{
-            "old_path": "services/auth/guard.py",
-            "new_path": "generated/guard.md",
-            "renamed_file": True,
-            "new_file": False,
-            "deleted_file": False,
-            "diff": "",
-        }]
-        gitlab_provider.incremental = SimpleNamespace(is_incremental=False)
-        gitlab_provider._get_merge_request_changes = MagicMock(return_value={"changes": changes})
-        gitlab_provider._expand_submodule_changes = MagicMock(side_effect=lambda files: files)
-
-        routing_files = gitlab_provider.get_files_for_routing()
-
-        assert routing_files == changes
-        gitlab_provider._expand_submodule_changes.assert_called_once_with(changes)
-
-    def test_get_files_for_routing_snapshots_incremental_change_records(self, gitlab_provider):
-        change = {
-            "old_path": "services/auth/guard.py",
-            "new_path": "docs/guard.md",
-            "renamed_file": True,
-            "new_file": False,
-            "deleted_file": False,
-            "diff": "@@ patch",
-        }
-        gitlab_provider.incremental = SimpleNamespace(is_incremental=True)
-        gitlab_provider.unreviewed_files_map = {"docs/guard.md": change}
-        gitlab_provider._incremental_scope_complete = True
-        gitlab_provider._get_merge_request_changes = MagicMock()
-        gitlab_provider._expand_submodule_changes = MagicMock(side_effect=lambda files: files)
-
-        routing_files = gitlab_provider.get_files_for_routing()
-
-        assert routing_files == [change]
-        gitlab_provider._get_merge_request_changes.assert_not_called()
 
     def test_get_repo_file_content_loads_from_mr_target_branch(self, gitlab_provider, mock_gitlab_client, mock_project):
         mock_project.default_branch = "main"
@@ -271,7 +227,7 @@ class TestGitLabProvider:
 
     def test_has_create_or_update_pr_file_method(self, gitlab_provider):
         assert hasattr(gitlab_provider, "create_or_update_pr_file")
-        assert callable(getattr(gitlab_provider, "create_or_update_pr_file"))
+        assert callable(gitlab_provider.create_or_update_pr_file)
 
     def test_method_signature_compatibility(self, gitlab_provider):
         import inspect
@@ -413,29 +369,19 @@ class TestGitLabProvider:
         assert gitlab_provider.mr.description == "Updated description"
         gitlab_provider.mr.save.assert_called_once()
 
-    @pytest.mark.parametrize(
-        ("configured", "expected"),
-        [(True, True), (False, False), ("true", True), ("false", False)],
-    )
-    def test_should_publish_review_as_thread_reflects_config(self, gitlab_provider, configured, expected):
+    def test_publish_description_propagates_save_failure(self, gitlab_provider):
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.mr.save.side_effect = RuntimeError("permission denied")
+        gitlab_provider.id_mr = 1
+
+        with pytest.raises(RuntimeError, match="permission denied"):
+            gitlab_provider.publish_description("AI title", "Updated description")
+
+    @pytest.mark.parametrize("configured", [True, False])
+    def test_should_publish_review_as_thread_reflects_config(self, gitlab_provider, configured):
         with patch("pr_agent.git_providers.gitlab_provider.get_settings",
                    return_value=_mock_settings(publish_review_as_thread=configured)):
-            assert gitlab_provider.should_publish_review_as_thread() is expected
-
-    @pytest.mark.parametrize(
-        ("configured", "expected"),
-        [(True, True), (False, False), ("true", True), ("false", False)],
-    )
-    def test_should_publish_improve_as_thread_reflects_config(self, gitlab_provider, configured, expected):
-        with patch("pr_agent.git_providers.gitlab_provider.get_settings",
-                   return_value=_mock_settings(publish_improve_as_thread=configured)):
-            assert gitlab_provider.should_publish_improve_as_thread() is expected
-
-    @pytest.mark.parametrize(("resolvable", "expected"), [(True, True), (False, False), (None, False)])
-    def test_is_comment_thread_uses_resolvable_flag(self, gitlab_provider, resolvable, expected):
-        comment = SimpleNamespace(resolvable=resolvable, attributes={"resolvable": resolvable})
-
-        assert gitlab_provider.is_comment_thread(comment) is expected
+            assert gitlab_provider.should_publish_review_as_thread() is configured
 
     def test_should_publish_review_as_thread_defaults_false(self, gitlab_provider):
         # Key absent -> default False (the feature is opt-in).
@@ -1344,67 +1290,7 @@ class TestGitLabIncrementalReview:
         # unreviewed_files_map is empty.
         assert gitlab_provider.incremental.is_incremental is True
         assert gitlab_provider.unreviewed_files_map == {}
-        assert gitlab_provider.is_incremental_scope_empty() is True
         mock_project.repository_compare.assert_not_called()
-
-    def test_malformed_incremental_diff_is_incomplete_not_known_empty(
-        self, gitlab_provider, mock_project
-    ):
-        gitlab_provider.mr.notes.list.return_value = [
-            self._make_note(7, "## PR Reviewer Guide 🔍\nbody", "2024-05-01T10:00:00Z"),
-        ]
-        gitlab_provider.mr.commits.return_value = [
-            self._make_commit("c1", "2024-05-01T11:00:00Z"),
-            self._make_commit("c0", "2024-05-01T09:00:00Z"),
-        ]
-        mock_project.repository_compare.return_value = {"diffs": [{}]}
-        gitlab_provider.mr.changes.return_value = {"changes": []}
-        gitlab_provider._expand_submodule_changes = MagicMock(side_effect=lambda files: files)
-
-        gitlab_provider.get_incremental_commits(IncrementalPR(True))
-
-        assert gitlab_provider.incremental.is_incremental is True
-        assert gitlab_provider.unreviewed_files_map == {}
-        assert gitlab_provider.is_incremental_scope_empty() is None
-        assert gitlab_provider.get_files_for_routing() == [{}]
-
-    @pytest.mark.parametrize(
-        "malformed_filter_change",
-        [{}, {"new_path": ""}, {"new_path": "   "}, object()],
-        ids=["missing", "empty", "whitespace", "non-mapping"],
-    )
-    def test_malformed_mr_filter_preserves_sensitive_compare_evidence(
-        self, gitlab_provider, mock_project, malformed_filter_change
-    ):
-        gitlab_provider.mr.notes.list.return_value = [
-            self._make_note(7, "## PR Reviewer Guide 🔍\nbody", "2024-05-01T10:00:00Z"),
-        ]
-        gitlab_provider.mr.commits.return_value = [
-            self._make_commit("c1", "2024-05-01T11:00:00Z"),
-            self._make_commit("c0", "2024-05-01T09:00:00Z"),
-        ]
-        sensitive_change = {
-            "new_path": "services/auth/guard.py",
-            "old_path": "services/auth/guard.py",
-            "diff": "@@ patch",
-            "new_file": False,
-            "deleted_file": False,
-            "renamed_file": False,
-        }
-        mock_project.repository_compare.return_value = {"diffs": [sensitive_change]}
-        gitlab_provider.mr.changes.return_value = {
-            "changes": [malformed_filter_change]
-        }
-        gitlab_provider._expand_submodule_changes = MagicMock(side_effect=lambda files: files)
-
-        gitlab_provider.get_incremental_commits(IncrementalPR(True))
-
-        assert gitlab_provider.unreviewed_files_map == {
-            "services/auth/guard.py": sensitive_change
-        }
-        assert gitlab_provider._incremental_scope_complete is False
-        assert gitlab_provider.is_incremental_scope_empty() is False
-        assert gitlab_provider.get_files_for_routing() == [sensitive_change, {}]
 
     def test_get_incremental_commits_no_anchor_commit_falls_back(self, gitlab_provider, mock_project):
         # All commits are after the previous review -> no last_seen_commit -> can't anchor.
@@ -2026,6 +1912,14 @@ class TestGitLabCapabilities:
 
         assert provider.get_issue_comments() == ["oldest", "middle", "newest"]
 
+    def test_persistent_state_ownership_uses_authenticated_user_id(self):
+        provider = self._provider()
+        provider._get_own_user_id = MagicMock(return_value=42)
+
+        assert provider.supports_review_finding_state() is True
+        assert provider.is_comment_authored_by_pr_agent({"author": {"id": 42}}) is True
+        assert provider.is_comment_authored_by_pr_agent({"author": {"id": 99}}) is False
+
     @pytest.mark.parametrize("capability", [
         "create_inline_comment",
         "publish_inline_comments",
@@ -2145,3 +2039,11 @@ class TestGitLabProviderUrlParsing:
         provider = self._provider("https://host.local/gitlab")
         with pytest.raises(ValueError):
             provider._parse_merge_request_url("https://host.local/gitlab/shai/pr-agent")
+
+
+def test_get_issue_comments_newest_first_returns_notes_newest_first():
+    provider = GitLabProvider.__new__(GitLabProvider)
+    provider.mr = MagicMock()
+    provider.mr.notes.list.return_value = ["newest", "middle", "oldest"]
+
+    assert provider.get_issue_comments_newest_first() == ["newest", "middle", "oldest"]

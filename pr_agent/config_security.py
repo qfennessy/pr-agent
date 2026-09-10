@@ -16,24 +16,18 @@
 # reach internal endpoints (SSRF), or append to arbitrary host files. The whole section is
 # therefore host-only (empty allowlist -> every key dropped).
 #
-# otel: selects telemetry exporters, endpoints, and authentication headers. Repository or command
-# input must not redirect telemetry to an attacker-controlled collector or inject exporter
-# credentials, so the whole section is host-only as well.
-#
-# checkpoint_evaluation: shadow_journal_path names a host filesystem destination that the recorder
-# creates and appends to. A repository able to set it, and to flip shadow_journal_enabled, could
-# have the host write attacker-chosen JSON to an arbitrary path the running user owns. The paid
-# execution and cost-cap keys in the same section authorize spending, which a repository must never
-# do either. The whole section is host-only.
+# prompt_fragments: contains Jinja source rendered by the host before it is inserted into tool
+# prompts. Keep the whole section host-only so repository settings and comment arguments cannot
+# supply executable template expressions.
 REPO_OVERRIDABLE_KEYS_BY_HOST_SECTION = {
     "skills": frozenset({"enabled", "max_skills_tokens"}),
     "push_outputs": frozenset(),
-    "otel": frozenset(),
-    "checkpoint_evaluation": frozenset(),
+    "prompt_fragments": frozenset(),
 }
 
-# Most of [config] remains repository-configurable, but these individual keys
-# select host resources or credentials and must never come from repository data.
+# Individual settings in otherwise repository-configurable sections may also be
+# host-only. publish_error_details controls what service-side failure state is
+# disclosed in a PR comment, so the PR author must not be able to enable it.
 REPO_HOST_ONLY_KEYS_BY_SECTION = {
-    "config": frozenset({"extra_config_url"}),
+    "pr_reviewer": frozenset({"publish_error_details"}),
 }

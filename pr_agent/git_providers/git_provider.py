@@ -5,7 +5,8 @@ import shutil
 import subprocess
 import time
 from abc import ABC, abstractmethod
-from typing import Iterable, Mapping, Optional, Tuple
+from collections.abc import Iterable
+from typing import Optional, Tuple
 
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.algo.utils import (
@@ -19,16 +20,27 @@ from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 
 MAX_FILES_ALLOWED_FULL = 50
-
-# Hidden marker that lets several PR-Agent runs keep separate persistent comments on the
-# same PR - for example one review per model. Persistent comments are otherwise found by
-# their visible header, which is identical for every run, so a second run would overwrite
-# the first run's comment instead of publishing its own.
 PERSISTENT_COMMENT_ID_MARKER = "<!-- pr-agent-persistent-id:"
-# Opens the visible attribution line placed under the comment's heading.
 PERSISTENT_COMMENT_ATTRIBUTION_PREFIX = "> Reviewed by"
+
 _URL_USERINFO_RE = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.\-]{0,30}://)[^/@\s]+@")
 _AUTH_HEADER_RE = re.compile(r"(?i)(authorization\s*:\s*(?:bearer|basic|token)\s+)\S+")
+
+
+# The reaction PR-Agent has always added when it picks a comment command up. Used as the
+# fallback for `reaction_on_start` so that a deployment whose configuration.toml predates
+# these settings keeps acknowledging comments instead of silently going quiet.
+DEFAULT_START_REACTION = "eyes"
+
+
+def get_reaction_setting(name: str, default: str = "") -> str:
+    """Read one `config.reaction_*` setting as a stripped string.
+
+    `default` applies only when the key is absent. A key that is present but unusable - empty,
+    or not a string - means the operator asked for no reaction, so "" is returned.
+    """
+    value = get_settings().config.get(name, default)
+    return value.strip() if isinstance(value, str) else ""
 
 
 def redact_credentials(text) -> str:
@@ -139,20 +151,7 @@ def get_git_ssl_env() -> dict[str, str]:
 
 
 def get_persistent_comment_id() -> str:
-    """Return the configured identity for this run's persistent comments, or "".
-
-    Set config.persistent_comment_id when more than one PR-Agent run comments on the same
-    PR (for example a review per model, run as separate CI jobs). Each run then finds and
-    updates only its own comment. Leave it unset for the single-run default.
-
-    Returns:
-        The trimmed id, or "" when unset.
-
-    Example:
-        >>> get_settings().set("config.persistent_comment_id", "kimi-k3")
-        >>> get_persistent_comment_id()
-        'kimi-k3'
-    """
+    """Return the configured identifier for one persistent review stream."""
     try:
         value = get_settings().config.get("persistent_comment_id", "")
     except AttributeError:
@@ -161,51 +160,20 @@ def get_persistent_comment_id() -> str:
 
 
 def _persistent_comment_marker(comment_id: str) -> str:
-    """Return the exact marker line published for the given id."""
     return f"{PERSISTENT_COMMENT_ID_MARKER} {comment_id} -->"
 
 
 def _last_line(text: str) -> str:
-    """Return the final non-empty line of a body, or "" - where the marker is written.
-
-    Ownership is decided on the LAST line, never on a substring of the whole body. A
-    review can quote a marker in its own text (a PR that edits the marker template will
-    quote it verbatim in the diff), and a substring test then reads that quotation as
-    proof of ownership - which drops the real marker and hands the comment to the wrong
-    run. Anchoring to the final line makes quoted text inert.
-    """
     stripped = (text or "").rstrip()
-    if not stripped:
-        return ""
-    return stripped.rsplit("\n", 1)[-1].strip()
+    return stripped.rsplit("\n", 1)[-1].strip() if stripped else ""
 
 
 def _persistent_comment_attribution(comment_id: str) -> str:
-    """Render the visible "who reviewed this" line for the current run.
-
-    Names the model that actually answered, not just the configured id: with
-    fallback_models a different model may have produced the text, and crediting the
-    wrong one is worse than not crediting at all. When the answering model is the
-    reviewer's own, the redundant half is dropped - "reviewer x, answered by x" is
-    noise that makes the interesting case (a fallback) harder to spot.
-
-    Args:
-        comment_id: The configured reviewer identity.
-
-    Returns:
-        A single markdown line.
-
-    Example:
-        >>> _persistent_comment_attribution("kimi-k3")  # doctest: +SKIP
-        '> Reviewed by `kimi-k3` - fallback model `openai/kimi-k2.7-code` answered'
-    """
     try:
         model_used = get_settings().config.get("last_used_model", "") or comment_id
     except AttributeError:
         model_used = comment_id
-    # Model ids carry a provider prefix ("openai/kimi-k3") that reviewer ids do not.
-    is_own_model = model_used == comment_id or str(model_used).rsplit("/", 1)[-1] == comment_id
-    if is_own_model:
+    if model_used == comment_id or str(model_used).rsplit("/", 1)[-1] == comment_id:
         return f"{PERSISTENT_COMMENT_ATTRIBUTION_PREFIX} `{comment_id}`"
     return (
         f"{PERSISTENT_COMMENT_ATTRIBUTION_PREFIX} `{comment_id}` - "
@@ -214,38 +182,18 @@ def _persistent_comment_attribution(comment_id: str) -> str:
 
 
 def attach_persistent_comment_id(pr_comment: str) -> str:
-    """Label a comment with this run's reviewer identity, visibly and invisibly.
-
-    The visible attribution goes directly under the heading, because every reviewer
-    publishes under the same "PR Reviewer Guide" heading: with three reviewers on one
-    PR, an attribution at the bottom of a long comment means the reader cannot tell the
-    opinions apart while scanning. The hidden marker stays the last line, where comment
-    ownership and the CI publish guard both look for it.
-
-    Args:
-        pr_comment: The rendered comment body.
-
-    Returns:
-        The body unchanged when no id is configured; otherwise the body with an
-        attribution line after its heading and the id marker as its final line.
-
-    Example:
-        >>> attach_persistent_comment_id("## PR Reviewer Guide")  # doctest: +SKIP
-        '## PR Reviewer Guide\\n\\n> Reviewed by `kimi-k3`\\n<!-- pr-agent-persistent-id: kimi-k3 -->'
-    """
+    """Add a visible attribution and terminal ownership marker when configured."""
     comment_id = get_persistent_comment_id()
     if not comment_id:
         return pr_comment
     marker = _persistent_comment_marker(comment_id)
-    if _last_line(pr_comment) == marker:  # already attached; do not double-append
+    if _last_line(pr_comment) == marker:
         return pr_comment
-
     attribution = _persistent_comment_attribution(comment_id)
     body = (pr_comment or "").rstrip()
     heading, _, rest = body.partition("\n")
     if heading.strip():
         rest = rest.lstrip("\n")
-        # Replace a stale attribution rather than stacking a second one.
         first_rest_line, _, remainder = rest.partition("\n")
         if first_rest_line.startswith(PERSISTENT_COMMENT_ATTRIBUTION_PREFIX):
             rest = remainder.lstrip("\n")
@@ -256,44 +204,23 @@ def attach_persistent_comment_id(pr_comment: str) -> str:
 
 
 def is_own_persistent_comment(comment_body: str, initial_header: str) -> bool:
-    """Decide whether an existing PR comment is the one this run should update.
-
-    With an id configured, both this tool's header and this run's marker line must match,
-    so parallel tools and reviewers never edit each other's comments. Without one, the
-    historical header match applies, except that a comment belonging to an identified run
-    is skipped: an un-identified run must not adopt another reviewer's comment as its own.
-
-    Args:
-        comment_body: The existing comment's body.
-        initial_header: The header this run publishes under.
-
-    Returns:
-        True when this run owns the comment.
-
-    Example:
-        >>> is_own_persistent_comment("## PR Reviewer Guide 🔍\\nbody", "## PR Reviewer Guide 🔍")
-        True
-    """
     return is_own_persistent_comment_for_identities(comment_body, (initial_header,))
 
 
 def is_own_persistent_comment_for_identities(comment_body: str, identities: Iterable[str]) -> bool:
-    """Match a tool identity and, when configured, this run's persistent reviewer id."""
     body = comment_body or ""
     if not any(comment_matches_identity(body, identity) for identity in identities if identity):
         return False
-    last_line = _last_line(body)
     comment_id = get_persistent_comment_id()
     if comment_id:
-        return last_line == _persistent_comment_marker(comment_id)
-    owned_by_an_identified_run = (
-        last_line.startswith(PERSISTENT_COMMENT_ID_MARKER) and last_line.endswith("-->")
+        return _last_line(body) == _persistent_comment_marker(comment_id)
+    return not (
+        _last_line(body).startswith(PERSISTENT_COMMENT_ID_MARKER)
+        and _last_line(body).endswith("-->")
     )
-    return not owned_by_an_identified_run
 
 
 def _comment_body(comment) -> str:
-    """Read comment text from provider objects and dictionary-shaped payloads."""
     if isinstance(comment, dict):
         return str(comment.get("body") or comment.get("comment") or "")
     return str(getattr(comment, "body", "") or "")
@@ -314,10 +241,6 @@ class GitProvider(ABC):
     def supports_code_suggestions_artifact(self) -> bool:
         """Return whether `publish_code_suggestions()` writes a standalone output artifact."""
         return False
-
-    def supports_repo_file_fetching(self) -> bool:
-        """Return whether this provider implements base-branch repository file reads."""
-        return type(self).get_repo_file_content is not GitProvider.get_repo_file_content
 
     def publish_code_suggestions_artifact(
             self, code_suggestions: list, artifact_footer: str = "",
@@ -415,44 +338,11 @@ class GitProvider(ABC):
             get_logger().error("Clone failed: Could not clone url.",
                 artifact={"error": redact_credentials(e), "url": redact_credentials(clone_url),
                           "dest_folder": dest_folder})
-        finally:
-            return returned_obj
+        return returned_obj
 
     @abstractmethod
     def get_files(self) -> list:
         pass
-
-    def get_files_for_routing(self) -> list:
-        """Return the complete current changed-file inventory used by review routing.
-
-        ``get_files()`` is the compatibility default. Providers whose ordinary file
-        list is filtered, incremental, or historical may override this method with a
-        current, unfiltered pull-request inventory. The returned paths may still use
-        provider-native spelling; ``normalize_file_path_for_routing()`` is the narrow
-        provider-owned adapter for that representation.
-        """
-        return self.get_files()
-
-    def is_incremental_scope_empty(self) -> Optional[bool]:
-        """Return whether the provider has a complete, known-empty incremental scope.
-
-        ``None`` means the provider cannot prove completeness, so callers must not
-        turn the run into a no-op. Providers with richer incremental evidence can
-        override this to distinguish a legitimate empty scope from a partial fetch.
-        """
-        inventory = getattr(self, "unreviewed_files_map", None)
-        if not isinstance(inventory, Mapping):
-            return None
-        return not inventory
-
-    def normalize_file_path_for_routing(self, path: str | None) -> str | None:
-        """Adapt a provider-native changed path to a repository-relative path.
-
-        The identity default deliberately leaves absolute paths untouched so the
-        router continues to reject arbitrary absolute input. A provider should only
-        override this when its API has a documented repository-root path format.
-        """
-        return path
 
     @abstractmethod
     def get_diff_files(self) -> list[FilePatchInfo]:
@@ -462,7 +352,12 @@ class GitProvider(ABC):
         pass
 
     @abstractmethod
-    def publish_description(self, pr_title: str, pr_body: str):
+    def publish_description(self, pr_title: str, pr_body: str) -> None:
+        """Publish the pull request title and description.
+
+        Implementations must raise when the remote update fails so callers do
+        not continue through a false-success path.
+        """
         # pr_title may be None, which means "leave the existing title unchanged"
         # and update only the description. Implementations must not write the
         # title in that case.
@@ -516,7 +411,7 @@ class GitProvider(ABC):
             return description
 
     def get_user_description(self) -> str:
-        if hasattr(self, 'user_description') and not (self.user_description is None):
+        if hasattr(self, "user_description") and (self.user_description is not None):
             return self.user_description
 
         description = (self.get_pr_description_full() or "").strip()
@@ -602,21 +497,6 @@ class GitProvider(ABC):
     def get_repo_file_content(self, file_path: str, from_default_branch: bool = False):
         return ""
 
-    def get_pr_head_file_content(self, file_path: str):
-        """Return file content from the current PR head when the provider supports it.
-
-        Candidate verification uses this separate capability for incremental
-        reviews. Repository-instruction loading intentionally continues to use
-        ``get_repo_file_content`` and its trusted target-branch boundary.
-        """
-        get_file = getattr(self, "get_pr_file_content", None)
-        if not callable(get_file):
-            return ""
-        ref = self.get_pr_head_sha() or self.get_pr_branch()
-        if not ref:
-            return ""
-        return get_file(file_path, ref)
-
     def get_workspace_name(self):
         return ""
 
@@ -654,29 +534,13 @@ class GitProvider(ABC):
     def supports_review_comment_identity(self) -> bool:
         return False
 
-    def supports_review_thread_lifecycle(self) -> bool:
-        """Return whether this active provider can safely inventory and mutate review threads."""
+    def supports_review_finding_state(self) -> bool:
+        """Return whether this provider can verify PR-Agent-authored review comments."""
         return False
 
-    def get_ci_failure_context(self) -> dict:
-        """Return bounded failed-check metadata when the provider can supply it."""
-        return {"status": "unavailable", "failures": []}
-
-    def clear_persistent_review(self, identity_marker: str, name: str = "review") -> bool:
-        """Remove the newest persistent review matching an exact tool identity."""
-        try:
-            comments = list(self.get_issue_comments())
-            for comment in reversed(comments):
-                if is_own_persistent_comment_for_identities(_comment_body(comment), (identity_marker,)):
-                    self.remove_comment(comment)
-                    return True
-        except Exception as e:
-            get_logger().exception(f"Failed to clear persistent {name}, error: {e}")
+    def is_comment_authored_by_pr_agent(self, comment) -> bool:
+        """Return whether a provider comment was authored by this PR-Agent identity."""
         return False
-
-    def clear_persistent_review_comment(self, identity_marker: str, name: str = "review") -> bool:
-        """Remove a persistent review comment without mutating provider-specific output channels."""
-        return GitProvider.clear_persistent_review(self, identity_marker, name)
 
     def unresolve_comment_thread(self, comment):  # noqa: B027 - intentional no-op
         pass
@@ -686,10 +550,6 @@ class GitProvider(ABC):
 
     def supports_thread_resolution(self) -> bool:
         """Providers that implement resolve_comment_thread override this."""
-        return False
-
-    def is_comment_thread(self, comment) -> bool:
-        """Return whether a provider comment belongs to a resolvable thread."""
         return False
 
     def resolve_outdated_inline_threads(self):  # noqa: B027 - intentional no-op
@@ -705,6 +565,39 @@ class GitProvider(ABC):
                                    legacy_initial_header: str | None = None):
         return self.publish_comment(pr_comment, **({'as_thread': True} if as_thread else {}))
 
+    @staticmethod
+    def _get_comment_body(comment) -> str:
+        """Return a comment body for object- and mapping-shaped provider payloads."""
+        if isinstance(comment, dict):
+            return comment.get("body", "")
+        return getattr(comment, "body", "")
+
+    def get_issue_comments_newest_first(self):
+        """Return issue comments newest first; providers override known API ordering."""
+        return list(reversed(list(self.get_issue_comments())))
+
+    def _iter_persistent_comments(
+        self,
+        identifiers,
+        *,
+        identity_marker: str | None = None,
+        require_agent_authorship: bool = False,
+    ):
+        """Yield matching comments in identity-priority and newest-first order."""
+        comments = self.get_issue_comments_newest_first()
+        for identifier in identifiers:
+            if not identifier:
+                continue
+            for comment in comments:
+                body = GitProvider._get_comment_body(comment)
+                if not comment_matches_identity(body, identifier):
+                    continue
+                if comment_carries_other_identity(body, identity_marker):
+                    continue
+                if require_agent_authorship and not self.is_comment_authored_by_pr_agent(comment):
+                    continue
+                yield comment, body
+
     def publish_persistent_comment_full(self, pr_comment: str,
                                    initial_header: str,
                                    update_header: bool = True,
@@ -712,27 +605,31 @@ class GitProvider(ABC):
                                    final_update_message=True,
                                    as_thread: bool = False,
                                    identity_marker: str | None = None,
-                                   legacy_initial_header: str | None = None):
+                                   legacy_initial_header: str | None = None,
+                                   require_agent_authorship: bool = False,
+                                   fallback_on_error: bool = True):
         pr_comment = attach_persistent_comment_id(pr_comment)
         try:
             pr_comment = add_pr_review_identity(pr_comment, identity_marker)
-            prev_comments = list(self.get_issue_comments())
             identifiers = (
                 [identity_marker, legacy_initial_header]
                 if identity_marker
                 else [initial_header]
             )
-            comment_to_update = next(
-                (
-                    comment
-                    for identifier in identifiers
-                    if identifier
-                    for comment in prev_comments
-                    if is_own_persistent_comment_for_identities(_comment_body(comment), (identifier,))
-                    and not comment_carries_other_identity(_comment_body(comment), identity_marker)
-                ),
-                None,
-            )
+            comment_to_update = None
+            for identifier in identifiers:
+                for comment in reversed(list(self.get_issue_comments())):
+                    body = _comment_body(comment)
+                    if not is_own_persistent_comment_for_identities(body, (identifier,)):
+                        continue
+                    if comment_carries_other_identity(body, identity_marker):
+                        continue
+                    if require_agent_authorship and not self.is_comment_authored_by_pr_agent(comment):
+                        continue
+                    comment_to_update = comment
+                    break
+                if comment_to_update is not None:
+                    break
             if comment_to_update is not None:
                 comment = comment_to_update
                 latest_commit_url = self.get_latest_commit_url()
@@ -745,31 +642,33 @@ class GitProvider(ABC):
                 else:
                     pr_comment_updated = pr_comment
                 get_logger().info(f"Persistent mode - updating comment {comment_url} to latest {name} message")
-                # response = self.mr.notes.update(comment.id, {'body': pr_comment_updated})
                 if self.edit_comment(comment, pr_comment_updated) is False:
                     raise RuntimeError("Failed to update persistent comment")
                 if as_thread:
                     try:
-                        # Reopen the thread if it was resolved, so the developer revisits the updated review.
                         self.unresolve_comment_thread(comment)
                     except Exception as e:
-                        # The review was already updated in place; a reopen failure must not reach the
-                        # outer except, whose fallback publish would duplicate the review.
                         get_logger().warning(f"Failed to reopen review thread: {e}")
                 if final_update_message:
                     try:
-                        return self.publish_comment(
+                        status_comment = self.publish_comment(
                             f"**[Persistent {name}]({comment_url})** updated to latest commit {latest_commit_url}")
+                        if status_comment is None or status_comment is False:
+                            get_logger().warning(
+                                "Persistent review update message was not published; "
+                                "review was already updated"
+                            )
+                            return comment
+                        return status_comment
                     except Exception:
-                        # The review was already updated in place; a notification failure must not reach
-                        # the outer except, whose fallback publish would duplicate the review.
                         get_logger().opt(exception=True).warning(
                             "Failed to publish persistent review update message; review was already updated")
                         return comment
                 return comment
         except Exception as e:
             get_logger().exception(f"Failed to update persistent review, error: {e}")
-            pass
+            if not fallback_on_error:
+                return None
         return self.publish_comment(pr_comment, **({'as_thread': True} if as_thread else {}))
 
     @abstractmethod
@@ -793,7 +692,8 @@ class GitProvider(ABC):
         pass
 
     @abstractmethod
-    def get_issue_comments(self):
+    def get_issue_comments(self) -> Iterable:
+        """Comments on the PR; every item exposes the comment text as `.body`."""
         pass
 
     def get_comment_url(self, comment) -> str:
@@ -814,9 +714,55 @@ class GitProvider(ABC):
     def get_repo_labels(self):
         pass
 
-    @abstractmethod
+    def add_reaction(self, issue_comment_id: int, reaction: str) -> Optional[int]:
+        """Add a named reaction to a comment, returning its id.
+
+        Returns None when the provider has no reaction API, when the name is empty, or when
+        the call failed. Providers that support reactions override this; `add_eyes_reaction`
+        and `react_to_outcome` are built on top of it.
+        """
+        return None
+
     def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> Optional[int]:
-        pass
+        """Acknowledge a comment command with the configured start reaction."""
+        if disable_eyes:
+            return None
+        reaction = get_reaction_setting("reaction_on_start", DEFAULT_START_REACTION)
+        if not reaction:
+            return None
+        reaction_id = self.add_reaction(issue_comment_id, reaction)
+        if reaction_id is not None:
+            # Remembered so that `react_to_outcome` can take it down again. Nothing else removes
+            # it, so without this the start reaction would sit next to the outcome one forever.
+            self._start_reaction = (issue_comment_id, reaction_id)
+        return reaction_id
+
+    def react_to_outcome(self, issue_comment_id: int, succeeded: bool) -> Optional[int]:
+        """Replace the start reaction with the configured outcome reaction.
+
+        Both outcome reactions are unset by default, so nothing changes unless an operator asks
+        for it. When one is configured the start reaction is removed first, so the comment ends
+        up carrying the outcome rather than both.
+        """
+        reaction = get_reaction_setting(
+            "reaction_on_success" if succeeded else "reaction_on_failure"
+        )
+        if not reaction or issue_comment_id is None:
+            return None
+        self._remove_start_reaction(issue_comment_id)
+        return self.add_reaction(issue_comment_id, reaction)
+
+    def _remove_start_reaction(self, issue_comment_id: int) -> None:
+        """Take down the start reaction this provider added to `issue_comment_id`, if any."""
+        pending = getattr(self, "_start_reaction", None)
+        if not pending or pending[0] != issue_comment_id:
+            return
+        self._start_reaction = None
+        try:
+            self.remove_reaction(issue_comment_id, pending[1])
+        except Exception as e:
+            # Losing the start reaction is cosmetic; never let it fail the command that succeeded.
+            get_logger().warning("Failed to remove the start reaction", artifact={"error": e})
 
     @abstractmethod
     def remove_reaction(self, issue_comment_id: int, reaction_id: int) -> bool:
@@ -824,7 +770,7 @@ class GitProvider(ABC):
 
     #### commits operations ####
     @abstractmethod
-    def get_commit_messages(self):
+    def get_commit_messages(self) -> str:
         pass
 
     def get_pr_url(self) -> str:
@@ -834,15 +780,6 @@ class GitProvider(ABC):
 
     def get_latest_commit_url(self) -> str:
         return ""
-
-    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
-        """Return a stable current head identity when the provider supports it.
-
-        A refreshed lookup must not replace cached PR or diff state: callers use
-        it to compare the live head with the immutable snapshot being reviewed.
-        """
-
-        return None
 
     def auto_approve(self) -> bool:
         return False
@@ -930,9 +867,8 @@ def get_main_pr_language(languages, files) -> str:
 
 
 class IncrementalPR:
-    def __init__(self, is_incremental: bool = False, review_profile: str = "full"):
+    def __init__(self, is_incremental: bool = False):
         self.is_incremental = is_incremental
-        self.review_profile = review_profile
         self.commits_range = None
         self.first_new_commit = None
         self.last_seen_commit = None

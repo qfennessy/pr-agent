@@ -353,7 +353,7 @@ class CodeCommitProvider(GitProvider):
 
     def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> Optional[int]:
         get_logger().info("CodeCommit provider does not support eyes reaction yet")
-        return True
+        return None
 
     def remove_reaction(self, issue_comment_id: int, reaction_id: int) -> bool:
         get_logger().info("CodeCommit provider does not support removing reactions yet")
@@ -497,7 +497,7 @@ class CodeCommitProvider(GitProvider):
         target_token = sha256(target_identity.encode("utf-8")).hexdigest()
         return f"__codecommit_target__/{target_token}/{filename}"
 
-    def get_commit_messages(self):
+    def get_commit_messages(self) -> str:
         return ""  # not implemented yet
 
     @staticmethod

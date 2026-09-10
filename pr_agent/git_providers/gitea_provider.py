@@ -6,7 +6,7 @@ import giteapy
 from giteapy.rest import ApiException
 
 from pr_agent.algo.file_filter import filter_ignored
-from pr_agent.algo.git_patch_processing import decode_if_bytes, iter_git_patch_lines, strip_git_line_ending
+from pr_agent.algo.git_patch_processing import decode_if_bytes
 from pr_agent.algo.language_handler import is_valid_file
 from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.algo.utils import clip_tokens, find_line_number_of_relevant_line_in_file
@@ -37,6 +37,8 @@ class _GiteaCommitAdapter:
 
 
 class GiteaProvider(GitProvider):
+    _base_url_html: Optional[str] = None  # resolved on first use, see base_url_html
+
     def __init__(self, url: Optional[str] = None):
         super().__init__()
         self.logger = get_logger()
@@ -77,7 +79,6 @@ class GiteaProvider(GitProvider):
         self.temp_comments = []
         self.pr = None
         self.git_files = []
-        self._routing_git_files = ()
         self.file_contents = {}
         self.file_diffs = {}
         self.sha = None
@@ -102,12 +103,8 @@ class GiteaProvider(GitProvider):
                 repo=self.repo,
                 pr_number=self.pr_number
             )
-            self._routing_git_files = tuple(self.git_files or ())
-            # Optional ignore with user custom
-            self.git_files = filter_ignored(self.git_files, platform="gitea")
 
             self.sha = self.pr.head.sha if self.pr.head.sha else ""
-            self.__add_file_content()
             self.__add_file_diff()
             self._set_pr_commits()
             self.base_sha = self.pr.base.sha if self.pr.base.sha else ""
@@ -119,7 +116,18 @@ class GiteaProvider(GitProvider):
         else:
             self.pr_commits = None
 
-        self.base_url_html = self._resolve_base_url_html()
+    @property
+    def base_url_html(self) -> str:
+        """User-facing base URL, resolved on first use rather than in the constructor:
+        apply_repo_settings builds the provider before it merges the repo's .pr_agent.toml,
+        so resolving here is what lets a repo-level `gitea.web_url` take effect."""
+        if self._base_url_html is None:
+            self._base_url_html = self._resolve_base_url_html()
+        return self._base_url_html
+
+    @base_url_html.setter
+    def base_url_html(self, value: str) -> None:
+        self._base_url_html = value
 
     def _resolve_base_url_html(self) -> str:
         """User-facing base URL interpolated into links published in comments.
@@ -204,23 +212,23 @@ class GiteaProvider(GitProvider):
                     pr_number=self.pr_number
             )
 
+            lines = diff_contents.splitlines()
             current_file = None
             current_patch = []
             file_patches = {}
-            for record in iter_git_patch_lines(diff_contents):
-                line = strip_git_line_ending(record)
-                if line.startswith('diff --git '):
+            for line in lines:
+                if line.startswith('diff --git'):
                     if current_file and current_patch:
-                        file_patches[current_file] = ''.join(current_patch)
+                        file_patches[current_file] = '\n'.join(current_patch)
                         current_patch = []
                     current_file = line.split(' b/')[-1]
                 elif line.startswith('@@') and not current_patch:
-                    current_patch = [record]
+                    current_patch = [line]
                 elif current_patch:
-                    current_patch.append(record)
+                    current_patch.append(line)
 
             if current_file and current_patch:
-                file_patches[current_file] = ''.join(current_patch)
+                file_patches[current_file] = '\n'.join(current_patch)
 
             self.file_diffs = file_patches
         except Exception as e:
@@ -311,8 +319,8 @@ class GiteaProvider(GitProvider):
 
     def get_comment_url(self, comment) -> str:
         if isinstance(comment, dict):
-            return str(comment.get("html_url") or "")
-        return comment.html_url
+            return comment.get("html_url") or comment.get("url") or ""
+        return getattr(comment, "html_url", "") or getattr(comment, "url", "")
 
     def publish_persistent_comment(self, pr_comment: str,
                                    initial_header: str,
@@ -321,7 +329,8 @@ class GiteaProvider(GitProvider):
                                    final_update_message=True,
                                    identity_marker: str | None = None,
                                    legacy_initial_header: str | None = None):
-        self.publish_persistent_comment_full(
+        # Keep the legacy updater path until Gitea normalizes its dictionary-shaped comment payloads.
+        return self.publish_persistent_comment_full(
             pr_comment,
             initial_header,
             update_header,
@@ -371,19 +380,23 @@ class GiteaProvider(GitProvider):
 
     def edit_comment(self, comment, body : str):
         body = self.limit_output_characters(body, self.max_comment_chars)
+        if isinstance(comment, dict):
+            comment_id = comment.get("comment_id") or comment.get("id")
+        else:
+            comment_id = getattr(comment, "id", None)
         try:
             self.repo_api.edit_comment(
                 owner=self.owner,
                 repo=self.repo,
-                comment_id=comment.get("comment_id") if isinstance(comment, dict) else comment.id,
+                comment_id=comment_id,
                 comment=body
             )
         except ApiException as e:
             self.logger.error(f"Error editing comment: {e}")
-            return None
+            return False
         except Exception as e:
             self.logger.error(f"Unexpected error: {e}")
-            return None
+            return False
 
 
     def publish_inline_comment(self,body: str, relevant_file: str, relevant_line_in_file: str, original_suggestion=None):
@@ -457,12 +470,9 @@ class GiteaProvider(GitProvider):
         return published_count > 0 or publishable_count == 0
 
 
-    def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> Optional[int]:
-        """Add eyes reaction to a comment"""
+    def add_reaction(self, issue_comment_id: int, reaction: str) -> Optional[int]:
+        """Add a named reaction to a comment"""
         try:
-            if disable_eyes:
-                return None
-
             comments = self.repo_api.list_all_comments(
                 owner=self.owner,
                 repo=self.repo,
@@ -478,7 +488,7 @@ class GiteaProvider(GitProvider):
                 owner=self.owner,
                 repo=self.repo,
                 comment_id=issue_comment_id,
-                reaction="eyes"
+                reaction=reaction
             )
 
             if not response:
@@ -494,20 +504,24 @@ class GiteaProvider(GitProvider):
             self.logger.error(f"Unexpected error: {e}")
             return None
 
-    def remove_reaction(self, comment_id: int) -> None:
-        """Remove reaction from a comment"""
+    def remove_reaction(self, issue_comment_id: int, reaction_id: int) -> bool:
+        """Remove the reaction from a comment; the Gitea API removes by comment, so `reaction_id` is unused."""
         try:
             response = self.repo_api.remove_reaction_comment(
                 owner=self.owner,
                 repo=self.repo,
-                comment_id=comment_id
+                comment_id=issue_comment_id
             )
             if not response:
                 self.logger.error("Failed to remove reaction")
+                return False
+            return True
         except ApiException as e:
             self.logger.error(f"Error removing reaction: {e}")
+            return False
         except Exception as e:
             self.logger.error(f"Unexpected error: {e}")
+            return False
 
     def get_commit_messages(self)-> str:
         """Get commit messages for the PR"""
@@ -558,6 +572,13 @@ class GiteaProvider(GitProvider):
         """Get files that were modified in the PR"""
         if self.diff_files:
             return self.diff_files
+
+        # Apply [ignore] rules at diff time, after apply_repo_settings() has merged
+        # the repository-level .pr_agent.toml (the provider is constructed before
+        # those settings exist). This matches the other providers, which filter
+        # lazily inside their diff fetch. See #2620.
+        self.git_files = filter_ignored(self.git_files, platform="gitea")
+        self.__add_file_content()
 
         invalid_files_names = []
         counter_valid = 0
@@ -620,8 +641,7 @@ class GiteaProvider(GitProvider):
                 filename=filename,
                 num_minus_lines=num_minus_lines,
                 num_plus_lines=num_plus_lines,
-                edit_type=edit_type,
-                old_filename=file.get("previous_filename"),
+                edit_type=edit_type
             )
             diff_files.append(file_patch_info)
 
@@ -657,10 +677,6 @@ class GiteaProvider(GitProvider):
         """Get all files in the PR"""
         return [file.get("filename","") for file in self.git_files]
 
-    def get_files_for_routing(self) -> List[Dict[str, Any]]:
-        """Keep unfiltered status and previous-path metadata for safety routing."""
-        return list(getattr(self, "_routing_git_files", None) or self.git_files)
-
     def get_num_of_files(self) -> int:
         """Get number of files changed in the PR"""
         return len(self.git_files)
@@ -673,9 +689,9 @@ class GiteaProvider(GitProvider):
             repo=self.repo,
             index=index
         )
-        if not comments:
+        if not isinstance(comments, list):
             self.logger.error("Failed to get comments")
-            return []
+            raise RuntimeError("Failed to get comments")
 
         return comments
 
@@ -699,22 +715,6 @@ class GiteaProvider(GitProvider):
             return ""
 
         return self.pr.head.ref if self.pr.head.ref else ""
-
-    def get_pr_head_sha(self, refresh: bool = False) -> Optional[str]:
-        """Return the cached PR head SHA, optionally refreshing it from Gitea."""
-        if refresh:
-            pr = self.repo_api.get_pull_request(
-                owner=self.owner,
-                repo=self.repo,
-                pr_number=self.pr_number
-            )
-            head = getattr(pr, "head", None)
-            sha = getattr(head, "sha", None)
-        else:
-            sha = self.sha
-
-        normalized_sha = sha.strip() if isinstance(sha, str) else ""
-        return normalized_sha or None
 
     def get_pr_description_full(self) -> str:
         """Get full PR description with metadata"""
@@ -790,7 +790,7 @@ class GiteaProvider(GitProvider):
 
         if not response:
             self.logger.error("Failed to publish PR description")
-            return None
+            raise RuntimeError("Failed to publish PR description")
 
         self.logger.info("PR description published successfully")
         if self.enabled_pr:
@@ -1039,15 +1039,21 @@ class RepoApi(giteapy.RepositoryApi):
             body=body
         )
 
-    def get_change_file_pull_request(self, owner: str, repo: str, pr_number: int):
-        """Get changed files in the pull request"""
-        try:
-            url = f'/repos/{owner}/{repo}/pulls/{pr_number}/files'
+    def _list_all_pages(self, url: str, page_size: int = 50) -> list:
+        """Walk a paginated list endpoint until it answers with an empty page.
 
+        Gitea serves at most `limit` items per page and caps `limit` at the server's own
+        MAX_RESPONSE_ITEMS, so a page shorter than `page_size` is not necessarily the last
+        one. Errors propagate: a failure mid-way must not yield a silently truncated list.
+        """
+        items = []
+        page = 1
+        while True:
             response = self.api_client.call_api(
                 url,
                 'GET',
                 path_params={},
+                query_params=[('page', page), ('limit', page_size)],
                 response_type=None,
                 _return_http_data_only=False,
                 _preload_content=False,
@@ -1056,15 +1062,21 @@ class RepoApi(giteapy.RepositoryApi):
 
             if hasattr(response, 'data'):
                 raw_data = response.data.read()
-                diff_content = raw_data.decode('utf-8')
-                return json.loads(diff_content) if isinstance(diff_content, str) else diff_content
             elif isinstance(response, tuple):
                 raw_data = response[0].read()
-                diff_content = raw_data.decode('utf-8')
-                return json.loads(diff_content) if isinstance(diff_content, str) else diff_content
+            else:
+                return items
 
-            return []
+            page_items = json.loads(raw_data.decode('utf-8'))
+            if not isinstance(page_items, list) or not page_items:
+                return items
+            items.extend(page_items)
+            page += 1
 
+    def get_change_file_pull_request(self, owner: str, repo: str, pr_number: int):
+        """Get changed files in the pull request"""
+        try:
+            return self._list_all_pages(f'/repos/{owner}/{repo}/pulls/{pr_number}/files')
         except ApiException as e:
             self.logger.error(f"Error getting changed files: {e}")
             return []
@@ -1207,29 +1219,7 @@ class RepoApi(giteapy.RepositoryApi):
     def get_pr_commits(self, owner: str, repo: str, pr_number: int):
         """Get all commits in a pull request"""
         try:
-            url = f'/repos/{owner}/{repo}/pulls/{pr_number}/commits'
-
-            response = self.api_client.call_api(
-                url,
-                'GET',
-                path_params={},
-                response_type=None,
-                _return_http_data_only=False,
-                _preload_content=False,
-                auth_settings=['AuthorizationHeaderToken']
-            )
-
-            if hasattr(response, 'data'):
-                raw_data = response.data.read()
-                commits_data = json.loads(raw_data.decode('utf-8'))
-                return commits_data
-            elif isinstance(response, tuple):
-                raw_data = response[0].read()
-                commits_data = json.loads(raw_data.decode('utf-8'))
-                return commits_data
-
-            return []
-
+            return self._list_all_pages(f'/repos/{owner}/{repo}/pulls/{pr_number}/commits')
         except ApiException as e:
             self.logger.error(f"Error getting PR commits: {e}")
             return []
