@@ -605,7 +605,9 @@ _SECRET_LIKE = re.compile(
 _MAX_SUMMARY_ERROR_CHARS = 400
 
 
-def _publish_model_failure_summary(attempts: List[dict], last_error: str) -> None:
+def publish_model_failure_summary(
+    attempts: List[dict], last_error: str, *, heading: str = "PR-Agent: no model produced a response"
+) -> None:
     """Write the model-failure evidence to the CI job summary, when running in one.
 
     The published review comment is the only signal most workflows check, so a run in
@@ -632,15 +634,16 @@ def _publish_model_failure_summary(attempts: List[dict], last_error: str) -> Non
         return
     redacted = _SECRET_LIKE.sub("[redacted]", last_error or "")[:_MAX_SUMMARY_ERROR_CHARS]
     lines = [
-        "### PR-Agent: no model produced a response",
+        f"### {heading}",
         "",
-        "| Attempt | Model | Configured timeout (s) | Error | Elapsed (s) |",
-        "| --- | --- | --- | --- | --- |",
+        "| Attempt | Model | Configured timeout (s) | Error | Elapsed (s) | Retry-After (s) |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for a in attempts:
         lines.append(
             f"| {a.get('attempt', '')} | `{a.get('model', '')}` | {a.get('ai_timeout', '')} "
-            f"| {a.get('error_class', '')} | {a.get('elapsed_seconds', '')} |"
+            f"| {a.get('error_class', '')} | {a.get('elapsed_seconds', '')} "
+            f"| {a.get('retry_after_seconds', '')} |"
         )
     lines += ["", f"Last error (redacted, truncated): `{redacted}`", ""]
     try:
@@ -648,6 +651,11 @@ def _publish_model_failure_summary(attempts: List[dict], last_error: str) -> Non
             fh.write("\n".join(lines) + "\n")
     except OSError as e:
         get_logger().warning(f"Failed to write model-failure summary: {e}")
+
+
+def _publish_model_failure_summary(attempts: List[dict], last_error: str) -> None:
+    """Preserve the historical all-model-failure summary heading."""
+    publish_model_failure_summary(attempts, last_error)
 
 
 def _get_all_models(model_type: ModelType = ModelType.REGULAR) -> List[str]:

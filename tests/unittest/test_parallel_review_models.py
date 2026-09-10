@@ -125,6 +125,32 @@ async def test_one_failure_does_not_cancel_other_model(monkeypatch, settings, fa
     assert "secret provider response" not in "".join(bodies.values())
 
 
+async def test_slot_failures_write_redacted_summary_with_timeout_and_retry_after(monkeypatch, settings, tmp_path):
+    class ProviderRateLimitError(RuntimeError):
+        response = SimpleNamespace(headers={"Retry-After": "17"})
+
+    class Handler:
+        async def chat_completion(self, model, **kwargs):
+            if model == "provider/a":
+                raise ProviderRateLimitError("api_key=provider-secret")
+            return "review:\n  estimated_effort_to_review_[1-5]: 2\n", "stop"
+
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    settings.set("config.ai_timeout", 480)
+    settings.set("pr_review_prompt.system", "review")
+    settings.set("pr_review_prompt.user", "{{ diff }}")
+    reviewer, _ = make_reviewer(monkeypatch, Handler)
+    await reviewer.run()
+
+    text = summary.read_text()
+    assert "### PR-Agent: independent review slot failures" in text
+    assert "| 1/1 | `provider/a` | 480 | ProviderRateLimitError |" in text
+    assert "| 17.0 |" in text
+    assert "provider-secret" not in text
+    assert "[redacted]" in text
+
+
 async def test_no_publish_duplicate_models_and_bugs_only_empty_result(monkeypatch, settings):
     handler = MagicMock()
     handler.chat_completion = AsyncMock(return_value=("review:\n  key_issues_to_review: []\n", "stop"))
