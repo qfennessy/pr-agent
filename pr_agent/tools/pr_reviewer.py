@@ -762,13 +762,15 @@ class PRReviewer:
                 rate_limit_retry_attempted = False
                 for attempt in range(2):
                     attempt_started_at = time.monotonic()
+                    prediction_task = None
                     try:
                         if model not in model_budgets:
                             raise LookupError("model context window unavailable")
                         reviewer.ai_handler = self._ai_handler_factory()
                         reviewer.ai_handler.main_pr_language = self.main_language
+                        prediction_task = asyncio.create_task(reviewer._get_prediction(model, prompts=prompts))
                         reviewer.prediction = await asyncio.wait_for(
-                            reviewer._get_prediction(model, prompts=prompts), timeout=settings.config.ai_timeout,
+                            prediction_task, timeout=settings.config.ai_timeout,
                         )
                         reviewer._reject_unparsable_prediction(model)
                         body = reviewer._prepare_pr_review()
@@ -791,12 +793,13 @@ class PRReviewer:
                             evidence = {"error_class": "invalid_or_empty_output", "exception": type(exc).__name__}
                         else:
                             evidence = _provider_failure_evidence(exc)
-                        # wait_for cancels the request and raises TimeoutError itself. A timeout
-                        # occurring at the configured boundary therefore identifies the local
-                        # watchdog, rather than pretending that the provider returned a timeout.
+                        # ``wait_for`` cancels its input task only when its own deadline expires.
+                        # A provider-raised TimeoutError leaves the task completed instead, even
+                        # if it happens near the same configured deadline.
                         if (
                             evidence["error_class"] == "timeout"
-                            and elapsed_seconds >= max(0, configured_timeout - 0.1)
+                            and prediction_task is not None
+                            and prediction_task.cancelled()
                         ):
                             evidence["timeout_stage"] = "review_watchdog"
                             evidence["elapsed_seconds"] = f"{elapsed_seconds:.1f}"
