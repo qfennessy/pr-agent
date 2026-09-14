@@ -120,9 +120,32 @@ async def test_one_failure_does_not_cancel_other_model(monkeypatch, settings, fa
     await reviewer.run()
     bodies = {comment.body.split("\n")[0]: comment.body for comment in provider.existing}
     assert len(bodies) == 2
-    assert "Review failed:" in bodies["## PR Reviewer Guide (provider/a) 🔍"]
+    failed = bodies["## PR Reviewer Guide (provider/a) 🔍"]
+    assert "Review failed:" in failed
     assert "Review failed:" not in bodies["## PR Reviewer Guide (provider/b) 🔍"]
     assert "secret provider response" not in "".join(bodies.values())
+    if failure == "timeout":
+        assert "timeout stage `review_watchdog`" in failed
+        assert "configured limit `0.05s`" in failed
+
+
+async def test_provider_timeout_is_not_misclassified_as_review_watchdog(monkeypatch, settings):
+    class Handler:
+        async def chat_completion(self, model, **kwargs):
+            if model == "provider/a":
+                raise TimeoutError("provider deadline exceeded")
+            return "review:\n  estimated_effort_to_review_[1-5]: 2\n", "stop"
+
+    settings.set("config.ai_timeout", .05)
+    settings.set("pr_review_prompt.system", "review")
+    settings.set("pr_review_prompt.user", "{{ diff }}")
+    reviewer, provider = make_reviewer(monkeypatch, Handler)
+    await reviewer.run()
+
+    failed = next(comment.body for comment in provider.existing if "provider/a" in comment.body)
+    assert "Review failed: timeout." in failed
+    assert "timeout stage `review_watchdog`" not in failed
+    assert "configured limit" not in failed
 
 
 async def test_rate_limit_retries_once_and_publishes_safe_failure_evidence(monkeypatch, settings):
