@@ -120,9 +120,13 @@ async def test_one_failure_does_not_cancel_other_model(monkeypatch, settings, fa
     await reviewer.run()
     bodies = {comment.body.split("\n")[0]: comment.body for comment in provider.existing}
     assert len(bodies) == 2
-    assert "Review failed:" in bodies["## PR Reviewer Guide (provider/a) 🔍"]
+    failed = bodies["## PR Reviewer Guide (provider/a) 🔍"]
+    assert "Review failed:" in failed
     assert "Review failed:" not in bodies["## PR Reviewer Guide (provider/b) 🔍"]
     assert "secret provider response" not in "".join(bodies.values())
+    if failure == "timeout":
+        assert "timeout stage `review_watchdog`" in failed
+        assert "configured limit `0.05s`" in failed
 
 
 async def test_rate_limit_retries_once_and_publishes_safe_failure_evidence(monkeypatch, settings):

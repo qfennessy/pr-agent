@@ -272,6 +272,14 @@ def _review_failure_body(heading: str, evidence: Mapping[str, str], retry_note: 
         details.append(f"request ID `{evidence['request_id']}`")
     if evidence.get("retry_after"):
         details.append(f"retry-after/reset `{evidence['retry_after']}`")
+    if evidence.get("timeout_stage"):
+        details.append(f"timeout stage `{evidence['timeout_stage']}`")
+    if evidence.get("elapsed_seconds") and evidence.get("configured_timeout_seconds"):
+        details.append(
+            "elapsed "
+            f"`{evidence['elapsed_seconds']}s` (configured limit "
+            f"`{evidence['configured_timeout_seconds']}s`)"
+        )
     if evidence.get("detail"):
         details.append(evidence["detail"])
     lines.append("\n- ".join(["", *details]))
@@ -753,6 +761,7 @@ class PRReviewer:
                 retry_delay = _rate_limit_retry_delay_seconds()
                 rate_limit_retry_attempted = False
                 for attempt in range(2):
+                    attempt_started_at = time.monotonic()
                     try:
                         if model not in model_budgets:
                             raise LookupError("model context window unavailable")
@@ -770,6 +779,8 @@ class PRReviewer:
                         break
                     except Exception as exc:
                         # Provider exception strings can contain credentials or prompt data.
+                        elapsed_seconds = time.monotonic() - attempt_started_at
+                        configured_timeout = float(settings.config.ai_timeout)
                         if model not in model_budgets:
                             evidence = {
                                 "error_class": "configuration_or_model",
@@ -780,6 +791,16 @@ class PRReviewer:
                             evidence = {"error_class": "invalid_or_empty_output", "exception": type(exc).__name__}
                         else:
                             evidence = _provider_failure_evidence(exc)
+                        # wait_for cancels the request and raises TimeoutError itself. A timeout
+                        # occurring at the configured boundary therefore identifies the local
+                        # watchdog, rather than pretending that the provider returned a timeout.
+                        if (
+                            evidence["error_class"] == "timeout"
+                            and elapsed_seconds >= max(0, configured_timeout - 0.1)
+                        ):
+                            evidence["timeout_stage"] = "review_watchdog"
+                            evidence["elapsed_seconds"] = f"{elapsed_seconds:.1f}"
+                            evidence["configured_timeout_seconds"] = f"{configured_timeout:g}"
                         if attempt == 0 and evidence["error_class"] == "rate_limited" and retry_delay:
                             rate_limit_retry_attempted = True
                             get_logger().warning(
