@@ -697,6 +697,36 @@ class LiteLLMAIHandler(BaseAiHandler):
             return "xhigh" if "xhigh" in grok_levels else "high"
         return "low"
 
+    @staticmethod
+    def _configure_deepseek_reasoning_effort(model: str, kwargs: dict) -> dict:
+        """Apply deepseek.reasoning_effort to a native DeepSeek request.
+
+        DeepSeek accepts low / high / max; "none" disables thinking. Unset leaves the
+        request unchanged, so DeepSeek applies its own default effort.
+        """
+        configured = str(get_settings().get("deepseek", {}).get("reasoning_effort", "") or "").strip().lower()
+        if not configured:
+            return kwargs
+        try:
+            ReasoningEffort(configured)
+        except ValueError:
+            get_logger().warning(
+                f"Ignoring invalid deepseek.reasoning_effort '{configured}'. "
+                f"Valid values: {[effort.value for effort in ReasoningEffort]}."
+            )
+            return kwargs
+        if configured == ReasoningEffort.NONE.value:
+            get_logger().info(f"Disabling DeepSeek thinking for model {model}.")
+            kwargs["thinking"] = {"type": "disabled"}
+            return kwargs
+        effort = {"minimal": "low", "medium": "high", "xhigh": "max"}.get(configured, configured)
+        if effort != configured:
+            get_logger().info(f"DeepSeek does not support reasoning_effort='{configured}'; using '{effort}' instead.")
+        get_logger().info(f"Adding DeepSeek reasoning_effort {effort} to model {model}.")
+        # A shallow copy keeps a caller-owned extra_body dict unchanged.
+        kwargs["extra_body"] = {**(kwargs.get("extra_body") or {}), "reasoning_effort": effort}
+        return kwargs
+
     def _configure_claude_extended_thinking(
         self,
         model: str,
@@ -1390,6 +1420,16 @@ class LiteLLMAIHandler(BaseAiHandler):
                             f"OpenRouter Anthropic max_tokens ({effective_max_tokens}) must be greater than "
                             f"reasoning_max_tokens ({effective_reasoning_max_tokens}) to leave output headroom."
                         )
+
+                # LiteLLM reduces a top-level reasoning_effort for DeepSeek to
+                # thinking={"type": "enabled"}, so the effort would silently fall back to
+                # DeepSeek's default ("high"); extra_body reaches the request body unchanged.
+                if (
+                    isinstance(model, str)
+                    and model.startswith("deepseek/")
+                    and custom_llm_provider in ("", "deepseek")
+                ):
+                    kwargs = self._configure_deepseek_reasoning_effort(model, kwargs)
 
                 get_logger().debug("Prompts", artifact={"system": system, "user": user})
 
