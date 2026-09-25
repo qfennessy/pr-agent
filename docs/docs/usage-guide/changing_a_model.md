@@ -416,6 +416,16 @@ key = ...
 
 (you can obtain a deepseek-v4 key from [here](https://platform.deepseek.com/api_keys))
 
+DeepSeek thinks at its default "high" effort. `config.reasoning_effort` does not change that, because LiteLLM
+reduces it to "thinking enabled". To choose the effort for `deepseek/...` models, set:
+
+```toml
+[deepseek] # in configuration.toml
+reasoning_effort = "low" # "low", "high" or "max"; "none" disables thinking; empty keeps DeepSeek's default
+```
+
+Lower effort answers faster, with fewer reasoning tokens.
+
 ### GLM (Z.AI)
 
 To use GLM models with Z.AI (Zhipu), for example, set:

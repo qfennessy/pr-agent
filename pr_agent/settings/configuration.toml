@@ -694,6 +694,15 @@ reasoning_effort = ""
 reasoning_max_tokens = 0
 max_tokens = 0 # hard cap on completion tokens for the request; 0 = unset
 
+[deepseek]
+# Thinking effort for models addressed as "deepseek/..." (DeepSeek's native API). The API
+# key lives in .secrets.toml (or the deepseek__key env var). Empty leaves the request
+# unchanged, so DeepSeek applies its own default ("high"); config.reasoning_effort is not
+# inherited. DeepSeek accepts "low", "high" and "max": "minimal" is sent as "low", "medium"
+# as "high" and "xhigh" as "max"; "none" disables thinking. Invalid values are warned
+# about and treated as unset. Ref: https://api-docs.deepseek.com/guides/thinking_mode
+reasoning_effort = ""
+
 [otel]
 # Keys map to settings.get("OTEL.*") via section-key dot notation.
 is_enabled = false # disabled by default; set to true to enable telemetry
