@@ -2,6 +2,7 @@ import asyncio
 import copy
 import datetime
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field, replace
@@ -287,6 +288,64 @@ def _review_failure_body(heading: str, evidence: Mapping[str, str], retry_note: 
         lines.append(f"\nRetry: {retry_note}.")
     lines.append("\nNo provider response body or credential value is shown.")
     return "\n".join(lines)
+
+
+def _escape_workflow_command_data(value: Any) -> str:
+    """Escape a value for the message part of a GitHub Actions workflow command."""
+    return str(value).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _publish_review_timings(timings: List[Mapping[str, Any]]) -> None:
+    """Record how long each independent reviewer took, in places that outlive the job log.
+
+    Actions job logs expire and the job summary cannot be read back through the API, so a
+    question like "how close do reviews run to the timeout?" was unanswerable a few weeks
+    later. Each reviewer slot is therefore written twice when running in GitHub Actions:
+    as a row in the job summary (for people) and as a ``::notice`` annotation (kept with
+    the check run and readable through the check-run annotations API).
+
+    Args:
+        timings: One mapping per reviewer slot with ``model``, ``outcome``, ``seconds``
+            and the token counts (``None`` when no usage was recorded).
+
+    Returns:
+        None. Write failures are logged and swallowed; diagnostics must never fail a review.
+
+    Example:
+        >>> _publish_review_timings([{"model": "openai/x", "outcome": "published", "seconds": 42.0}])
+    """
+    if not timings or review_execution_is_isolated():
+        return
+    fields = ("prompt_tokens", "completion_tokens", "reasoning_tokens")
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        for timing in timings:
+            parts = [
+                f"model={timing.get('model')}",
+                f"outcome={timing.get('outcome')}",
+                f"seconds={timing.get('seconds')}",
+                *(f"{name}={timing.get(name)}" for name in fields),
+            ]
+            print(
+                "::notice title=PR-Agent review timing::" + _escape_workflow_command_data(" ".join(parts)),
+                flush=True,
+            )
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    lines = [
+        "### PR-Agent review timings",
+        "",
+        "| Model | Outcome | Seconds | Input tokens | Output tokens | Reasoning tokens |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for timing in timings:
+        counts = " | ".join("" if timing.get(name) is None else str(timing.get(name)) for name in fields)
+        lines.append(f"| `{timing.get('model')}` | {timing.get('outcome')} | {timing.get('seconds')} | {counts} |")
+    try:
+        with open(summary_path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n\n")
+    except OSError as e:
+        get_logger().warning(f"Failed to write review timing summary: {e}")
 
 
 @dataclass(frozen=True)
@@ -740,6 +799,7 @@ class PRReviewer:
                 return
             prompts = self._render_review_prompts()
         settings = copy.deepcopy(get_settings())
+        timings = []
 
         async def review_model(model):
             # A new context dictionary is essential: inherited request dictionaries
@@ -760,6 +820,8 @@ class PRReviewer:
                 heading = f"## PR Reviewer Guide ({model}) 🔍"
                 retry_delay = _rate_limit_retry_delay_seconds()
                 rate_limit_retry_attempted = False
+                slot_started_at = time.monotonic()
+                outcome = "published"
                 for attempt in range(2):
                     attempt_started_at = time.monotonic()
                     prediction_task = None
@@ -816,12 +878,22 @@ class PRReviewer:
                             f"one rate-limit retry after {retry_delay}s also failed ({evidence['error_class']})"
                             if rate_limit_retry_attempted else None
                         )
+                        outcome = evidence["error_class"]
                         body = _review_failure_body(heading, evidence, retry_note)
                         get_logger().warning(
                             "Independent review failed",
                             artifact={"model": model, "attempt": attempt + 1, **evidence},
                         )
                         break
+                details = get_run_details()
+                timings.append({
+                    "model": model,
+                    "outcome": outcome,
+                    "seconds": round(time.monotonic() - slot_started_at, 1),
+                    "prompt_tokens": details.prompt_tokens if details else None,
+                    "completion_tokens": details.completion_tokens if details else None,
+                    "reasoning_tokens": details.reasoning_tokens if details else None,
+                })
                 if settings.config.publish_output:
                     self.git_provider.publish_persistent_comment(
                         body,
@@ -833,6 +905,7 @@ class PRReviewer:
                 return body
 
         results = await asyncio.gather(*(review_model(model) for model in models), return_exceptions=True)
+        _publish_review_timings(timings)
         artifacts = {}
         for model, result in zip(models, results):
             if isinstance(result, BaseException):

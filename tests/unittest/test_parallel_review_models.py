@@ -8,10 +8,18 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from starlette_context import request_cycle_context
 
+from pr_agent.algo.run_details import add_token_usage
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.git_provider import IncrementalPR
 from pr_agent.tools.pr_reviewer import PRReviewer
 from tests.unittest.test_persistent_comment_identity import FakeProvider
+
+
+@pytest.fixture(autouse=True)
+def no_actions_output(monkeypatch):
+    """Keep review timings out of the real job summary when this suite runs in CI."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
 
 
 @pytest.fixture
@@ -127,6 +135,57 @@ async def test_one_failure_does_not_cancel_other_model(monkeypatch, settings, fa
     if failure == "timeout":
         assert "timeout stage `review_watchdog`" in failed
         assert "configured limit `0.05s`" in failed
+
+
+async def test_review_timings_reach_job_summary_and_annotations(monkeypatch, settings, tmp_path, capsys):
+    class Handler:
+        async def chat_completion(self, model, **kwargs):
+            if model == "provider/a":
+                await asyncio.sleep(10)
+            add_token_usage({
+                "prompt_tokens": 1200,
+                "completion_tokens": 300,
+                "total_tokens": 1500,
+                "completion_tokens_details": {"reasoning_tokens": 250},
+            })
+            return "review:\n  estimated_effort_to_review_[1-5]: 2\n", "stop"
+
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    settings.set("config.ai_timeout", .05)
+    settings.set("pr_review_prompt.system", "review")
+    settings.set("pr_review_prompt.user", "{{ diff }}")
+    reviewer, _ = make_reviewer(monkeypatch, Handler)
+    await reviewer.run()
+
+    notices = [line for line in capsys.readouterr().out.splitlines() if line.startswith("::notice")]
+    assert len(notices) == 2
+    published = next(line for line in notices if "model=provider/b" in line)
+    assert published.startswith("::notice title=PR-Agent review timing::")
+    assert "outcome=published" in published
+    assert "prompt_tokens=1200 completion_tokens=300 reasoning_tokens=250" in published
+    timed_out = next(line for line in notices if "model=provider/a" in line)
+    assert "outcome=timeout" in timed_out
+    assert "prompt_tokens=0 completion_tokens=0 reasoning_tokens=0" in timed_out
+    table = summary.read_text()
+    assert "### PR-Agent review timings" in table
+    assert "| `provider/b` | published |" in table
+    assert "| 1200 | 300 | 250 |" in table
+    assert "| `provider/a` | timeout |" in table
+
+
+async def test_review_timings_are_silent_outside_actions(monkeypatch, settings, capsys):
+    class Handler:
+        async def chat_completion(self, model, **kwargs):
+            return "review:\n  estimated_effort_to_review_[1-5]: 2\n", "stop"
+
+    settings.set("pr_review_prompt.system", "review")
+    settings.set("pr_review_prompt.user", "{{ diff }}")
+    reviewer, _ = make_reviewer(monkeypatch, Handler)
+    await reviewer.run()
+
+    assert "::notice" not in capsys.readouterr().out
 
 
 async def test_provider_timeout_is_not_misclassified_as_review_watchdog(monkeypatch, settings):

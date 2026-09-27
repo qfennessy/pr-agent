@@ -256,6 +256,10 @@ class RunDetails:
     # reaches the collector, e.g. streaming responses or the langchain handler.
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Hidden thinking tokens, already included in completion_tokens. Read from litellm's
+    # usage.completion_tokens_details and 0 when the provider does not report them. Kept
+    # out of the evaluation payload; only the per-run timing record reads it.
+    reasoning_tokens: int = 0
     # Provider-reported total when available, otherwise derived from prompt + completion.
     # Counts failed fallback attempts as well, so it reflects what the run really cost,
     # while `model_used` names only the model behind the final answer.
@@ -867,6 +871,13 @@ def _add_token_usage(details, usage) -> None:
     details.prompt_tokens += prompt_tokens
     details.completion_tokens += completion_tokens
     details.total_tokens += total_tokens
+    if hasattr(details, "reasoning_tokens"):
+        if isinstance(usage, dict):
+            completion_details = usage.get("completion_tokens_details")
+        else:
+            completion_details = getattr(usage, "completion_tokens_details", None)
+        if completion_details is not None:
+            details.reasoning_tokens += _read_token_field(completion_details, "reasoning_tokens")
 
 
 def _has_complete_token_usage(usage) -> bool:
