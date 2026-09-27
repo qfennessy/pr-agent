@@ -1,5 +1,6 @@
 import asyncio
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -231,6 +232,24 @@ def test_add_token_usage_accumulates_across_calls():
     assert details.completion_tokens == 11
     assert details.total_tokens == 116
     assert details.has_token_usage is True
+
+
+def test_add_token_usage_accumulates_reasoning_tokens_from_either_shape():
+    init_run_details()
+
+    add_token_usage({
+        "prompt_tokens": 10, "completion_tokens": 8,
+        "completion_tokens_details": {"reasoning_tokens": 6},
+    })
+    add_token_usage(SimpleNamespace(
+        prompt_tokens=10, completion_tokens=4, total_tokens=14,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=3),
+    ))
+    add_token_usage({"prompt_tokens": 1, "completion_tokens": 1, "completion_tokens_details": None})
+
+    details = get_run_details()
+    assert details.reasoning_tokens == 9
+    assert details.completion_tokens == 13
 
 
 def test_add_token_usage_derives_total_when_missing():
