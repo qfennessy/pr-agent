@@ -1979,6 +1979,16 @@ class LiteLLMAIHandler(BaseAiHandler):
             )
         return clamped_effort
 
+    @staticmethod
+    def _is_native_deepseek_model(model: str, custom_llm_provider: str) -> bool:
+        """Return whether a request goes to DeepSeek's own API rather than a gateway."""
+        return model.startswith("deepseek/") and custom_llm_provider in ("", "deepseek")
+
+    @staticmethod
+    def _deepseek_reasoning_effort(reasoning_effort: str) -> str:
+        """Map a validated reasoning effort onto DeepSeek's low / high / max levels."""
+        return {"minimal": "low", "medium": "high", "xhigh": "max"}.get(reasoning_effort, reasoning_effort)
+
     def _apply_openrouter_request_controls(
         self,
         model: str,
@@ -2773,6 +2783,17 @@ class LiteLLMAIHandler(BaseAiHandler):
                         # model IDs it does not mark as reasoning-capable; defer to
                         # OpenRouter's unified reasoning object below.
                         openrouter_reasoning_effort = reasoning_effort
+                    elif (
+                        self._is_native_deepseek_model(model, custom_llm_provider)
+                        and reasoning_effort != ReasoningEffort.NONE.value
+                    ):
+                        # LiteLLM's DeepSeek mapping reduces a top-level reasoning_effort to
+                        # thinking={"type": "enabled"}, so DeepSeek would always think at its
+                        # default ("high"). extra_body reaches the request body unchanged.
+                        # "none" stays top-level: LiteLLM maps it to thinking disabled.
+                        deepseek_effort = self._deepseek_reasoning_effort(reasoning_effort)
+                        get_logger().info(f"Adding reasoning_effort with value {deepseek_effort} to model {model}.")
+                        kwargs["extra_body"] = {**(kwargs.get("extra_body") or {}), "reasoning_effort": deepseek_effort}
                     else:
                         get_logger().info(f"Adding reasoning_effort with value {reasoning_effort} to model {model}.")
                         kwargs["reasoning_effort"] = reasoning_effort

@@ -497,6 +497,10 @@ key = ...
 
 (you can obtain a deepseek-v4 key from [here](https://platform.deepseek.com/api_keys))
 
+`config.reasoning_effort` sets DeepSeek's thinking effort. DeepSeek accepts `low`, `high` and `max`, so `minimal` is
+sent as `low`, `medium` (the default) as `high`, and `xhigh` as `max`; `none` disables thinking. Lower effort answers
+faster, with fewer reasoning tokens.
+
 ### GLM (Z.AI)
 
 To use GLM models with Z.AI (Zhipu), for example, set:

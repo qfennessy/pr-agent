@@ -1740,3 +1740,66 @@ class TestAdditionalReasoningEffortModels:
         assert kwargs["reasoning_effort"] == "xhigh"
         assert "temperature" not in kwargs
         assert kwargs["allowed_openai_params"] == ["reasoning_effort"]
+
+
+class TestLiteLLMReasoningEffortDeepSeek:
+    """Native DeepSeek models receive config.reasoning_effort in extra_body.
+
+    LiteLLM's DeepSeek mapping reduces a top-level reasoning_effort to
+    thinking={"type": "enabled"}, so the configured effort never reached DeepSeek,
+    which then thinks at its default "high". extra_body reaches the request body
+    unchanged. DeepSeek accepts low / high / max.
+    """
+
+    def _isolate_env(self, monkeypatch):
+        for variable in ("AWS_USE_IMDS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                         "AWS_SESSION_TOKEN", "AWS_REGION_NAME", "OPENAI_API_KEY"):
+            monkeypatch.delenv(variable, raising=False)
+
+    async def _run(self, monkeypatch, model, global_effort, custom_llm_provider=""):
+        # Pin reasoning support so the result does not depend on the bundled cost map version.
+        for key in ("deepseek-flash", "deepseek/deepseek-flash", "deepseek-v4-pro", "deepseek/deepseek-v4-pro"):
+            monkeypatch.setitem(litellm.model_cost, key, {"supports_reasoning": True})
+        fake_settings = create_mock_settings(global_effort)
+        monkeypatch.setattr(fake_settings.litellm, "custom_llm_provider", custom_llm_provider, raising=False)
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        self._isolate_env(monkeypatch)
+        with patch(ACOMPLETION_PATCH_TARGET, new_callable=AsyncMock) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+            await LiteLLMAIHandler().chat_completion(model=model, system="test system", user="test user")
+        return mock_completion.call_args[1]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("configured", "sent"),
+        [("minimal", "low"), ("low", "low"), ("medium", "high"), ("high", "high"), ("xhigh", "max"), ("max", "max")],
+    )
+    async def test_effort_is_sent_in_extra_body(self, monkeypatch, mock_logger, configured, sent):
+        for model in ("deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"):
+            kwargs = await self._run(monkeypatch, model, configured)
+            assert kwargs["extra_body"] == {"reasoning_effort": sent}, f"failed for {model}"
+            assert "reasoning_effort" not in kwargs
+            assert "allowed_openai_params" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_none_keeps_top_level_so_litellm_disables_thinking(self, monkeypatch, mock_logger):
+        kwargs = await self._run(monkeypatch, "deepseek/deepseek-flash", "none")
+        assert kwargs["reasoning_effort"] == "none"
+        assert "extra_body" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_custom_provider_keeps_top_level_effort(self, monkeypatch, mock_logger):
+        """A raw "deepseek/..." id sent to another provider is not DeepSeek's native API."""
+        kwargs = await self._run(monkeypatch, "deepseek/deepseek-flash", "low", custom_llm_provider="openai")
+        assert kwargs["reasoning_effort"] == "low"
+        assert "extra_body" not in kwargs
+
+    def test_litellm_keeps_extra_body_effort_but_reduces_top_level(self):
+        """Pin the LiteLLM behavior this relies on."""
+        via_extra_body = get_optional_params(
+            model="deepseek-flash", custom_llm_provider="deepseek", extra_body={"reasoning_effort": "low"},
+        )
+        assert via_extra_body["extra_body"] == {"reasoning_effort": "low"}
+        top_level = get_optional_params(model="deepseek-flash", custom_llm_provider="deepseek", reasoning_effort="low")
+        assert top_level["thinking"] == {"type": "enabled"}
+        assert "reasoning_effort" not in (top_level.get("extra_body") or {})
