@@ -1008,7 +1008,9 @@ class LiteLLMAIHandler(BaseAiHandler):
                 model_base = model
                 while model_base.startswith(('openai/', 'azure/')):
                     model_base = model_base.removeprefix('openai/').removeprefix('azure/')
-                if model_base.startswith('gpt-5'):
+                # GPT-6 models take the same reasoning_effort contract (none..max) and,
+                # like GPT-5, reject temperature, so they share this path.
+                if model_base.startswith(('gpt-5', 'gpt-6')):
                     # Use configured reasoning_effort or default to MEDIUM
                     config_effort = get_settings().config.reasoning_effort
                     try:

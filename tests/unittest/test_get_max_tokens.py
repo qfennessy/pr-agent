@@ -75,6 +75,18 @@ class TestGetMaxTokens:
 
         assert get_max_tokens(model) == 1050000
 
+    def test_gpt6_luna_model_max_tokens(self, monkeypatch):
+        fake_settings = type('', (), {
+            'config': type('', (), {
+                'custom_model_max_tokens': 0,
+                'max_model_tokens': 0
+            })()
+        })()
+
+        monkeypatch.setattr(utils, "get_settings", lambda: fake_settings)
+
+        assert get_max_tokens("gpt-6-luna") == 1050000
+
     @pytest.mark.parametrize("model", ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
     def test_gpt56_model_max_tokens(self, monkeypatch, model):
         fake_settings = type('', (), {

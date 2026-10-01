@@ -762,6 +762,36 @@ class TestLiteLLMReasoningEffort:
                 assert call_kwargs["model"] == model, f"model double-prefixed: {call_kwargs['model']}"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", ["gpt-6-luna", "openai/gpt-6-luna"])
+    async def test_gpt6_luna_uses_reasoning_effort_path(self, monkeypatch, mock_logger, model):
+        """GPT-6 models take the same path as GPT-5: reasoning_effort, no temperature.
+
+        Without this, "openai/gpt-6-luna" fell through to the generic path: the
+        configured effort was never sent and temperature=0.2 was passed instead.
+        """
+        fake_settings = create_mock_settings("max")
+        monkeypatch.setattr(litellm_handler, "get_settings", lambda: fake_settings)
+        for _var in ("AWS_USE_IMDS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                     "AWS_SESSION_TOKEN", "AWS_REGION_NAME", "OPENAI_API_KEY"):
+            monkeypatch.delenv(_var, raising=False)
+
+        with patch(
+            'pr_agent.algo.ai_handlers.litellm_ai_handler.acompletion',
+            new_callable=AsyncMock,
+        ) as mock_completion:
+            mock_completion.return_value = create_mock_acompletion_response()
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(model=model, system="test system", user="test user")
+
+            call_kwargs = mock_completion.call_args[1]
+            assert call_kwargs["reasoning_effort"] == "max"
+            assert "reasoning_effort" in call_kwargs["allowed_openai_params"]
+            assert "temperature" not in call_kwargs
+            # A bare name gets the default openai/ routing, as GPT-5 names do.
+            assert call_kwargs["model"] == "openai/gpt-6-luna"
+
+    @pytest.mark.asyncio
     async def test_gpt5_with_openai_prefix_strips_thinking_suffix(self, monkeypatch, mock_logger):
         """Prefixed _thinking models must have the suffix removed without double-prefixing."""
         fake_settings = create_mock_settings("low")
